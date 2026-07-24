@@ -32,8 +32,13 @@ pub async fn run(args: crate::LoginArgs) -> Result<()> {
         .await
         .map_err(|_| anyhow!("Login timed out after 5 minutes."))??;
 
-    save_credentials(&Credentials { api_url, token }).await?;
+    let creds = Credentials { api_url, token };
+    save_credentials(&creds).await?;
     println!("\u{2713} Logged in. Credentials saved.");
+
+    // Catch "the box is online but SSH is denied" now, while the user is at the
+    // keyboard — not at the end of a provision they already paid for.
+    crate::commands::ssh_key::verify_after_login(&creds).await;
 
     // Offer to install the `orx` skill shim into any coding agent already set up
     // here, so it auto-discovers how to drive the CLI. Consent-gated and
