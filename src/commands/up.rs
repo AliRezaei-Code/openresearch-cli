@@ -2237,26 +2237,59 @@ async fn slurm_preflight(Json(req): Json<SlurmPreflightReq>) -> ApiResult {
 /// fetched when a row is expanded.
 /// Whether a box would accept this machine. Three-valued on purpose: the check
 /// needs the api, so "we couldn't ask" is a different answer from "no" and the
-/// badge shouldn't have to pick one of the two.
-#[derive(Clone, Copy, PartialEq)]
+/// badge shouldn't have to pick one of the two. Each arm carries what the row
+/// needs to say — guessing a key path would send the user to a file that may
+/// not exist.
+#[derive(Clone, PartialEq)]
 enum SshReadiness {
     Ready,
-    NoUsableKey,
-    Unverified,
+    /// The `.pub` on this machine worth registering, if there is one.
+    NoUsableKey {
+        pub_path: Option<String>,
+    },
+    Unverified {
+        reason: String,
+    },
 }
 
 async fn openresearch_ssh_readiness() -> SshReadiness {
-    use crate::local::ssh_identity::KeyStatus;
+    use crate::local::ssh_identity::{preferred_local, tilde, KeyStatus};
     let Ok(Some(creds)) = crate::config::load_credentials().await else {
         // Signed-out is reported by the row's own `or_logged_in`.
-        return SshReadiness::NoUsableKey;
+        return SshReadiness::NoUsableKey { pub_path: None };
+    };
+    let named = |local: &[crate::local::ssh_identity::LocalKey]| SshReadiness::NoUsableKey {
+        pub_path: preferred_local(local)
+            .and_then(|k| k.path.as_deref())
+            .map(tilde),
     };
     match crate::local::ssh_identity::check(&creds).await {
         KeyStatus::Matched => SshReadiness::Ready,
-        KeyStatus::NoLocalMatch { .. } | KeyStatus::NoneRegistered { .. } => {
-            SshReadiness::NoUsableKey
+        KeyStatus::NoLocalMatch { local, .. } | KeyStatus::NoneRegistered { local } => {
+            named(&local)
         }
-        KeyStatus::Unknown { .. } => SshReadiness::Unverified,
+        KeyStatus::Unknown { reason } => SshReadiness::Unverified { reason },
+    }
+}
+
+/// The openresearch row's one-line status. Every branch that tells the user to
+/// run something names a path we actually found — never a guessed one.
+fn openresearch_summary(logged_in: bool, ssh: &SshReadiness) -> String {
+    if !logged_in {
+        return "Not signed in — run orx login".to_string();
+    }
+    match ssh {
+        SshReadiness::Ready => "Signed in — ephemeral boxes billed to your org".to_string(),
+        SshReadiness::NoUsableKey {
+            pub_path: Some(path),
+        } => format!("No usable SSH key — run orx ssh-key add {path}"),
+        SshReadiness::NoUsableKey { pub_path: None } => {
+            "No SSH key on this computer — run ssh-keygen -t ed25519, then orx ssh-key add"
+                .to_string()
+        }
+        SshReadiness::Unverified { reason } => {
+            format!("Signed in — couldn't check your SSH key ({reason})")
+        }
     }
 }
 
@@ -2344,15 +2377,8 @@ fn compute_settings_json(ssh: SshReadiness) -> Value {
             // connect — the box authorizes your *registered* keys, so one of
             // them has to be on this machine too.
             "configured": or_logged_in && ssh == SshReadiness::Ready,
-            "unverified": or_logged_in && ssh == SshReadiness::Unverified,
-            "summary": match (or_logged_in, ssh) {
-                (false, _) => "Not signed in — run orx login",
-                (true, SshReadiness::Ready) => "Signed in — ephemeral boxes billed to your org",
-                (true, SshReadiness::NoUsableKey) => {
-                    "No usable SSH key — run orx ssh-key add ~/.ssh/id_ed25519.pub"
-                }
-                (true, SshReadiness::Unverified) => "Signed in — couldn't check your SSH key",
-            },
+            "unverified": or_logged_in && matches!(ssh, SshReadiness::Unverified { .. }),
+            "summary": openresearch_summary(or_logged_in, &ssh),
         },
     ]);
     json!({
@@ -3010,5 +3036,49 @@ async fn spa(uri: Uri) -> Response {
     match UiDist::get("index.html") {
         Some(file) => asset_response("index.html", file),
         None => Html(NOT_BUILT_PAGE).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn no_key(path: Option<&str>) -> SshReadiness {
+        SshReadiness::NoUsableKey {
+            pub_path: path.map(str::to_string),
+        }
+    }
+
+    /// The row used to hardcode `~/.ssh/id_ed25519.pub`, which is wrong on any
+    /// machine whose key is named something else.
+    #[test]
+    fn names_the_key_file_we_actually_found() {
+        let s = openresearch_summary(true, &no_key(Some("~/.ssh/work_ed25519.pub")));
+        assert!(s.contains("orx ssh-key add ~/.ssh/work_ed25519.pub"));
+        assert!(!s.contains("id_ed25519"), "no guessed default");
+    }
+
+    /// Nothing on disk to register, so `ssh-key add` alone would fail.
+    #[test]
+    fn tells_you_to_generate_one_when_there_is_no_key() {
+        let s = openresearch_summary(true, &no_key(None));
+        assert!(s.contains("ssh-keygen"));
+    }
+
+    #[test]
+    fn signed_out_beats_every_key_state() {
+        assert!(openresearch_summary(false, &SshReadiness::Ready).contains("orx login"));
+        assert!(openresearch_summary(false, &no_key(None)).contains("orx login"));
+    }
+
+    #[test]
+    fn unverified_says_why_it_could_not_check() {
+        let s = openresearch_summary(
+            true,
+            &SshReadiness::Unverified {
+                reason: "timed out".to_string(),
+            },
+        );
+        assert!(s.contains("timed out"), "surfaces the cause: {s}");
     }
 }
