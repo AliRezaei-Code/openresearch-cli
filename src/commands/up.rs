@@ -2235,7 +2235,21 @@ async fn slurm_preflight(Json(req): Json<SlurmPreflightReq>) -> ApiResult {
 /// or the modal python import. `configured` means "worth trying", not
 /// "healthy"; deep health stays in each backend's own settings endpoint,
 /// fetched when a row is expanded.
-fn compute_settings_json() -> Value {
+/// Whether a box would accept this machine: signed in AND holding a key the
+/// account has registered. `Unknown` (api unreachable, unreadable ~/.ssh) is
+/// treated as ready — we couldn't tell, so don't cry wolf.
+async fn openresearch_ssh_ready() -> bool {
+    use crate::local::ssh_identity::KeyStatus;
+    match crate::config::load_credentials().await {
+        Ok(Some(creds)) => matches!(
+            crate::local::ssh_identity::check(&creds).await,
+            KeyStatus::Matched | KeyStatus::Unknown { .. }
+        ),
+        _ => false,
+    }
+}
+
+fn compute_settings_json(ssh_ready: bool) -> Value {
     let default = crate::config::compute_default();
     let (default_backend, default_flavor) = match &default {
         Some((b, f)) => (Some(b.as_str()), f.as_deref()),
@@ -2315,11 +2329,14 @@ fn compute_settings_json() -> Value {
         },
         {
             "id": "openresearch",
-            "configured": or_logged_in,
-            "summary": if or_logged_in {
-                "Signed in — ephemeral boxes billed to your org"
-            } else {
-                "Not signed in — run orx login"
+            // Signed in alone would be a green light on a backend that can't
+            // connect — the box authorizes your *registered* keys, so one of
+            // them has to be on this machine too.
+            "configured": or_logged_in && ssh_ready,
+            "summary": match (or_logged_in, ssh_ready) {
+                (false, _) => "Not signed in — run orx login",
+                (true, false) => "No usable SSH key — run orx ssh-key add ~/.ssh/id_ed25519.pub",
+                (true, true) => "Signed in — ephemeral boxes billed to your org",
             },
         },
     ]);
@@ -2331,8 +2348,9 @@ fn compute_settings_json() -> Value {
 }
 
 async fn compute_settings() -> ApiResult {
+    let ssh_ready = openresearch_ssh_ready().await;
     // fs/env probes only, but keep them off the async runtime anyway.
-    let payload = tokio::task::spawn_blocking(compute_settings_json)
+    let payload = tokio::task::spawn_blocking(move || compute_settings_json(ssh_ready))
         .await
         .map_err(|e| ApiError::from(anyhow!("compute settings task failed: {e}")))?;
     Ok(Json(payload))
@@ -2361,12 +2379,15 @@ async fn set_compute_default(Json(req): Json<SetComputeDefaultReq>) -> ApiResult
     if let Some(b) = &backend {
         local::validate_compute_default(b, flavor.as_deref()).map_err(bad_request)?;
     }
+    // Picking openresearch as the default is the moment to answer "will this
+    // actually work?", so the row that comes back is honest about the SSH key.
+    let ssh_ready = openresearch_ssh_ready().await;
     // Validation already ran above, so a failure in here is a server-side
     // fault (io error, corrupt settings.json refusal) — surface it as 500 via
     // the plain ApiError conversion, not as a 400 blaming the request.
     let payload = tokio::task::spawn_blocking(move || -> Result<Value> {
         crate::config::set_compute_default(backend, flavor)?;
-        Ok(compute_settings_json())
+        Ok(compute_settings_json(ssh_ready))
     })
     .await
     .map_err(|e| ApiError::from(anyhow!("compute default task failed: {e}")))??;
