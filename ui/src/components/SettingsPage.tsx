@@ -836,18 +836,31 @@ function OpenResearchSection() {
               )}
             </span>
           </div>
-          {s.sshKeyStatus === "none_registered" && (
-            <p className="settings-note">
-              Add one with <code>orx ssh-key add ~/.ssh/id_ed25519.pub</code>.
-            </p>
-          )}
-          {s.sshKeyStatus === "no_local_match" && (
-            <p className="settings-note">
-              Register this computer with{" "}
-              <code>orx ssh-key add ~/.ssh/id_ed25519.pub</code>, or load a registered
-              key with <code>ssh-add</code>.
-            </p>
-          )}
+          {s.sshKeyStatus === "none_registered" &&
+            (s.sshKeyPath ? (
+              <p className="settings-note">
+                Add one with <code>orx ssh-key add {s.sshKeyPath}</code>.
+              </p>
+            ) : (
+              <p className="settings-note">
+                No key on this computer yet — create one with{" "}
+                <code>ssh-keygen -t ed25519</code>, then add it with{" "}
+                <code>orx ssh-key add</code>.
+              </p>
+            ))}
+          {s.sshKeyStatus === "no_local_match" &&
+            (s.sshKeyPath ? (
+              <p className="settings-note">
+                Register this computer with <code>orx ssh-key add {s.sshKeyPath}</code>,
+                or load a registered key with <code>ssh-add</code>.
+              </p>
+            ) : (
+              <p className="settings-note">
+                No key on this computer to register — load a registered key with{" "}
+                <code>ssh-add</code>, or create one with{" "}
+                <code>ssh-keygen -t ed25519</code>.
+              </p>
+            ))}
           {s.error && <p className="settings-note">{s.error}</p>}
         </>
       )}

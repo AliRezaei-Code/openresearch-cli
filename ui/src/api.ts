@@ -571,6 +571,8 @@ export interface OpenResearchSettings {
    * binary serving a newer ui omits it.
    */
   sshKeyStatus?: "matched" | "no_local_match" | "none_registered" | "unknown";
+  /** The `.pub` on this machine worth registering; null if there isn't one. */
+  sshKeyPath?: string | null;
   error: string | null;
 }
 

@@ -2468,11 +2468,25 @@ async fn openresearch_settings() -> ApiResult {
     // "Registered" alone is a misleading green: a key registered from another
     // laptop leaves this machine unable to reach any box. Report whether the
     // private half is actually here.
-    use crate::local::ssh_identity::KeyStatus;
+    use crate::local::ssh_identity::{preferred_local, tilde, KeyStatus};
+    // Hand back the .pub we actually found so the note can name a real file
+    // rather than guessing at ~/.ssh/id_ed25519.pub.
+    let mut ssh_key_path: Option<String> = None;
+    let mut note_key = |local: &[crate::local::ssh_identity::LocalKey]| {
+        ssh_key_path = preferred_local(local)
+            .and_then(|k| k.path.as_deref())
+            .map(tilde);
+    };
     let ssh_key_status = match crate::local::ssh_identity::check(&creds).await {
         KeyStatus::Matched => "matched",
-        KeyStatus::NoLocalMatch { .. } => "no_local_match",
-        KeyStatus::NoneRegistered { .. } => "none_registered",
+        KeyStatus::NoLocalMatch { local, .. } => {
+            note_key(&local);
+            "no_local_match"
+        }
+        KeyStatus::NoneRegistered { local } => {
+            note_key(&local);
+            "none_registered"
+        }
         KeyStatus::Unknown { reason } => {
             error.get_or_insert(reason);
             "unknown"
@@ -2483,6 +2497,7 @@ async fn openresearch_settings() -> ApiResult {
         "apiUrl": creds.api_url,
         "orgs": orgs,
         "sshKeyStatus": ssh_key_status,
+        "sshKeyPath": ssh_key_path,
         "error": error,
     })))
 }

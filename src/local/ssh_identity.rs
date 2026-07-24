@@ -257,10 +257,11 @@ pub fn explain_launch_failure(sandbox_id: &str, err: &str) -> String {
         let one_line = err.split_whitespace().collect::<Vec<_>>().join(" ");
         return format!("Could not launch the run on box {sandbox_id}: {one_line}");
     }
+    // No key path here — this runs in the supervisor with no view of ~/.ssh, and
+    // `orx ssh-key list` names the file without us guessing at one.
     format!(
         "Could not launch the run on box {sandbox_id}: it refused this computer's SSH key. \
-         Run `orx ssh-key add ~/.ssh/id_ed25519.pub` on the computer you launched from, \
-         then relaunch."
+         Run `orx ssh-key list` to see which key to register, then relaunch."
     )
 }
 
@@ -446,7 +447,10 @@ mod tests {
             "ssh root@h failed (exit 255):\nWarning: Permanently added 'h' to known hosts.\nroot@h: Permission denied (publickey).",
         );
         assert_eq!(msg.lines().count(), 1);
-        assert!(msg.contains("orx ssh-key add"));
+        // Points at the command that *names* the key rather than guessing a path
+        // this code can't see.
+        assert!(msg.contains("orx ssh-key list"));
+        assert!(!msg.contains("id_ed25519"), "no guessed key path");
         assert!(
             !msg.contains("known hosts"),
             "drops the noise before the denial"
