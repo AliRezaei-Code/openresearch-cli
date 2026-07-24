@@ -518,6 +518,12 @@ export type ComputeTargetId =
 export interface ComputeTargetSummary {
   id: ComputeTargetId;
   configured: boolean;
+  /**
+   * The readiness check couldn't run (offline, unreadable ~/.ssh), so
+   * `configured` is a guess rather than an answer. Absent for backends whose
+   * state is decidable locally.
+   */
+  unverified?: boolean;
   summary: string;
 }
 

@@ -892,6 +892,8 @@ const FLAVOR_SUGGESTIONS: Partial<Record<ComputeTargetId, string[]>> = {
 
 function TargetStatusBadge({ t, isDefault }: { t: ComputeTargetSummary; isDefault: boolean }) {
   if (t.id === "local") return <span className="badge ok">Ready</span>;
+  // Don't claim either answer when the check couldn't run.
+  if (t.unverified) return <span className="badge">Unknown</span>;
   if (!t.configured && isDefault) return <span className="badge warn">Not configured</span>;
   if (!t.configured) return <span className="badge">Not set up</span>;
   return <span className="badge ok">Configured</span>;
