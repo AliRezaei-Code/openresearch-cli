@@ -678,18 +678,27 @@ pub struct ListSandboxes {
     pub sandboxes: Vec<Sandbox>,
 }
 
-/// A registered SSH public key (`zSshKey`, secrets-free).
+/// A registered SSH public key (`zSshKey`, secrets-free). `public_key` is the
+/// raw OpenSSH line, so the CLI can tell whether this machine holds the
+/// matching private half.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SshKey {
     pub id: String,
     pub name: String,
+    pub public_key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListSshKeys {
     pub ssh_keys: Vec<SshKey>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshKeyEnvelope {
+    pub ssh_key: SshKey,
 }
 
 // ---------------------------------------------------------------------------
@@ -1054,6 +1063,22 @@ pub async fn list_sandboxes(creds: &Credentials, org_id: &str) -> Result<ListSan
 /// org members' registered keys, so an empty list means an unreachable box.
 pub async fn list_ssh_keys(creds: &Credentials) -> Result<ListSshKeys> {
     api_get(creds, "/ssh-keys").await
+}
+
+/// Register a public key on the account — `POST /ssh-keys`. The api pushes it to
+/// every live box in the user's orgs, so an already-running box becomes
+/// reachable without a restart.
+pub async fn create_ssh_key(
+    creds: &Credentials,
+    name: &str,
+    public_key: &str,
+) -> Result<SshKeyEnvelope> {
+    api_post(
+        creds,
+        "/ssh-keys",
+        serde_json::json!({ "name": name, "publicKey": public_key }),
+    )
+    .await
 }
 
 pub async fn cancel_experiment_run(creds: &Credentials, exp_id: &str) -> Result<()> {

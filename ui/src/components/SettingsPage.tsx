@@ -825,19 +825,27 @@ function OpenResearchSection() {
             <span className="v">{s.orgs.length > 0 ? s.orgs.join(", ") : "—"}</span>
             <span className="k">SSH key</span>
             <span className="v">
-              {s.sshKeyRegistered === true ? (
-                <span className="badge ok">Registered</span>
-              ) : s.sshKeyRegistered === false ? (
+              {s.sshKeyStatus === "matched" ? (
+                <span className="badge ok">On this computer</span>
+              ) : s.sshKeyStatus === "no_local_match" ? (
+                <span className="badge warn">Not on this computer</span>
+              ) : s.sshKeyStatus === "none_registered" ? (
                 <span className="badge err">None registered</span>
               ) : (
                 <span className="badge">Unknown</span>
               )}
             </span>
           </div>
-          {s.sshKeyRegistered === false && (
+          {s.sshKeyStatus === "none_registered" && (
             <p className="settings-note">
-              Launches need a registered SSH key. Add one with{" "}
-              <code>orx ssh-key add ~/.ssh/id_ed25519.pub</code>.
+              Add one with <code>orx ssh-key add ~/.ssh/id_ed25519.pub</code>.
+            </p>
+          )}
+          {s.sshKeyStatus === "no_local_match" && (
+            <p className="settings-note">
+              Register this computer with{" "}
+              <code>orx ssh-key add ~/.ssh/id_ed25519.pub</code>, or load a registered
+              key with <code>ssh-add</code>.
             </p>
           )}
           {s.error && <p className="settings-note">{s.error}</p>}

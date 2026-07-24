@@ -2391,7 +2391,7 @@ async fn openresearch_settings() -> ApiResult {
             "loggedIn": false,
             "apiUrl": null,
             "orgs": [],
-            "sshKeyRegistered": null,
+            "sshKeyStatus": "unknown",
             "error": null,
         })));
     };
@@ -2403,18 +2403,24 @@ async fn openresearch_settings() -> ApiResult {
             Vec::new()
         }
     };
-    let ssh_key_registered = match crate::client::list_ssh_keys(&creds).await {
-        Ok(k) => Some(!k.ssh_keys.is_empty()),
-        Err(e) => {
-            error.get_or_insert(e.to_string());
-            None
+    // "Registered" alone is a misleading green: a key registered from another
+    // laptop leaves this machine unable to reach any box. Report whether the
+    // private half is actually here.
+    use crate::local::ssh_identity::KeyStatus;
+    let ssh_key_status = match crate::local::ssh_identity::check(&creds).await {
+        KeyStatus::Matched => "matched",
+        KeyStatus::NoLocalMatch { .. } => "no_local_match",
+        KeyStatus::NoneRegistered { .. } => "none_registered",
+        KeyStatus::Unknown { reason } => {
+            error.get_or_insert(reason);
+            "unknown"
         }
     };
     Ok(Json(json!({
         "loggedIn": true,
         "apiUrl": creds.api_url,
         "orgs": orgs,
-        "sshKeyRegistered": ssh_key_registered,
+        "sshKeyStatus": ssh_key_status,
         "error": error,
     })))
 }

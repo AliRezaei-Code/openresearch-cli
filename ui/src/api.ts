@@ -559,8 +559,12 @@ export interface OpenResearchSettings {
   loggedIn: boolean;
   apiUrl: string | null;
   orgs: string[];
-  /** null = signed in but the key check failed (see error). */
-  sshKeyRegistered: boolean | null;
+  /**
+   * Whether a registered key's private half is on THIS machine — `matched` is
+   * the only state that can actually reach a box. Optional: an older `orx`
+   * binary serving a newer ui omits it.
+   */
+  sshKeyStatus?: "matched" | "no_local_match" | "none_registered" | "unknown";
   error: string | null;
 }
 

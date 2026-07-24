@@ -43,6 +43,7 @@ pub mod runs;
 pub mod search_logs;
 pub mod serve;
 pub mod skill;
+pub mod ssh_key;
 pub mod supervise;
 pub mod telemetry;
 pub mod up;

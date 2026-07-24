@@ -114,6 +114,10 @@ enum Command {
     /// Spin up standalone compute in an organization (no experiment).
     Instance(InstanceArgs),
 
+    /// Register this computer's SSH key so the boxes you provision accept it.
+    #[command(name = "ssh-key")]
+    SshKey(SshKeyArgs),
+
     /// Operate on one experiment node (status / run command / run / cancel).
     Exp(ExpArgs),
 
@@ -384,6 +388,27 @@ pub struct ComputeArgs {
     /// Filter to one provider (e.g. `runpod`, `vast`, `lambda`). Case-insensitive. GPU mode only.
     #[arg(long)]
     pub provider: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct SshKeyArgs {
+    #[command(subcommand)]
+    pub command: SshKeyCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SshKeyCommand {
+    /// Register a public key on your account. Every box in your orgs — including
+    /// ones already running — starts accepting it.
+    Add(SshKeyAddArgs),
+    /// List registered keys, marking the ones usable from this computer.
+    List,
+}
+
+#[derive(Args, Debug)]
+pub struct SshKeyAddArgs {
+    /// Path to the PUBLIC key (defaults to `~/.ssh/id_ed25519.pub`).
+    pub path: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -843,6 +868,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::CreateExperiment(_) => "create-experiment",
         Command::Compute(_) => "compute",
         Command::Instance(_) => "instance",
+        Command::SshKey(_) => "ssh-key",
         Command::Exp(_) => "exp",
         Command::Report(_) => "report",
         Command::Skill(_) => "skill",
@@ -881,6 +907,10 @@ async fn dispatch(command: Command) -> error::Result<()> {
         Command::CreateExperiment(args) => commands::create_experiment::run(args).await,
         Command::Compute(args) => commands::compute::run(args).await,
         Command::Instance(args) => commands::instance::run(args).await,
+        Command::SshKey(args) => match args.command {
+            SshKeyCommand::Add(a) => commands::ssh_key::add(a.path).await,
+            SshKeyCommand::List => commands::ssh_key::list().await,
+        },
         Command::Exp(args) => commands::exp::run(args).await,
         Command::Report(args) => commands::report::run(args).await,
         Command::Skill(args) => commands::skill::run(args).await,

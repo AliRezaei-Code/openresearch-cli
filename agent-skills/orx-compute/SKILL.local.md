@@ -130,7 +130,10 @@ orx exp run <expId> --backend slurm                    # CPU-only, settings defa
 
 Provisions an **ephemeral OpenResearch machine billed to the user's org** —
 created for this run and deleted when it ends — with a fixed CUDA + PyTorch +
-uv image. Needs `orx login` and a registered SSH key.
+uv image. Needs `orx login` and an SSH key registered from *this* computer —
+`orx ssh-key list` shows which keys are usable here, and `orx ssh-key add
+~/.ssh/id_ed25519.pub` registers this one. Without it the box comes online but
+refuses the connection.
 
 ```sh
 orx exp run <expId> --backend openresearch --flavor h100_sxm:2 --timeout 4h

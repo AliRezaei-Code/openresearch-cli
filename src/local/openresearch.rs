@@ -4,11 +4,12 @@
 //! the run as `starting` and the detached supervisor does the rest (wait for
 //! online, launch over ssh, watch, tear the box down at terminal state).
 
-use crate::client::{create_sandbox, list_orgs, list_ssh_keys, CreateSandboxBody};
+use crate::client::{create_sandbox, list_orgs, CreateSandboxBody};
 use crate::commands::exp::spawn_detached_supervise;
 use crate::error::{anyhow, require_credentials, Result};
 use crate::jobs::{openresearch, BackendDescriptor};
 use crate::local::git;
+use crate::local::ssh_identity;
 use crate::store::{now_ms, Store, StoredRun};
 
 /// CLI wrapper around `submit_local_openresearch`: submit, then print the
@@ -105,18 +106,32 @@ pub async fn submit_local_openresearch(args: &crate::ExpRunArgs) -> Result<Store
         }
     };
 
-    // Boxes authorize org members' *registered* SSH keys; without one the box
-    // would come online unreachable. Preflight is best-effort — an older API
-    // without the route must not block the submit.
-    match list_ssh_keys(&creds).await {
-        Ok(keys) if keys.ssh_keys.is_empty() => {
+    // Boxes authorize org members' *registered* SSH keys, and orx authenticates
+    // with whatever this machine's ssh offers — so a key registered from another
+    // computer leaves the box online but unreachable.
+    match ssh_identity::check(&creds).await {
+        ssh_identity::KeyStatus::Matched => {}
+        ssh_identity::KeyStatus::Unknown { reason } => {
+            eprintln!("warning: could not check your registered SSH keys: {reason}");
+        }
+        // No keys at all is the api's own answer, so blocking is safe.
+        ssh_identity::KeyStatus::NoneRegistered { local } => {
             return Err(anyhow!(
-                "No SSH key is registered on your account, so orx couldn't reach the box. \
-                 Add one in the dashboard (Settings → SSH keys), then rerun."
+                "{}\n\n{}",
+                ssh_identity::diagnosis(&[]),
+                ssh_identity::remediation(&[], &local)
             ));
         }
-        Ok(_) => {}
-        Err(err) => eprintln!("warning: could not check your registered SSH keys: {err}"),
+        // We only enumerate the agent and ~/.ssh/*.pub, so ssh can still succeed
+        // via an IdentityFile elsewhere or a key whose .pub isn't on disk. Warn
+        // loudly rather than block a launch that would have worked.
+        ssh_identity::KeyStatus::NoLocalMatch { registered, local } => {
+            eprintln!(
+                "warning: {}\n\n{}",
+                ssh_identity::diagnosis(&registered),
+                ssh_identity::remediation(&registered, &local)
+            );
+        }
     }
 
     let store = Store::open()?;
