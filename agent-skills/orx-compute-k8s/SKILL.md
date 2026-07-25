@@ -69,11 +69,13 @@ The contract orx enforces at submit (loud, before anything runs):
   `orx logs`, cancel via `orx exp cancel`). A detached `orx supervise`
   watches the Job via kubectl; don't kill it.
 - **A rejected submit or a failed Job is not an experiment result.** Manifest
-  errors, unschedulable pods, image-pull failures, OOMKilled — fix
+  errors, unschedulable pods, and image-pull failures — fix
   `.orx/k8s.yaml` (or the code) on the **same** experiment branch and re-run the
   same `<expId>` (see `orx-experiment-tree`: the freeze test). Before the node
   has measured, a manifest change is a repair, and it counts toward the repair
   cap: **two** runs in a row that measure nothing on the same node, then stop
-  and ask the user. After it has measured, the node is frozen — a deliberate
+  and ask the user. An **OOMKilled** container is different: if this node's own
+  change grew the model or the batch, that OOM *is* its result — freeze it and
+  put the bigger shape on a child. After it has measured, the node is frozen — a deliberate
   compute change (node count, GPU type) is then a real experimental variable
   and goes on a child.

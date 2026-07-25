@@ -34,9 +34,10 @@ has measured something is frozen — branch a child instead (see
 `orx-experiment-tree`: the freeze test).
 
 The sync recipe is **idempotent** — run it verbatim whether or not the clone
-already exists from a previous session. Always fetch + reset before editing, so a
-reused clone is never stale (and the experiment's branch, created server-side, is
-fetched even when it's brand-new and not in your local clone yet):
+already exists from a previous session. Always fetch + fast-forward before
+editing, so a reused clone is never stale (and the experiment's branch, created
+server-side, is fetched even when it's brand-new and not in your local clone
+yet):
 
 ```sh
 DIR=~/.cache/openresearch/repos/<owner>/<repo>
@@ -108,6 +109,7 @@ re-checking-out a branch you may have already left, in a **worktree** where
 ```sh
 git fetch origin
 git checkout orx/<slug>            # the SAME branch — not a new one
+git merge --ff-only origin/orx/<slug>   # a previous repair may already be pushed
 #   …fix the dependency / import / path…
 git commit -am "repair: pin numpy<2 for the CUDA image"
 git push

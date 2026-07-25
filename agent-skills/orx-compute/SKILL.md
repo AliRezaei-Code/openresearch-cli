@@ -328,16 +328,20 @@ orx exp wait <expId> --interval 10 --timeout 3600   # tune polling
   line points at `orx logs <runId>`, where the traceback/OOM/setup error lives.
   The same `reason:` line appears under `orx exp status <expId>` and beneath the
   `orx runs <projectId>` table.
-- **A failed run never creates a node.** Compute failures — spin-up errors, no
-  capacity, quota, a bad flavor, OOM, timeout, a missing dependency in the
-  image, an env that didn't activate — are **provisioning and setup, not
-  results**. This applies while the node is **provisional**; once a run has put
+- **A failed run on a *provisional* node never creates a node.** Provisioning
+  failures — spin-up errors, no capacity, quota, a missing dependency in the
+  image, an env that didn't activate — are **setup, not results**. **First ask
+  whether this node's own change caused the failure**: an OOM or timeout on a
+  node whose change grew the model, the batch, or the runtime *is* that node's
+  result — it is frozen, and a bigger flavor belongs on a child
+  (`orx-experiment-tree`: the freeze test). This applies while the node is **provisional**; once a run has put
   the intended numbers in the log the node is frozen (`orx-experiment-tree`:
   the freeze test), and a deliberate compute change is then an experimental
   variable that goes on a child. Fix it where it belongs and **re-launch the
   same `<expId>`**:
   - transient provider/spin-up error → re-launch, or a different flavor/provider;
-  - OOM or timeout → bigger flavor / longer `--timeout`, same node;
+  - OOM or timeout the node's own change didn't cause → bigger flavor / longer
+    `--timeout`, same node;
   - dependency, import, or env error → fix the **code on that node's branch**,
     push, re-run the same node (see `orx-git`: repairing a node in place).
 

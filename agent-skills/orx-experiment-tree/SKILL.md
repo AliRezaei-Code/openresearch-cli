@@ -20,22 +20,32 @@ there is nothing to protect.
 **The freeze test — a node is FROZEN the moment ANY of its runs is
 *evidence-valid*:**
 
-> A run is **evidence-valid** when its log carries **any of the numbers** this
-> node owes — something you could put in a comparison table against a sibling.
-> Not "it exited `done`". Not "it printed something".
+> A run is **evidence-valid** when its log carries the measurement this node
+> owes — the metric its `orx exp desc` names, the number you would put in a
+> comparison table against a sibling. Not "it exited `done`". Not "it printed
+> something". A partial trace — a step-0 loss, a warmup value, a config echo —
+> is **not** the measurement unless the node's question is about early
+> training; a run that died before reaching the stated metric measured nothing.
 >
 > A run that failed **because of the change this node makes** — diverged to NaN,
 > OOMed on the bigger model, timed out on the slower config — is also
-> evidence-valid: that failure *is* the node's answer. The test: **would this
-> have happened on the parent too?** If no, it's a result, not a defect.
+> evidence-valid: that failure *is* the node's answer.
+>
+> **Deciding which it was.** The parent's run is on record — read it
+> (`orx logs` on the parent's latest run). If the parent hit the same thing,
+> it's a defect: repair. If you cannot point to a concrete, node-independent
+> cause in the log (a missing module, a bad path, an env that didn't activate),
+> **uncertainty freezes**: treat it as the node's result and branch a child.
+> "Probably a bad seed" is not a concrete cause. Freezing wrongly costs one
+> extra node; repairing wrongly destroys a measurement and cannot be undone.
 
 | What `orx runs` / `orx logs` show | State | What you may do |
 |---|---|---|
 | No runs at all | provisional | edit the node's branch in place |
-| Every run `failed` / `cancelled` | provisional | edit the node's branch in place |
+| Every run `failed` / `cancelled`, none for a reason this node introduced | provisional | edit the node's branch in place |
 | Failed for a reason unrelated to this node's change — deps, imports, paths, env, a mis-sized flavor | provisional (**execution-invalid**) | edit in place — this is Repair |
 | Failed *because of* this node's own change — diverged, OOM on the bigger model, timed out on the slower config | **FROZEN** | that failure is the result; branch a child to follow up |
-| **Any** run whose log carries some or all of the numbers this node owes | **FROZEN** | never edit this branch again; branch a child |
+| **Any** run whose log carries the measurement this node owes | **FROZEN** | never edit this branch again; branch a child |
 
 Frozen is **permanent and per-node** — it never un-freezes, not after a later
 failure, not because the number was disappointing. You judge this from the log
@@ -228,8 +238,10 @@ the run command:
    changed, use the local git diff recipe `orx exp status <expId>` prints (see
    the `orx-git` skill). Don't infer from status alone. Each
    completion is a decision point with four moves:
-   - **Repair** — the run produced no measurement (deps, imports, paths, OOM,
-     truncated output). The node is still **provisional**: fix its branch in
+   - **Repair** — the run produced no measurement for a reason unrelated to
+     this node's change (deps, imports, paths, env, truncated output; an OOM or
+     timeout only when it isn't this node's own change — see the freeze test).
+     The node is still **provisional**: fix its branch in
      place, push, and re-launch the *same* node. Do not create a child for a
      fix. Cap: two runs in a row measuring nothing → stop and ask the user.
    - **Refill** — result is mediocre or inconclusive: launch the next queued child to

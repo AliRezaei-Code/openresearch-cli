@@ -122,8 +122,9 @@ preferences.
    any of its runs put the intended numbers in the log — that includes the
    baseline. Freezing is **permanent**: a later failure does not un-freeze it,
    and a *disappointing* number is a result, not a reason to repair. Before that
-   it is **provisional**: no runs, or only runs that failed or printed nothing
-   but diagnostics — edit its branch in place and re-run
+   it is **provisional**: no runs, or only runs that failed for a reason
+   unrelated to this node's own change (deps, imports, paths, env) — edit its
+   branch in place and re-run
    (**`orx-experiment-tree`**: the freeze test). To try a new *idea*, branch a
    child (`orx create-experiment … --parent <expId>`) and edit the child's branch.
 2. **The run command and the environment are a fixed contract — identical on
@@ -188,9 +189,11 @@ Carry one goal across many runs (full guidance: **`orx-experiment-tree`** skill)
 5. **Analyze**: `orx logs <runId>`. Logs are the only evidence channel — make
    the run command print every metric you'll need (**`orx-evidence`** skill).
 6. **Decide** — four moves. Write what you learned into `orx exp desc`.
-   - **Repair** — the run never measured anything (deps, imports, paths, OOM).
-     Fix it **on this same node's branch** and re-run: a setup fix is not an
-     experiment and never gets its own node.
+   - **Repair** — the run measured nothing for a reason unrelated to this
+     node's change (deps, imports, paths, env). Fix it **on this same node's
+     branch** and re-run: a setup fix is not an experiment and never gets its
+     own node. A failure the node's *own* change caused is its result — freeze
+     it (**`orx-experiment-tree`**).
    - **Refill** the round with another sibling.
    - **Promote** the winner and descend.
    - **Stop** and report.
