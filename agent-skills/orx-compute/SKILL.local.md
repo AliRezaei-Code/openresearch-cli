@@ -219,8 +219,11 @@ orx exp wait <expId> --interval 10 --timeout 3600   # tune polling
 - **A failed run never creates a node.** Compute failures — spin-up errors, no
   capacity, quota, a bad flavor, OOM, timeout, a missing dependency in the
   image, an env that didn't activate — are **provisioning and setup, not
-  results**. The experiment still hasn't been run. Fix it where it belongs and
-  **re-launch the same `<expId>`**:
+  results**. This applies while the node is **provisional**; once a run has put
+  the intended numbers in the log the node is frozen (`orx-experiment-tree`:
+  the freeze test), and a deliberate compute change is then an experimental
+  variable that goes on a child. Fix it where it belongs and **re-launch the
+  same `<expId>`**:
   - transient provider/spin-up error → re-launch, or a different flavor/backend;
   - OOM or timeout → bigger flavor / longer `--timeout`, same node;
   - dependency, import, or env error → fix the **code on that node's branch**,
@@ -229,10 +232,10 @@ orx exp wait <expId> --interval 10 --timeout 3600   # tune polling
   `orx create-experiment` is for a new **question**, never for a retry. A row of
   nodes whose only difference is "this one has the deps installed" is the
   failure mode this rule exists to prevent. Hard cap: after **two** runs in a
-  row that produce no measurement, stop relaunching and ask the user about
-  their setup. Different errors still count as consecutive, and flavor,
-  provider, and backend switches are repairs that count toward the cap — only a
-  run that measures something resets it.
+  row that produce no measurement **on the same node**, stop relaunching and ask
+  the user about their setup — different errors still count as consecutive, and
+  switching flavor, provider, or backend is itself a repair that counts toward
+  the cap (`orx-experiment-tree`).
 
 ## Sizing compute
 

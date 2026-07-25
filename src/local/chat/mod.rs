@@ -1943,11 +1943,12 @@ pub fn launching_chat_session() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Whether this process is running inside a local `orx up` session. Only a
-/// harness child carries [`CHAT_SESSION_ENV`], and only local projects can own
-/// a chat session, so its presence means "local session". Commands that take a
-/// project or run id should prefer `…is_local()` on the resolved entity; this
-/// is for the ones that take neither (e.g. `orx skill <name>`).
+/// Whether this process is running inside a local `orx up` session.
+/// [`CHAT_SESSION_ENV`] is exported only by [`set_chat_session_env`] onto
+/// `orx up` harness children, so its presence means this process is one (or a
+/// subprocess of one). Commands that take a project or run id should prefer
+/// `…is_local()` on the resolved entity; this is for the ones that take
+/// neither (e.g. `orx skill <name>`).
 pub fn in_local_session() -> bool {
     launching_chat_session().is_some()
 }
@@ -1957,6 +1958,10 @@ mod session_env_tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// Module-local: this does NOT exclude a test in another module reading
+    /// `CHAT_SESSION_ENV` concurrently. Today none does — the backend files
+    /// calling `launching_chat_session` have no test modules. A new test
+    /// elsewhere that touches this var must isolate itself.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// The session env is the mode signal for commands with no id to resolve;

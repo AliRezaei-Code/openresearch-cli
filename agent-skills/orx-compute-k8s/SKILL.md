@@ -73,6 +73,7 @@ The contract orx enforces at submit (loud, before anything runs):
   `.orx/k8s.yaml` (or the code) on the **same** experiment branch and re-run the
   same `<expId>` (see `orx-experiment-tree`: the freeze test). Before the node
   has measured, a manifest change is a repair, and it counts toward the repair
-  cap. After it has measured, the node is frozen — a deliberate compute change
-  (node count, GPU type) is then a real experimental variable and goes on a
-  child.
+  cap: **two** runs in a row that measure nothing on the same node, then stop
+  and ask the user. After it has measured, the node is frozen — a deliberate
+  compute change (node count, GPU type) is then a real experimental variable
+  and goes on a child.

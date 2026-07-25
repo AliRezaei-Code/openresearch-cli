@@ -160,6 +160,12 @@ orx runs <projectId>             # find a run id
 orx logs <runId>                 # read its output
 ```
 
-To actually **drive** a project toward a goal — branch children off the baseline,
-edit each child's code on its git branch, and keep the GPU capacity saturated —
-follow the auto-research loop in the `orx-experiment-tree` module.
+To actually **drive** a project toward a goal — edit each node's code on its git
+branch and keep the GPU capacity saturated — follow the auto-research loop in
+the `orx-experiment-tree` module. Every completed run is a decision point with
+four moves: **repair** the same node when the run measured nothing (deps,
+imports, paths, OOM — a setup fix is not an experiment and never gets its own
+node), **refill** the round with another sibling, **promote** the winner and
+descend, or **stop**. Repair is capped: after **two** runs in a row that measure
+nothing on the same node, ask the user about their setup — different errors
+still count as consecutive.

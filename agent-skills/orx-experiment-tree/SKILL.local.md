@@ -20,17 +20,22 @@ there is nothing to protect.
 **The freeze test — a node is FROZEN the moment ANY of its runs is
 *evidence-valid*:**
 
-> A run is **evidence-valid** when its log contains the node's intended
-> measurement — the numbers you would cite comparing this node to a sibling.
+> A run is **evidence-valid** when its log carries **any of the numbers** this
+> node owes — something you could put in a comparison table against a sibling.
 > Not "it exited `done`". Not "it printed something".
+>
+> A run that failed **because of the change this node makes** — diverged to NaN,
+> OOMed on the bigger model, timed out on the slower config — is also
+> evidence-valid: that failure *is* the node's answer. The test: **would this
+> have happened on the parent too?** If no, it's a result, not a defect.
 
 | What `orx runs` / `orx logs` show | State | What you may do |
 |---|---|---|
 | No runs at all | provisional | edit the node's branch in place |
 | Every run `failed` / `cancelled` | provisional | edit the node's branch in place |
-| Runs `done`, but logs show only tracebacks, install errors, usage text, or an empty metric block | provisional (**execution-invalid**) | edit in place — this is Repair |
-| **Some but not all** intended metrics present | **FROZEN** | any real measurement freezes the node |
-| **Any** run whose log carries the intended measurement | **FROZEN** | never edit this branch again; branch a child |
+| Failed for a reason unrelated to this node's change — deps, imports, paths, env, a mis-sized flavor | provisional (**execution-invalid**) | edit in place — this is Repair |
+| Failed *because of* this node's own change — diverged, OOM on the bigger model, timed out on the slower config | **FROZEN** | that failure is the result; branch a child to follow up |
+| **Any** run whose log carries some or all of the numbers this node owes | **FROZEN** | never edit this branch again; branch a child |
 
 Frozen is **permanent and per-node** — it never un-freezes, not after a later
 failure, not because the number was disappointing. You judge this from the log
@@ -39,10 +44,9 @@ yourself; there is no acceptance step. A node that ran correctly and produced a
 preserved either way: `orx runs` records the exact `commit_sha` of every run, so
 a repaired branch never erases what it ran.
 
-If you need metrics a frozen node didn't print, branch a child that prints them
-— don't edit that branch to add prints. The node's question and the measurement
-it owes live in `orx exp desc <expId>`; write them there when you create it, so
-"did the intended measurement land?" stays answerable later.
+The node's question and the numbers it owes live in `orx exp desc <expId>` —
+write them there when you create it, so "did the measurement land?" stays
+answerable later, and record the judgement there when you make it.
 
 ## Shape the tree — stacked bushes, not a flat fan or a noodle
 
@@ -105,7 +109,8 @@ already have and re-run it.
 
 | Situation | Move | Why |
 |---|---|---|
-| Anything that stops the code measuring at all | **Repair** the node | no hypothesis, no measurement |
+| Failed for a reason unrelated to this node's change | **Repair** the node | no hypothesis was tested |
+| Failed *because of* this node's own change | **FROZEN** — that failure is the result | branch a child to follow up |
 | Same measurement, different hyperparameter | **Sibling** child | co-equal option of one decision |
 | New idea built on a node's confirmed result | **Child** of that node | real depth |
 | Node measured something; you want a *variant* | **Child** — node is frozen | never edit a frozen branch |
@@ -157,6 +162,7 @@ intended flow — do **not** edit a frozen node or rewrite the run command:
    prints the child's branch (`orx/<slug>`); in your worktree:
    ```sh
    git fetch origin && git checkout orx/<child-slug>
+   git merge --ff-only origin/orx/<child-slug>
    #   …edit only the files that idea touches…
    git commit -am "cosine LR + warmup" && git push
    ```

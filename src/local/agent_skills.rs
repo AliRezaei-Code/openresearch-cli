@@ -336,22 +336,25 @@ mod tests {
     /// lacks. Covers every skill whose body swaps between the two sets.
     #[test]
     fn find_serves_the_requested_variant_body() {
-        for name in ["evidence", "experiment-tree", "compute", "reports"] {
+        // Pinned against the embedded consts, not against `skills()` — the body
+        // a set *should* hold, from a source of truth outside the lookup under
+        // test.
+        let want = [
+            ("evidence", EVIDENCE_LOCAL, EVIDENCE_CLOUD),
+            (
+                "experiment-tree",
+                EXPERIMENT_TREE_LOCAL,
+                EXPERIMENT_TREE_CLOUD,
+            ),
+            ("compute", COMPUTE_LOCAL, COMPUTE_CLOUD),
+            ("reports", REPORTS_LOCAL, REPORTS_CLOUD),
+        ];
+        for (name, local_body, cloud_body) in want {
             let local = find(name, SkillSet::Local).unwrap_or_else(|| panic!("local {name}"));
             let cloud = find(name, SkillSet::Full).unwrap_or_else(|| panic!("cloud {name}"));
-            assert_eq!(local.name, cloud.name, "{name} shares one public name");
-            assert_ne!(local.content, cloud.content, "{name} bodies must differ");
-            // Each returned body is the one its own set holds — the contract.
-            for (set, got) in [(SkillSet::Local, local), (SkillSet::Full, cloud)] {
-                let want = skills(set)
-                    .into_iter()
-                    .find(|s| s.name == got.name)
-                    .unwrap_or_else(|| panic!("{name} missing from {set:?}"));
-                assert!(
-                    std::ptr::eq(got, want),
-                    "{name} served the wrong {set:?} body"
-                );
-            }
+            assert_ne!(local_body, cloud_body, "{name} bodies must differ");
+            assert_eq!(local.content, local_body, "{name} served a non-local body");
+            assert_eq!(cloud.content, cloud_body, "{name} served a non-cloud body");
         }
     }
 

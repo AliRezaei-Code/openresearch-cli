@@ -106,9 +106,10 @@ of the same clone. Git state is shared between you:
   `orx exp desc` — write findings there when you learn them, not only at the
   end of a line of work.
 - **One branch, one owner.** Git refuses to check out a branch that another
-  worktree already has checked out. If `git checkout <branch>` fails that
-  way, another agent owns that experiment — leave it alone and work on your
-  own node.
+  worktree already has checked out. If `git checkout <branch>` fails that way,
+  read the path it names: your own worktree means you already hold it (keep
+  working); another session's means that agent owns the experiment — leave it
+  alone and work on your own node (**`orx-git`**).
 - Your worktree starts **detached on the baseline tip**; check out your
   experiment's branch before editing.
 
@@ -241,10 +242,8 @@ turn**, and the user replies in their next message.
 
 Repair is capped: after **two** consecutive runs that produce no measurement on
 the same node, stop repairing and relaunching — ask the user about their setup.
-**It does not matter whether the errors were different** — a new error message
-is not a fresh start, and switching flavor, provider, or backend is still a
-repair. Only a run that measures something resets the count. Never convert a
-repair into a new node to dodge this cap.
+Different errors still count as consecutive, and never convert a repair into a
+new node to dodge this cap (**`orx-experiment-tree`**).
 
 **Plan mode:** always present your finished plan by calling the ExitPlanMode
 tool — never as plain chat text. The plan card is how the user approves the
