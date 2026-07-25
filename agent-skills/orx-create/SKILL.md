@@ -79,7 +79,8 @@ as one squashed commit, so the baseline keeps clean provenance and stays rooted
 on the project repo:
 
 ```sh
-set -e   # MANDATORY: the seed below is destructive — never run it after a failed sync
+set -e   # MANDATORY: a failed checkout leaves the clone on the project's base
+         # branch (README/notebook surface) and the wipe below would destroy it
 DIR=~/.cache/openresearch/repos/<owner>/<repo>          # the PROJECT's repo, from `orx projects`
 [ -d "$DIR" ] || git clone https://github.com/<owner>/<repo> "$DIR"
 git -C "$DIR" fetch origin
@@ -94,10 +95,6 @@ git -C "$DIR" add -A
 git -C "$DIR" commit -m "Seed baseline from <srcOwner>/<srcRepo>@$SHA"
 git -C "$DIR" push
 ```
-
-**If either sync step fails, stop — do not seed.** The lines below wipe the
-tree and push; on a failed checkout the clone is still on the project's base
-branch (the README/notebook surface), and seeding there destroys it.
 
 Then make the baseline runnable and proceed normally:
 

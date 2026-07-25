@@ -109,7 +109,7 @@ of the same clone. Git state is shared between you:
   worktree already has checked out. If `git checkout <branch>` fails that way,
   read the path it names: your own worktree means you already hold it (keep
   working); another session's means that agent owns the experiment — leave it
-  alone and work on your own node (**`orx-git`**).
+  alone and work on your own node (**`orx-git`**: repairing a node in place).
 - Your worktree starts **detached on the baseline tip**; check out your
   experiment's branch before editing.
 
@@ -121,10 +121,8 @@ preferences.
 1. **Never edit a node that has produced a measurement.** A node is frozen once
    any of its runs put the intended numbers in the log — that includes the
    baseline, and freezing is **permanent**: a *disappointing* number is a
-   result, not a reason to repair. Before that
-   it is **provisional**: no runs, or only runs that failed for a reason
-   unrelated to this node's own change (deps, imports, paths, env) — edit its
-   branch in place and re-run
+   result, not a reason to repair. While its runs produce only **errors** and
+   no numbers it is **provisional** — edit its branch in place and re-run
    (**`orx-experiment-tree`**: the freeze test). To try a new *idea*, branch a
    child (`orx create-experiment … --parent <expId>`) and edit the child's branch.
 2. **The run command and the environment are a fixed contract — identical on
@@ -190,13 +188,12 @@ Carry one goal across many runs (full guidance: **`orx-experiment-tree`** skill)
 5. **Analyze**: `orx logs <runId>`. Logs are the only evidence channel — make
    the run command print every metric you'll need (**`orx-evidence`** skill).
 6. **Decide** — four moves. Write what you learned into `orx exp desc`.
-   - **Repair** — the run measured nothing for a reason unrelated to this
-     node's change (deps, imports, paths, env), or the edit was malformed and
-     never expressed the idea (a `NameError`, a rejected kwarg). Fix it **on
-     this same node's branch** and re-run: a setup fix is not an experiment and
-     never gets its own node. A failure the node's change genuinely caused —
-     divergence, OOM, timeout — is its result; freeze it
-     (**`orx-experiment-tree`**).
+   - **Repair** — the run produced only an **error** and no numbers (a
+     traceback, a missing dep or file, a rejected kwarg, an env that didn't
+     activate). Fix it **on this same node's branch** and re-run: a setup fix
+     is not an experiment and never gets its own node. A run that produced
+     **numbers** — including a NaN, OOM, or timeout of what this node changed —
+     is a result; freeze it (**`orx-experiment-tree`**: the freeze test).
    - **Refill** the round with another sibling.
    - **Promote** the winner and descend.
    - **Stop** and report.

@@ -20,9 +20,7 @@ fn current_skill_set() -> SkillSet {
 pub async fn run(args: crate::SkillArgs) -> Result<()> {
     if let Some(path) = args.path {
         // First: a bundled module (with or without the `orx-` prefix). These
-        // ship in the binary, so they resolve offline and never drift. Inside a
-        // session the agent must get the *local* body — the playbook points here
-        // as the fallback, and cloud bodies name commands local mode lacks.
+        // ship in the binary, so they resolve offline and never drift.
         if let Some(skill) = agent_skills::find(&path, current_skill_set()) {
             println!("{}", skill.content.trim_end());
             return Ok(());

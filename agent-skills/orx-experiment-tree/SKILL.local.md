@@ -20,58 +20,45 @@ there is nothing to protect.
 **The freeze test — a node is FROZEN the moment ANY of its runs is
 *evidence-valid*:**
 
-> A run is **evidence-valid** when its log carries the measurement this node
-> owes — the metric its `orx exp desc` names, the number you would put in a
-> comparison table against a sibling. Not "it exited `done`". Not "it printed
-> something". A partial trace — a step-0 loss, a warmup value, a config echo —
-> is **not** the measurement unless the node's question is about early
-> training; a run that died before reaching the stated metric measured nothing.
+> Judge the **evidence the run produced**, not what caused the failure. Causes
+> are arguable; evidence is on disk.
 >
-> A run that failed **because of the change this node makes** — diverged to NaN,
-> OOMed on the bigger model, timed out on the slower config — is also
-> evidence-valid: that failure *is* the node's answer.
+> - The log carries **numbers** — the measurement this node owes (the metric
+>   its `orx exp desc` names), *or* a quantitative failure of the thing this
+>   node changed: a NaN at a known step, an OOM at a known memory watermark, a
+>   timeout at a known step rate. **FROZEN.** That is the node's answer, good
+>   or bad.
+> - The log carries **only an error** and no numbers — a traceback, an import
+>   or dependency failure, a missing file or config key, a rejected kwarg, a
+>   shape mismatch, an env that didn't activate, a build that won't install.
+>   **Provisional.** Nothing was measured; repair it in place.
+> - The log carries **nothing to judge** — the box never came up, the job was
+>   preempted, the output is empty or truncated. **Provisional.** Repair or
+>   relaunch; it counts toward the cap like any other attempt.
 >
-> The one exception is narrow and **syntactic**: the code never expressed the
-> idea at all — a `NameError`, a syntax error, a kwarg the callee *rejects*
-> (`TypeError: unexpected keyword argument`), a shape mismatch **inside the
-> lines you edited**. Repair those. The counterfactual is over **the diff you
-> actually wrote**, never over the idea in the abstract: ask "is this diff
-> malformed?", not "could a better version of this idea have avoided it?" —
-> the answer to the second is always yes and it is not a licence to repair.
+> A partial trace is not numbers: a step-0 loss, a warmup value, or a config
+> echo before a crash leaves the node provisional, unless the node's question
+> *is* about early training.
 >
-> So: **resource and dynamics failures are never defects.** OOM, timeout, NaN,
-> divergence, instability — if this node's change grew the model, the batch,
-> the sequence length, or the runtime, that failure *is* the result. "A correct
-> implementation would have used gradient checkpointing" is **a new idea for a
-> child**, not a repair of this one. A kwarg *value* you now regret is the
-> hypothesis, not a typo. And a shape mismatch where your edit is internally
-> consistent but collides with code you did not touch is the finding that the
-> idea does not fit this architecture — freeze it, redesign on a child.
+> **Why this way round.** "A correct implementation wouldn't have OOMed — it
+> would use gradient checkpointing" is always available and always sounds
+> reasonable; it is a **new idea for a child**, not a licence to repair this
+> one. Asking what the log contains removes that argument entirely. A kwarg
+> *value* you now regret is the hypothesis; a kwarg the callee *rejects* is an
+> error. Both are settled by reading the log, not by reasoning about intent.
 >
 > **No metric named?** If the node's `orx exp desc` names none, infer it from
-> the node's title and its siblings' descriptions, write it there, and judge
-> against that. If it still cannot be pinned down, treat the run as
-> evidence-valid — uncertainty freezes.
->
-> **Deciding which it was.** The parent's run is on record — read it
-> (`orx logs` on the parent's latest run; a root has no parent, so judge it
-> against the node's own idea). If the parent hit the same thing, it's a
-> defect: repair. A run that produced **no log to judge** — the box never came
-> up, the job was preempted, the output is empty — is not a result at all:
-> repair or relaunch. If you cannot point to a concrete, node-independent
-> cause in the log (a missing module, a bad path, an env that didn't activate),
-> **uncertainty freezes**: treat it as the node's result and branch a child.
-> "Probably a bad seed" is not a concrete cause. Freezing wrongly costs one
-> extra node; repairing wrongly destroys a measurement and cannot be undone.
+> the node's title — before you open the log — and write it there. If it still
+> cannot be pinned down, treat numbers in the log as the measurement.
 
-| What `orx runs` / `orx logs` show | State | What you may do |
+| What the log holds | State | What you may do |
 |---|---|---|
 | No runs at all | provisional | edit the node's branch in place |
-| Every run `failed` / `cancelled` **before the owed metric appeared**, none for a reason this node introduced | provisional | edit the node's branch in place |
-| No judgeable log — spin-up failure, preemption, empty or truncated output | provisional | nothing to judge; repair or relaunch |
-| Failed for a reason unrelated to this node's change — deps, imports, paths, env, a mis-sized flavor | provisional | edit in place — this is Repair |
-| Failed *because of* this node's own change — diverged, OOM on the bigger model, timed out on the slower config | **FROZEN** | that failure is the result; branch a child to follow up |
-| **Any** run whose log carries the measurement this node owes | **FROZEN** | never edit this branch again; branch a child |
+| Nothing to judge — spin-up failure, preemption, empty or truncated output | provisional | repair or relaunch; counts toward the cap |
+| An error and no numbers — traceback, import or dependency failure, missing file or config key, rejected kwarg, shape mismatch, env that didn't activate | provisional | edit in place — this is Repair |
+| Only a partial trace — step-0 loss, warmup value, config echo — then a crash | provisional | the measurement never landed; repair |
+| **Numbers**: a NaN at a known step, an OOM at a known watermark, a timeout at a known step rate | **FROZEN** | that failure is the result; branch a child to follow up |
+| **Numbers**: the measurement this node owes | **FROZEN** | never edit this branch again; branch a child |
 
 Frozen is **permanent and per-node** — it never un-freezes: not after a later
 failure, and not because the number disappointed you. A node that ran correctly
@@ -142,8 +129,7 @@ already have and re-run it.
 
 | Situation | Move | Why |
 |---|---|---|
-| Failed for a reason unrelated to this node's change | **Repair** the node | no hypothesis was tested |
-| Failed *because of* this node's own change | **FROZEN** — that failure is the result | branch a child to follow up |
+| Any failure — is the node frozen? | see the **freeze test** above | repair vs. result is decided there |
 | Same measurement, different hyperparameter | **Sibling** child | co-equal option of one decision |
 | New idea built on a node's confirmed result | **Child** of that node | real depth |
 | Node measured something; you want a *variant* | **Child** — node is frozen | never edit a frozen branch |
@@ -152,9 +138,15 @@ already have and re-run it.
 **The repair loop is not a research loop.** Repairs do not count toward "~3
 consecutive failed or regressed runs" — that counter is about *scientific*
 failure. The repair cap is separate and hard: two runs in a row that measure
-nothing, then ask. **Different errors still count as consecutive**, and
-switching flavor, provider, or backend is itself a repair — only a run that
-measures something resets the count.
+nothing, then ask. **Different errors still count as consecutive**, switching
+flavor, provider, or backend is itself a repair, and a bare **relaunch** counts
+too — a run that measured nothing is a run that measured nothing, whatever the
+reason. Only a run that measures something resets the count.
+
+The cap is also **project-wide**: if repairs on *different* nodes keep hitting
+the same class of environmental failure (the same missing package, the same env
+that won't activate), that is one setup problem, not N node problems — ask the
+user after the second node rather than repairing each one twice.
 
 ## The auto-research loop
 
@@ -290,5 +282,8 @@ cat notes.md | orx exp desc <expId> --stdin   # overwrite from stdin (long markd
 - **Write** with exactly one of `--set` (inline) or `--stdin` (whole of stdin).
   Passing both is an error. Writing **replaces** the entire description — to
   append, read first, edit, and write back.
+- **Name the measurement here.** The freeze test reads the metric this node
+  owes from this field — write "Measures: <metric>" when you create the node,
+  and record the judgement here when the run lands.
 - `<expId>` comes from `orx create-experiment` output or `orx project view
   <projectId>` (the experiment id, not a run or project id).

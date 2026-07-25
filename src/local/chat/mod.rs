@@ -1958,10 +1958,8 @@ mod session_env_tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Module-local: this does NOT exclude a test in another module reading
-    /// `CHAT_SESSION_ENV` concurrently. Today none does — the backend files
-    /// calling `launching_chat_session` have no test modules. A new test
-    /// elsewhere that touches this var must isolate itself.
+    /// Serializes this module's env mutation; no other module's tests touch
+    /// `CHAT_SESSION_ENV` today.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Restores `CHAT_SESSION_ENV` on drop, so a failing assert can't leak the

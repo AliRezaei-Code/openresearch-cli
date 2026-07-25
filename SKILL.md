@@ -31,10 +31,11 @@ expands on the why; these are the non-negotiables.
    root, the control its variants are measured against. Projects start with an
    empty tree — **you create the baseline** (the first `orx create-experiment`,
    no `--parent`) and, on a blank repo, seed it with starting code before its
-   first run (see the `orx-create` module). Until a run measures something — and
-   provided no run failed *because of this node's own change* — the node is
-   **provisional**: seeding it, fixing its dependencies, and making it run all
-   happen on its own branch. From the moment a node has measured
+   first run (see the `orx-create` module). While its runs produce only
+   **errors** and no numbers, the node is **provisional**: seeding it, fixing
+   its dependencies, and making it run all happen on its own branch. The moment
+   a run puts **numbers** in the log — the measurement, or a NaN/OOM/timeout of
+   the thing this node changed — it is frozen. From the moment a node has measured
    something this rule is absolute, and freezing is **permanent** — a later
    failure does not un-freeze it, and a *disappointing* number is a result, not
    a reason to repair. To try an idea, **branch a child** and edit the child.
@@ -164,7 +165,8 @@ orx logs <runId>                 # read its output
 To actually **drive** a project toward a goal — edit each node's code on its git
 branch and keep the GPU capacity saturated — follow the auto-research loop in
 the `orx-experiment-tree` module. Every completed run is a decision point with
-four moves: **repair** the same node when the run measured nothing for a reason
-unrelated to its own change, **refill** the round with another sibling,
-**promote** the winner and descend, or **stop**. Repair is capped — see the
-module.
+four moves: **repair** the same node when the run produced only an error and no
+numbers, **refill** the round with another sibling, **promote** the winner and
+descend, or **stop**. A run that produced numbers — including a NaN, OOM, or
+timeout of what this node changed — is a result: the node is frozen. Repair is
+capped at **two** runs in a row measuring nothing on one node.
