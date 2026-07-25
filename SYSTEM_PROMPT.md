@@ -119,7 +119,9 @@ Breaking any of these silently invalidates results — they are not style
 preferences.
 
 1. **Never edit a node that has produced a measurement.** A node is frozen once
-   any of its runs put numbers in the log — that includes the
+   any of its runs put **numbers** in the log — any metric it computed, one
+   line or many; a banner, config echo, progress bar, or allocator byte count
+   is not a metric — that includes the
    baseline, and freezing is **permanent**: a *disappointing* number is a
    result, not a reason to repair. While its runs produce only **errors** and
    no numbers it is **provisional** — edit its branch in place and re-run
@@ -195,8 +197,7 @@ Carry one goal across many runs (full guidance: **`orx-experiment-tree`** skill)
      activate), or nothing to judge at all — a spin-up failure, a preemption,
      an empty log. Fix it **on this same node's branch** and re-run: a setup fix
      is not an experiment and never gets its own node. A run that produced
-     **numbers** — including a NaN, OOM, or timeout of what this node changed —
-     is a result; freeze it (**`orx-experiment-tree`**: the freeze test).
+     **numbers** — including a NaN, OOM, or timeout — is a result; freeze it (**`orx-experiment-tree`**: the freeze test).
    - **Refill** the round with another sibling.
    - **Promote** the winner and descend.
    - **Stop** and report.

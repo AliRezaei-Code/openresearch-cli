@@ -68,7 +68,7 @@ Rules and notes:
   GitHub — uncommitted or unpushed edits won't be in the run. Commit and push
   first.
 - **Never merge or rebase a branch once its node is frozen** (cardinal rule) —
-  frozen meaning one of its runs put two or more metric lines in the log (see
+  frozen meaning one of its runs put a metric it computed in the log (see
   `orx-experiment-tree`: the freeze test). Its history is the code those results
   came from. To bring in changes from another branch, create a **child**
   experiment and put the merge commit on the child's branch. On a *provisional*

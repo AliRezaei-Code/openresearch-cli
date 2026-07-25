@@ -43,9 +43,10 @@ orx search-logs <projectId> "loss=nan" --experiment <id> --max 5000
 Judging a run is also judging its **node**. The rule (full test:
 `orx-experiment-tree`, "A node is an evidence contract"):
 
-- the log carries **numbers** the run computed — **two or more metric lines**,
-  whatever they measure — the node is **FROZEN**, whatever ended the run. One
-  banner or a single step-0 line is not numbers. Numbers
+- the run produced **numbers** it computed — any metric value, in the log, an
+  uploaded artifact, or a linked W&B run — the node is **FROZEN**, whatever ended the run. A
+  banner, a config echo, or a progress bar is not a metric, however often it
+  appears. Numbers
   win over a later traceback, a non-zero exit, or a cancel.
 - the log carries **only an error** and no numbers, or **nothing to judge**
   (spin-up failure, preemption, empty or truncated output) — the node is

@@ -27,14 +27,14 @@ results — they are not style preferences. The `orx-experiment-tree` module
 expands on the why; these are the non-negotiables.
 
 1. **Never edit a node that has produced a measurement.** A node is frozen once
-   any of its runs put **two or more metric lines** in the log — that includes the
+   any of its runs put a **metric it computed** in the log — that includes the
    root, the control its variants are measured against. Projects start with an
    empty tree — **you create the baseline** (the first `orx create-experiment`,
    no `--parent`) and, on a blank repo, seed it with starting code before its
    first run (see the `orx-create` module). While its runs produce only
    **errors** and no numbers, the node is **provisional**: seeding it, fixing
    its dependencies, and making it run all happen on its own branch. The moment
-   a run puts **numbers** in the log — two or more metric lines it computed — the
+   a run puts **numbers** in the log — any metric it computed, one line or many — the
    node is frozen, whatever ended the run. From the moment a node has measured
    something this rule is absolute, and freezing is **permanent** — a later
    failure does not un-freeze it, and a *disappointing* number is a result, not
@@ -169,5 +169,5 @@ four moves: **repair** the same node when the run produced only an error and no
 numbers — or nothing to judge at all (spin-up failure, preemption, empty log) —
 **refill** the round with another sibling, **promote** the winner and
 descend, or **stop**. A run that produced numbers — including a NaN, OOM, or
-timeout of what this node changed — is a result: the node is frozen. Repair is
+timeout — is a result: the node is frozen. Repair is
 capped at **two** runs in a row measuring nothing on one node.

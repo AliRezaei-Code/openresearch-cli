@@ -25,17 +25,19 @@ the **measurement** that answers it. Until then — including before its first r
 >
 > **"Numbers" means a measurement this run computed** — a loss, an eval figure,
 > a score the training or eval loop produced from **this node's own commit**.
-> These are **not** numbers: byte counts inside an allocator error (`tried to
-> allocate 2.5 GiB`), a duration in a timeout message, a progress bar or its
-> `it/s` and ETA, a banner or config echo, and any figure carried over from a
-> resumed checkpoint rather than computed by this run. Digits in an error
-> string, or in the harness's own chatter, are not a measurement.
+> Excluded **however many times they appear** — these are never numbers: byte
+> counts inside an allocator error (`tried to allocate 2.5 GiB`), a duration in
+> a timeout message, a progress bar or its `it/s` and ETA, a banner, a config
+> or seed echo, and any figure carried over from a resumed checkpoint rather
+> than computed by this run. Digits in an error string, or in the harness's own
+> chatter, are not a measurement. The test is **kind, not count**: one real
+> metric freezes the node; a hundred progress ticks do not.
 >
-> - The log carries **numbers** — **two or more metric lines** this run
->   computed (a loss trace, eval figures), whatever they measure. One config
->   echo, one banner, or a single step-0 line is **not** numbers; two logged
->   intervals are, whatever they say. **FROZEN, whatever caused the run to
->   end.** Don't ask
+> - The run produced **numbers** — **one or more metric values it computed**
+>   (a loss, an eval figure, a score), whether on one summary line or across
+>   many, and wherever the evidence landed: the log, an uploaded artifact
+>   (`EVAL.md`), or a linked W&B run. A single `accuracy: 0.83` **is** numbers.
+>   **FROZEN, whatever caused the run to end.** Don't ask
 >   whether this node's change caused it; ask only whether the run got far
 >   enough to emit numbers. Numbers that aren't the ones you named still freeze
 >   it — record what actually landed. If numbers landed and a traceback follows
@@ -52,7 +54,8 @@ the **measurement** that answers it. Until then — including before its first r
 > **Read a log the same way on every attempt.** Re-reading an already-classified
 > log as "numbers after all" does not clear the repair cap — at the cap, ask the
 > user. Equally, do not re-read numbers as "not really numbers" to justify
-> another repair. The count of metric lines does not change between readings.
+> another repair. Whether a metric appears once or forty times, on one line or
+> in a table, does not change the verdict.
 >
 > **Erring toward FROZEN is the cheap error.** A spurious freeze costs one node
 > in a tree that is cheap to extend. A spurious repair rewrites the branch a
@@ -60,15 +63,19 @@ the **measurement** that answers it. Until then — including before its first r
 > When the log is genuinely ambiguous, freeze.
 >
 > **If the only available repair would change what the node is testing, it is
-> not a repair.** A node whose idea is "2x wider MLP" that OOMs at allocation
-> cannot be "fixed" by shrinking the width — freeze it, record that the
-> configuration did not fit, and put the fitted variant on a child.
+> not a repair** — but this applies **only to a node the freeze test already
+> froze**. It explains why you may not un-freeze by shrinking the change; it is
+> never a reason to freeze a node whose run produced no metrics. If there are
+> no metrics the node is provisional however invasive the fix looks: pinning a
+> dep, fixing a driver, correcting a shape error in your own edit are all
+> repairs.
 >
 > **This deliberately over-freezes.** A node that OOMed on a pre-existing leak
-> after emitting a few losses is frozen even though its own change was
-> innocent. That is the accepted cost of a test you cannot argue with: put the
-> fix on a child and note the confound in `orx exp desc`. Do not treat the
-> over-freeze as an oversight to reason around — it is the trade.
+> after emitting losses is frozen even though its own change was innocent. That
+> is the accepted cost of a test you cannot argue with: put the fix on a child
+> and note the confound in `orx exp desc`. That child is legitimate depth
+> *because the parent holds a measurement* — a node that measured nothing never
+> earns a child this way; it gets repaired.
 >
 > **A missing eval block is a reporting defect, not a missing measurement.** If
 > the run emitted real metrics but not the field you named, freeze it and fix
