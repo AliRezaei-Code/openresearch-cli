@@ -13,9 +13,10 @@
 //!   `.agents/skills`), so the session's own agent auto-discovers them and never
 //!   sees drift.
 //! * **`orx skill <name>`** resolves a bundled module (with or without the
-//!   `orx-` prefix) and prints it; the no-arg overview lists the
-//!   [`SkillSet::Full`] set. `orx install-skills --full` writes the Full set into
-//!   an agent's global skills dir (the dedicated cloud box).
+//!   `orx-` prefix) from the set matching its context — the Local set inside an
+//!   `orx up` session, the Full set otherwise — and prints it; the no-arg
+//!   overview lists that same set. `orx install-skills --full` writes the Full
+//!   set into an agent's global skills dir (the dedicated cloud box).
 //!
 //! The two sets share the same public skill *names* so docs and references stay
 //! stable; several modules swap their **body** between a local-mode form
@@ -169,12 +170,8 @@ pub fn skills(set: SkillSet) -> Vec<&'static AgentSkill> {
 
 /// Resolve a bundled skill by name within `set`, accepting both the public name
 /// (`orx-compute`) and the bare form (`compute`). `None` for an unknown name —
-/// the caller falls back to the live API fetch.
-///
-/// The set matters: local and cloud share skill *names* but swap bodies, and the
-/// local bodies are the ones that describe local mode's actual command surface.
-/// Serving a Full body inside an `orx up` session would tell the agent to use
-/// `orx artifact` / `orx query` / `orx chart`, which local mode does not have.
+/// the caller falls back to the live API fetch. Local and cloud share skill
+/// *names* but swap bodies, so pass the set you actually want.
 pub fn find(name: &str, set: SkillSet) -> Option<&'static AgentSkill> {
     let want = name.trim();
     skills(set)
@@ -333,26 +330,28 @@ mod tests {
         assert!(find("orx-create", SkillSet::Local).is_none());
     }
 
-    /// `orx skill <name>` inside an `orx up` session must serve the **local**
-    /// body: the playbook points there as the fallback, and the cloud bodies
-    /// describe commands (`orx artifact`/`query`/`chart`) local mode lacks.
+    /// `find` must return the body from the set it was asked for. `orx skill
+    /// <name>` inside an `orx up` session relies on this: the playbook points
+    /// there as the fallback, and a cloud body would name commands local mode
+    /// lacks. Covers every skill whose body swaps between the two sets.
     #[test]
     fn find_serves_the_requested_variant_body() {
-        let local = find("evidence", SkillSet::Local).expect("local evidence");
-        let cloud = find("evidence", SkillSet::Full).expect("cloud evidence");
-        assert_ne!(
-            local.content, cloud.content,
-            "local and cloud evidence bodies must differ"
-        );
-        assert!(
-            local.content.contains("logs are the only evidence channel"),
-            "local body should state the logs-only contract"
-        );
-        for absent in ["orx artifacts", "orx query", "orx chart"] {
-            assert!(
-                !local.content.contains(absent),
-                "local evidence body must not mention `{absent}`"
-            );
+        for name in ["evidence", "experiment-tree", "compute", "reports"] {
+            let local = find(name, SkillSet::Local).unwrap_or_else(|| panic!("local {name}"));
+            let cloud = find(name, SkillSet::Full).unwrap_or_else(|| panic!("cloud {name}"));
+            assert_eq!(local.name, cloud.name, "{name} shares one public name");
+            assert_ne!(local.content, cloud.content, "{name} bodies must differ");
+            // Each returned body is the one its own set holds — the contract.
+            for (set, got) in [(SkillSet::Local, local), (SkillSet::Full, cloud)] {
+                let want = skills(set)
+                    .into_iter()
+                    .find(|s| s.name == got.name)
+                    .unwrap_or_else(|| panic!("{name} missing from {set:?}"));
+                assert!(
+                    std::ptr::eq(got, want),
+                    "{name} served the wrong {set:?} body"
+                );
+            }
         }
     }
 

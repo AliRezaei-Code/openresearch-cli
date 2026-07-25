@@ -82,7 +82,7 @@ on the project repo:
 DIR=~/.cache/openresearch/repos/<owner>/<repo>          # the PROJECT's repo, from `orx projects`
 [ -d "$DIR" ] || git clone https://github.com/<owner>/<repo> "$DIR"
 git -C "$DIR" fetch origin
-git -C "$DIR" checkout -B orx/<baseline-slug> origin/orx/<baseline-slug>   # the baseline's branch
+git -C "$DIR" checkout orx/<baseline-slug>   # the baseline's branch (empty stub — nothing to lose)
 
 src=$(mktemp -d) && git clone --depth 1 https://github.com/<srcOwner>/<srcRepo> "$src"
 SHA=$(git -C "$src" rev-parse --short HEAD) && rm -rf "$src/.git"
@@ -103,8 +103,8 @@ Then make the baseline runnable and proceed normally:
   push, re-run the same node): the baseline hasn't measured anything yet, so it
   is still provisional. Do **not** create a child to carry a setup fix, and do
   **not** treat a failed first launch as "the baseline exists now, so it's
-  frozen." After **two** consecutive runs that fail before producing numbers,
-  stop and ask the user how they run this code.
+  frozen." After **two** runs in a row that produce no numbers, stop and ask the
+  user how they run this code — different errors still count as consecutive.
 - Once the baseline has produced its reference numbers it is **frozen**. Then
   branch children and vary code per the auto-research loop — shrink to the
   smallest config that still shows the paper's claim by editing a **child**,

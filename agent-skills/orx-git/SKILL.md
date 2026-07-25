@@ -29,7 +29,9 @@ This is how you **realize a child's hypothesis**: after `create-experiment
 --parent`, check out the child's branch and make the specific code/config edits
 its description calls for — then commit, push, and run. Edit only the files that
 idea touches, and **don't touch the run command** (it's inherited; see the
-`orx-experiment-tree` skill). Edit children, never the baseline.
+`orx-experiment-tree` skill). Edit the node whose branch you own; a node that
+has measured something is frozen — branch a child instead (see
+`orx-experiment-tree`: the freeze test).
 
 The sync recipe is **idempotent** — run it verbatim whether or not the clone
 already exists from a previous session. Always fetch + reset before editing, so a
@@ -42,7 +44,8 @@ DIR=~/.cache/openresearch/repos/<owner>/<repo>
 # Clone once (skips if it already exists), then ALWAYS sync before touching a branch:
 [ -d "$DIR" ] || git clone https://github.com/<owner>/<repo> "$DIR"
 git -C "$DIR" fetch origin
-git -C "$DIR" checkout -B orx/<slug> origin/orx/<slug>   # create, or reset to origin if it exists
+git -C "$DIR" checkout orx/<slug>                 # creates a tracking branch if it's remote-only
+git -C "$DIR" merge --ff-only origin/orx/<slug>   # fails loudly rather than discarding unpushed work
 
 #   …edit files under "$DIR" with your normal tools…
 git -C "$DIR" commit -am "tune lr"     # one or more commits — your call
@@ -50,24 +53,12 @@ git -C "$DIR" push                     # push so runs and the tree see the chang
 ```
 
 Rules and notes:
-- **Always sync first — but never blow away unpushed work.** `checkout -B
-  <branch> origin/<branch>` **hard-resets to the GitHub tip and discards local
-  commits that were never pushed** — a real hazard when a previous push failed,
-  and when you're returning to a branch to repair it. Use the safe form:
-  ```sh
-  git -C "$DIR" fetch origin
-  git -C "$DIR" checkout orx/<slug> 2>/dev/null \
-    || git -C "$DIR" checkout -b orx/<slug> origin/orx/<slug>   # first time only
-  git -C "$DIR" status -sb          # check for unpushed commits BEFORE you reset
-  git -C "$DIR" merge --ff-only origin/orx/<slug>    # fails loudly if you'd lose work
-  ```
-  Only reach for `checkout -B …origin/…` when `status -sb` shows nothing ahead
-  and you deliberately want the remote tip. The contract is still commit +
-  push before moving on.
-- **One branch, one owner.** Git refuses to check out a branch another worktree
-  already holds. In a live `orx up` session every chat has its own worktree of
-  the same clone, so a checkout can fail that way — see "Repairing a node in
-  place" below for what to do (and what never to do) when it does.
+- **Always sync first — but never blow away unpushed work.** `merge --ff-only`
+  fails loudly instead of silently discarding commits you never pushed — a real
+  hazard when a push has failed and you're returning to a branch to repair it.
+  Never use `checkout -B <branch> origin/<branch>`: it hard-resets to the GitHub
+  tip and throws that work away. The contract is still commit + push before
+  moving on.
 - **Auth is your own git.** Clone/push use whatever GitHub credentials your `git`
   already has — the repo lives under your account or your org, so access is the
   same as any of your repos. If a clone or push fails on auth, authenticate git
@@ -81,8 +72,8 @@ Rules and notes:
   came from. To bring in changes from another branch, create a **child**
   experiment and put the merge commit on the child's branch. On a *provisional*
   node a plain `git merge origin/<parent-branch>` to pick up an upstream fix is
-  fine. And never rebase, anywhere — the tree records what actually ran, and
-  rewriting history makes no sense in an experiment tree.
+  fine. And never rewrite history anywhere — no rebase, `commit --amend`,
+  `reset --hard`, or force-push: the tree records what actually ran.
 - **Reading another node's code** without disturbing your checkout: that branch is
   already in the clone after a fetch — `git -C "$DIR" show origin/orx/<slug>:<path>`.
 
@@ -123,24 +114,23 @@ git push
 orx exp run <expId> --backend <b>  # re-run the SAME node
 ```
 
+(Outside a live session — the cloud/full flow — do the same thing in the
+cache-dir clone with `git -C "$DIR" …`.)
+
 **If that checkout fails with "already checked out at …":**
 
 1. **If the path it names is your own worktree** — you already have it; just
    `git status` and keep editing. This is the common case and is not an error.
 2. **If it names another session's worktree** — another agent owns that node.
-   **Do not** create a child to get around the lock, and **do not** delete or
-   force the other worktree. Leave the node alone and work on your own; if the
-   repair is genuinely yours to make, say so in `orx exp desc <expId>` and tell
-   the user, or wait for the other session to release it.
-3. **Never** `git worktree remove`, `git worktree prune --force`, or `--force` a
-   checkout to break someone else's lock.
+   Leave it alone and work on your own; do **not** create a child to dodge the
+   lock, and never `git worktree remove`/`prune --force` or force a checkout to
+   break someone else's. If the repair is genuinely yours, note it in
+   `orx exp desc <expId>` and tell the user.
 
 **Reading or fixing without owning the branch:** you can always inspect it
 without checking out — `git show origin/orx/<slug>:<path>`,
 `git log origin/orx/<slug>`, `git diff origin/<parent-branch>...origin/orx/<slug>`.
 
-**Repair commits are first-class history — never rewrite them.** Do not
-`commit --amend`, `rebase`, `reset --hard`, or force-push a repair. Each run
-recorded its own `commit_sha`, so the failed attempts remain resolvable from
-`orx runs`; a repair is a *new commit on top*, which is exactly the record you
-want ("this is what it took to make it run").
+**Repair commits are first-class history.** Each run recorded its own
+`commit_sha`, so failed attempts stay resolvable from `orx runs`; a repair is a
+*new commit on top*, which is exactly the record you want.

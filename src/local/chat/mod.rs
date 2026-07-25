@@ -1943,6 +1943,44 @@ pub fn launching_chat_session() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Whether this process is running inside a local `orx up` session. Only a
+/// harness child carries [`CHAT_SESSION_ENV`], and only local projects can own
+/// a chat session, so its presence means "local session". Commands that take a
+/// project or run id should prefer `…is_local()` on the resolved entity; this
+/// is for the ones that take neither (e.g. `orx skill <name>`).
+pub fn in_local_session() -> bool {
+    launching_chat_session().is_some()
+}
+
+#[cfg(test)]
+mod session_env_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The session env is the mode signal for commands with no id to resolve;
+    /// an empty value must read as "not in a session", matching
+    /// [`launching_chat_session`]'s own filtering.
+    #[test]
+    fn in_local_session_follows_the_session_env() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var(CHAT_SESSION_ENV).ok();
+
+        std::env::remove_var(CHAT_SESSION_ENV);
+        assert!(!in_local_session(), "unset → not a session");
+        std::env::set_var(CHAT_SESSION_ENV, "sess-1");
+        assert!(in_local_session(), "set → session");
+        std::env::set_var(CHAT_SESSION_ENV, "");
+        assert!(!in_local_session(), "empty → not a session");
+
+        match saved {
+            Some(v) => std::env::set_var(CHAT_SESSION_ENV, v),
+            None => std::env::remove_var(CHAT_SESSION_ENV),
+        }
+    }
+}
+
 /// Append-only stderr sink for a harness child (startup/debug diagnostics).
 pub fn harness_log(name: &str) -> Result<std::fs::File> {
     let path = crate::store::data_dir().join(format!("agent-{name}.log"));

@@ -7,15 +7,10 @@ use crate::local::agent_skills::{self, SkillSet};
 // compile time from the repo-root SKILL.md.
 const SKILL_MD: &str = include_str!("../../SKILL.md");
 
-/// Which bundled skill set this invocation should serve.
-///
-/// An agent driving a local `orx up` project shells out to a fresh `orx`
-/// process that inherits `ORX_CHAT_SESSION_ID` from its harness child, so that
-/// env var is the signal for "inside a local session" — the same one run
-/// creation uses to attribute a run to its launching chat. Outside one (a
-/// human at a terminal, a cloud project) the Full set stays correct.
+/// Which bundled skill set this invocation serves: the Local bodies inside an
+/// `orx up` session, the Full ones for a human at a terminal or a cloud box.
 fn current_skill_set() -> SkillSet {
-    if crate::local::chat::launching_chat_session().is_some() {
+    if crate::local::chat::in_local_session() {
         SkillSet::Local
     } else {
         SkillSet::Full
@@ -25,11 +20,9 @@ fn current_skill_set() -> SkillSet {
 pub async fn run(args: crate::SkillArgs) -> Result<()> {
     if let Some(path) = args.path {
         // First: a bundled module (with or without the `orx-` prefix). These
-        // ship in the binary, so they resolve offline and never drift.
-        //
-        // Inside an `orx up` session the agent must get the *local* body — the
-        // playbook points here as the fallback when a harness hasn't surfaced a
-        // skill, and the cloud bodies describe commands local mode doesn't have.
+        // ship in the binary, so they resolve offline and never drift. Inside a
+        // session the agent must get the *local* body — the playbook points here
+        // as the fallback, and cloud bodies name commands local mode lacks.
         if let Some(skill) = agent_skills::find(&path, current_skill_set()) {
             println!("{}", skill.content.trim_end());
             return Ok(());

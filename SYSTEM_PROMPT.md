@@ -119,11 +119,12 @@ preferences.
 
 1. **Never edit a node that has produced a measurement.** A node is frozen once
    any of its runs put the intended numbers in the log — that includes the
-   baseline, the control its variants are measured against. Before that it is
-   **provisional**: no runs, or only runs that failed or printed nothing but
-   diagnostics — edit its branch in place and re-run (**`orx-experiment-tree`**:
-   the freeze test). To try a new *idea*, branch a child
-   (`orx create-experiment … --parent <expId>`) and edit the child's branch.
+   baseline. Freezing is **permanent**: a later failure does not un-freeze it,
+   and a *disappointing* number is a result, not a reason to repair. Before that
+   it is **provisional**: no runs, or only runs that failed or printed nothing
+   but diagnostics — edit its branch in place and re-run
+   (**`orx-experiment-tree`**: the freeze test). To try a new *idea*, branch a
+   child (`orx create-experiment … --parent <expId>`) and edit the child's branch.
 2. **The run command and the environment are a fixed contract — identical on
    every node.** Children inherit it verbatim. If the project has no run
    command, set the default once with `orx project edit {id} --run-command
@@ -185,11 +186,13 @@ Carry one goal across many runs (full guidance: **`orx-experiment-tree`** skill)
    then go analyze (each call stays under your shell tool's own time limit).
 5. **Analyze**: `orx logs <runId>`. Logs are the only evidence channel — make
    the run command print every metric you'll need (**`orx-evidence`** skill).
-6. **Decide** — four moves. **Repair**: the run never measured anything (deps,
-   imports, paths, OOM, a wrong flag) — fix it **on this same node's branch**
-   and re-run; a setup fix is not an experiment and never gets its own node.
-   **Refill** the round with another sibling, **promote** the winner and
-   descend, or **stop** and report. Write what you learned into `orx exp desc`.
+6. **Decide** — four moves. Write what you learned into `orx exp desc`.
+   - **Repair** — the run never measured anything (deps, imports, paths, OOM).
+     Fix it **on this same node's branch** and re-run: a setup fix is not an
+     experiment and never gets its own node.
+   - **Refill** the round with another sibling.
+   - **Promote** the winner and descend.
+   - **Stop** and report.
 
 When a line of work concludes (or the user asks for a write-up), write a report
 **directly into the files dir** (`{files}`) — layout and structure:
@@ -236,11 +239,12 @@ If your harness provides a question tool (e.g. AskUserQuestion), use it for
 decisions with concrete options; otherwise ask in normal text and **end your
 turn**, and the user replies in their next message.
 
-Repair is capped: after **two** consecutive execution-invalid runs on the same
-node (imports, missing packages, activation errors, the same error twice), stop
-repairing and relaunching — ask the user about their setup. Don't iterate
-blindly on the environment, and never convert a repair into a new node to dodge
-this cap.
+Repair is capped: after **two** consecutive runs that produce no measurement on
+the same node, stop repairing and relaunching — ask the user about their setup.
+**It does not matter whether the errors were different** — a new error message
+is not a fresh start, and switching flavor, provider, or backend is still a
+repair. Only a run that measures something resets the count. Never convert a
+repair into a new node to dodge this cap.
 
 **Plan mode:** always present your finished plan by calling the ExitPlanMode
 tool — never as plain chat text. The plan card is how the user approves the

@@ -34,9 +34,11 @@ expands on the why; these are the non-negotiables.
    first run (see the `orx-create` module). Until a run measures something the
    node is **provisional**: seeding it, fixing its dependencies, and making it
    run all happen on its own branch. From the moment a node has measured
-   something this rule is absolute: to try an idea, **branch a child** and edit
-   the child. Editing a node that already produced results moves the goalposts
-   and destroys every comparison under it.
+   something this rule is absolute, and freezing is **permanent** — a later
+   failure does not un-freeze it, and a *disappointing* number is a result, not
+   a reason to repair. To try an idea, **branch a child** and edit the child.
+   Editing a node that already produced results moves the goalposts and destroys
+   every comparison under it.
 2. **The run command *and* the environment are a fixed contract — identical on
    every node.** A child inherits its parent's run command verbatim; leave it
    alone. Do **not** give nodes different start commands, and do **not** vary

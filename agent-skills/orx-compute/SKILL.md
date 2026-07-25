@@ -340,9 +340,11 @@ orx exp wait <expId> --interval 10 --timeout 3600   # tune polling
 
   `orx create-experiment` is for a new **question**, never for a retry. A row of
   nodes whose only difference is "this one has the deps installed" is the
-  failure mode this rule exists to prevent. Hard cap: after **two** consecutive
-  runs that fail before producing any measurement, stop relaunching and ask the
-  user about their setup.
+  failure mode this rule exists to prevent. Hard cap: after **two** runs in a
+  row that produce no measurement, stop relaunching and ask the user about
+  their setup. Different errors still count as consecutive, and flavor,
+  provider, and backend switches are repairs that count toward the cap — only a
+  run that measures something resets it.
 
 ## Sizing compute
 

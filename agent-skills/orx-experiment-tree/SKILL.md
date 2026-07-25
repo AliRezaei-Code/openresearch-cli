@@ -29,17 +29,20 @@ there is nothing to protect.
 | No runs at all | provisional | edit the node's branch in place |
 | Every run `failed` / `cancelled` | provisional | edit the node's branch in place |
 | Runs `done`, but logs show only tracebacks, install errors, usage text, or an empty metric block | provisional (**execution-invalid**) | edit in place — this is Repair |
+| **Some but not all** intended metrics present | **FROZEN** | any real measurement freezes the node |
 | **Any** run whose log carries the intended measurement | **FROZEN** | never edit this branch again; branch a child |
 
 Frozen is **permanent and per-node** — it never un-freezes, not after a later
-failure, not because the number was disappointing. Every attempt is preserved
-either way: `orx runs` records the exact `commit_sha` of every run, so a
-repaired branch never erases what it ran.
+failure, not because the number was disappointing. You judge this from the log
+yourself; there is no acceptance step. A node that ran correctly and produced a
+**bad** measurement is FROZEN — a negative result is a result. Every attempt is
+preserved either way: `orx runs` records the exact `commit_sha` of every run, so
+a repaired branch never erases what it ran.
 
-**Two things the freeze test is NOT:**
-- Not "did a human accept it" — there is no acceptance step; you judge the log.
-- Not "was the number good". A node that ran correctly and produced a **bad**
-  measurement is FROZEN — a negative result is a result.
+If you need metrics a frozen node didn't print, branch a child that prints them
+— don't edit that branch to add prints. The node's question and the measurement
+it owes live in `orx exp desc <expId>`; write them there when you create it, so
+"did the intended measurement land?" stays answerable later.
 
 ## Shape the tree — stacked bushes, not a flat fan or a noodle
 
@@ -101,17 +104,18 @@ already have and re-run it.
 
 | Situation | Move | Why |
 |---|---|---|
-| Missing dep, bad import, wrong path, env activation, typo | **Repair** the node | no hypothesis, no measurement |
-| OOM, timeout, wrong flavor/backend | **Repair** the node | provisioning, not science |
-| Run exited `done` but printed only diagnostics | **Repair** the node | execution-invalid — the node never spoke |
+| Anything that stops the code measuring at all | **Repair** the node | no hypothesis, no measurement |
 | Same measurement, different hyperparameter | **Sibling** child | co-equal option of one decision |
 | New idea built on a node's confirmed result | **Child** of that node | real depth |
 | Node measured something; you want a *variant* | **Child** — node is frozen | never edit a frozen branch |
-| 2 consecutive execution-invalid runs on one node | **Ask the user** | repair cap |
+| 2 runs in a row measuring nothing on one node | **Ask the user** | repair cap |
 
 **The repair loop is not a research loop.** Repairs do not count toward "~3
 consecutive failed or regressed runs" — that counter is about *scientific*
-failure. The repair cap is separate and hard: two strikes, then ask.
+failure. The repair cap is separate and hard: two runs in a row that measure
+nothing, then ask. **Different errors still count as consecutive**, and
+switching flavor, provider, or backend is itself a repair — only a run that
+measures something resets the count.
 
 ## The auto-research loop
 
@@ -156,7 +160,7 @@ the run command:
    ```sh
    DIR=~/.cache/openresearch/repos/<owner>/<repo>   # owner/repo from `orx projects`
    [ -d "$DIR" ] || git clone https://github.com/<owner>/<repo> "$DIR"
-   git -C "$DIR" fetch origin && git -C "$DIR" checkout -B orx/<child-slug> origin/orx/<child-slug>
+   git -C "$DIR" fetch origin && git -C "$DIR" checkout orx/<child-slug>
    #   …edit config.yaml under "$DIR": schedule: constant → cosine …
    git -C "$DIR" commit -am "cosine LR + warmup" && git -C "$DIR" push
    ```
@@ -221,7 +225,7 @@ the run command:
    - **Repair** — the run produced no measurement (deps, imports, paths, OOM,
      truncated output). The node is still **provisional**: fix its branch in
      place, push, and re-launch the *same* node. Do not create a child for a
-     fix. Cap: two consecutive execution-invalid runs → stop and ask the user.
+     fix. Cap: two runs in a row measuring nothing → stop and ask the user.
    - **Refill** — result is mediocre or inconclusive: launch the next queued child to
      keep the GPU capacity saturated (step 5).
    - **Promote** — result is a clear win: this node becomes the **parent for the next
