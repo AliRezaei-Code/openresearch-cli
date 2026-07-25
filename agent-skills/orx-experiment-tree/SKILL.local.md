@@ -7,8 +7,39 @@ A project is a **tree of experiment nodes**. The root (**baseline**) holds the
 starting code and a **run command** — the single shell command that trains or
 evaluates the node and prints its results to the run log. Every other node is a
 **child** branched off a parent, inheriting its code and its run command. The two
-rules this depends on — **never edit the baseline** and **the run command + env is
-a fixed contract** — are the cardinal rules; everything below assumes them.
+rules this depends on — **never edit a node that has measured something** and
+**the run command + env is a fixed contract** — are the cardinal rules;
+everything below assumes them.
+
+## A node is an evidence contract — provisional until it measures something
+
+A node exists to answer **one question**, and it is finished when it has produced
+the **measurement** that answers it. Until then it has produced nothing, and
+there is nothing to protect.
+
+**The freeze test — a node is FROZEN the moment ANY of its runs is
+*evidence-valid*:**
+
+> A run is **evidence-valid** when its log contains the node's intended
+> measurement — the numbers you would cite comparing this node to a sibling.
+> Not "it exited `done`". Not "it printed something".
+
+| What `orx runs` / `orx logs` show | State | What you may do |
+|---|---|---|
+| No runs at all | provisional | edit the node's branch in place |
+| Every run `failed` / `cancelled` | provisional | edit the node's branch in place |
+| Runs `done`, but logs show only tracebacks, install errors, usage text, or an empty metric block | provisional (**execution-invalid**) | edit in place — this is Repair |
+| **Any** run whose log carries the intended measurement | **FROZEN** | never edit this branch again; branch a child |
+
+Frozen is **permanent and per-node** — it never un-freezes, not after a later
+failure, not because the number was disappointing. Every attempt is preserved
+either way: `orx runs` records the exact `commit_sha` of every run, so a
+repaired branch never erases what it ran.
+
+**Two things the freeze test is NOT:**
+- Not "did a human accept it" — there is no acceptance step; you judge the log.
+- Not "was the number good". A node that ran correctly and produced a **bad**
+  measurement is FROZEN — a negative result is a result.
 
 ## Shape the tree — stacked bushes, not a flat fan or a noodle
 
@@ -54,10 +85,39 @@ direct children off the root with no grandchildren means you're fanning when you
 should be descending; a long depth-N chain with no branching means you're chaining
 co-equal variants that should have been siblings.
 
+## Classify before you create — remediation is neither width nor depth
+
+Width is **the open options of one decision**. Depth is **decisions already
+resolved, stacked**. Engineering remediation — making the code run at all — is
+**neither**: no hypothesis, no comparison, no result. A chain of nodes each
+fixing the next error is a **noodle made of non-experiments**.
+
+Before every `orx create-experiment`, answer in one sentence:
+
+> **"What will this node measure that no existing node measures?"**
+
+If the honest answer is a *fix* ("it will finally import torch", "it will run
+without the CUDA error"), **it is not a node.** Repair the provisional node you
+already have and re-run it.
+
+| Situation | Move | Why |
+|---|---|---|
+| Missing dep, bad import, wrong path, env activation, typo | **Repair** the node | no hypothesis, no measurement |
+| OOM, timeout, wrong flavor/backend | **Repair** the node | provisioning, not science |
+| Run exited `done` but printed only diagnostics | **Repair** the node | execution-invalid — the node never spoke |
+| Same measurement, different hyperparameter | **Sibling** child | co-equal option of one decision |
+| New idea built on a node's confirmed result | **Child** of that node | real depth |
+| Node measured something; you want a *variant* | **Child** — node is frozen | never edit a frozen branch |
+| 2 consecutive execution-invalid runs on one node | **Ask the user** | repair cap |
+
+**The repair loop is not a research loop.** Repairs do not count toward "~3
+consecutive failed or regressed runs" — that counter is about *scientific*
+failure. The repair cap is separate and hard: two strikes, then ask.
+
 ## The auto-research loop
 
 To drive a project toward a goal (e.g. "best convergence for d=8"), this is the
-intended flow — do **not** edit the baseline or rewrite the run command:
+intended flow — do **not** edit a frozen node or rewrite the run command:
 
 1. **Read the baseline's code.** You already sit in a private git worktree of the
    project's repo — `git fetch origin && git checkout <branch>` and read it with
@@ -145,7 +205,11 @@ intended flow — do **not** edit the baseline or rewrite the run command:
    **actually read its results**: `orx logs <runId>` (see the `orx-evidence`
    skill). To see exactly what a finished node changed, diff its branch against
    its parent's (see the `orx-git` skill). Don't infer from status alone. Each
-   completion is a decision point with three moves:
+   completion is a decision point with four moves:
+   - **Repair** — the run produced no measurement (deps, imports, paths, OOM,
+     truncated output). The node is still **provisional**: fix its branch in
+     place, push, and re-launch the *same* node. Do not create a child for a
+     fix. Cap: two consecutive execution-invalid runs → stop and ask the user.
    - **Refill** — result is mediocre or inconclusive: launch the next queued child to
      keep the round moving (step 5).
    - **Promote** — result is a clear win: this node becomes the **parent for the next
@@ -154,8 +218,8 @@ intended flow — do **not** edit the baseline or rewrite the run command:
      the tree grow deeper; skipping it is what produces a flat, sweep-only tree.
    - **Stop** — goal met, or the branch is exhausted.
 
-   The baseline stays untouched throughout — promotion moves the *focal parent* down the
-   tree, it never edits the root.
+   Frozen nodes stay untouched throughout — promotion moves the *focal parent*
+   down the tree, it never rewrites a node that already measured something.
 
 Stop when the goal is met, or after ~3 consecutive failed or regressed runs.
 When you stop, write up the tree as a report in the project's files dir — see

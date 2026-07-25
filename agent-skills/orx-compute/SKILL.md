@@ -328,6 +328,21 @@ orx exp wait <expId> --interval 10 --timeout 3600   # tune polling
   line points at `orx logs <runId>`, where the traceback/OOM/setup error lives.
   The same `reason:` line appears under `orx exp status <expId>` and beneath the
   `orx runs <projectId>` table.
+- **A failed run never creates a node.** Compute failures — spin-up errors, no
+  capacity, quota, a bad flavor, OOM, timeout, a missing dependency in the
+  image, an env that didn't activate — are **provisioning and setup, not
+  results**. The experiment still hasn't been run. Fix it where it belongs and
+  **re-launch the same `<expId>`**:
+  - transient provider/spin-up error → re-launch, or a different flavor/provider;
+  - OOM or timeout → bigger flavor / longer `--timeout`, same node;
+  - dependency, import, or env error → fix the **code on that node's branch**,
+    push, re-run the same node (see `orx-git`: repairing a node in place).
+
+  `orx create-experiment` is for a new **question**, never for a retry. A row of
+  nodes whose only difference is "this one has the deps installed" is the
+  failure mode this rule exists to prevent. Hard cap: after **two** consecutive
+  runs that fail before producing any measurement, stop relaunching and ask the
+  user about their setup.
 
 ## Sizing compute
 

@@ -117,10 +117,12 @@ of the same clone. Git state is shared between you:
 Breaking any of these silently invalidates results — they are not style
 preferences.
 
-1. **Never edit a baseline (root experiment) once it exists.** A root is the
-   control its variants are measured against — on a fresh project you create
-   it (first `orx create-experiment`, no `--parent`), and from then on it is
-   frozen. To try an idea, **branch a child**
+1. **Never edit a node that has produced a measurement.** A node is frozen once
+   any of its runs put the intended numbers in the log — that includes the
+   baseline, the control its variants are measured against. Before that it is
+   **provisional**: no runs, or only runs that failed or printed nothing but
+   diagnostics — edit its branch in place and re-run (**`orx-experiment-tree`**:
+   the freeze test). To try a new *idea*, branch a child
    (`orx create-experiment … --parent <expId>`) and edit the child's branch.
 2. **The run command and the environment are a fixed contract — identical on
    every node.** Children inherit it verbatim. If the project has no run
@@ -139,13 +141,12 @@ preferences.
    trains, evaluates, or produces results goes through `orx exp run`. Direct
    jobs are unsupervised, invisible to the dashboard, run whatever happens to
    be in your checkout instead of the branch tip, and block your turn.
-6. **Never merge or rebase an experiment branch once it has a completed
-   non-failed run.** That branch's history is the code its recorded results
-   came from — leave it as it ran. To bring in changes from another branch,
-   **create a child and put the merge commit on the child's branch**
-   (`orx create-experiment … --parent <expId>`, then `git merge` there). And
-   never rebase, anywhere: the tree records what actually ran, and rewriting
-   history makes no sense in an experiment tree.
+6. **Never merge or rebase a branch once its node is frozen.** That history is
+   the code its measurement came from — leave it as it ran. To bring in changes
+   from another branch, **create a child and put the merge commit on the
+   child's branch** (`orx create-experiment … --parent <expId>`, then
+   `git merge` there). And never rebase, anywhere: the tree records what
+   actually ran, and rewriting history makes no sense in an experiment tree.
 
 ## Command index (local mode)
 
@@ -184,8 +185,11 @@ Carry one goal across many runs (full guidance: **`orx-experiment-tree`** skill)
    then go analyze (each call stays under your shell tool's own time limit).
 5. **Analyze**: `orx logs <runId>`. Logs are the only evidence channel — make
    the run command print every metric you'll need (**`orx-evidence`** skill).
-6. **Decide**: refill the round with another sibling, promote the winner and
-   descend, or stop and report. Write what you learned into `orx exp desc`.
+6. **Decide** — four moves. **Repair**: the run never measured anything (deps,
+   imports, paths, OOM, a wrong flag) — fix it **on this same node's branch**
+   and re-run; a setup fix is not an experiment and never gets its own node.
+   **Refill** the round with another sibling, **promote** the winner and
+   descend, or **stop** and report. Write what you learned into `orx exp desc`.
 
 When a line of work concludes (or the user asks for a write-up), write a report
 **directly into the files dir** (`{files}`) — layout and structure:
@@ -232,9 +236,11 @@ If your harness provides a question tool (e.g. AskUserQuestion), use it for
 decisions with concrete options; otherwise ask in normal text and **end your
 turn**, and the user replies in their next message.
 
-If two consecutive runs fail for environmental reasons (imports, missing
-packages, activation errors) rather than scientific ones, stop relaunching and
-ask the user about their setup — don't iterate blindly on the environment.
+Repair is capped: after **two** consecutive execution-invalid runs on the same
+node (imports, missing packages, activation errors, the same error twice), stop
+repairing and relaunching — ask the user about their setup. Don't iterate
+blindly on the environment, and never convert a repair into a new node to dodge
+this cap.
 
 **Plan mode:** always present your finished plan by calling the ExitPlanMode
 tool — never as plain chat text. The plan card is how the user approves the

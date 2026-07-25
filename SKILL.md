@@ -26,15 +26,17 @@ These four govern everything below. Breaking any one silently invalidates your
 results — they are not style preferences. The `orx-experiment-tree` module
 expands on the why; these are the non-negotiables.
 
-1. **Never edit a baseline (root) once it holds real code.** A root is the
-   control its variants are measured against. Projects start with an empty
-   tree — **you create the baseline** (the first `orx create-experiment`, no
-   `--parent`) and, on a blank repo, seed it with starting code before its first
-   run (see the `orx-create` module). That setup window is the one
-   exception, like rule 2's single legitimate `--set`. From the moment a root
-   holds real code this rule is absolute: to try an idea, **branch a child**
-   and edit the child. Editing a root moves the goalposts and destroys every
-   comparison under it.
+1. **Never edit a node that has produced a measurement.** A node is frozen once
+   any of its runs put the intended numbers in the log — that includes the
+   root, the control its variants are measured against. Projects start with an
+   empty tree — **you create the baseline** (the first `orx create-experiment`,
+   no `--parent`) and, on a blank repo, seed it with starting code before its
+   first run (see the `orx-create` module). Until a run measures something the
+   node is **provisional**: seeding it, fixing its dependencies, and making it
+   run all happen on its own branch. From the moment a node has measured
+   something this rule is absolute: to try an idea, **branch a child** and edit
+   the child. Editing a node that already produced results moves the goalposts
+   and destroys every comparison under it.
 2. **The run command *and* the environment are a fixed contract — identical on
    every node.** A child inherits its parent's run command verbatim; leave it
    alone. Do **not** give nodes different start commands, and do **not** vary

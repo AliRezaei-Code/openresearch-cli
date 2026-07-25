@@ -167,12 +167,17 @@ pub fn skills(set: SkillSet) -> Vec<&'static AgentSkill> {
     }
 }
 
-/// Resolve a bundled Full-set skill by name, accepting both the public name
+/// Resolve a bundled skill by name within `set`, accepting both the public name
 /// (`orx-compute`) and the bare form (`compute`). `None` for an unknown name —
 /// the caller falls back to the live API fetch.
-pub fn find(name: &str) -> Option<&'static AgentSkill> {
+///
+/// The set matters: local and cloud share skill *names* but swap bodies, and the
+/// local bodies are the ones that describe local mode's actual command surface.
+/// Serving a Full body inside an `orx up` session would tell the agent to use
+/// `orx artifact` / `orx query` / `orx chart`, which local mode does not have.
+pub fn find(name: &str, set: SkillSet) -> Option<&'static AgentSkill> {
     let want = name.trim();
-    skills(SkillSet::Full)
+    skills(set)
         .into_iter()
         .find(|s| s.name == want || s.name.strip_prefix("orx-") == Some(want))
 }
@@ -307,12 +312,48 @@ mod tests {
 
     #[test]
     fn find_resolves_prefixed_and_bare() {
-        assert_eq!(find("orx-compute").map(|s| s.name), Some("orx-compute"));
-        assert_eq!(find("compute").map(|s| s.name), Some("orx-compute"));
-        assert_eq!(find("orx-create").map(|s| s.name), Some("orx-create"));
-        assert_eq!(find("create").map(|s| s.name), Some("orx-create"));
-        assert!(find("does-not-exist").is_none());
-        assert!(find("project-query").is_none());
+        for set in [SkillSet::Local, SkillSet::Full] {
+            assert_eq!(
+                find("orx-compute", set).map(|s| s.name),
+                Some("orx-compute")
+            );
+            assert_eq!(find("compute", set).map(|s| s.name), Some("orx-compute"));
+            assert!(find("does-not-exist", set).is_none());
+            assert!(find("project-query", set).is_none());
+        }
+        // `orx-create` is Full-only — a local session has no create surface.
+        assert_eq!(
+            find("orx-create", SkillSet::Full).map(|s| s.name),
+            Some("orx-create")
+        );
+        assert_eq!(
+            find("create", SkillSet::Full).map(|s| s.name),
+            Some("orx-create")
+        );
+        assert!(find("orx-create", SkillSet::Local).is_none());
+    }
+
+    /// `orx skill <name>` inside an `orx up` session must serve the **local**
+    /// body: the playbook points there as the fallback, and the cloud bodies
+    /// describe commands (`orx artifact`/`query`/`chart`) local mode lacks.
+    #[test]
+    fn find_serves_the_requested_variant_body() {
+        let local = find("evidence", SkillSet::Local).expect("local evidence");
+        let cloud = find("evidence", SkillSet::Full).expect("cloud evidence");
+        assert_ne!(
+            local.content, cloud.content,
+            "local and cloud evidence bodies must differ"
+        );
+        assert!(
+            local.content.contains("logs are the only evidence channel"),
+            "local body should state the logs-only contract"
+        );
+        for absent in ["orx artifacts", "orx query", "orx chart"] {
+            assert!(
+                !local.content.contains(absent),
+                "local evidence body must not mention `{absent}`"
+            );
+        }
     }
 
     #[test]

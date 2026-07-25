@@ -43,10 +43,14 @@ and seeding the baseline from that repo is faster, more faithful, and a far
 better control than something typed from memory. Reproductions should start from
 the authors' (or a strong community) implementation, not a blank file.
 
-This is the one legitimate time you put code *on the baseline itself* (cardinal
-rule 1's only exception): it applies **only while the baseline is still the empty
-stub.** Once it holds real code, the baseline is frozen — vary code on children
-from then on.
+This is when you put code *on the baseline itself*, and it is not an exception
+to cardinal rule 1 — it is that rule working as written. The baseline is
+**provisional** until one of its runs actually produces reference numbers in its
+log. Seeding it, fixing its dependencies, and making it run are all part of
+building the control; none of them is an experiment. Once a run has produced the
+baseline's reference measurement, the root is **frozen** — from then on you vary
+code on children (the mechanical test: `orx-experiment-tree`, "A node is an
+evidence contract").
 
 **Find the code to seed from, in priority order:**
 
@@ -93,10 +97,18 @@ Then make the baseline runnable and proceed normally:
 
 - read the seeded code, find its entry point, and set the run command **once**:
   `orx exp cmd <baselineId> --set "bash run.sh"` (rule 2's one legitimate `--set`);
-- run the baseline first for a control `EVAL.md`, then branch children and vary
-  code per the auto-research loop. The baseline is **frozen** the moment it holds
-  real code — shrink to the smallest config that still shows the paper's claim by
-  editing a **child**, never by trimming the root.
+- run the baseline first for a control `EVAL.md`. **Expect the first launch to
+  fail** — missing deps, a wrong entry point, an env that doesn't activate.
+  Every one of those is repaired **on the baseline's own branch** (fix, commit,
+  push, re-run the same node): the baseline hasn't measured anything yet, so it
+  is still provisional. Do **not** create a child to carry a setup fix, and do
+  **not** treat a failed first launch as "the baseline exists now, so it's
+  frozen." After **two** consecutive runs that fail before producing numbers,
+  stop and ask the user how they run this code.
+- Once the baseline has produced its reference numbers it is **frozen**. Then
+  branch children and vary code per the auto-research loop — shrink to the
+  smallest config that still shows the paper's claim by editing a **child**,
+  never by trimming the root.
 
 ## `orx create-experiment` — add a node to the tree
 

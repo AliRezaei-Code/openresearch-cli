@@ -68,3 +68,11 @@ The contract orx enforces at submit (loud, before anything runs):
 - Everything downstream is identical (`orx exp wait` / `orx runs` /
   `orx logs`, cancel via `orx exp cancel`). A detached `orx supervise`
   watches the Job via kubectl; don't kill it.
+- **A rejected submit or a failed Job is not an experiment result.** Manifest
+  validation errors, unschedulable pods, image-pull failures, and OOMKilled
+  containers are infrastructure — fix `.orx/k8s.yaml` (or the code) **on the
+  same experiment branch**, push, and re-run the same `<expId>`. Never create a
+  child node to carry a manifest fix: the node hasn't produced a measurement
+  yet, so its branch is still editable (see `orx-experiment-tree`: the freeze
+  test). Once the node *has* measured something, a manifest change (node count,
+  GPU type) is a real experimental variable and belongs on a child.
