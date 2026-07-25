@@ -11,90 +11,29 @@ rules this depends on — **never edit a node that has measured something** and
 **the run command + env is a fixed contract** — are the cardinal rules;
 everything below assumes them.
 
-## A node is an evidence contract — provisional until it measures something
+## Provisional until it measures — repair, don't branch
 
-A node answers **one question** and is finished when it has produced the
-measurement that answers it. Until then it has produced nothing, and there is
-nothing to protect.
+A node answers **one question** and is finished when a run produces the
+measurement that answers it. Judge what a run produced, not what caused it to
+fail:
 
-**The freeze test.** Judge what the run produced, not what caused it to fail:
-
-- It produced a **quality metric** — a loss, perplexity, accuracy, reward, eval
-  score — anywhere its evidence lands (log, `EVAL.md`, a linked W&B run):
-  **FROZEN**, whatever ended the run, even a bad number or a `nan`. Check the
-  artifacts before concluding a run measured nothing.
-- It produced **only an error**, or nothing judgeable (preempted, empty log):
-  **provisional** — repair its branch in place and re-run the same node.
+- a **quality metric** (loss, perplexity, accuracy, reward, eval score) — in
+  the log, an uploaded artifact, or a linked W&B run: **FROZEN**, whatever
+  ended the run, even a bad number or a `nan`;
+- **only an error**, or nothing judgeable: **provisional** — repair its branch
+  in place and re-run the same node, never branch a child for a fix.
 
 Operational figures are not metrics: LR, throughput, `it/s`, grad-norm,
-wall-clock, step counters, byte counts in an allocator error, config echoes,
-progress bars.
+wall-clock, step counters, allocator byte counts, config echoes, progress bars.
 
 Freezing is **permanent** — a bad number is a result, not a reason to repair.
-When it's genuinely ambiguous, freeze: a spurious freeze costs one cheap node, a
-spurious repair rewrites the branch a recorded `commit_sha` points at.
+When ambiguous, freeze: a spurious freeze costs one cheap node, a spurious
+repair rewrites the branch a recorded `commit_sha` points at.
 
-Record the node's question and what it measured in `orx exp desc <expId>`.
-
-## Shape the tree — stacked bushes, not a flat fan or a noodle
-
-The single most common way to drive a project badly is to get the **shape** wrong.
-There are two opposite failures, and the right shape sits between them:
-
-```
-FLAT FAN (wrong)            NOODLE (wrong)            STACKED BUSHES (right)
-root                        root                      root
-├ a ├ b ├ c ... ├ n         └ a                       └ lr-head        ┐ round 1:
-                              └ b                        ├ lr 2e-5     │ a small fan of
-                                └ c                      └ lr 3e-5     ┘ co-equal options
-                                  └ d ...                   └ winner ── arch-head   ┐ round 2
-                                                               ├ arch-A             │ descends onto
-                                                               └ arch-B             ┘ round 1's winner
-```
-
-- **Flat fan** (your whole sweep hanging off the root): every result is measured
-  against the *start*, so wins never accumulate and the tree never makes progress.
-- **Noodle** (a long single-child chain): depth manufactured for its own sake —
-  each step doesn't actually build on the one above it.
-- **Stacked bushes** (correct): a *small fan within a round* (the options of one
-  decision), then **descend onto that round's winner** for the next round.
-
-**The one rule that produces this shape.** Before you make X a child of Y, name
-what Y established that X builds on:
-
-- **You can name it** ("Y is the LR winner; X keeps that LR and changes the
-  architecture") → real depth. X is a **child** of Y. Descend.
-- **You can't — X and Y are co-equal options you're trying at the same time**
-  (lr 2e-5 vs lr 3e-5) → they don't build on each other. They're **siblings** in
-  the same bush. Fan, don't chain.
-
-So: **width = the open options of one decision** (fan freely — a 3-way LR sweep
-*should* be three siblings under a common head); **depth = decisions already
-resolved, stacked** (one level down per winner kept). A new *round* never hangs off
-the root — it hangs off the previous round's winner. That keeps the tree moving
-**downward** as research progresses, without stringing unrelated nodes into a line.
-
-Re-read `orx experiments` each round and check the shape: a wide row of direct
-children off the root with no grandchildren means you're fanning when you should be
-descending; a long depth-N chain with no branching means you're chaining co-equal
-variants that should have been siblings.
-
-## Classify before you create — remediation is neither width nor depth
-
-Making the code run at all is neither width nor depth: no hypothesis, no
-comparison, no result. Before every `orx create-experiment`, answer:
-
-> **"What will this node measure that no existing node measures?"**
-
-If the honest answer is a *fix* ("it will finally import torch"), **it is not a
-node** — repair the provisional node you already have.
-
-**The repair cap.** Two runs in a row measuring nothing on one node, then ask
-the user. Different errors still count as consecutive; a bare relaunch and a
-flavor/provider/backend switch are repairs too. If the same failure hits a
-second node, that is one setup problem — ask then, don't repair each node twice.
-Repairs don't count toward the separate "~3 consecutive failed or regressed
-runs" scientific stop.
+**Repair cap:** two runs in a row measuring nothing on one node, then ask the
+user. Different errors still count; a bare relaunch or a flavor/backend switch
+is a repair. If the same failure hits a second node, that is one setup problem
+— ask then. (Separate from the "~3 failed or regressed runs" scientific stop.)
 
 ## The auto-research loop
 
@@ -204,11 +143,7 @@ the run command:
    changed, use the local git diff recipe `orx exp status <expId>` prints (see
    the `orx-git` skill). Don't infer from status alone. Each
    completion is a decision point with four moves:
-   - **Repair** — the run put **no numbers** in the log (deps, imports, paths,
-     env, truncated output — see the freeze test). The node is still
-     **provisional**: fix its branch in
-     place, push, and re-launch the *same* node. Do not create a child for a
-     fix. Cap: two runs in a row measuring nothing → stop and ask the user.
+   - **Repair** — no metric: fix this node's branch and re-launch it (above).
    - **Refill** — result is mediocre or inconclusive: launch the next queued child to
      keep the GPU capacity saturated (step 5).
    - **Promote** — result is a clear win: this node becomes the **parent for the next

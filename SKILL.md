@@ -26,21 +26,12 @@ These four govern everything below. Breaking any one silently invalidates your
 results — they are not style preferences. The `orx-experiment-tree` module
 expands on the why; these are the non-negotiables.
 
-1. **Never edit a node that has produced a measurement.** A node is frozen once
-   any of its runs put a **metric it computed** in the log — that includes the
-   root, the control its variants are measured against. Projects start with an
-   empty tree — **you create the baseline** (the first `orx create-experiment`,
-   no `--parent`) and, on a blank repo, seed it with starting code before its
-   first run (see the `orx-create` module). While its runs produce only
-   **errors** and no numbers, the node is **provisional**: seeding it, fixing
-   its dependencies, and making it run all happen on its own branch. The moment
-   a run puts **numbers** anywhere its evidence lands — the log, an uploaded
-   artifact, or a linked W&B run — the node is frozen, whatever ended the run. From the moment a node has measured
-   something this rule is absolute, and freezing is **permanent** — a later
-   failure does not un-freeze it, and a *disappointing* number is a result, not
-   a reason to repair. To try an idea, **branch a child** and edit the child.
-   Editing a node that already produced results moves the goalposts and destroys
-   every comparison under it.
+1. **Never edit a node that has produced a measurement.** A node freezes the
+   moment a run computes a metric — that includes the root — and freezing is
+   permanent: a disappointing number is a result, not a reason to repair. Until
+   then it is **provisional**: seeding it, fixing its deps, and making it run
+   all happen on its own branch (`orx-experiment-tree`). To try an idea, branch
+   a **child** and edit the child.
 2. **The run command *and* the environment are a fixed contract — identical on
    every node.** A child inherits its parent's run command verbatim; leave it
    alone. Do **not** give nodes different start commands, and do **not** vary
@@ -165,9 +156,5 @@ orx logs <runId>                 # read its output
 To actually **drive** a project toward a goal — edit each node's code on its git
 branch and keep the GPU capacity saturated — follow the auto-research loop in
 the `orx-experiment-tree` module. Every completed run is a decision point with
-four moves: **repair** the same node when the run produced only an error and no
-numbers anywhere — log, artifacts, or W&B — or nothing to judge at all —
-**refill** the round with another sibling, **promote** the winner and
-descend, or **stop**. A run that produced numbers — including a NaN, OOM, or
-timeout — is a result: the node is frozen. Repair is
-capped at **two** runs in a row measuring nothing on one node.
+four moves: **repair** the same node when a run computed no metric, **refill**
+the round with another sibling, **promote** the winner and descend, or **stop**.

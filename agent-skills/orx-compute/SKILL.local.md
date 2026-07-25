@@ -216,24 +216,13 @@ orx exp wait <expId> --interval 10 --timeout 3600   # tune polling
   when one is known). Provider spin-up failures are usually transient and
   retryable: re-launch, or pick a different flavor or backend, rather than
   treating the experiment as a dead end.
-- **A failed run on a *provisional* node never creates a node.** Provisioning
-  failures — spin-up errors, no capacity, quota, a missing dep in the image, an
-  env that didn't activate — are setup, not results. **Read the log first**: if
-  the run computed a metric, that *is* the node's result and it is frozen
-  (`orx-experiment-tree`: the freeze test); a bigger flavor belongs on a child.
-  Otherwise fix it where it belongs and **re-launch the same `<expId>`**:
-  - transient provider/spin-up error → re-launch, or a different flavor/backend;
-  - OOM or timeout with **no numbers** anywhere → bigger flavor / longer
-    `--timeout`, same node — but only while *no* node in this round has
-    measured. Once one has, the round is committed to that shape (cardinal
-    rule 2): a bigger flavor belongs on a child;
-  - dependency, import, or env error → fix the **code on that node's branch**,
-    push, re-run the same node (see `orx-git`: repairing a node in place).
-
-  `orx create-experiment` is for a new **question**, never a retry — a row of
-  nodes differing only in "this one has the deps installed" is the failure mode
-  this prevents. Cap: two runs in a row measuring nothing on one node, then ask
-  (`orx-experiment-tree`: the repair cap).
+- **A failed run never creates a node.** Provisioning failures are setup, not
+  results — fix them and **re-launch the same `<expId>`**: transient spin-up →
+  re-launch or a different flavor/backend; OOM or timeout → bigger flavor or
+  longer `--timeout`; dep/import/env error → fix the code on that node's branch
+  (`orx-git`). But **read the log first**: if the run computed a metric, that is
+  the node's result and it is frozen — a bigger flavor belongs on a child
+  (`orx-experiment-tree`: the freeze test and the repair cap).
 
 ## Sizing compute
 
@@ -242,7 +231,5 @@ orx exp wait <expId> --interval 10 --timeout 3600   # tune polling
 - **Pick the smallest flavor that fits** the model and a minimal batch; don't
   reflexively grab the biggest.
 - **Let a real failure escalate you.** An OOM or hopeless slowness that left
-  **no numbers** in the log → move up a tier. That's expected, not a mistake;
-  an OOM after the run emitted metrics is its result, not a sizing problem
-  (`orx-experiment-tree`: the freeze test).
+  **no metric** → move up a tier. That's expected, not a mistake.
 - Raise `--timeout` (`--timeout 1d`) only for genuinely long runs.

@@ -43,10 +43,9 @@ and seeding the baseline from that repo is faster, more faithful, and a far
 better control than something typed from memory. Reproductions should start from
 the authors' (or a strong community) implementation, not a blank file.
 
-This is cardinal rule 1 working as written, not an exception to it: the
-baseline is **provisional** until a run produces reference numbers. Seeding it
-and making it run are part of building the control. Once a run measures, the
-root is **frozen** — vary code on children from then on.
+This is cardinal rule 1 working as written: the baseline is **provisional**
+until a run produces reference numbers, so seeding it and making it run are
+part of building the control.
 
 **Find the code to seed from, in priority order:**
 
@@ -97,11 +96,9 @@ Then make the baseline runnable and proceed normally:
 - read the seeded code, find its entry point, and set the run command **once**:
   `orx exp cmd <baselineId> --set "bash run.sh"` (rule 2's one legitimate `--set`);
 - run the baseline first for a control `EVAL.md`. **Expect the first launch to
-  fail** on setup — repair it on the baseline's own branch and re-run the same
-  node; don't branch a child for a setup fix. Cap: two runs in a row measuring
-  nothing, then ask the user (`orx-experiment-tree`: the repair cap).
-- Once it has produced reference numbers it is **frozen**. Shrink to the
-  smallest config that still shows the paper's claim by editing a **child**,
+  fail** on setup — repair it on the baseline's own branch, don't branch a child
+  (`orx-experiment-tree`). Once it has produced reference numbers it is
+  **frozen**: shrink to the smallest config that shows the claim on a **child**,
   never by trimming the root.
 
 ## `orx create-experiment` — add a node to the tree

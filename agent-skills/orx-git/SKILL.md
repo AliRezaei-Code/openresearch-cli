@@ -29,9 +29,8 @@ This is how you **realize a child's hypothesis**: after `create-experiment
 --parent`, check out the child's branch and make the specific code/config edits
 its description calls for — then commit, push, and run. Edit only the files that
 idea touches, and **don't touch the run command** (it's inherited; see the
-`orx-experiment-tree` skill). Edit the node whose branch you own; a node that
-has measured something is frozen — branch a child instead (see
-`orx-experiment-tree`: the freeze test).
+`orx-experiment-tree` skill). A node that has measured is frozen — branch a
+child instead.
 
 The sync recipe is **idempotent** — run it verbatim whether or not the clone
 already exists from a previous session. Always fetch + fast-forward before
@@ -98,13 +97,9 @@ git -C "$DIR" diff origin/<parent-branch>...<full-commit-sha>
 ## Repairing a node in place (`orx up` worktrees)
 
 A node that produced no metric is provisional: fix it on **its own branch** and
-re-run the same `<expId>` — don't create a child (`orx-experiment-tree`: the
-freeze test). Use the sync recipe above, then commit, push, and `orx exp run`.
+re-run the same `<expId>` — don't create a child (`orx-experiment-tree`). Sync
+as above, then commit, push, `orx exp run`.
 
 If the checkout fails with "already checked out at …", read the path: your own
-worktree means you already hold it, keep editing. Another session's means that
-agent owns the node — leave it alone. Never create a child to dodge the lock,
-and never `git worktree remove`/`prune --force` to break someone else's.
-
-Repairs are append-only commits: each run recorded its own `commit_sha`, so
-failed attempts stay resolvable from `orx runs`.
+worktree means you already hold it. Another session's means that agent owns the
+node — leave it alone; never break the lock or branch a child to dodge it.
