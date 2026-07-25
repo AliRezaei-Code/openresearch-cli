@@ -24,6 +24,22 @@ orx logs <runId> --range 4096:8192  # exact byte window [start, end)
   status line goes to **stderr**, noting if content was truncated above/below.
 - `<runId>` comes from `orx runs <projectId>` (the run id, not the experiment id).
 
+## Is the node frozen? — read the log, not the cause
+
+Judging a run is also judging its **node**. The rule (full test:
+`orx-experiment-tree`, "A node is an evidence contract"):
+
+- the log carries **numbers** the run emitted — the measurement, or any
+  substantive metric — the node is **FROZEN**, whatever ended the run. Numbers
+  win over a later traceback, a non-zero exit, or a cancel.
+- the log carries **only an error** and no numbers, or **nothing to judge**
+  (spin-up failure, preemption, empty or truncated output) — the node is
+  **provisional**: repair its branch in place and re-run the same node.
+
+Byte counts inside an allocator error are not numbers; digits in an error
+string are part of the error. Never edit a node whose run produced numbers —
+branch a child instead.
+
 ## Make the run print its own evidence
 
 Run logs are the only evidence channel in local mode. Make the run command

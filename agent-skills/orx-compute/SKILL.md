@@ -337,7 +337,7 @@ orx exp wait <expId> --interval 10 --timeout 3600   # tune polling
   (`orx-experiment-tree`: the freeze test). Otherwise the node is still
   provisional — fix it where it belongs and **re-launch the same `<expId>`**:
   - transient provider/spin-up error → re-launch, or a different flavor/provider;
-  - OOM or timeout the node's own change didn't cause → bigger flavor / longer
+  - OOM or timeout with **no numbers** in the log → bigger flavor / longer
     `--timeout`, same node;
   - dependency, import, or env error → fix the **code on that node's branch**,
     push, re-run the same node (see `orx-git`: repairing a node in place).
@@ -356,8 +356,8 @@ orx exp wait <expId> --interval 10 --timeout 3600   # tune polling
   papers run fine (and far cheaper) on a CPU flavor.
 - **Pick the smallest flavor that fits** the model and a minimal batch; don't
   reflexively grab the biggest.
-- **Let a real failure escalate you.** An OOM or hopeless slowness **the
-  node's own change didn't cause** → move up a tier. That's expected, not a
-  mistake — but an OOM caused by this node's change is its result, not a sizing
-  problem (`orx-experiment-tree`: the freeze test).
+- **Let a real failure escalate you.** An OOM or hopeless slowness that left
+  **no numbers** in the log → move up a tier. That's expected, not a mistake;
+  an OOM after the run emitted metrics is its result, not a sizing problem
+  (`orx-experiment-tree`: the freeze test).
 - Raise `--timeout` (`--timeout 1d`) only for genuinely long runs.

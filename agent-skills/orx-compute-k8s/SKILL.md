@@ -72,7 +72,7 @@ The contract orx enforces at submit (loud, before anything runs):
   errors, unschedulable pods, and image-pull failures are repairs: fix
   `.orx/k8s.yaml` (or the code) on the **same** experiment branch and re-run the
   same `<expId>`. Before the node has measured, changing the GPU type or node
-  count is a repair too, and repairs count toward the cap. An **OOMKilled**
-  container is different — if this node's own change grew the model or the
-  batch, that OOM *is* its result: freeze it and put the bigger shape on a
+  count is a repair too, and the re-run counts toward the cap. An **OOMKilled**
+  container is not automatically a repair — if the log holds numbers the run
+  emitted, that OOM *is* its result: freeze it and put the bigger shape on a
   child (`orx-experiment-tree`: the freeze test and the repair cap).

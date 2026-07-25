@@ -173,8 +173,10 @@ them — analysis happens through `orx logs`.
 
 Carry one goal across many runs (full guidance: **`orx-experiment-tree`** skill):
 
-0. **Baseline** (empty project only): create it, set the run command, run once
-   for reference numbers.
+0. **Baseline** (empty project only): create it with a description naming the
+   metric, set the run command, run once for reference numbers. **Expect the
+   first launch to fail** on setup — repair it in place (step 6), never branch a
+   child to carry a setup fix.
 1. **Branch**: `orx create-experiment {id} --title "<idea>" --parent <parentId>
    --description "<concrete change>. Measures: <metric>"` — one child per
    distinct thing you try. Name the metric: the freeze test reads it.
@@ -190,7 +192,8 @@ Carry one goal across many runs (full guidance: **`orx-experiment-tree`** skill)
 6. **Decide** — four moves. Write what you learned into `orx exp desc`.
    - **Repair** — the run produced only an **error** and no numbers (a
      traceback, a missing dep or file, a rejected kwarg, an env that didn't
-     activate). Fix it **on this same node's branch** and re-run: a setup fix
+     activate), or nothing to judge at all — a spin-up failure, a preemption,
+     an empty log. Fix it **on this same node's branch** and re-run: a setup fix
      is not an experiment and never gets its own node. A run that produced
      **numbers** — including a NaN, OOM, or timeout of what this node changed —
      is a result; freeze it (**`orx-experiment-tree`**: the freeze test).

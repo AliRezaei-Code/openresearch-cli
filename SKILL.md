@@ -34,8 +34,8 @@ expands on the why; these are the non-negotiables.
    first run (see the `orx-create` module). While its runs produce only
    **errors** and no numbers, the node is **provisional**: seeding it, fixing
    its dependencies, and making it run all happen on its own branch. The moment
-   a run puts **numbers** in the log — the measurement, or a NaN/OOM/timeout of
-   the thing this node changed — it is frozen. From the moment a node has measured
+   a run puts **numbers** in the log — any substantive metric it emitted — the
+   node is frozen, whatever ended the run. From the moment a node has measured
    something this rule is absolute, and freezing is **permanent** — a later
    failure does not un-freeze it, and a *disappointing* number is a result, not
    a reason to repair. To try an idea, **branch a child** and edit the child.
@@ -166,7 +166,8 @@ To actually **drive** a project toward a goal — edit each node's code on its g
 branch and keep the GPU capacity saturated — follow the auto-research loop in
 the `orx-experiment-tree` module. Every completed run is a decision point with
 four moves: **repair** the same node when the run produced only an error and no
-numbers, **refill** the round with another sibling, **promote** the winner and
+numbers — or nothing to judge at all (spin-up failure, preemption, empty log) —
+**refill** the round with another sibling, **promote** the winner and
 descend, or **stop**. A run that produced numbers — including a NaN, OOM, or
 timeout of what this node changed — is a result: the node is frozen. Repair is
 capped at **two** runs in a row measuring nothing on one node.

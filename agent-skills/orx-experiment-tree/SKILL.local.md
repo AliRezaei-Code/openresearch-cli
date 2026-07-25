@@ -14,8 +14,8 @@ everything below assumes them.
 ## A node is an evidence contract — provisional until it measures something
 
 A node exists to answer **one question**, and it is finished when it has produced
-the **measurement** that answers it. Until then it has produced nothing, and
-there is nothing to protect.
+the **measurement** that answers it. Until then — including before its first run
+— it has produced nothing, and there is nothing to protect.
 
 **The freeze test — a node is FROZEN the moment ANY of its runs is
 *evidence-valid*:**
@@ -23,11 +23,20 @@ there is nothing to protect.
 > Judge the **evidence the run produced**, not what caused the failure. Causes
 > are arguable; evidence is on disk.
 >
-> - The log carries **numbers** — the measurement this node owes (the metric
->   its `orx exp desc` names), *or* a quantitative failure of the thing this
->   node changed: a NaN at a known step, an OOM at a known memory watermark, a
->   timeout at a known step rate. **FROZEN.** That is the node's answer, good
->   or bad.
+> **"Numbers" means the run's own measurement stream** — values the run command
+> *emitted* as it worked: a metric line, a step/loss trace, an eval summary.
+> Byte counts inside an allocator error (`tried to allocate 2.5 GiB`) are **not**
+> numbers; neither is a duration in a timeout message. Digits in an error string
+> are part of the error.
+>
+> - The log carries **numbers** — any substantive metric the run emitted: the
+>   measurement its `orx exp desc` names, or losses past warmup, an eval figure,
+>   a throughput line. **FROZEN, whatever caused the run to end.** Don't ask
+>   whether this node's change caused it; ask only whether the run got far
+>   enough to emit numbers. Numbers that aren't the ones you named still freeze
+>   it — record what actually landed. If numbers landed and a traceback follows
+>   (a crash in teardown, a non-zero exit, a cancel), **numbers win: still
+>   FROZEN** — cancelling after the numbers land does not un-land them.
 > - The log carries **only an error** and no numbers — a traceback, an import
 >   or dependency failure, a missing file or config key, a rejected kwarg, a
 >   shape mismatch, an env that didn't activate, a build that won't install.
@@ -37,8 +46,18 @@ there is nothing to protect.
 >   relaunch; it counts toward the cap like any other attempt.
 >
 > A partial trace is not numbers: a step-0 loss, a warmup value, or a config
-> echo before a crash leaves the node provisional, unless the node's question
-> *is* about early training.
+> echo before a crash leaves the node provisional, unless the node's
+> `orx exp desc`, written before the run, names an early-training metric.
+>
+> **The freeze test is not an exit from a hard debug.** If "the OOM is numbers"
+> only became attractive on the run *after* a repair, or as the second
+> no-measurement run in a row, it is the wrong reading — hitting the cap and
+> asking the user is the correct outcome. A quantitative failure freezes a node
+> on its first run as readily as its third.
+>
+> **A missing eval block is a reporting defect, not a missing measurement.** If
+> the run emitted real metrics but not the field you named, freeze it and fix
+> the printing on a **child**. Never edit a node whose run produced numbers.
 >
 > **Why this way round.** "A correct implementation wouldn't have OOMed — it
 > would use gradient checkpointing" is always available and always sounds
@@ -51,14 +70,6 @@ there is nothing to protect.
 > the node's title — before you open the log — and write it there. If it still
 > cannot be pinned down, treat numbers in the log as the measurement.
 
-| What the log holds | State | What you may do |
-|---|---|---|
-| No runs at all | provisional | edit the node's branch in place |
-| Nothing to judge — spin-up failure, preemption, empty or truncated output | provisional | repair or relaunch; counts toward the cap |
-| An error and no numbers — traceback, import or dependency failure, missing file or config key, rejected kwarg, shape mismatch, env that didn't activate | provisional | edit in place — this is Repair |
-| Only a partial trace — step-0 loss, warmup value, config echo — then a crash | provisional | the measurement never landed; repair |
-| **Numbers**: a NaN at a known step, an OOM at a known watermark, a timeout at a known step rate | **FROZEN** | that failure is the result; branch a child to follow up |
-| **Numbers**: the measurement this node owes | **FROZEN** | never edit this branch again; branch a child |
 
 Frozen is **permanent and per-node** — it never un-freezes: not after a later
 failure, and not because the number disappointed you. A node that ran correctly
@@ -243,10 +254,9 @@ intended flow — do **not** edit a frozen node or rewrite the run command:
    skill). To see exactly what a finished node changed, diff its branch against
    its parent's (see the `orx-git` skill). Don't infer from status alone. Each
    completion is a decision point with four moves:
-   - **Repair** — the run produced no measurement for a reason unrelated to
-     this node's change (deps, imports, paths, env, truncated output; an OOM or
-     timeout only when it isn't this node's own change — see the freeze test).
-     The node is still **provisional**: fix its branch in
+   - **Repair** — the run put **no numbers** in the log (deps, imports, paths,
+     env, truncated output — see the freeze test). The node is still
+     **provisional**: fix its branch in
      place, push, and re-launch the *same* node. Do not create a child for a
      fix. Cap: two runs in a row measuring nothing → stop and ask the user.
    - **Refill** — result is mediocre or inconclusive: launch the next queued child to

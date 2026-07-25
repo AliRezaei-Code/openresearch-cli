@@ -120,14 +120,18 @@ Adds a node to the experiment tree. `--title` is always required. The node shape
 is chosen by flags:
 
 ```sh
-# Child node, branched off an existing experiment:
-orx create-experiment <projectId> --title "Larger batch size" --parent <experimentId>
+# Child node, branched off an existing experiment. Always name the measurement:
+# the freeze test reads it, and a node without one cannot be judged.
+orx create-experiment <projectId> --title "Larger batch size" --parent <experimentId> \
+  --description "Raise per-device batch 16->32 in config.yaml. Measures: final eval accuracy."
 
 # Baseline (root) node on the project's bound repo:
-orx create-experiment <projectId> --title "Baseline"
+orx create-experiment <projectId> --title "Baseline" \
+  --description "Unmodified upstream code. Measures: final eval accuracy."
 
 # Additional baseline (another root) when the project already has one:
-orx create-experiment <projectId> --title "Baseline v2" --baseline
+orx create-experiment <projectId> --title "Baseline v2" --baseline \
+  --description "<what this control establishes>. Measures: <metric>."
 ```
 
 - `--parent` selects the shape: with `--parent` ⇒ child; without it, on an
