@@ -181,7 +181,8 @@ Carry one goal across many runs (full guidance: **`orx-experiment-tree`** skill)
    child to carry a setup fix.
 1. **Branch**: `orx create-experiment {id} --title "<idea>" --parent <parentId>
    --description "<concrete change>. Measures: <metric>"` — one child per
-   distinct thing you try. Name the metric: the freeze test reads it.
+   distinct thing you try. Name the metric so a later reader knows what the
+   node owed.
 2. **Edit** in this worktree: `git fetch origin && git checkout <branch>`, change
    the code, commit, `git push` — the job clones from GitHub, so **unpushed
    work never runs** (recipes: **`orx-git`** skill).

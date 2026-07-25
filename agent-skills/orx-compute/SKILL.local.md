@@ -219,10 +219,9 @@ orx exp wait <expId> --interval 10 --timeout 3600   # tune polling
 - **A failed run on a *provisional* node never creates a node.** Provisioning
   failures — spin-up errors, no capacity, quota, a missing dependency in the
   image, an env that didn't activate — are **setup, not results**. **First read the log**: if the
-  run put numbers there — an OOM at a known memory watermark, a timeout at a
-  known step rate for the shape this node changed — that *is* the node's
-  result, it is frozen, and a bigger flavor belongs on a child
-  (`orx-experiment-tree`: the freeze test). Otherwise the node is still
+  run computed metrics before it died, that *is* the node's result — it is
+  frozen, and a bigger flavor belongs on a child (`orx-experiment-tree`: the
+  freeze test). Otherwise the node is still
   provisional — fix it where it belongs and **re-launch the same `<expId>`**:
   - transient provider/spin-up error → re-launch, or a different flavor/backend;
   - OOM or timeout with **no numbers** in the log → bigger flavor / longer

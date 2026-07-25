@@ -77,20 +77,12 @@ the **measurement** that answers it. Until then — including before its first r
 > *because the parent holds a measurement* — a node that measured nothing never
 > earns a child this way; it gets repaired.
 >
-> **A missing eval block is a reporting defect, not a missing measurement.** If
-> the run emitted real metrics but not the field you named, freeze it and fix
-> the printing on a **child**. Never edit a node whose run produced numbers.
->
 > **Why this way round.** "A correct implementation wouldn't have OOMed — it
 > would use gradient checkpointing" is always available and always sounds
 > reasonable; it is a **new idea for a child**, not a licence to repair this
 > one. Asking what the log contains removes that argument entirely. A kwarg
 > *value* you now regret is the hypothesis; a kwarg the callee *rejects* is an
 > error. Both are settled by reading the log, not by reasoning about intent.
->
-> **No metric named?** If the node's `orx exp desc` names none, infer it from
-> the node's title — before you open the log — and write it there. If it still
-> cannot be pinned down, treat numbers in the log as the measurement.
 
 Frozen is **permanent and per-node** — it never un-freezes: not after a later
 failure, and not because the number disappointed you. A node that ran correctly
@@ -197,8 +189,8 @@ the run command:
 3. **Create the round as a bush, and pick its parent deliberately.** All of this
    round's options are **siblings under one parent** — the title is the idea, the
    description is the concrete change you'll make on that node's branch **and
-   the measurement it owes** — the freeze test reads that metric, so a node
-   without one cannot be judged. The parent is:
+   the measurement it owes** — so a later reader knows what to compare it
+   against. The parent is:
    - the **baseline**, only for the very first round (nothing has been won yet); or
    - the **previous round's confirmed winner**, for every round after — so this
      round's changes build *on top of* the last gain instead of resetting to the
@@ -326,8 +318,8 @@ cat notes.md | orx exp desc <expId> --stdin   # overwrite from stdin (long markd
 - **Write** with exactly one of `--set` (inline) or `--stdin` (whole of stdin).
   Passing both is an error. Writing **replaces** the entire description — to
   append, read first, edit, and write back.
-- **Name the measurement here.** The freeze test reads the metric this node
-  owes from this field — write "Measures: <metric>" when you create the node,
-  and record the judgement here when the run lands.
+- **Name the measurement here.** Write "Measures: <metric>" when you create
+  the node, and record the judgement here when the run lands — what it
+  measured, and whether it froze.
 - `<expId>` comes from `orx experiments <projectId>` (the experiment id, not a run
   or project id).

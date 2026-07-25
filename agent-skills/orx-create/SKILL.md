@@ -121,7 +121,7 @@ is chosen by flags:
 
 ```sh
 # Child node, branched off an existing experiment. Always name the measurement:
-# the freeze test reads it, and a node without one cannot be judged.
+# it records what the node owes, so a later reader knows what to compare.
 orx create-experiment <projectId> --title "Larger batch size" --parent <experimentId> \
   --description "Raise per-device batch 16->32 in config.yaml. Measures: final eval accuracy."
 
@@ -154,8 +154,8 @@ orx create-experiment <projectId> --title "Baseline v2" --baseline \
   Piling round after round of children onto the root is the flat-fan failure (see
   "Shape the tree" in the `orx-experiment-tree` skill). Co-equal options of the
   same decision are siblings under one parent — don't chain them into a line either.
-- `--description` **should name the measurement the node owes** — the freeze
-  test reads that metric, so a node without one cannot be judged. Use it to
+- `--description` **should name the measurement the node owes** — so a later
+  reader knows what to compare it against. Use it to
   record the hypothesis / the concrete change this node makes. It's the node's
   free-form notes field (the same one `orx exp desc` reads/writes), and it's how
   you and the analysis tools tell sibling variants apart.
