@@ -31,9 +31,10 @@ expands on the why; these are the non-negotiables.
    root, the control its variants are measured against. Projects start with an
    empty tree — **you create the baseline** (the first `orx create-experiment`,
    no `--parent`) and, on a blank repo, seed it with starting code before its
-   first run (see the `orx-create` module). Until a run measures something the
-   node is **provisional**: seeding it, fixing its dependencies, and making it
-   run all happen on its own branch. From the moment a node has measured
+   first run (see the `orx-create` module). Until a run measures something — and
+   provided no run failed *because of this node's own change* — the node is
+   **provisional**: seeding it, fixing its dependencies, and making it run all
+   happen on its own branch. From the moment a node has measured
    something this rule is absolute, and freezing is **permanent** — a later
    failure does not un-freeze it, and a *disappointing* number is a result, not
    a reason to repair. To try an idea, **branch a child** and edit the child.

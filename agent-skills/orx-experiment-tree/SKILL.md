@@ -29,11 +29,18 @@ there is nothing to protect.
 >
 > A run that failed **because of the change this node makes** — diverged to NaN,
 > OOMed on the bigger model, timed out on the slower config — is also
-> evidence-valid: that failure *is* the node's answer.
+> evidence-valid: that failure *is* the node's answer. But the node's change is
+> its *hypothesis*, not its typos: a malformed edit — `NameError`, a shape
+> mismatch, a wrong kwarg — that a **correct implementation of the same idea**
+> would not have hit is a defect. Repair it. Freeze only when a correct
+> implementation of this node's idea would have failed the same way.
 >
 > **Deciding which it was.** The parent's run is on record — read it
-> (`orx logs` on the parent's latest run). If the parent hit the same thing,
-> it's a defect: repair. If you cannot point to a concrete, node-independent
+> (`orx logs` on the parent's latest run; a root has no parent, so judge it
+> against the node's own idea). If the parent hit the same thing, it's a
+> defect: repair. A run that produced **no log to judge** — the box never came
+> up, the job was preempted, the output is empty — is not a result at all:
+> repair or relaunch. If you cannot point to a concrete, node-independent
 > cause in the log (a missing module, a bad path, an env that didn't activate),
 > **uncertainty freezes**: treat it as the node's result and branch a child.
 > "Probably a bad seed" is not a concrete cause. Freezing wrongly costs one
@@ -42,7 +49,8 @@ there is nothing to protect.
 | What `orx runs` / `orx logs` show | State | What you may do |
 |---|---|---|
 | No runs at all | provisional | edit the node's branch in place |
-| Every run `failed` / `cancelled`, none for a reason this node introduced | provisional | edit the node's branch in place |
+| Every run `failed` / `cancelled` **before the owed metric appeared**, none for a reason this node introduced | provisional | edit the node's branch in place |
+| No usable log at all — spin-up failure, preemption, empty or truncated output | provisional | nothing ran; repair or relaunch |
 | Failed for a reason unrelated to this node's change — deps, imports, paths, env, a mis-sized flavor | provisional (**execution-invalid**) | edit in place — this is Repair |
 | Failed *because of* this node's own change — diverged, OOM on the bigger model, timed out on the slower config | **FROZEN** | that failure is the result; branch a child to follow up |
 | **Any** run whose log carries the measurement this node owes | **FROZEN** | never edit this branch again; branch a child |
@@ -148,7 +156,9 @@ the run command:
    different rounds into one batch — that's what produces the flat fan.
 3. **Create the round as a bush, and pick its parent deliberately.** All of this
    round's options are **siblings under one parent** — the title is the idea, the
-   description is the concrete change you'll make on that node's branch. The parent is:
+   description is the concrete change you'll make on that node's branch **and
+   the measurement it owes** — the freeze test reads that metric, so a node
+   without one cannot be judged. The parent is:
    - the **baseline**, only for the very first round (nothing has been won yet); or
    - the **previous round's confirmed winner**, for every round after — so this
      round's changes build *on top of* the last gain instead of resetting to the
@@ -157,13 +167,13 @@ the run command:
    ```sh
    # Round 1 — one decision (the LR), its options fanned off the baseline:
    orx create-experiment <projectId> --parent <baseId> --title "LR 2e-5" \
-     --description "Set the LR in config.yaml to 2e-5; change nothing else."
+     --description "Set the LR in config.yaml to 2e-5; change nothing else. Measures: final eval accuracy."
    orx create-experiment <projectId> --parent <baseId> --title "LR 3e-5" \
-     --description "Set the LR in config.yaml to 3e-5; change nothing else."
+     --description "Set the LR in config.yaml to 3e-5; change nothing else. Measures: final eval accuracy."
 
    # Round 2 — LR 3e-5 won → the next decision (architecture) descends onto it:
    orx create-experiment <projectId> --parent <lr3e5WinnerId> --title "Wider MLP" \
-     --description "On top of the LR-3e-5 winner, widen the MLP hidden dim 1024→2048 in model.py."
+     --description "On top of the LR-3e-5 winner, widen the MLP hidden dim 1024→2048 in model.py. Measures: final eval accuracy."
    ```
    The child inherits its parent's run command automatically — you don't set it,
    and you never give siblings different commands or env vars (cardinal rule 2).

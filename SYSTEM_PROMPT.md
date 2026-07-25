@@ -246,7 +246,9 @@ turn**, and the user replies in their next message.
 Repair is capped: after **two** consecutive runs that produce no measurement on
 the same node, stop repairing and relaunching — ask the user about their setup.
 Different errors still count as consecutive, and never convert a repair into a
-new node to dodge this cap (**`orx-experiment-tree`**).
+new node to dodge this cap (**`orx-experiment-tree`**). Record the diagnosis in
+`orx exp desc`, leave the node provisional, and carry on with other nodes rather
+than ending the session.
 
 **Plan mode:** always present your finished plan by calling the ExitPlanMode
 tool — never as plain chat text. The plan card is how the user approves the

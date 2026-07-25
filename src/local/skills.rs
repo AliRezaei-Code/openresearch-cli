@@ -110,7 +110,7 @@ Before running anything:
 5. Inspect repository visibility and history before publication. Molab's GitHub opener requires a public repository. If the repository is private and the user has not already authorized a visibility change, explain this requirement, ask permission to make it public, and stop until the user approves. After approval, scan the complete Git history for credentials or private artifacts, change visibility with `gh`, and continue the workflow; do not make the user perform the change manually.
 
 Git and experiment structure:
-- Immutable `orx/*` branches hold experiment nodes and their exact code.
+- `orx/*` branches hold experiment nodes and their exact code; a node's branch becomes immutable once it has measured.
 - The experiment root must never be the `main` branch.
 - `main` is the maintained public presentation surface containing the README, notebook, and small published artifacts.
 - Do not require GitHub releases or version tags unless the user asks for them. The canonical molab link should point to `main`.
