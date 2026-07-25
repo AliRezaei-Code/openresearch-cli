@@ -336,8 +336,10 @@ orx exp wait <expId> --interval 10 --timeout 3600   # tune polling
   freeze test). Otherwise the node is still
   provisional — fix it where it belongs and **re-launch the same `<expId>`**:
   - transient provider/spin-up error → re-launch, or a different flavor/provider;
-  - OOM or timeout with **no numbers** in the log → bigger flavor / longer
-    `--timeout`, same node;
+  - OOM or timeout with **no numbers** anywhere → bigger flavor / longer
+    `--timeout`, same node — but only while *no* node in this round has
+    measured. Once one has, the round is committed to that shape (cardinal
+    rule 2): a bigger flavor belongs on a child;
   - dependency, import, or env error → fix the **code on that node's branch**,
     push, re-run the same node (see `orx-git`: repairing a node in place).
 

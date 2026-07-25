@@ -51,7 +51,8 @@ summary, key config — and read it back with `orx logs <runId>` (use `--head` /
 - Print final metrics and a compact summary block at the end of the run, not just
   scattered mid-training lines — that's what you'll tail to compare siblings.
 - Echo the key config the run actually used (LR, batch size, seed) so a log alone
-  tells you which variant it was.
+  tells you which variant it was — but a config echo is **not** evidence, so it
+  must never be the run's only output (see the freeze test).
 - For a long run, a periodic one-line-per-step metric print keeps the trajectory
   visible via `orx logs --range`; a run that only prints a final number hides
   whether it was converging or diverging.

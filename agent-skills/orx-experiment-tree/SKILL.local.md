@@ -21,17 +21,24 @@ the **measurement** that answers it. Until then — including before its first r
 *evidence-valid*:**
 
 > Judge the **evidence the run produced**, not what caused the failure. Causes
-> are arguable; evidence is on disk.
+> are arguable; evidence is on disk. In local mode the run log is the only
+> evidence channel — there is nothing else to check.
 >
-> **"Numbers" means a measurement this run computed** — a loss, an eval figure,
-> a score the training or eval loop produced from **this node's own commit**.
-> Excluded **however many times they appear** — these are never numbers: byte
-> counts inside an allocator error (`tried to allocate 2.5 GiB`), a duration in
-> a timeout message, a progress bar or its `it/s` and ETA, a banner, a config
-> or seed echo, and any figure carried over from a resumed checkpoint rather
-> than computed by this run. Digits in an error string, or in the harness's own
-> chatter, are not a measurement. The test is **kind, not count**: one real
-> metric freezes the node; a hundred progress ticks do not.
+> **Numbers means a *quality* measurement** — a value saying how good the model
+> or its output is: a loss, a perplexity, an accuracy/F1/reward/win-rate, an
+> eval score. That list is closed; nothing else is a metric for this test,
+> whatever it is called. **Operational** figures are never numbers, however many
+> appear and however central they are to the node's idea: learning rate,
+> throughput, `it/s`, tokens/s, grad-norm, memory watermark, step or epoch
+> counters, wall-clock, allocator byte counts, timeout durations, seeds, config
+> echoes, banners, progress bars, and figures replayed verbatim from a resumed
+> checkpoint's saved history. A node whose stated `Measures:` is an operational
+> figure is mis-specified — it owes a quality metric.
+>
+> A `loss=nan` the loop computed **is** a quality measurement: a NaN is a
+> result. Whether *your edit* produced the number is irrelevant — inherited code
+> emitting a loss is still this run computing a metric. The exclusion is **per
+> value, not per line**: `step 100 lr=3e-5 loss=0.42` contains numbers.
 >
 > - The log carries **numbers** — **one or more metric values this run
 >   computed** (a loss, an eval figure, a score), whether on one summary line
@@ -39,7 +46,8 @@ the **measurement** that answers it. Until then — including before its first r
 >   whatever caused the run to end.** Don't ask
 >   whether this node's change caused it; ask only whether the run got far
 >   enough to emit numbers. Numbers that aren't the ones you named still freeze
->   it — record what actually landed. If numbers landed and a traceback follows
+>   it — record what actually landed, and put any print fix on a **child**, never
+>   on this branch. If numbers landed and a traceback follows
 >   (a crash in teardown, a non-zero exit, a cancel), **numbers win: still
 >   FROZEN** — cancelling after the numbers land does not un-land them.
 > - The log carries **only an error** and no numbers — a traceback, an import
@@ -53,8 +61,7 @@ the **measurement** that answers it. Until then — including before its first r
 > **Read a log the same way on every attempt.** Re-reading an already-classified
 > log as "numbers after all" does not clear the repair cap — at the cap, ask the
 > user. Equally, do not re-read numbers as "not really numbers" to justify
-> another repair. Whether a metric appears once or forty times, on one line or
-> in a table, does not change the verdict.
+> another repair.
 >
 > **Erring toward FROZEN is the cheap error.** A spurious freeze costs one node
 > in a tree that is cheap to extend. A spurious repair rewrites the branch a
@@ -72,24 +79,16 @@ the **measurement** that answers it. Until then — including before its first r
 > **This deliberately over-freezes.** A node that OOMed on a pre-existing leak
 > after emitting losses is frozen even though its own change was innocent. That
 > is the accepted cost of a test you cannot argue with: put the fix on a child
-> and note the confound in `orx exp desc`. That child is legitimate depth
-> *because the parent holds a measurement* — a node that measured nothing never
-> earns a child this way; it gets repaired.
->
-> **Why this way round.** "A correct implementation wouldn't have OOMed — it
-> would use gradient checkpointing" is always available and always sounds
-> reasonable; it is a **new idea for a child**, not a licence to repair this
-> one. Asking what the log contains removes that argument entirely. A kwarg
-> *value* you now regret is the hypothesis; a kwarg the callee *rejects* is an
-> error. Both are settled by reading the log, not by reasoning about intent.
+> and note the confound in `orx exp desc`.
+
 
 Frozen is **permanent and per-node** — it never un-freezes: not after a later
 failure, and not because the number disappointed you. A node that ran correctly
 and produced a **bad** measurement is FROZEN — a negative result is a result.
 
 The node's question and the numbers it owes live in `orx exp desc <expId>` —
-write them there when you create it, so "did the measurement land?" stays
-answerable later, and record the judgement there when you make it.
+write them there when you create it, so a later reader can interpret the
+result, and record the judgement there when you make it.
 
 ## Shape the tree — stacked bushes, not a flat fan or a noodle
 

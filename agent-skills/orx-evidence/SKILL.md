@@ -48,9 +48,9 @@ Judging a run is also judging its **node**. The rule (full test:
   banner, a config echo, or a progress bar is not a metric, however often it
   appears. Numbers
   win over a later traceback, a non-zero exit, or a cancel.
-- the log carries **only an error** and no numbers, or **nothing to judge**
-  (spin-up failure, preemption, empty or truncated output) — the node is
-  **provisional**: repair its branch in place and re-run the same node.
+- the run produced **only an error** and no numbers **anywhere**, or **nothing
+  to judge** on any channel (spin-up failure, preemption, empty or truncated
+  output and no artifact or W&B run) — the node is **provisional**: repair its branch in place and re-run the same node.
 
 Byte counts inside an allocator error are not numbers; digits in an error
 string are part of the error.

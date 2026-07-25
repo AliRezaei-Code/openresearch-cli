@@ -251,7 +251,9 @@ turn**, and the user replies in their next message.
 Repair is capped: after **two** consecutive runs that produce no measurement on
 the same node, stop repairing and relaunching — ask the user about their setup.
 Different errors still count as consecutive, and never convert a repair into a
-new node to dodge this cap. Record the diagnosis and carry on with other nodes
+new node to dodge this cap. If repairs on *different* nodes keep hitting the
+same class of failure, that is one setup problem, not N — ask after the second
+node. Record the diagnosis and carry on with other nodes
 rather than ending the session (**`orx-experiment-tree`**).
 
 **Plan mode:** always present your finished plan by calling the ExitPlanMode
