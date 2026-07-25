@@ -217,12 +217,11 @@ orx exp wait <expId> --interval 10 --timeout 3600   # tune polling
   retryable: re-launch, or pick a different flavor or backend, rather than
   treating the experiment as a dead end.
 - **A failed run on a *provisional* node never creates a node.** Provisioning
-  failures — spin-up errors, no capacity, quota, a missing dependency in the
-  image, an env that didn't activate — are **setup, not results**. **First read the log**: if the
-  run computed metrics before it died, that *is* the node's result — it is
-  frozen, and a bigger flavor belongs on a child (`orx-experiment-tree`: the
-  freeze test). Otherwise the node is still
-  provisional — fix it where it belongs and **re-launch the same `<expId>`**:
+  failures — spin-up errors, no capacity, quota, a missing dep in the image, an
+  env that didn't activate — are setup, not results. **Read the log first**: if
+  the run computed a metric, that *is* the node's result and it is frozen
+  (`orx-experiment-tree`: the freeze test); a bigger flavor belongs on a child.
+  Otherwise fix it where it belongs and **re-launch the same `<expId>`**:
   - transient provider/spin-up error → re-launch, or a different flavor/backend;
   - OOM or timeout with **no numbers** anywhere → bigger flavor / longer
     `--timeout`, same node — but only while *no* node in this round has
@@ -231,13 +230,10 @@ orx exp wait <expId> --interval 10 --timeout 3600   # tune polling
   - dependency, import, or env error → fix the **code on that node's branch**,
     push, re-run the same node (see `orx-git`: repairing a node in place).
 
-  `orx create-experiment` is for a new **question**, never for a retry. A row of
-  nodes whose only difference is "this one has the deps installed" is the
-  failure mode this rule exists to prevent. Hard cap: after **two** runs in a
-  row that produce no measurement **on the same node**, stop relaunching and ask
-  the user about their setup — different errors still count as consecutive, and
-  switching flavor, provider, or backend is itself a repair that counts toward
-  the cap (`orx-experiment-tree`).
+  `orx create-experiment` is for a new **question**, never a retry — a row of
+  nodes differing only in "this one has the deps installed" is the failure mode
+  this prevents. Cap: two runs in a row measuring nothing on one node, then ask
+  (`orx-experiment-tree`: the repair cap).
 
 ## Sizing compute
 

@@ -13,89 +13,28 @@ everything below assumes them.
 
 ## A node is an evidence contract — provisional until it measures something
 
-A node exists to answer **one question**, and it is finished when it has produced
-the **measurement** that answers it. Until then — including before its first run
-— it has produced nothing, and there is nothing to protect.
+A node answers **one question** and is finished when it has produced the
+measurement that answers it. Until then it has produced nothing, and there is
+nothing to protect.
 
-**The freeze test — a node is FROZEN the moment ANY of its runs is
-*evidence-valid*:**
+**The freeze test.** Judge what the run produced, not what caused it to fail:
 
-> Judge the **evidence the run produced**, not what caused the failure. Causes
-> are arguable; evidence is on disk.
->
-> **Look before you classify.** A node is provisional only after you have
-> checked every channel the run had: the log, `orx artifact <runId> EVAL.md`,
-> and `orx wandb <runId>` if linked. "The log had only a traceback" is not a
-> classification until the artifacts are empty too.
->
-> **Numbers means a *quality* measurement** — a value saying how good the model
-> or its output is: a loss, a perplexity, an accuracy/F1/reward/win-rate, an
-> eval score. That list is closed; nothing else is a metric for this test,
-> whatever it is called. **Operational** figures are never numbers, however many
-> appear and however central they are to the node's idea: learning rate,
-> throughput, `it/s`, tokens/s, grad-norm, memory watermark, step or epoch
-> counters, wall-clock, allocator byte counts, timeout durations, seeds, config
-> echoes, banners, progress bars, and figures replayed verbatim from a resumed
-> checkpoint's saved history. A node whose stated `Measures:` is an operational
-> figure is mis-specified — it owes a quality metric.
->
-> A `loss=nan` the loop computed **is** a quality measurement: a NaN is a
-> result. Whether *your edit* produced the number is irrelevant — inherited code
-> emitting a loss is still this run computing a metric. The exclusion is **per
-> value, not per line**: `step 100 lr=3e-5 loss=0.42` contains numbers.
->
-> - The run produced **numbers** — **one or more metric values it computed**
->   (a loss, an eval figure, a score), whether on one summary line or across
->   many, and wherever the evidence landed: the log, an uploaded artifact
->   (`EVAL.md`), or a linked W&B run. A single `accuracy: 0.83` **is** numbers.
->   **FROZEN, whatever caused the run to end.** Don't ask
->   whether this node's change caused it; ask only whether the run got far
->   enough to emit numbers. Numbers that aren't the ones you named still freeze
->   it — record what actually landed, and put any print fix on a **child**, never
->   on this branch. If numbers landed and a traceback follows
->   (a crash in teardown, a non-zero exit, a cancel), **numbers win: still
->   FROZEN** — cancelling after the numbers land does not un-land them.
-> - The run produced **only an error** and no numbers **anywhere** — check the
->   artifacts and any linked W&B run before you conclude this. A traceback, an
->   import or dependency failure, a missing file or config key, a rejected
->   kwarg, a shape mismatch, an env that didn't activate, a build that won't
->   install. **Provisional.** Nothing was measured; repair it in place.
-> - The run produced **nothing to judge anywhere** — the box never came up, the
->   job was preempted, the output is empty or truncated and no artifact or W&B
->   run landed either. **Provisional.** Repair or relaunch; it counts toward the
->   cap like any other attempt.
->
-> **Read a log the same way on every attempt.** Re-reading an already-classified
-> log as "numbers after all" does not clear the repair cap — at the cap, ask the
-> user. Equally, do not re-read numbers as "not really numbers" to justify
-> another repair.
->
-> **Erring toward FROZEN is the cheap error.** A spurious freeze costs one node
-> in a tree that is cheap to extend. A spurious repair rewrites the branch a
-> recorded `commit_sha` points at — the evidence is gone and unrecoverable.
-> When the log is genuinely ambiguous, freeze.
->
-> **If the only available repair would change what the node is testing, it is
-> not a repair** — but this applies **only to a node the freeze test already
-> froze**. It explains why you may not un-freeze by shrinking the change; it is
-> never a reason to freeze a node whose run produced no metrics. If there are
-> no metrics the node is provisional however invasive the fix looks: pinning a
-> dep, fixing a driver, correcting a shape error in your own edit are all
-> repairs.
->
-> **This deliberately over-freezes.** A node that OOMed on a pre-existing leak
-> after emitting losses is frozen even though its own change was innocent. That
-> is the accepted cost of a test you cannot argue with: put the fix on a child
-> and note the confound in `orx exp desc`.
+- It produced a **quality metric** — a loss, perplexity, accuracy, reward, eval
+  score — anywhere its evidence lands (log, `EVAL.md`, a linked W&B run):
+  **FROZEN**, whatever ended the run, even a bad number or a `nan`. Check the
+  artifacts before concluding a run measured nothing.
+- It produced **only an error**, or nothing judgeable (preempted, empty log):
+  **provisional** — repair its branch in place and re-run the same node.
 
+Operational figures are not metrics: LR, throughput, `it/s`, grad-norm,
+wall-clock, step counters, byte counts in an allocator error, config echoes,
+progress bars.
 
-Frozen is **permanent and per-node** — it never un-freezes: not after a later
-failure, and not because the number disappointed you. A node that ran correctly
-and produced a **bad** measurement is FROZEN — a negative result is a result.
+Freezing is **permanent** — a bad number is a result, not a reason to repair.
+When it's genuinely ambiguous, freeze: a spurious freeze costs one cheap node, a
+spurious repair rewrites the branch a recorded `commit_sha` points at.
 
-The node's question and the numbers it owes live in `orx exp desc <expId>` —
-write them there when you create it, so a later reader can interpret the
-result, and record the judgement there when you make it.
+Record the node's question and what it measured in `orx exp desc <expId>`.
 
 ## Shape the tree — stacked bushes, not a flat fan or a noodle
 
@@ -142,40 +81,20 @@ variants that should have been siblings.
 
 ## Classify before you create — remediation is neither width nor depth
 
-Width is **the open options of one decision**. Depth is **decisions already
-resolved, stacked**. Engineering remediation — making the code run at all — is
-**neither**: no hypothesis, no comparison, no result. A chain of nodes each
-fixing the next error is a **noodle made of non-experiments**.
-
-Before every `orx create-experiment`, answer in one sentence:
+Making the code run at all is neither width nor depth: no hypothesis, no
+comparison, no result. Before every `orx create-experiment`, answer:
 
 > **"What will this node measure that no existing node measures?"**
 
-If the honest answer is a *fix* ("it will finally import torch", "it will run
-without the CUDA error"), **it is not a node.** Repair the provisional node you
-already have and re-run it.
+If the honest answer is a *fix* ("it will finally import torch"), **it is not a
+node** — repair the provisional node you already have.
 
-| Situation | Move | Why |
-|---|---|---|
-| Any failure — is the node frozen? | see the **freeze test** above | repair vs. result is decided there |
-| Same measurement, different hyperparameter | **Sibling** child | co-equal option of one decision |
-| New idea built on a node's confirmed result | **Child** of that node | real depth |
-| Node measured something; you want a *variant* | **Child** — node is frozen | never edit a frozen branch |
-| 2 runs in a row measuring nothing on one node | **Ask the user** | repair cap |
-
-**The repair loop is not a research loop.** Repairs do not count toward "~3
-consecutive failed or regressed runs" — that counter is about *scientific*
-failure. The repair cap is separate and hard: two runs in a row that measure
-nothing, then ask. **Different errors still count as consecutive**, switching
-flavor, provider, or backend is itself a repair, and a bare **relaunch** counts
-too — a run that measured nothing is a run that measured nothing, whatever the
-reason. Nothing resets the count: a run that *does* measure something freezes
-the node, so repair ends there anyway.
-
-The cap is also **project-wide**: if repairs on *different* nodes keep hitting
-the same class of environmental failure (the same missing package, the same env
-that won't activate), that is one setup problem, not N node problems — ask the
-user after the second node rather than repairing each one twice.
+**The repair cap.** Two runs in a row measuring nothing on one node, then ask
+the user. Different errors still count as consecutive; a bare relaunch and a
+flavor/provider/backend switch are repairs too. If the same failure hits a
+second node, that is one setup problem — ask then, don't repair each node twice.
+Repairs don't count toward the separate "~3 consecutive failed or regressed
+runs" scientific stop.
 
 ## The auto-research loop
 

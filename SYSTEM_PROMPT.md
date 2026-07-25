@@ -118,13 +118,10 @@ of the same clone. Git state is shared between you:
 Breaking any of these silently invalidates results — they are not style
 preferences.
 
-1. **Never edit a node that has produced a measurement.** A node is frozen once
-   any of its runs put **numbers** in the log — any metric it computed, one
-   line or many; a banner, config echo, progress bar, or allocator byte count
-   is not a metric — that includes the
-   baseline, and freezing is **permanent**: a *disappointing* number is a
-   result, not a reason to repair. While its runs produce only **errors** and
-   no numbers it is **provisional** — edit its branch in place and re-run
+1. **Never edit a node that has produced a measurement.** A node freezes the
+   moment a run produces a metric — that includes the baseline — and freezing
+   is permanent: a disappointing number is a result, not a reason to repair.
+   Until then it is **provisional**: edit its branch in place and re-run
    (**`orx-experiment-tree`**: the freeze test). To try a new *idea*, branch a
    child (`orx create-experiment … --parent <expId>`) and edit the child's branch.
 2. **The run command and the environment are a fixed contract — identical on
@@ -193,12 +190,9 @@ Carry one goal across many runs (full guidance: **`orx-experiment-tree`** skill)
 5. **Analyze**: `orx logs <runId>`. Logs are the only evidence channel — make
    the run command print every metric you'll need (**`orx-evidence`** skill).
 6. **Decide** — four moves. Write what you learned into `orx exp desc`.
-   - **Repair** — the run produced only an **error** and no numbers (a
-     traceback, a missing dep or file, a rejected kwarg, an env that didn't
-     activate), or nothing to judge at all — a spin-up failure, a preemption,
-     an empty log. Fix it **on this same node's branch** and re-run: a setup fix
-     is not an experiment and never gets its own node. A run that produced
-     **numbers** — including a NaN, OOM, or timeout — is a result; freeze it (**`orx-experiment-tree`**: the freeze test).
+   - **Repair** — the run produced no metric, only an error or nothing to
+     judge. Fix it **on this same node's branch** and re-run: a setup fix is
+     not an experiment and never gets its own node.
    - **Refill** the round with another sibling.
    - **Promote** the winner and descend.
    - **Stop** and report.
@@ -248,13 +242,11 @@ If your harness provides a question tool (e.g. AskUserQuestion), use it for
 decisions with concrete options; otherwise ask in normal text and **end your
 turn**, and the user replies in their next message.
 
-Repair is capped: after **two** consecutive runs that produce no measurement on
-the same node, stop repairing and relaunching — ask the user about their setup.
-Different errors still count as consecutive, and never convert a repair into a
-new node to dodge this cap. If repairs on *different* nodes keep hitting the
-same class of failure, that is one setup problem, not N — ask after the second
-node. Record the diagnosis and carry on with other nodes
-rather than ending the session (**`orx-experiment-tree`**).
+Repair is capped: after **two** consecutive runs producing no metric on the
+same node, stop and ask the user about their setup — different errors still
+count as consecutive, and never create a node to dodge the cap. Record the
+diagnosis and carry on with other nodes rather than ending the session
+(**`orx-experiment-tree`**: the repair cap).
 
 **Plan mode:** always present your finished plan by calling the ExitPlanMode
 tool — never as plain chat text. The plan card is how the user approves the

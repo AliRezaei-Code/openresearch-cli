@@ -43,14 +43,10 @@ and seeding the baseline from that repo is faster, more faithful, and a far
 better control than something typed from memory. Reproductions should start from
 the authors' (or a strong community) implementation, not a blank file.
 
-This is when you put code *on the baseline itself*, and it is not an exception
-to cardinal rule 1 — it is that rule working as written. The baseline is
-**provisional** until one of its runs actually produces reference numbers in its
-log. Seeding it, fixing its dependencies, and making it run are all part of
-building the control; none of them is an experiment. Once a run has produced the
-baseline's reference measurement, the root is **frozen** — from then on you vary
-code on children (the mechanical test: `orx-experiment-tree`, "A node is an
-evidence contract").
+This is cardinal rule 1 working as written, not an exception to it: the
+baseline is **provisional** until a run produces reference numbers. Seeding it
+and making it run are part of building the control. Once a run measures, the
+root is **frozen** — vary code on children from then on.
 
 **Find the code to seed from, in priority order:**
 
@@ -101,16 +97,10 @@ Then make the baseline runnable and proceed normally:
 - read the seeded code, find its entry point, and set the run command **once**:
   `orx exp cmd <baselineId> --set "bash run.sh"` (rule 2's one legitimate `--set`);
 - run the baseline first for a control `EVAL.md`. **Expect the first launch to
-  fail** — missing deps, a wrong entry point, an env that doesn't activate.
-  Every one of those is repaired **on the baseline's own branch** (fix, commit,
-  push, re-run the same node): the baseline hasn't measured anything yet, so it
-  is still provisional. Do **not** create a child to carry a setup fix, and do
-  **not** treat a failed first launch as "the baseline exists now, so it's
-  frozen." After **two** runs in a row that produce no measurement on this node,
-  stop and ask the user about their setup — different errors still count as
-  consecutive, and switching flavor, provider, or backend is itself a repair.
-- Once the baseline has produced its reference numbers it is **frozen**. Then
-  branch children and vary code per the auto-research loop — shrink to the
+  fail** on setup — repair it on the baseline's own branch and re-run the same
+  node; don't branch a child for a setup fix. Cap: two runs in a row measuring
+  nothing, then ask the user (`orx-experiment-tree`: the repair cap).
+- Once it has produced reference numbers it is **frozen**. Shrink to the
   smallest config that still shows the paper's claim by editing a **child**,
   never by trimming the root.
 
@@ -120,8 +110,7 @@ Adds a node to the experiment tree. `--title` is always required. The node shape
 is chosen by flags:
 
 ```sh
-# Child node, branched off an existing experiment. Always name the measurement:
-# it records what the node owes, so a later reader knows what to compare.
+# Child node. Name the measurement so a later reader knows what to compare:
 orx create-experiment <projectId> --title "Larger batch size" --parent <experimentId> \
   --description "Raise per-device batch 16->32 in config.yaml. Measures: final eval accuracy."
 
@@ -140,8 +129,8 @@ orx create-experiment <projectId> --title "Baseline v2" --baseline \
   root on local projects (server projects create another baseline); pass
   `--baseline` to explicitly add another root — projects may hold multiple
   baselines, each the control for its own subtree. Never create a second
-  baseline to escape a failing setup: that is a repair wearing a root's hat —
-  hit the repair cap and ask the user instead. The repo a project works
+  baseline to escape a failing setup — that is a repair wearing a root's hat.
+  The repo a project works
   on is chosen when the **project** is created (`orx create-project` or the
   web), so there is no `--repo` flag here.
 - **A `--parent` child inherits the parent's run command** (and branches off its

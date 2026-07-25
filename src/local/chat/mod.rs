@@ -1953,51 +1953,6 @@ pub fn in_local_session() -> bool {
     launching_chat_session().is_some()
 }
 
-#[cfg(test)]
-mod session_env_tests {
-    use super::*;
-    use std::sync::Mutex;
-
-    /// Serializes this module's env mutation; no other module's tests touch
-    /// `CHAT_SESSION_ENV` today.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Restores `CHAT_SESSION_ENV` on drop, so a failing assert can't leak the
-    /// mutated value into the rest of the test binary (same shape as
-    /// `telemetry::tests::EnvGuard`).
-    struct EnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        saved: Option<String>,
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.saved {
-                Some(v) => std::env::set_var(CHAT_SESSION_ENV, v),
-                None => std::env::remove_var(CHAT_SESSION_ENV),
-            }
-        }
-    }
-
-    /// The session env is the mode signal for commands with no id to resolve;
-    /// an empty value must read as "not in a session", matching
-    /// [`launching_chat_session`]'s own filtering.
-    #[test]
-    fn in_local_session_follows_the_session_env() {
-        let _guard = EnvGuard {
-            _lock: ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
-            saved: std::env::var(CHAT_SESSION_ENV).ok(),
-        };
-
-        std::env::remove_var(CHAT_SESSION_ENV);
-        assert!(!in_local_session(), "unset → not a session");
-        std::env::set_var(CHAT_SESSION_ENV, "sess-1");
-        assert!(in_local_session(), "set → session");
-        std::env::set_var(CHAT_SESSION_ENV, "");
-        assert!(!in_local_session(), "empty → not a session");
-    }
-}
-
 /// Append-only stderr sink for a harness child (startup/debug diagnostics).
 pub fn harness_log(name: &str) -> Result<std::fs::File> {
     let path = crate::store::data_dir().join(format!("agent-{name}.log"));

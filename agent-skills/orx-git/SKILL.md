@@ -67,14 +67,11 @@ Rules and notes:
 - **Push before you run.** `orx exp run` launches from the branch's pushed tip on
   GitHub — uncommitted or unpushed edits won't be in the run. Commit and push
   first.
-- **Never merge or rebase a branch once its node is frozen** (cardinal rule) —
-  frozen meaning one of its runs put a metric it computed in the log (see
-  `orx-experiment-tree`: the freeze test). Its history is the code those results
-  came from. To bring in changes from another branch, create a **child**
-  experiment and put the merge commit on the child's branch. On a *provisional*
-  node a plain `git merge origin/<parent-branch>` to pick up an upstream fix is
-  fine. And never rewrite history anywhere — no rebase, `commit --amend`,
-  `reset --hard`, or force-push: the tree records what actually ran.
+- **Never merge or rebase a branch once its node is frozen** (cardinal rule):
+  its history is the code those results came from. Bring changes in on a
+  **child** instead. On a *provisional* node a plain `git merge
+  origin/<parent-branch>` is fine. Never rewrite history anywhere — no rebase,
+  amend, `reset --hard`, or force-push.
 - **Reading another node's code** without disturbing your checkout: that branch is
   already in the clone after a fetch — `git -C "$DIR" show origin/orx/<slug>:<path>`.
 
@@ -100,39 +97,14 @@ git -C "$DIR" diff origin/<parent-branch>...<full-commit-sha>
 
 ## Repairing a node in place (`orx up` worktrees)
 
-A node that has produced **no measurement** is provisional: you fix it on its
-own branch and re-run it — you do **not** create a child (see
-`orx-experiment-tree`: the freeze test). In a live `orx up` session that means
-re-checking-out a branch you may have already left, in a **worktree** where
-"one branch, one owner" applies.
+A node that produced no metric is provisional: fix it on **its own branch** and
+re-run the same `<expId>` — don't create a child (`orx-experiment-tree`: the
+freeze test). Use the sync recipe above, then commit, push, and `orx exp run`.
 
-```sh
-git fetch origin
-git checkout orx/<slug>            # the SAME branch — not a new one
-git merge --ff-only origin/orx/<slug>   # a previous repair may already be pushed
-#   …fix the dependency / import / path…
-git commit -am "repair: pin numpy<2 for the CUDA image"
-git push
-orx exp run <expId> --backend <b>  # re-run the SAME node
-```
+If the checkout fails with "already checked out at …", read the path: your own
+worktree means you already hold it, keep editing. Another session's means that
+agent owns the node — leave it alone. Never create a child to dodge the lock,
+and never `git worktree remove`/`prune --force` to break someone else's.
 
-(Outside a live session — the cloud/full flow — do the same thing in the
-cache-dir clone with `git -C "$DIR" …`.)
-
-**If that checkout fails with "already checked out at …":**
-
-1. **If the path it names is your own worktree** — you already have it; just
-   `git status` and keep editing. This is the common case and is not an error.
-2. **If it names another session's worktree** — another agent owns that node.
-   Leave it alone and work on your own; do **not** create a child to dodge the
-   lock, and never `git worktree remove`/`prune --force` or force a checkout to
-   break someone else's. If the repair is genuinely yours, note it in
-   `orx exp desc <expId>` and tell the user.
-
-**Reading or fixing without owning the branch:** you can always inspect it
-without checking out — `git show origin/orx/<slug>:<path>`,
-`git log origin/orx/<slug>`, `git diff origin/<parent-branch>...origin/orx/<slug>`.
-
-**Repair commits are first-class history.** Each run recorded its own
-`commit_sha`, so failed attempts stay resolvable from `orx runs`; a repair is a
-*new commit on top*, which is exactly the record you want.
+Repairs are append-only commits: each run recorded its own `commit_sha`, so
+failed attempts stay resolvable from `orx runs`.
