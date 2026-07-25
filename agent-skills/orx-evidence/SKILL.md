@@ -43,16 +43,16 @@ orx search-logs <projectId> "loss=nan" --experiment <id> --max 5000
 Judging a run is also judging its **node**. The rule (full test:
 `orx-experiment-tree`, "A node is an evidence contract"):
 
-- the log carries **numbers** the run emitted — the measurement, or any
-  substantive metric — the node is **FROZEN**, whatever ended the run. Numbers
+- the log carries **numbers** the run computed — **two or more metric lines**,
+  whatever they measure — the node is **FROZEN**, whatever ended the run. One
+  banner or a single step-0 line is not numbers. Numbers
   win over a later traceback, a non-zero exit, or a cancel.
 - the log carries **only an error** and no numbers, or **nothing to judge**
   (spin-up failure, preemption, empty or truncated output) — the node is
   **provisional**: repair its branch in place and re-run the same node.
 
 Byte counts inside an allocator error are not numbers; digits in an error
-string are part of the error. Never edit a node whose run produced numbers —
-branch a child instead.
+string are part of the error.
 
 ## Run artifacts — `orx artifacts` / `orx artifact`
 

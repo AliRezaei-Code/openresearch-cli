@@ -27,14 +27,14 @@ results — they are not style preferences. The `orx-experiment-tree` module
 expands on the why; these are the non-negotiables.
 
 1. **Never edit a node that has produced a measurement.** A node is frozen once
-   any of its runs put the intended numbers in the log — that includes the
+   any of its runs put **two or more metric lines** in the log — that includes the
    root, the control its variants are measured against. Projects start with an
    empty tree — **you create the baseline** (the first `orx create-experiment`,
    no `--parent`) and, on a blank repo, seed it with starting code before its
    first run (see the `orx-create` module). While its runs produce only
    **errors** and no numbers, the node is **provisional**: seeding it, fixing
    its dependencies, and making it run all happen on its own branch. The moment
-   a run puts **numbers** in the log — any substantive metric it emitted — the
+   a run puts **numbers** in the log — two or more metric lines it computed — the
    node is frozen, whatever ended the run. From the moment a node has measured
    something this rule is absolute, and freezing is **permanent** — a later
    failure does not un-freeze it, and a *disappointing* number is a result, not

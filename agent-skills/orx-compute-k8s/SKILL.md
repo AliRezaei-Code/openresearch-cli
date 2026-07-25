@@ -71,8 +71,10 @@ The contract orx enforces at submit (loud, before anything runs):
 - **A rejected submit or a failed Job is not an experiment result.** Manifest
   errors, unschedulable pods, and image-pull failures are repairs: fix
   `.orx/k8s.yaml` (or the code) on the **same** experiment branch and re-run the
-  same `<expId>`. Before the node has measured, changing the GPU type or node
-  count is a repair too, and the re-run counts toward the cap. An **OOMKilled**
+  same `<expId>`. Before the node has measured, correcting a manifest that
+  won't schedule is a repair, and the re-run counts toward the cap — but the
+  hardware shape is part of the fixed environment contract (cardinal rule 2):
+  size it once for the round, don't tune it per node. An **OOMKilled**
   container is not automatically a repair — if the log holds numbers the run
   emitted, that OOM *is* its result: freeze it and put the bigger shape on a
   child (`orx-experiment-tree`: the freeze test and the repair cap).

@@ -23,15 +23,19 @@ the **measurement** that answers it. Until then — including before its first r
 > Judge the **evidence the run produced**, not what caused the failure. Causes
 > are arguable; evidence is on disk.
 >
-> **"Numbers" means the run's own measurement stream** — values the run command
-> *emitted* as it worked: a metric line, a step/loss trace, an eval summary.
-> Byte counts inside an allocator error (`tried to allocate 2.5 GiB`) are **not**
-> numbers; neither is a duration in a timeout message. Digits in an error string
-> are part of the error.
+> **"Numbers" means a measurement this run computed** — a loss, an eval figure,
+> a score the training or eval loop produced from **this node's own commit**.
+> These are **not** numbers: byte counts inside an allocator error (`tried to
+> allocate 2.5 GiB`), a duration in a timeout message, a progress bar or its
+> `it/s` and ETA, a banner or config echo, and any figure carried over from a
+> resumed checkpoint rather than computed by this run. Digits in an error
+> string, or in the harness's own chatter, are not a measurement.
 >
-> - The log carries **numbers** — any substantive metric the run emitted: the
->   measurement its `orx exp desc` names, or losses past warmup, an eval figure,
->   a throughput line. **FROZEN, whatever caused the run to end.** Don't ask
+> - The log carries **numbers** — **two or more metric lines** this run
+>   computed (a loss trace, eval figures), whatever they measure. One config
+>   echo, one banner, or a single step-0 line is **not** numbers; two logged
+>   intervals are, whatever they say. **FROZEN, whatever caused the run to
+>   end.** Don't ask
 >   whether this node's change caused it; ask only whether the run got far
 >   enough to emit numbers. Numbers that aren't the ones you named still freeze
 >   it — record what actually landed. If numbers landed and a traceback follows
@@ -45,15 +49,26 @@ the **measurement** that answers it. Until then — including before its first r
 >   preempted, the output is empty or truncated. **Provisional.** Repair or
 >   relaunch; it counts toward the cap like any other attempt.
 >
-> A partial trace is not numbers: a step-0 loss, a warmup value, or a config
-> echo before a crash leaves the node provisional, unless the node's
-> `orx exp desc`, written before the run, names an early-training metric.
+> **Read a log the same way on every attempt.** Re-reading an already-classified
+> log as "numbers after all" does not clear the repair cap — at the cap, ask the
+> user. Equally, do not re-read numbers as "not really numbers" to justify
+> another repair. The count of metric lines does not change between readings.
 >
-> **The freeze test is not an exit from a hard debug.** If "the OOM is numbers"
-> only became attractive on the run *after* a repair, or as the second
-> no-measurement run in a row, it is the wrong reading — hitting the cap and
-> asking the user is the correct outcome. A quantitative failure freezes a node
-> on its first run as readily as its third.
+> **Erring toward FROZEN is the cheap error.** A spurious freeze costs one node
+> in a tree that is cheap to extend. A spurious repair rewrites the branch a
+> recorded `commit_sha` points at — the evidence is gone and unrecoverable.
+> When the log is genuinely ambiguous, freeze.
+>
+> **If the only available repair would change what the node is testing, it is
+> not a repair.** A node whose idea is "2x wider MLP" that OOMs at allocation
+> cannot be "fixed" by shrinking the width — freeze it, record that the
+> configuration did not fit, and put the fitted variant on a child.
+>
+> **This deliberately over-freezes.** A node that OOMed on a pre-existing leak
+> after emitting a few losses is frozen even though its own change was
+> innocent. That is the accepted cost of a test you cannot argue with: put the
+> fix on a child and note the confound in `orx exp desc`. Do not treat the
+> over-freeze as an oversight to reason around — it is the trade.
 >
 > **A missing eval block is a reporting defect, not a missing measurement.** If
 > the run emitted real metrics but not the field you named, freeze it and fix
@@ -69,7 +84,6 @@ the **measurement** that answers it. Until then — including before its first r
 > **No metric named?** If the node's `orx exp desc` names none, infer it from
 > the node's title — before you open the log — and write it there. If it still
 > cannot be pinned down, treat numbers in the log as the measurement.
-
 
 Frozen is **permanent and per-node** — it never un-freezes: not after a later
 failure, and not because the number disappointed you. A node that ran correctly
@@ -152,7 +166,8 @@ failure. The repair cap is separate and hard: two runs in a row that measure
 nothing, then ask. **Different errors still count as consecutive**, switching
 flavor, provider, or backend is itself a repair, and a bare **relaunch** counts
 too — a run that measured nothing is a run that measured nothing, whatever the
-reason. Only a run that measures something resets the count.
+reason. Nothing resets the count: a run that *does* measure something freezes
+the node, so repair ends there anyway.
 
 The cap is also **project-wide**: if repairs on *different* nodes keep hitting
 the same class of environmental failure (the same missing package, the same env

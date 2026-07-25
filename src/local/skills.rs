@@ -114,7 +114,7 @@ Git and experiment structure:
 - The experiment root must never be the `main` branch.
 - `main` is the maintained public presentation surface containing the README, notebook, and small published artifacts.
 - Do not require GitHub releases or version tags unless the user asks for them. The canonical molab link should point to `main`.
-- Never mutate a node once one of its runs has produced its intended measurement — it is frozen. Before that it is provisional: fix its branch in place and re-run the same node. Create child experiments for every code or configuration variant of a frozen node.
+- Never mutate a node once one of its runs has put numbers in the log — it is frozen. Before that it is provisional: fix its branch in place and re-run the same node — capped at two runs in a row that measure nothing, then ask the user. Create child experiments for every code or configuration variant of a frozen node.
 
 orx never binds a new experiment root to `main` — every node gets its own `orx/*` branch — so `main` is free for publication by default. Only a legacy project may have a root riding `main` (orx prints a warning when touching one); in that case do not silently edit it: publish through a dedicated documentation branch and flag the needed migration at handoff.
 

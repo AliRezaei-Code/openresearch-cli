@@ -119,7 +119,7 @@ Breaking any of these silently invalidates results — they are not style
 preferences.
 
 1. **Never edit a node that has produced a measurement.** A node is frozen once
-   any of its runs put the intended numbers in the log — that includes the
+   any of its runs put numbers in the log — that includes the
    baseline, and freezing is **permanent**: a *disappointing* number is a
    result, not a reason to repair. While its runs produce only **errors** and
    no numbers it is **provisional** — edit its branch in place and re-run
