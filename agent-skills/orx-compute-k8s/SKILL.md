@@ -76,6 +76,7 @@ The contract orx enforces at submit (loud, before anything runs):
   cap: **two** runs in a row that measure nothing on the same node, then stop
   and ask the user. An **OOMKilled** container is different: if this node's own
   change grew the model or the batch, that OOM *is* its result — freeze it and
-  put the bigger shape on a child. After it has measured, the node is frozen — a deliberate
-  compute change (node count, GPU type) is then a real experimental variable
-  and goes on a child.
+  put the bigger shape on a child. Before it has measured, changing the GPU type
+  or node count is a repair like any other and counts toward the cap. After it
+  has measured, the node is frozen — a deliberate compute change (node count,
+  GPU type) is then a real experimental variable and goes on a child.

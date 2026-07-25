@@ -334,11 +334,8 @@ orx exp wait <expId> --interval 10 --timeout 3600   # tune polling
   whether this node's own change caused the failure**: an OOM or timeout on a
   node whose change grew the model, the batch, or the runtime *is* that node's
   result — it is frozen, and a bigger flavor belongs on a child
-  (`orx-experiment-tree`: the freeze test). This applies while the node is **provisional**; once a run has put
-  the intended numbers in the log the node is frozen (`orx-experiment-tree`:
-  the freeze test), and a deliberate compute change is then an experimental
-  variable that goes on a child. Fix it where it belongs and **re-launch the
-  same `<expId>`**:
+  (`orx-experiment-tree`: the freeze test). Otherwise the node is still
+  provisional — fix it where it belongs and **re-launch the same `<expId>`**:
   - transient provider/spin-up error → re-launch, or a different flavor/provider;
   - OOM or timeout the node's own change didn't cause → bigger flavor / longer
     `--timeout`, same node;

@@ -29,11 +29,29 @@ there is nothing to protect.
 >
 > A run that failed **because of the change this node makes** — diverged to NaN,
 > OOMed on the bigger model, timed out on the slower config — is also
-> evidence-valid: that failure *is* the node's answer. But the node's change is
-> its *hypothesis*, not its typos: a malformed edit — `NameError`, a shape
-> mismatch, a wrong kwarg — that a **correct implementation of the same idea**
-> would not have hit is a defect. Repair it. Freeze only when a correct
-> implementation of this node's idea would have failed the same way.
+> evidence-valid: that failure *is* the node's answer.
+>
+> The one exception is narrow and **syntactic**: the code never expressed the
+> idea at all — a `NameError`, a syntax error, a kwarg the callee *rejects*
+> (`TypeError: unexpected keyword argument`), a shape mismatch **inside the
+> lines you edited**. Repair those. The counterfactual is over **the diff you
+> actually wrote**, never over the idea in the abstract: ask "is this diff
+> malformed?", not "could a better version of this idea have avoided it?" —
+> the answer to the second is always yes and it is not a licence to repair.
+>
+> So: **resource and dynamics failures are never defects.** OOM, timeout, NaN,
+> divergence, instability — if this node's change grew the model, the batch,
+> the sequence length, or the runtime, that failure *is* the result. "A correct
+> implementation would have used gradient checkpointing" is **a new idea for a
+> child**, not a repair of this one. A kwarg *value* you now regret is the
+> hypothesis, not a typo. And a shape mismatch where your edit is internally
+> consistent but collides with code you did not touch is the finding that the
+> idea does not fit this architecture — freeze it, redesign on a child.
+>
+> **No metric named?** If the node's `orx exp desc` names none, infer it from
+> the node's title and its siblings' descriptions, write it there, and judge
+> against that. If it still cannot be pinned down, treat the run as
+> evidence-valid — uncertainty freezes.
 >
 > **Deciding which it was.** The parent's run is on record — read it
 > (`orx logs` on the parent's latest run; a root has no parent, so judge it
@@ -50,17 +68,14 @@ there is nothing to protect.
 |---|---|---|
 | No runs at all | provisional | edit the node's branch in place |
 | Every run `failed` / `cancelled` **before the owed metric appeared**, none for a reason this node introduced | provisional | edit the node's branch in place |
-| No usable log at all — spin-up failure, preemption, empty or truncated output | provisional | nothing ran; repair or relaunch |
-| Failed for a reason unrelated to this node's change — deps, imports, paths, env, a mis-sized flavor | provisional (**execution-invalid**) | edit in place — this is Repair |
+| No judgeable log — spin-up failure, preemption, empty or truncated output | provisional | nothing to judge; repair or relaunch |
+| Failed for a reason unrelated to this node's change — deps, imports, paths, env, a mis-sized flavor | provisional | edit in place — this is Repair |
 | Failed *because of* this node's own change — diverged, OOM on the bigger model, timed out on the slower config | **FROZEN** | that failure is the result; branch a child to follow up |
 | **Any** run whose log carries the measurement this node owes | **FROZEN** | never edit this branch again; branch a child |
 
-Frozen is **permanent and per-node** — it never un-freezes, not after a later
-failure, not because the number was disappointing. You judge this from the log
-yourself; there is no acceptance step. A node that ran correctly and produced a
-**bad** measurement is FROZEN — a negative result is a result. Every attempt is
-preserved either way: `orx runs` records the exact `commit_sha` of every run, so
-a repaired branch never erases what it ran.
+Frozen is **permanent and per-node** — it never un-freezes: not after a later
+failure, and not because the number disappointed you. A node that ran correctly
+and produced a **bad** measurement is FROZEN — a negative result is a result.
 
 The node's question and the numbers it owes live in `orx exp desc <expId>` —
 write them there when you create it, so "did the measurement land?" stays

@@ -67,7 +67,7 @@ pub fn legacy_root_warning(project: &LocalProject, experiment: &LocalExperiment)
 /// pushed to origin: a child forks off its parent's tip, a baseline/root off
 /// the project's base branch. The base branch itself is never an experiment
 /// node — it stays mutable (README, notebooks, publication surface) while
-/// `orx/*` branches hold the experiment code. Matches the server path,
+/// `orx/*` branches hold the experiment nodes' recorded code. Matches the server path,
 /// which also branches baselines to `orx/<slug>`.
 pub fn create_experiment(
     store: &Store,

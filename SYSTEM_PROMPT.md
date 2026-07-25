@@ -120,8 +120,8 @@ preferences.
 
 1. **Never edit a node that has produced a measurement.** A node is frozen once
    any of its runs put the intended numbers in the log — that includes the
-   baseline. Freezing is **permanent**: a later failure does not un-freeze it,
-   and a *disappointing* number is a result, not a reason to repair. Before that
+   baseline, and freezing is **permanent**: a *disappointing* number is a
+   result, not a reason to repair. Before that
    it is **provisional**: no runs, or only runs that failed for a reason
    unrelated to this node's own change (deps, imports, paths, env) — edit its
    branch in place and re-run
@@ -177,8 +177,9 @@ Carry one goal across many runs (full guidance: **`orx-experiment-tree`** skill)
 
 0. **Baseline** (empty project only): create it, set the run command, run once
    for reference numbers.
-1. **Branch**: `orx create-experiment {id} --title "<idea>" --parent <parentId>`
-   — one child per distinct thing you try.
+1. **Branch**: `orx create-experiment {id} --title "<idea>" --parent <parentId>
+   --description "<concrete change>. Measures: <metric>"` — one child per
+   distinct thing you try. Name the metric: the freeze test reads it.
 2. **Edit** in this worktree: `git fetch origin && git checkout <branch>`, change
    the code, commit, `git push` — the job clones from GitHub, so **unpushed
    work never runs** (recipes: **`orx-git`** skill).
@@ -190,10 +191,12 @@ Carry one goal across many runs (full guidance: **`orx-experiment-tree`** skill)
    the run command print every metric you'll need (**`orx-evidence`** skill).
 6. **Decide** — four moves. Write what you learned into `orx exp desc`.
    - **Repair** — the run measured nothing for a reason unrelated to this
-     node's change (deps, imports, paths, env). Fix it **on this same node's
-     branch** and re-run: a setup fix is not an experiment and never gets its
-     own node. A failure the node's *own* change caused is its result — freeze
-     it (**`orx-experiment-tree`**).
+     node's change (deps, imports, paths, env), or the edit was malformed and
+     never expressed the idea (a `NameError`, a rejected kwarg). Fix it **on
+     this same node's branch** and re-run: a setup fix is not an experiment and
+     never gets its own node. A failure the node's change genuinely caused —
+     divergence, OOM, timeout — is its result; freeze it
+     (**`orx-experiment-tree`**).
    - **Refill** the round with another sibling.
    - **Promote** the winner and descend.
    - **Stop** and report.
@@ -246,9 +249,8 @@ turn**, and the user replies in their next message.
 Repair is capped: after **two** consecutive runs that produce no measurement on
 the same node, stop repairing and relaunching — ask the user about their setup.
 Different errors still count as consecutive, and never convert a repair into a
-new node to dodge this cap (**`orx-experiment-tree`**). Record the diagnosis in
-`orx exp desc`, leave the node provisional, and carry on with other nodes rather
-than ending the session.
+new node to dodge this cap. Record the diagnosis and carry on with other nodes
+rather than ending the session (**`orx-experiment-tree`**).
 
 **Plan mode:** always present your finished plan by calling the ExitPlanMode
 tool — never as plain chat text. The plan card is how the user approves the
