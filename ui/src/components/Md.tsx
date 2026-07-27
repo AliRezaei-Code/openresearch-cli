@@ -136,7 +136,13 @@ function FileChip({
 // (tolerating an unclosed fence mid-stream) and inline code spans.
 const CODE_REGIONS = /(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`)/g;
 
-/** Rewrite `\(...\)` / `\[...\]` math delimiters to remark-math's `$` forms.
+/** Single-dollar math is off: prose like "cost $8–18 across nodes ($1.45
+ * each)" would pair its dollar signs into an inline-math region. Math must
+ * use `$$` delimiters — mid-paragraph `$$...$$` still renders inline. */
+export const remarkMathOptions = { singleDollarTextMath: false };
+
+/** Rewrite `\(...\)` / `\[...\]` math delimiters to remark-math's `$$` forms
+ * (`$` alone is not math — see `remarkMathOptions`).
  *
  * Agents emit LaTeX with backslash delimiters, which plain markdown mangles:
  * `\(` parses as an escaped paren and `_` as emphasis. remark-math only
@@ -150,7 +156,7 @@ export function normalizeMathDelimiters(text: string): string {
       if (i % 2 === 1) return seg; // odd segments are code — leave untouched
       return seg
         .replace(/\\\[([\s\S]+?)\\\]/g, (_, inner: string) => `$$${inner}$$`)
-        .replace(/\\\(([\s\S]+?)\\\)/g, (_, inner: string) => `$${inner}$`);
+        .replace(/\\\(([\s\S]+?)\\\)/g, (_, inner: string) => `$$${inner}$$`);
     })
     .join("");
 }
@@ -218,7 +224,7 @@ export const Md = memo(function Md({
   return (
     <div className="md">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkMath, remarkFileMentions]}
+        remarkPlugins={[remarkGfm, [remarkMath, remarkMathOptions], remarkFileMentions]}
         rehypePlugins={[rehypeKatex]}
         components={components as any}
       >
