@@ -1679,7 +1679,7 @@ textarea::placeholder {
  * disturbs the tree layout. */
 .exp-hover-card {
   position: fixed;
-  /* Must clear the maximized right pane (.floating-panel.max, z 60) that
+  /* Must clear the maximized right pane (.right-pane.max, z 60) that
    * hosts the tree; the portal's end-of-body DOM order breaks the tie in the
    * card's favor. Still below the modal tier (100). */
   z-index: 60;

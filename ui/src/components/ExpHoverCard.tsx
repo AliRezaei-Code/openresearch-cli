@@ -153,8 +153,11 @@ export function ExpHoverCard({
   // that committed something (the endpoint 400s otherwise).
   const diffRunId = exp.parentExperimentId && latestRun?.commitSha ? latestRun.id : null;
   useEffect(() => {
+    // Reset on every run change so a previous run's stat can't linger next
+    // to the new run's status while (or if) the new fetch resolves.
+    setDiffStat(null);
     if (!diffRunId) return;
-    let stale = false;
+    let cancelled = false;
     getRunDiff(diffRunId)
       .then((p) => {
         // Same parser and counting helpers as the Changes tab, so renames,
@@ -180,7 +183,7 @@ export function ExpHoverCard({
           additions += c.additions;
           deletions += c.deletions;
         }
-        if (!stale) {
+        if (!cancelled) {
           setDiffStat({
             files: files.map(formatDiffFilePath),
             additions,
@@ -193,7 +196,7 @@ export function ExpHoverCard({
         // Diffstat is a nice-to-have; drop the row on fetch or parse failure.
       });
     return () => {
-      stale = true;
+      cancelled = true;
     };
   }, [diffRunId]);
 
@@ -270,7 +273,9 @@ export function ExpHoverCard({
               <span className="diff-stat-add">+{diffStat.additions}</span>{" "}
               <span className="diff-stat-del">−{diffStat.deletions}</span>
               {" · "}
-              {diffStat.files.length === 1 ? "1 file" : `${diffStat.files.length} files`}
+              {diffStat.files.length === 1 && !diffStat.truncated
+                ? "1 file"
+                : `${diffStat.files.length}${diffStat.truncated ? "+" : ""} files`}
             </span>
             <span className="hc-files hc-mono">
               {diffStat.files.slice(0, MAX_FILES_SHOWN).join(" · ")}
