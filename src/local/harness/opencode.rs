@@ -70,15 +70,18 @@ impl Harness for OpenCode {
             info.account = Some(providers.join(", "));
         }
 
-        info.agent_ready = info.installed;
+        info.agent_ready = info.installed && info.authenticated;
         if info.agent_ready {
             info.models = models
                 .into_iter()
                 .map(|id| super::ModelInfo { id })
                 .collect();
+        } else if info.installed {
+            info.agent_note =
+                Some("Sign in with `opencode auth login` to chat with it here.".to_string());
         } else {
             info.agent_note = Some(
-                "Install opencode (curl -fsSL https://opencode.ai/install | bash) to chat with it here."
+                "Install opencode (curl -fsSL https://opencode.ai/install | bash), then sign in with `opencode auth login`."
                     .to_string(),
             );
         }

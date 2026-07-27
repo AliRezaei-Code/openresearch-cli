@@ -196,6 +196,8 @@ fn router(state: AppState) -> Router {
         )
         .route("/api/settings/data-dir/validate", post(validate_data_dir))
         .route("/api/settings/data-dir/move", post(move_data_dir))
+        .route("/api/github/repo-access", get(github_repo_access))
+        .route("/api/github/account", get(github_account))
         .route(
             "/api/settings/git",
             get(git_settings).post(set_git_settings),
@@ -446,13 +448,16 @@ async fn create_project(
             return Err(bad_request("githubOwner and githubRepo are required"));
         }
         let branch = req.baseline_branch.filter(|b| !b.trim().is_empty());
+        // One API call answers both questions below.
+        let meta = local::github::repo_meta(&owner, &repo).await;
+        // No branch given → use the repo's own default. Falling through to
+        // create_project's hardcoded "main" would break every master/dev repo
+        // with "Branch 'main' not found".
+        let branch = branch.or_else(|| meta.as_ref().and_then(|m| m.default_branch.clone()));
         // Unknown access (no token / API hiccup) counts as access: forking
         // needs a token anyway, and surprise forks are worse than a later
         // push error.
-        let fork = req.fork_repo
-            || !local::github::has_push_access(&owner, &repo)
-                .await
-                .unwrap_or(true);
+        let fork = req.fork_repo || !meta.as_ref().map(|m| m.can_push).unwrap_or(true);
         if fork {
             // The entered branch picks what gets copied; the fork itself
             // starts at its default branch.
@@ -1612,6 +1617,39 @@ fn data_dir_json() -> Value {
         // env | config | xdg | default — env means a forced override (read-only).
         "source": source,
     })
+}
+
+/// The signed-in GitHub login, so "creates github.com/you/x" can name the real
+/// account. `null` when there's no usable token — the UI keeps saying "you".
+async fn github_account() -> ApiResult {
+    Ok(Json(
+        json!({ "login": local::github::viewer_login().await }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct RepoAccessQuery {
+    owner: String,
+    repo: String,
+}
+
+/// Whether the stored credentials can push to `owner/repo`, so the New project
+/// form can drop the fork choice when it isn't one. Mirrors the create path:
+/// unknown (no token / API hiccup) counts as access, so the UI never nags about
+/// a fork the server wouldn't make.
+async fn github_repo_access(Query(q): Query<RepoAccessQuery>) -> ApiResult {
+    let owner = q.owner.trim().to_string();
+    let repo = q.repo.trim().to_string();
+    if owner.is_empty() || repo.is_empty() {
+        return Err(bad_request("owner and repo are required"));
+    }
+    let meta = local::github::repo_meta(&owner, &repo).await;
+    Ok(Json(json!({
+        "canPush": meta.as_ref().map(|m| m.can_push).unwrap_or(true),
+        // Distinguishes "we checked" from "we couldn't tell" for the copy.
+        "known": meta.is_some(),
+        "defaultBranch": meta.as_ref().and_then(|m| m.default_branch.clone()),
+    })))
 }
 
 async fn data_dir_settings() -> ApiResult {

@@ -107,9 +107,13 @@ impl Harness for ClaudeCode {
         info.agent_ready = info.installed && info.authenticated;
         if info.agent_ready {
             info = info.with_models(&CLAUDE_MODELS);
+        } else if info.installed {
+            info.agent_note =
+                Some("Sign in with `claude auth login` to chat with it here.".to_string());
         } else {
             info.agent_note = Some(
-                "Install Claude Code and sign in (`claude`) to chat with it here.".to_string(),
+                "Install Claude Code (claude.com/download), then sign in with `claude auth login`."
+                    .to_string(),
             );
         }
         Some(info)

@@ -2,38 +2,46 @@ import { ArrowLeft, ArrowRight, Check, Copy, RefreshCw } from "lucide-react";
 import { Wordmark } from "./Wordmark";
 import { useEffect, useState } from "react";
 import {
-  getDataDir,
   getGitSettings,
   getHarnesses,
   getTelemetry,
   modelLabel,
-  setDataDir,
   recordTelemetryConsent,
   setTelemetry,
-  type DataDirSettings,
   type GitSettings,
   type Harness,
   type TelemetrySettings,
 } from "../api";
 import { GitTokenForm } from "./GitTokenForm";
 
-/** First-run walkthrough: the detected coding agents, then the git/GitHub
- * model, then the usage-analytics choice, then hand off to the (empty)
- * projects page. Purely informative — nothing here gates anything. */
+/** First-run walkthrough: the detected coding agents, then GitHub access, then
+ * the usage-analytics choice, then hand off to the (empty) projects page.
+ * Steps 1 and 2 are hard gates — orx can't chat or create a project without
+ * them. The data-dir choice deliberately lives in Settings → Storage instead:
+ * the default suits almost everyone, and Settings can also *move* existing
+ * data, which this flow never could. */
 export function Onboarding({ onDone }: { onDone: () => void }) {
-  const [step, setStep] = useState<0 | 1 | 2 | 3>(0);
+  const [step, setStep] = useState<0 | 1 | 2>(0);
   const [harnesses, setHarnesses] = useState<Harness[] | null>(null);
   const [git, setGit] = useState<GitSettings | null>(null);
-  const [dataDir, setDataDirState] = useState<DataDirSettings | null>(null);
   const [telemetry, setTelemetryState] = useState<TelemetrySettings | null>(null);
   const [checking, setChecking] = useState(false);
+
+  // orx can't chat or run autoresearch without a signed-in agent, so step 1 is
+  // a hard gate. Null (still detecting) counts as not-ready: better a briefly
+  // disabled button than one that goes dead under the cursor.
+  const anyAgentReady = harnesses?.some((h) => h.agentReady) ?? false;
+
+  // Creating a project hits the GitHub API (repo creation, push-access check),
+  // which hard-fails without a token — so step 2 gates too. Null (still
+  // checking) counts as not-connected, same as the agent gate.
+  const githubConnected = git?.githubTokenSource != null;
 
   const load = (refresh: boolean) => {
     setChecking(true);
     void Promise.allSettled([
       getHarnesses(refresh).then(setHarnesses),
       getGitSettings().then(setGit),
-      getDataDir().then(setDataDirState),
       getTelemetry().then(setTelemetryState),
     ]).finally(() => setChecking(false));
   };
@@ -54,7 +62,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
         {step === 0 ? (
           <>
             <div className="onb-eyebrow">
-              <Wordmark /> · Step 1 of 4
+              <Wordmark /> · Step 1 of 3
             </div>
             <h2 className="onb-title">Your coding agents</h2>
             <p className="onb-sub">
@@ -70,12 +78,22 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 harnesses.map((h) => <AgentCard key={h.id} h={h} />)
               )}
             </div>
+            {harnesses !== null && !anyAgentReady && (
+              <p className="onb-gate-hint">Sign in to at least one agent to continue.</p>
+            )}
             <div className="onb-actions">
               <button className="btn ghost" onClick={() => load(true)} disabled={checking}>
                 <RefreshCw size={12} className={checking ? "spin" : ""} /> Re-check
               </button>
               <div style={{ flex: 1 }} />
-              <button className="btn primary" onClick={() => setStep(1)}>
+              <button
+                className="btn primary"
+                onClick={() => setStep(1)}
+                disabled={!anyAgentReady}
+                title={
+                  anyAgentReady ? undefined : "Sign in to at least one coding agent to continue"
+                }
+              >
                 Continue <ArrowRight size={13} />
               </button>
             </div>
@@ -83,17 +101,18 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
         ) : step === 1 ? (
           <>
             <div className="onb-eyebrow">
-              <Wordmark /> · Step 2 of 4
+              <Wordmark /> · Step 2 of 3
             </div>
-            <h2 className="onb-title">Git &amp; GitHub</h2>
+            <h2 className="onb-title">Connect GitHub</h2>
             <p className="onb-sub">
-              A project is a clone of one of your GitHub repos, made with your own git
-              credentials. Every experiment becomes a branch pushed to that repo — compute jobs
-              clone it from there.
+              orx clones your GitHub repos and pushes each experiment as a branch.
             </p>
             <div className="onb-cards">
               <GitCard git={git} onUpdate={setGit} />
             </div>
+            {git !== null && !githubConnected && (
+              <p className="onb-gate-hint">Connect GitHub to continue.</p>
+            )}
             <div className="onb-actions">
               <button className="btn ghost" onClick={() => setStep(0)}>
                 <ArrowLeft size={12} /> Back
@@ -102,31 +121,12 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 <RefreshCw size={12} className={checking ? "spin" : ""} /> Re-check
               </button>
               <div style={{ flex: 1 }} />
-              <button className="btn primary" onClick={() => setStep(2)}>
-                Continue <ArrowRight size={13} />
-              </button>
-            </div>
-          </>
-        ) : step === 2 ? (
-          <>
-            <div className="onb-eyebrow">
-              <Wordmark /> · Step 3 of 4
-            </div>
-            <h2 className="onb-title">Where orx keeps your data</h2>
-            <p className="onb-sub">
-              Your local database, run logs, artifacts, and chat attachments live in one folder on
-              this machine. The default works for most people — change it if you&apos;d rather keep
-              it on another disk.
-            </p>
-            <div className="onb-cards">
-              <StorageCard dataDir={dataDir} onUpdate={setDataDirState} />
-            </div>
-            <div className="onb-actions">
-              <button className="btn ghost" onClick={() => setStep(1)}>
-                <ArrowLeft size={12} /> Back
-              </button>
-              <div style={{ flex: 1 }} />
-              <button className="btn primary" onClick={() => setStep(3)}>
+              <button
+                className="btn primary"
+                onClick={() => setStep(2)}
+                disabled={!githubConnected}
+                title={githubConnected ? undefined : "Connect GitHub to continue"}
+              >
                 Continue <ArrowRight size={13} />
               </button>
             </div>
@@ -134,7 +134,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
         ) : (
           <>
             <div className="onb-eyebrow">
-              <Wordmark /> · Step 4 of 4
+              <Wordmark /> · Step 3 of 3
             </div>
             <h2 className="onb-title">Usage analytics</h2>
             <p className="onb-sub">
@@ -145,8 +145,14 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
             <div className="onb-cards">
               <TelemetryCard telemetry={telemetry} onUpdate={setTelemetryState} />
             </div>
+            {/* The data dir moved to Settings → Storage; still disclose where
+                things land so the location isn't a surprise. */}
+            <p className="onb-aside-text" style={{ marginTop: 12 }}>
+              Your database, run logs, and artifacts stay on this machine — change where they live
+              any time in Settings → Storage.
+            </p>
             <div className="onb-actions">
-              <button className="btn ghost" onClick={() => setStep(2)}>
+              <button className="btn ghost" onClick={() => setStep(1)}>
                 <ArrowLeft size={12} /> Back
               </button>
               <div style={{ flex: 1 }} />
@@ -158,6 +164,46 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
         )}
       </div>
     </div>
+  );
+}
+
+/** A shell command plus its own copy button, sharing one border so the button
+ * reads as part of the command. Each chip owns its "Copied" state. */
+function CmdChip({ cmd }: { cmd: string }) {
+  const [copied, setCopied] = useState(false);
+  const copy = () => {
+    void navigator.clipboard.writeText(cmd).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  };
+  return (
+    <span className="onb-cmd-chip">
+      <code>{cmd}</code>
+      <button
+        className="onb-cmd-copy"
+        onClick={copy}
+        aria-label={copied ? "Copied" : "Copy command"}
+        title={copied ? "Copied" : "Copy"}
+      >
+        {copied ? <Check size={13} strokeWidth={3} /> : <Copy size={13} />}
+      </button>
+    </span>
+  );
+}
+
+/** Agent notes carry the command to run in backticks (`claude auth login`) —
+ * render those spans as code so they read as something to type, not prose. */
+export function renderNote(note: string | undefined) {
+  if (!note) return null;
+  return note.split(/`([^`]+)`/).map((part, i) =>
+    i % 2 === 1 ? (
+      <code key={i} className="mono">
+        {part}
+      </code>
+    ) : (
+      part
+    ),
   );
 }
 
@@ -199,7 +245,7 @@ function AgentCard({ h }: { h: Harness }) {
           </div>
         </>
       ) : (
-        <div className="onb-card-meta">{h.agentNote?.replace(/`/g, "")}</div>
+        <div className="onb-card-meta">{renderNote(h.agentNote)}</div>
       )}
     </div>
   );
@@ -212,13 +258,9 @@ function GitCard({
   git: GitSettings | null;
   onUpdate: (g: GitSettings) => void;
 }) {
-  const [copied, setCopied] = useState(false);
-  const copyCmd = () => {
-    void navigator.clipboard.writeText("gh auth login").then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    });
-  };
+  // The PAT form is the fallback, not a peer of `gh auth login` — keep it
+  // behind a disclosure so the card offers one obvious action per row.
+  const [tokenOpen, setTokenOpen] = useState(false);
   if (git === null) {
     return (
       <div className="onb-loading">
@@ -232,7 +274,7 @@ function GitCard({
         <div className="onb-card-head">
           <span className="onb-card-name">git</span>
           <span className="status-badge st-failed">
-            <span className="dot" /> not found
+            <span className="dot" /> Not found
           </span>
         </div>
         <div className="onb-card-meta">Install git to clone projects, then re-open orx.</div>
@@ -245,179 +287,44 @@ function GitCard({
   return (
     <div className="onb-card">
       <div className="onb-card-row">
-        <span className="onb-card-name">git</span>
-        <span className="onb-card-detail mono">
-          {git.gitVersion.replace(/^git version /, "")}
-          {identity ? ` · ${identity}` : ""}
-        </span>
-        <span className={`status-badge ${identity ? "st-done" : "st-starting"}`}>
-          {identity ? <Check size={12} strokeWidth={3} /> : <span className="dot" />}
-          {identity ? "ready" : "no identity"}
-        </span>
-      </div>
-      <div className="onb-card-row">
         <span className="onb-card-name">GitHub</span>
         <span className="onb-card-detail mono">
           {git.githubTokenSource === "env"
-            ? "token from GITHUB_TOKEN"
+            ? "Token from GITHUB_TOKEN"
             : git.githubTokenSource === "stored"
               ? "Token saved in orx"
               : git.githubTokenSource === "gh"
                 ? "Signed in via gh CLI"
-                : "Not connected"}
+                : ""}
         </span>
         <span className={`status-badge ${git.githubTokenSource ? "st-done" : "st-starting"}`}>
           {git.githubTokenSource ? <Check size={12} strokeWidth={3} /> : <span className="dot" />}
-          {git.githubTokenSource ? "ready" : "check"}
+          {git.githubTokenSource ? "Connected" : "Not connected"}
         </span>
       </div>
-      {!identity && (
-        <div className="onb-card-meta">
-          Set <code>git config --global user.name / user.email</code> so the agent can commit.
-        </div>
-      )}
       {!git.githubTokenSource && (
-        <div className="onb-gh-options">
-          <div className="onb-card-meta">
-            GitHub access is used to clone your repos and push experiment branches. Connect
-            either way:
-          </div>
-          <div className="onb-gh-option">
-            <span className="onb-gh-option-label">GitHub CLI</span>
-            <div className="onb-gh-option-body">
-              {git.ghInstalled ? (
-                <>
-                  <code className="onb-gh-cmd">gh auth login</code>
-                  <button className="btn ghost" onClick={copyCmd}>
-                    {copied ? <Check size={12} strokeWidth={3} /> : <Copy size={12} />}
-                    {copied ? "Copied" : "Copy"}
-                  </button>
-                  <span className="onb-gh-hint">run in a terminal, then Re-check</span>
-                </>
-              ) : (
-                <span className="onb-gh-hint">
-                  install the GitHub CLI, run <code>gh auth login</code>, then Re-check
-                </span>
-              )}
-            </div>
-          </div>
-          <div className="onb-gh-or">or</div>
-          <div className="onb-gh-option">
-            <span className="onb-gh-option-label">Paste a token</span>
-            <GitTokenForm onSaved={onUpdate} />
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function StorageCard({
-  dataDir,
-  onUpdate,
-}: {
-  dataDir: DataDirSettings | null;
-  onUpdate: (d: DataDirSettings) => void;
-}) {
-  const [path, setPath] = useState("");
-  const [editing, setEditing] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  // Seed the input once the current path loads.
-  useEffect(() => {
-    if (dataDir && !path) setPath(dataDir.current);
-  }, [dataDir, path]);
-
-  if (dataDir === null) {
-    return (
-      <div className="onb-loading">
-        <span className="spinner" /> Checking storage…
-      </div>
-    );
-  }
-
-  // $ORX_DATA_DIR forces the path — nothing to choose here.
-  if (dataDir.source === "env") {
-    return (
-      <div className="onb-card">
-        <div className="onb-card-row">
-          <span className="onb-card-name">Data folder</span>
-          <span className="onb-card-detail mono">{dataDir.current}</span>
-          <span className="status-badge st-done">
-            <Check size={12} strokeWidth={3} /> pinned
-          </span>
-        </div>
-        <div className="onb-card-meta">
-          Set by the <code>ORX_DATA_DIR</code> environment variable.
-        </div>
-      </div>
-    );
-  }
-
-  const trimmed = path.trim();
-  const changed = trimmed !== "" && trimmed !== dataDir.current;
-
-  async function save() {
-    if (saving || !changed) return;
-    setSaving(true);
-    setError(null);
-    try {
-      onUpdate(await setDataDir(trimmed));
-      setEditing(false);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  return (
-    <div className="onb-card">
-      <div className="onb-card-row">
-        <span className="onb-card-name">Data folder</span>
-        <span className="onb-card-detail mono">{dataDir.current}</span>
-        <span className={`status-badge ${dataDir.isDefault ? "st-idle" : "st-done"}`}>
-          {dataDir.isDefault ? <span className="dot" /> : <Check size={12} strokeWidth={3} />}
-          {dataDir.isDefault ? "default" : "custom"}
-        </span>
-      </div>
-      {editing ? (
         <>
-          <input
-            className="mono"
-            type="text"
-            value={path}
-            onChange={(e) => setPath(e.target.value)}
-            placeholder="/absolute/path/to/openresearch"
-            autoComplete="off"
-            spellCheck={false}
-            style={{ width: "100%", marginTop: 10 }}
-          />
-          {error && <div className="error" style={{ marginTop: 8 }}>{error}</div>}
-          <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
-            <button className="btn primary" onClick={save} disabled={saving || !changed}>
-              {saving ? "Saving…" : "Use this folder"}
-            </button>
-            <button
-              className="btn ghost"
-              onClick={() => {
-                setEditing(false);
-                setPath(dataDir.current);
-                setError(null);
-              }}
-              disabled={saving}
-            >
-              Cancel
+          <div className="onb-fix">
+            <span className="onb-fix-label">
+              {tokenOpen
+                ? "Paste a personal access token:"
+                : git.ghInstalled
+                  ? "Run this in your terminal to sign in:"
+                  : "Install the GitHub CLI, then run this to sign in:"}
+            </span>
+            <button className="onb-fix-alt" onClick={() => setTokenOpen((v) => !v)}>
+              {tokenOpen ? "Use gh instead" : "Paste a token instead"}
             </button>
           </div>
+          {tokenOpen ? <GitTokenForm onSaved={onUpdate} /> : <CmdChip cmd="gh auth login" />}
         </>
-      ) : (
-        <div className="onb-card-meta" style={{ display: "flex", gap: 10, alignItems: "center" }}>
-          The default is fine for most setups.
-          <button className="btn ghost" onClick={() => setEditing(true)}>
-            Change…
-          </button>
+      )}
+      {!identity && (
+        <div className="onb-aside">
+          <div className="onb-aside-text">
+            Optional — so the agent&apos;s commits are attributed to you:
+          </div>
+          <CmdChip cmd={`git config --global user.name "Your Name" && git config --global user.email "you@example.com"`} />
         </div>
       )}
     </div>

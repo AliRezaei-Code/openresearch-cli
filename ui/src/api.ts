@@ -119,6 +119,18 @@ export const searchPapers = (q: string) =>
     (r) => r.papers,
   );
 
+/** The signed-in GitHub login, for naming the account a new repo lands on.
+ * `login` is null when there's no usable token. */
+export const githubAccount = () => get<{ login: string | null }>("/api/github/account");
+
+/** Whether the stored credentials can push to a repo. `known: false` means we
+ * couldn't tell (no token / API hiccup) — the server then assumes access, so
+ * the UI should too rather than showing a fork choice it won't honour. */
+export const repoAccess = (owner: string, repo: string) =>
+  get<{ canPush: boolean; known: boolean; defaultBranch: string | null }>(
+    `/api/github/repo-access?owner=${encodeURIComponent(owner)}&repo=${encodeURIComponent(repo)}`,
+  );
+
 /** Resolve an arXiv id / URL to title + linked GitHub repo. May take a few
  * seconds for papers alphaXiv hasn't indexed yet (it scrapes arXiv on a miss). */
 export const resolvePaper = (id: string) =>

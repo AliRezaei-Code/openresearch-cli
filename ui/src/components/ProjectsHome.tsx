@@ -9,13 +9,18 @@ export function ProjectsHome({
   onOpen,
   onCreated,
   onDeleted,
+  openNewProject = false,
 }: {
   projects: Project[];
   onOpen: (id: string) => void;
   onCreated: (project: Project) => void;
   onDeleted: (id: string) => void;
+  /** Open the New project modal on mount — onboarding ends on "Create your
+   * first project", so landing behind an empty page would ask for that click
+   * twice. Only the post-onboarding hand-off sets this. */
+  openNewProject?: boolean;
 }) {
-  const [modalOpen, setModalOpen] = useState(false);
+  const [modalOpen, setModalOpen] = useState(openNewProject);
   const [deleting, setDeleting] = useState<string | null>(null);
 
   async function onDelete(p: Project) {

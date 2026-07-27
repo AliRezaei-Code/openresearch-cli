@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import {
   createProject,
+  githubAccount,
+  repoAccess,
   resolvePaper,
   searchPapers,
   type PaperHit,
@@ -63,7 +65,9 @@ export function NewProjectForm({
   const [repoInput, setRepoInput] = useState("");
   const [name, setName] = useState("");
   const [nameTouched, setNameTouched] = useState(false);
-  const [branch, setBranch] = useState("main");
+  // No branch picker: the server uses the repo's own default branch. It's
+  // write-once, invisible after creation, and right for ~everyone — so it's a
+  // setting, not a question worth asking during project creation.
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -76,6 +80,22 @@ export function NewProjectForm({
   const [paperNote, setPaperNote] = useState<string | null>(null);
   // Drops out-of-order search/resolve responses.
   const paperSeq = useRef(0);
+
+  // Push access for the entered repo: null while unknown/checking. The server
+  // force-forks when this is false, so the fork choice is only a real choice
+  // when it's true — otherwise we state what will happen instead of asking.
+  const [canPush, setCanPush] = useState<boolean | null>(null);
+  const [checkingAccess, setCheckingAccess] = useState(false);
+  // The signed-in GitHub login, so previews name the real account. Falls back
+  // to "you" when there's no usable token.
+  const [ghLogin, setGhLogin] = useState<string | null>(null);
+  useEffect(() => {
+    void githubAccount()
+      .then((r) => setGhLogin(r.login))
+      .catch(() => setGhLogin(null));
+  }, []);
+  const ghOwner = ghLogin ?? "you";
+  const accessSeq = useRef(0);
 
   const parsed = parseRepo(repoInput);
   const valid = Boolean(
@@ -123,6 +143,46 @@ export function NewProjectForm({
     setRepoInput("");
     if (!nameTouched) setName("");
   }
+
+  // Ask GitHub whether we can push to the entered repo, so the fork choice only
+  // appears when the user actually has one.
+  const repoKey = parsed ? `${parsed.owner}/${parsed.repo}` : "";
+  useEffect(() => {
+    if (!repoKey) {
+      setCanPush(null);
+      setCheckingAccess(false);
+      return;
+    }
+    const [owner, repo] = repoKey.split("/");
+    let live = true;
+    setCheckingAccess(true);
+    const t = setTimeout(() => {
+      // seq is claimed when the request actually starts, not on every
+      // keystroke — otherwise a superseded effect bumps it and the in-flight
+      // response fails its own guard, leaving "checking…" stuck forever.
+      const seq = ++accessSeq.current;
+      repoAccess(owner, repo)
+        .then((r) => {
+          if (!live || seq !== accessSeq.current) return;
+          setCanPush(r.canPush);
+          // No push access → the server copies regardless; keep the two in sync.
+          if (!r.canPush) setRepoMode("fork");
+        })
+        .catch(() => {
+          // Unreachable check: assume access, matching the server's fallback.
+          if (live && seq === accessSeq.current) setCanPush(true);
+        })
+        .finally(() => {
+          if (live && seq === accessSeq.current) setCheckingAccess(false);
+        });
+    }, 400);
+    return () => {
+      // A newer effect owns the spinner now; never leave it on for a repo key
+      // nobody is waiting for.
+      live = false;
+      clearTimeout(t);
+    };
+  }, [repoKey]);
 
   // Debounced lookup: an id/URL resolves directly, anything else title-searches.
   useEffect(() => {
@@ -173,7 +233,6 @@ export function NewProjectForm({
                 name: name.trim(),
                 githubOwner: parsed!.owner,
                 githubRepo: parsed!.repo,
-                baselineBranch: branch.trim() || "main",
                 forkRepo: repoMode === "fork",
                 ...(mode === "paper" ? { paperId: paper!.paperId } : {}),
               },
@@ -187,29 +246,49 @@ export function NewProjectForm({
   }
 
   const creatingRepo = mode === "new" || (mode === "paper" && !parsed);
-  const repoFields = (
+  const repoLabel = parsed ? `${parsed.owner}/${parsed.repo}` : "the repo";
+  // Everything below the repo input is about a *specific* repo, so none of it
+  // renders until one is entered and we know whether the user can push to it.
+  // Showing "Use this repo" for a repo they can't push to is a false choice.
+  const repoFields = !parsed ? null : checkingAccess || canPush === null ? (
+    <span className="repo-hint">Checking your access to {repoLabel}…</span>
+  ) : (
     <>
-      <div className="seg form-seg">
-        <button
-          type="button"
-          className={repoMode === "use" ? "active" : ""}
-          onClick={() => setRepoMode("use")}
-        >
-          Use this repo
-        </button>
-        <button
-          type="button"
-          className={repoMode === "fork" ? "active" : ""}
-          onClick={() => setRepoMode("fork")}
-        >
-          Fork a copy
-        </button>
-      </div>
-      <span className="repo-hint">
-        {repoMode === "fork"
-          ? `snapshots ${parsed ? `${parsed.owner}/${parsed.repo}` : "the repo"} into a private repo on your account`
-          : "experiments push branches here — if you can't push to it, a fork is made automatically"}
-      </span>
+      {canPush === false ? (
+        <span className="repo-hint">
+          You can&apos;t push to {repoLabel}, so orx snapshots its latest commit into a new private
+          repo on github.com/{ghOwner}. Your experiments push there.
+        </span>
+      ) : (
+        <>
+          <div className="seg form-seg">
+            <button
+              type="button"
+              className={repoMode === "use" ? "active" : ""}
+              onClick={() => setRepoMode("use")}
+            >
+              Use this repo
+            </button>
+            <button
+              type="button"
+              className={repoMode === "fork" ? "active" : ""}
+              onClick={() => setRepoMode("fork")}
+            >
+              Private copy
+            </button>
+          </div>
+          {/* `ok` (green) like the resolved owner/repo above: this states the
+              confirmed outcome, not a caveat. */}
+          <span className="repo-hint mono ok">
+            {repoMode === "fork"
+              ? // Not a GitHub fork: seed_copy does a --depth=1 --single-branch
+                // clone, then an orphan commit. One branch, no history, no fork
+                // link — say so rather than letting "copy" imply otherwise.
+                `Snapshots the latest commit of ${repoLabel} into a new private repo on github.com/${ghOwner}`
+              : `Experiments push branches straight to ${repoLabel}`}
+          </span>
+        </>
+      )}
       <div className="row2">
         <label>
           Project name
@@ -221,10 +300,6 @@ export function NewProjectForm({
             }}
             placeholder="my-research"
           />
-        </label>
-        <label>
-          Branch
-          <input value={branch} onChange={(e) => setBranch(e.target.value)} placeholder="main" />
         </label>
       </div>
     </>
@@ -271,7 +346,7 @@ export function NewProjectForm({
               {parsed
                 ? `${parsed.owner} / ${parsed.repo}`
                 : repoInput.trim()
-                  ? "paste a GitHub URL or owner/repo"
+                  ? "Paste a GitHub URL or owner/repo"
                   : "URL or owner/repo — cloned with your git credentials"}
             </span>
           </label>
@@ -293,12 +368,17 @@ export function NewProjectForm({
               />
               <span className={`repo-hint ${paperNote ? "" : "mono"}`}>
                 {resolving
-                  ? "looking up paper…"
+                  ? "Looking up paper…"
                   : searching
-                    ? "searching alphaXiv…"
-                    : (paperNote ?? "searches alphaXiv by title — or paste an arXiv id / URL")}
+                    ? "Searching alphaXiv…"
+                    : (paperNote ?? "Searches alphaXiv by title — or paste an arXiv id / URL")}
               </span>
             </label>
+            {!paperNote && !resolving && !searching && (
+              <span className="repo-hint">
+                orx clones the code repo linked to the paper on alphaXiv.
+              </span>
+            )}
             {hits.length > 0 && (
               <div className="paper-results">
                 {hits.map((h) => (
@@ -321,6 +401,22 @@ export function NewProjectForm({
                 Change
               </button>
             </div>
+            {/* Say outright whether the paper had code, so the repo field below
+                is either "here's what we found" or "there wasn't one". */}
+            <span className="repo-hint">
+              {paper.repoUrl && parseRepo(paper.repoUrl) ? (
+                <>
+                  This paper links to <strong>{parseRepo(paper.repoUrl)!.owner}/
+                  {parseRepo(paper.repoUrl)!.repo}</strong>
+                  {paper.repoStars != null ? ` · ★ ${paper.repoStars}` : ""} — orx will clone it.
+                </>
+              ) : (
+                <>
+                  No code is linked to this paper on alphaXiv. Enter a repo yourself, or leave it
+                  blank to start from a blank private repo.
+                </>
+              )}
+            </span>
             <label>
               GitHub repository{paper.repoUrl ? "" : " (optional)"}
               <input
@@ -336,8 +432,8 @@ export function NewProjectForm({
                       ? ` · linked on alphaXiv${paper.repoStars != null ? ` · ★ ${paper.repoStars}` : ""}`
                       : "")
                   : repoInput.trim()
-                    ? "paste a GitHub URL or owner/repo"
-                    : "no code linked to this paper — a blank private repo will be created"}
+                    ? "Paste a GitHub URL or owner/repo"
+                    : "No code linked to this paper — a blank private repo will be created"}
               </span>
             </label>
             {parsed ? (
@@ -355,8 +451,8 @@ export function NewProjectForm({
                 />
                 <span className={`repo-hint mono ${name.trim() ? "ok" : ""}`}>
                   {name.trim()
-                    ? `creates github.com/you/${slugify(name)} · private`
-                    : "a blank private repo is created on your GitHub account"}
+                    ? `Creates github.com/${ghOwner}/${slugify(name)} · private`
+                    : "A blank private repo is created on your GitHub account"}
                 </span>
               </label>
             )}
@@ -377,8 +473,8 @@ export function NewProjectForm({
           />
           <span className={`repo-hint mono ${name.trim() ? "ok" : ""}`}>
             {name.trim()
-              ? `creates github.com/you/${slugify(name)} · private`
-              : "a blank private repo is created on your GitHub account"}
+              ? `Creates github.com/${ghOwner}/${slugify(name)} · private`
+              : "A blank private repo is created on your GitHub account"}
           </span>
         </label>
       )}
@@ -395,7 +491,7 @@ export function NewProjectForm({
             ? creatingRepo
               ? "Creating repo…"
               : repoMode === "fork"
-                ? "Forking repo…"
+                ? "Copying repo…"
                 : "Cloning repo…"
             : "Create project"}
         </button>

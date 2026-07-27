@@ -24,6 +24,43 @@ pub async fn create_repo(
 /// determine" (no token, network error, auth trouble) — callers should treat
 /// that as access rather than surprise-forking on a transient failure.
 pub async fn has_push_access(owner: &str, repo: &str) -> Option<bool> {
+    repo_meta(owner, repo).await.map(|m| m.can_push)
+}
+
+/// What the New project form needs about a repo, from one API call.
+pub struct RepoMeta {
+    pub can_push: bool,
+    /// The repo's own default branch — the honest baseline when the user
+    /// doesn't pick one (`create_project` would otherwise assume "main").
+    pub default_branch: Option<String>,
+}
+
+/// The signed-in GitHub login, so the UI can name the account a new repo lands
+/// on instead of guessing "you". `None` when there's no usable token.
+pub async fn viewer_login() -> Option<String> {
+    let token = resolve_github_token()?;
+    let res = reqwest::Client::new()
+        .get("https://api.github.com/user")
+        .bearer_auth(&token)
+        .header("user-agent", UA)
+        .header("accept", "application/vnd.github+json")
+        .send()
+        .await
+        .ok()?;
+    if !res.status().is_success() {
+        return None;
+    }
+    let body: Value = res.json().await.ok()?;
+    body.get("login")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Repo permissions + default branch. `None` means we couldn't tell (no token,
+/// API hiccup); callers treat that as "assume access" so a check outage never
+/// forces a surprise fork.
+pub async fn repo_meta(owner: &str, repo: &str) -> Option<RepoMeta> {
     let token = resolve_github_token()?;
     let res = reqwest::Client::new()
         .get(format!("https://api.github.com/repos/{owner}/{repo}"))
@@ -35,14 +72,23 @@ pub async fn has_push_access(owner: &str, repo: &str) -> Option<bool> {
         .ok()?;
     match res.status() {
         // Not visible with this token: definitely can't push.
-        reqwest::StatusCode::NOT_FOUND => Some(false),
+        reqwest::StatusCode::NOT_FOUND => Some(RepoMeta {
+            can_push: false,
+            default_branch: None,
+        }),
         s if s.is_success() => {
             let body: Value = res.json().await.ok()?;
-            Some(
-                body.pointer("/permissions/push")
+            Some(RepoMeta {
+                can_push: body
+                    .pointer("/permissions/push")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
-            )
+                default_branch: body
+                    .get("default_branch")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+            })
         }
         _ => None,
     }

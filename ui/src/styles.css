@@ -502,8 +502,10 @@ textarea::placeholder {
 .status-badge.live .dot {
   animation: pulse 1.2s ease-in-out infinite;
 }
-/* The status color lives on the dot; the label stays neutral. */
-.st-done .dot {
+/* The status color lives on the dot — or on the check icon, for states that
+   render one instead (Connected). The label stays neutral either way. */
+.st-done .dot,
+.st-done > svg {
   color: var(--accent-green);
 }
 .st-failed .dot {
@@ -2039,10 +2041,10 @@ textarea::placeholder {
   padding-top: 96px;
 }
 .onb-eyebrow {
-  font-size: var(--fs-2xs);
+  font-size: var(--fs-xl);
   font-weight: var(--fw-semibold);
   color: var(--muted);
-  margin-bottom: 14px;
+  margin-bottom: 18px;
 }
 .onb-title {
   margin: 0 0 6px;
@@ -2087,9 +2089,15 @@ textarea::placeholder {
   font-size: var(--fs-sm);
   color: var(--subtext);
 }
+/* Commands to type (`claude auth login`) read as a chip, matching `.md code`. */
 .onb-card-meta code {
   font-family: var(--mono);
   font-size: var(--fs-xs);
+  background: var(--panel);
+  border: 1px solid var(--border-variant);
+  border-radius: var(--radius-xs);
+  padding: 1px 5px;
+  white-space: nowrap;
 }
 .onb-card-row {
   display: grid;
@@ -2106,64 +2114,107 @@ textarea::placeholder {
   font-size: var(--fs-md);
   padding: 8px 0;
 }
-.onb-gh-options {
+/* The fix for the row above it: one command, one action. Indented under its
+   status row so it reads as a remedy, not a third peer item. */
+.onb-fix {
   display: flex;
-  flex-direction: column;
-  gap: 16px;
-  margin-top: 12px;
-  padding-top: 14px;
-  border-top: 1px solid var(--border-variant);
-}
-.onb-gh-option {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.onb-gh-option-label {
-  font-size: var(--fs-xs);
-  font-weight: var(--fw-semibold);
-  color: var(--text);
-}
-.onb-gh-option-body {
-  display: flex;
-  align-items: center;
+  align-items: baseline;
   flex-wrap: wrap;
   gap: 10px;
+  margin: 6px 0 9px;
 }
-.onb-gh-cmd {
-  font-family: var(--mono);
-  font-size: var(--fs-sm);
+/* Nice-to-have that isn't required to proceed (git identity) — set below the
+   requirement and visually quieter so it never reads as a second blocker. */
+.onb-aside {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 7px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-variant);
+}
+.onb-aside-text {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  line-height: 1.5;
+}
+/* The identity command is long — let it wrap inside the chip rather than
+   overflow the card. */
+.onb-aside .onb-cmd-chip {
+  max-width: 100%;
+}
+.onb-aside .onb-cmd-chip code {
+  font-size: var(--fs-xs);
+  white-space: normal;
+  word-break: break-word;
+}
+/* Names what the command/form below it is for, so the action is never a bare
+   chip with no instruction. */
+/* The call to action. Full-strength text so it's unmissable, but regular
+   weight at body size — semibold would tie it with the `GitHub` row label
+   above and read as a second heading. */
+.onb-fix-label {
+  font-size: var(--fs-md);
+  font-weight: var(--fw-regular);
+  color: var(--text);
+}
+/* Secondary escape hatch (paste a PAT) — deliberately quiet so it doesn't
+   compete with the primary command. */
+.onb-fix-alt {
+  margin-left: auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  text-decoration: underline;
+  cursor: pointer;
+}
+.onb-fix-alt:hover {
+  color: var(--text);
+}
+/* Command + its copy button share one border, so the button reads as part of
+   the command rather than a separate control next to it. */
+.onb-cmd-chip {
+  display: inline-flex;
+  align-items: stretch;
+  /* Hug the command — the card is a flex column, which would stretch it. */
+  align-self: flex-start;
+  max-width: 100%;
   background: var(--panel);
   border: 1px solid var(--border-variant);
   border-radius: var(--radius-sm);
-  padding: 3px 8px;
+  overflow: hidden;
 }
-.onb-gh-hint {
-  font-size: var(--fs-sm);
-  color: var(--subtext);
-}
-.onb-gh-hint code {
+.onb-cmd-chip code {
   font-family: var(--mono);
-  font-size: var(--fs-xs);
+  font-size: var(--fs-sm);
+  padding: 4px 9px;
 }
-.onb-gh-or {
-  display: flex;
+.onb-cmd-copy {
+  display: inline-flex;
   align-items: center;
-  gap: 10px;
+  flex-shrink: 0;
+  padding: 0 8px;
+  border: 0;
+  border-left: 1px solid var(--border-variant);
+  background: none;
   color: var(--muted);
-  font-size: var(--fs-xs);
+  cursor: pointer;
 }
-.onb-gh-or::before,
-.onb-gh-or::after {
-  content: "";
-  flex: 1;
-  height: 1px;
-  background: var(--border-variant);
+.onb-cmd-copy:hover {
+  background: var(--surface);
+  color: var(--text);
 }
-.onb-gh-option .onb-token-form {
-  flex: 1;
-  min-width: 0;
-  margin-top: 0;
+/* Why Continue is disabled on step 1 — a disabled control with no explanation
+   reads as a bug. */
+.onb-gate-hint {
+  margin: 18px 0 0;
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semibold);
+  line-height: 1.5;
+  color: var(--text);
 }
 .onb-token-form {
   display: flex;
@@ -2311,14 +2362,19 @@ textarea::placeholder {
   inset: 0;
   background: rgba(29, 27, 26, 0.4);
   display: flex;
-  align-items: center;
+  /* Top-anchored, not centered: the card's height changes with the selected
+     tab, and centering would slide the tab row up/down under the cursor. */
+  align-items: flex-start;
   justify-content: center;
+  padding: 30vh 16px 24px;
+  overflow-y: auto;
   z-index: 100;
 }
 .modal {
   width: 480px;
   max-width: 94vw;
-  max-height: 88vh;
+  /* Leaves room for the backdrop's 30vh top offset + bottom padding. */
+  max-height: 66vh;
   overflow-y: auto;
   background: var(--base);
   border: 1px solid var(--border);
@@ -3544,6 +3600,14 @@ a.files-pill:hover {
   padding: 4px 8px 8px;
   font-size: var(--fs-xs);
   color: var(--muted);
+}
+.model-more code {
+  font-family: var(--mono);
+  background: var(--panel);
+  border: 1px solid var(--border-variant);
+  border-radius: var(--radius-xs);
+  padding: 1px 5px;
+  white-space: nowrap;
 }
 /* Mid-session footer: the harness is fixed, so only its models are offered. */
 .model-locked-note {

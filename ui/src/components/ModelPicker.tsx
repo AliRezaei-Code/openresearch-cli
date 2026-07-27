@@ -7,6 +7,7 @@ import {
   type HarnessId,
   type OptionChoice,
 } from "../api";
+import { renderNote } from "./Onboarding";
 
 export interface ModelSelection {
   harness: HarnessId;
@@ -161,7 +162,9 @@ export function ModelPicker({
               <div key={harness.id}>
                 <div className="model-group">{harness.name}</div>
                 {!harness.agentReady ? (
-                  <div className="model-more">{harness.agentNote ?? "Not available"}</div>
+                  <div className="model-more">
+                    {harness.agentNote ? renderNote(harness.agentNote) : "Not available"}
+                  </div>
                 ) : (
                   <>
                     {models.map((m) => (
