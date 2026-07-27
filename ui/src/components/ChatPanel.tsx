@@ -31,6 +31,8 @@ import {
   getSkills,
   interruptChat,
   listChatSessions,
+  reasoningFor,
+  reconcileReasoning,
   renameChatSession,
   respondChat,
   sendChatMessage,
@@ -1066,7 +1068,7 @@ export function ChatPanel({
   //  * with a session open — that session's stored settings, with any unsent
   //    picker tweaks layered on. The harness is the session's, not the global.
   //  * with no session — the sticky global preference (seeds a new session).
-  const composerSelection: ModelSelection | null = openSession
+  const rawSelection: ModelSelection | null = openSession
     ? {
         harness: openSession.harness,
         model: sessionOverride.model ?? openSession.model,
@@ -1074,31 +1076,51 @@ export function ChatPanel({
         reasoningLevel: sessionOverride.reasoningLevel ?? openSession.reasoningLevel,
       }
     : (selection ?? defaultSelection(harnesses));
-  const activeHarness = composerSelection
-    ? harnesses.find((h) => h.id === composerSelection.harness)
+  const activeHarness = rawSelection
+    ? harnesses.find((h) => h.id === rawSelection.harness)
     : undefined;
   const opts = activeHarness?.options;
+  // Reconcile the reasoning level against the *currently selected model* here
+  // rather than only in the picker's `pick`. Two paths reach the composer with
+  // a level nobody chose for this model: a session row stored by an older build
+  // (which always wrote an explicit effort), and a stale localStorage selection.
+  // Reconciling at the point the composer derives its state covers both, so the
+  // displayed value and the value `send` transmits can never be one the model
+  // rejects.
+  const composerSelection: ModelSelection | null = rawSelection && {
+    ...rawSelection,
+    reasoningLevel: reconcileReasoning(
+      activeHarness,
+      rawSelection.model,
+      rawSelection.reasoningLevel,
+    ),
+  };
+  // Reasoning choices follow the *selected model*, not just the harness — an
+  // OpenCode model with no `variants` hides the picker entirely, and Codex's
+  // top tiers appear only on the models that accept them.
+  const reasoning = reasoningFor(activeHarness, composerSelection?.model);
 
-  // Editing the pickers: a session-scoped tweak when a session is open (applied
-  // on next send), else an update to the sticky global preference.
-  const selectModel = (next: ModelSelection) => {
-    if (openSession) {
-      setSessionOverride({
-        model: next.model,
-        permissionMode: next.permissionMode,
-        reasoningLevel: next.reasoningLevel,
-      });
-    } else {
-      setSelection(next);
-      localStorage.setItem(SELECTION_STORAGE_KEY, JSON.stringify(next));
-    }
+  // Editing the pickers: every change updates the sticky global preference —
+  // the config a "New session" composer opens with is whatever the user chose
+  // LAST, whether they chose it on an empty composer or inside a session. With
+  // a session open the change additionally lands as that session's unsent
+  // tweak (applied on the next send).
+  //
+  // The session override is *merged*, never replaced. It has to be: the pickers
+  // build their `next` by spreading `composerSelection`, whose reasoning level
+  // is a reconciled value rather than the session's stored one. Replacing would
+  // let a change on one axis pin a reconciled value on another — picking a
+  // permission mode would write a reasoning level the user never chose, and the
+  // next send would persist it over their real setting.
+  const selectModel = (next: Partial<ModelSelection>) => {
+    if (!composerSelection) return;
+    const merged = { ...composerSelection, ...next };
+    setSelection(merged);
+    localStorage.setItem(SELECTION_STORAGE_KEY, JSON.stringify(merged));
+    if (openSession) setSessionOverride((cur) => ({ ...cur, ...next }));
   };
-  const setPermissionMode = (id: string) => {
-    if (composerSelection) selectModel({ ...composerSelection, permissionMode: id });
-  };
-  const setReasoningLevel = (id: string) => {
-    if (composerSelection) selectModel({ ...composerSelection, reasoningLevel: id });
-  };
+  const setPermissionMode = (id: string) => selectModel({ permissionMode: id });
+  const setReasoningLevel = (id: string) => selectModel({ reasoningLevel: id });
 
   // Reset everything when the project changes.
   useEffect(() => {
@@ -1926,13 +1948,13 @@ export function ChatPanel({
               lockHarness={!!openSession}
             />
             <OptionPicker
-              choices={opts?.reasoningLevels ?? []}
+              choices={reasoning.choices}
               value={composerSelection?.reasoningLevel ?? null}
-              defaultId={opts?.defaultReasoningLevel ?? null}
+              defaultId={reasoning.defaultId}
               header="Reasoning"
               align="right"
               variant="bare"
-              title="Reasoning level for this chat"
+              title="Reasoning level for this chat — Default sends no override, so the harness CLI's own configured effort applies"
               onSelect={setReasoningLevel}
             />
             <ContextMeter usage={openSession?.contextUsage} />

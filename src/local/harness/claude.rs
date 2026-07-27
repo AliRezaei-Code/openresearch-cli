@@ -18,13 +18,17 @@
 //! fallbacks, and are what a custom `ANTHROPIC_BASE_URL` gateway uses.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
 
-use super::detect::{bin_version, find_on_path, nonempty_str, read_json, HarnessInfo};
-use super::options::{HarnessOptions, PermissionMode};
+use super::detect::{bin_version, find_on_path, nonempty_str, read_json, HarnessInfo, ModelInfo};
+use super::options::{HarnessOptions, PermissionMode, REASONING_DEFAULT_ID};
 use super::{Harness, ResumeAction};
 use crate::error::{anyhow, Result};
 use crate::local::chat::{
@@ -34,8 +38,10 @@ use crate::local::chat::{
 use crate::local::claude::{SpawnConfig, SpawnSpec, TurnEvent};
 use crate::local::opencode::ensure_playbook;
 
-/// Each harness runs directly (its own CLI, the user's own login), so its
-/// model list is its own: static ids for the Claude Code CLI.
+/// FALLBACK model list, used only when the `list_models` control request fails
+/// (a CLI too old to answer it, or a spawn/timeout failure). The primary source
+/// is [`claude_list_models`]: the same catalog the CLI's own `/model` menu
+/// renders, with per-model `supportedEffortLevels`.
 const CLAUDE_MODELS: [&str; 4] = [
     "claude-fable-5",
     "claude-sonnet-5",
@@ -43,15 +49,188 @@ const CLAUDE_MODELS: [&str; 4] = [
     "claude-haiku-4-5",
 ];
 
-/// Claude Code's `--effort` tiers (id == the CLI value). `xhigh`/`max` are
-/// Claude-specific — the reasoning vocabulary is per-harness, not global.
-const CLAUDE_EFFORT_LEVELS: [(&str, &str); 5] = [
-    ("low", "Low"),
-    ("medium", "Medium"),
-    ("high", "High"),
-    ("xhigh", "XHigh"),
-    ("max", "Max"),
-];
+/// FALLBACK effort tiers, paired with `CLAUDE_MODELS` above — the base five
+/// every supported CLI accepts. The primary source is per-model
+/// `supportedEffortLevels` from `list_models`.
+const CLAUDE_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// `ultracode` — the session mode that selects `xhigh` effort plus standing
+/// dynamic-workflow orchestration. NOT the same as `ultrathink` (a prompt
+/// keyword) or Codex's `ultra`. The CLI models it as a *mode*, not an effort
+/// level: `list_models` never includes it in `supportedEffortLevels`, even on
+/// versions whose `--effort` accepts it — which is why support is detected by
+/// [`claude_accepts_ultracode`] rather than read from the catalog.
+const CLAUDE_ULTRACODE: &str = "ultracode";
+
+/// Ask the installed CLI's own argument parser whether it accepts
+/// `--effort ultracode`. `--version` still runs the parser, which prints
+/// `Warning: Unknown --effort value …` for a value it doesn't know and exits
+/// without touching the network (~0.2s); absence of the warning is acceptance.
+///
+/// The parser is the only truthful surface. Every enumeration the CLI offers
+/// lies about this value: `--help` lists five tiers on versions that accept
+/// six; the warning's own "Valid values:" list omits `ultracode` on versions
+/// that accept it; and `list_models` never advertises it (see
+/// [`CLAUDE_ULTRACODE`]). Probing the parser replaces a hard-coded version
+/// gate — the boundary (2.1.202 rejects / 2.1.203 accepts, bisected across
+/// every published version in between) is now discovered per install instead
+/// of pinned.
+///
+/// Any failure reports unsupported: a missing choice is a smaller harm than a
+/// choice that silently runs at the default effort.
+async fn claude_accepts_ultracode(bin: &Path) -> bool {
+    let fut = Command::new(bin)
+        .args(["--effort", CLAUDE_ULTRACODE, "--version"])
+        .stdin(Stdio::null())
+        .output();
+    match tokio::time::timeout(Duration::from_secs(10), fut).await {
+        Ok(Ok(out)) => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.status.success() && !text.contains("Unknown --effort value")
+        }
+        _ => false,
+    }
+}
+
+/// Query the CLI's own model catalog — the `list_models` control request over
+/// `--print` stream-json, the same data its `/model` menu renders: every model
+/// with its `supportedEffortLevels`. This is the Claude analogue of codex's
+/// `model/list` and opencode's `models --verbose`; a curated table here shipped
+/// effort tiers on Haiku, which the catalog says supports none.
+///
+/// One shot: spawn, write the control request, read until its
+/// `control_response` (skipping stream noise), kill the child. Any failure —
+/// spawn, timeout, a CLI too old for the subtype — returns `None` and the
+/// caller falls back to the static table.
+async fn claude_list_models(bin: &Path, ultracode: bool) -> Option<Vec<ModelInfo>> {
+    let fut = async {
+        let mut child = Command::new(bin)
+            .args([
+                "--print",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take()?;
+        let mut lines = BufReader::new(child.stdout.take()?).lines();
+
+        use tokio::io::AsyncWriteExt;
+        let req = serde_json::json!({
+            "type": "control_request",
+            "request_id": "orx_list_models",
+            "request": { "subtype": "list_models" },
+        });
+        let mut line = req.to_string();
+        line.push('\n');
+        stdin.write_all(line.as_bytes()).await.ok()?;
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if v.get("type").and_then(Value::as_str) != Some("control_response") {
+                continue;
+            }
+            let resp = v.get("response")?;
+            if resp.get("request_id").and_then(Value::as_str) != Some("orx_list_models") {
+                continue;
+            }
+            // An `error` subtype has no inner response — `?` falls through to
+            // the static fallback.
+            let models = parse_claude_model_list(resp.get("response")?, ultracode);
+            return (!models.is_empty()).then_some(models);
+        }
+        None
+    };
+    tokio::time::timeout(Duration::from_secs(15), fut)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// `list_models` response → per-model `ModelInfo`. Split from the transport
+/// for testability.
+///
+/// * `value` is the id the CLI's own picker submits (aliases like `sonnet`,
+///   `opus[1m]`), so it's what we store and pass back as `--model`.
+/// * The `default` entry is skipped — the composer's "Default model" row (a
+///   null model) already means "let the CLI pick".
+/// * A model without `supportedEffortLevels` (Haiku) gets an empty list, which
+///   hides the reasoning picker — same absent-vs-empty contract as opencode.
+/// * `ultracode` is appended where the CLI accepts it (see
+///   [`claude_accepts_ultracode`]) and the model reaches `xhigh`, since the
+///   mode is documented as `xhigh` + dynamic workflows.
+fn parse_claude_model_list(result: &Value, ultracode: bool) -> Vec<ModelInfo> {
+    let Some(models) = result.get("models").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    models
+        .iter()
+        .filter_map(|m| {
+            let value = m.get("value").and_then(Value::as_str)?;
+            if value == "default" {
+                return None;
+            }
+            let mut efforts: Vec<&str> = m
+                .get("supportedEffortLevels")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if ultracode && efforts.contains(&"xhigh") {
+                efforts.push(CLAUDE_ULTRACODE);
+            }
+            // The catalog's `displayName` is unversioned ("Opus"); the version
+            // lives in the description's first `·` segment ("Opus 4.8 with 1M
+            // context · Best for everyday, complex tasks"). Promote that
+            // segment to the display name and keep the rest as the blurb, so
+            // the picker leads with the resolved version.
+            let (name, blurb) = match m.get("description").and_then(Value::as_str) {
+                Some(desc) => match desc.split_once('·') {
+                    Some((head, tail)) => (Some(head.trim()), Some(tail.trim())),
+                    None => (m.get("displayName").and_then(Value::as_str), Some(desc)),
+                },
+                None => (m.get("displayName").and_then(Value::as_str), None),
+            };
+            let mut info = ModelInfo::new(value)
+                .with_reasoning(&efforts)
+                .with_label(name, blurb);
+            // Claude reports no default *tier* because its unset default isn't
+            // one: with adaptive thinking, the CLI scales effort per request.
+            // Name the sentinel row for what actually runs — preselecting a
+            // fixed tier here would pin behavior the user never asked for.
+            if m.get("supportsAdaptiveThinking") == Some(&Value::Bool(true)) {
+                if let Some(choices) = info.reasoning_levels.as_mut() {
+                    if let Some(sentinel) = choices.first_mut() {
+                        sentinel.label = "Adaptive".to_string();
+                    }
+                }
+            }
+            Some(info)
+        })
+        .collect()
+}
+
+/// The FALLBACK effort ids (see `CLAUDE_EFFORT_LEVELS`), plus `ultracode` when
+/// the parser probe accepted it.
+fn claude_effort_ids(ultracode: bool) -> Vec<&'static str> {
+    let mut ids: Vec<&'static str> = CLAUDE_EFFORT_LEVELS.to_vec();
+    if ultracode {
+        ids.push(CLAUDE_ULTRACODE);
+    }
+    ids
+}
 
 pub struct ClaudeCode;
 
@@ -133,7 +312,26 @@ impl Harness for ClaudeCode {
 
         info.agent_ready = info.installed && info.authenticated;
         if info.agent_ready {
-            info = info.with_models(&CLAUDE_MODELS);
+            // Ask the installed CLI for its own catalog: `list_models` for the
+            // models and their per-model effort tiers, and the parser probe for
+            // `ultracode` (a session mode the catalog never advertises — see
+            // `claude_accepts_ultracode`). The static table only covers a CLI
+            // too old to answer.
+            let bin = info.bin_path.as_deref().map(Path::new);
+            let (ultracode, models) = match bin {
+                Some(bin) => {
+                    let ultracode = claude_accepts_ultracode(bin).await;
+                    (ultracode, claude_list_models(bin, ultracode).await)
+                }
+                None => (false, None),
+            };
+            info = info.with_models(models.unwrap_or_else(|| {
+                let ids = claude_effort_ids(ultracode);
+                CLAUDE_MODELS
+                    .iter()
+                    .map(|id| ModelInfo::new(*id).with_reasoning(&ids))
+                    .collect()
+            }));
         } else if info.installed {
             info.agent_note =
                 Some("Sign in with `claude auth login` to chat with it here.".to_string());
@@ -172,8 +370,12 @@ impl Harness for ClaudeCode {
                 ],
                 PermissionMode::Auto,
             )
-            // Claude Code's `--effort` tiers (default `high` on current models).
-            .with_reasoning_levels(&CLAUDE_EFFORT_LEVELS, "high")
+            // Harness-wide fallback only, and deliberately the conservative
+            // five: `options()` is static and can't see the detected CLI
+            // version, so `ultracode` is added per-model in `detect` where the
+            // version IS known. The default is `Default` (no `--effort` at all),
+            // so the CLI's own configured effort survives (issue #123).
+            .with_reasoning_levels(&CLAUDE_EFFORT_LEVELS)
     }
 
     /// Two resume paths. A card the permission bridge surfaced mid-turn
@@ -423,15 +625,17 @@ pub(crate) fn write_mcp_config(
     Ok(path)
 }
 
-/// Session reasoning id → Claude Code `--effort` value. The composer only
-/// offers ids from `CLAUDE_EFFORT_LEVELS`, so an unrecognized/absent value just
-/// omits the flag and lets the CLI apply its own default (`high`).
+/// Session reasoning id → Claude's `--effort` value.
+///
+/// Only the `default` sentinel (and an absent level) send nothing; every other
+/// value is forwarded. The composer only offers what `list_models` reported
+/// for the selected model (plus a probe-verified `ultracode`), so an allowlist
+/// here would drop tiers a future catalog genuinely advertises — the same
+/// policy as `codex_reasoning` for catalog models and `opencode_variant`.
+/// Claude is also the gentlest harness to forward into: an unknown value warns
+/// on stderr and runs at the default effort rather than failing the turn.
 fn claude_effort(level: Option<&str>) -> Option<&str> {
-    let level = level?;
-    CLAUDE_EFFORT_LEVELS
-        .iter()
-        .any(|(id, _)| *id == level)
-        .then_some(level)
+    level.filter(|l| *l != REASONING_DEFAULT_ID)
 }
 
 /// The follow-up message + resume mode for an answered Claude prompt — Claude's
@@ -1088,7 +1292,134 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::options::REASONING_DEFAULT_ID;
     use super::*;
+
+    /// A `list_models` response in the live 2.1.212 shape (fields we don't
+    /// read trimmed). Covers the four things the parser decides: the `default`
+    /// entry is skipped, `value` (the alias the CLI's own picker submits) is
+    /// the id, a model without `supportedEffortLevels` hides the picker, and
+    /// `ultracode` is appended only when probed AND the model reaches `xhigh`.
+    #[test]
+    fn model_list_parses_catalog_models_and_efforts() {
+        let result = serde_json::json!({
+            "models": [
+                {
+                    "value": "default",
+                    "resolvedModel": "claude-opus-4-8[1m]",
+                    "displayName": "Default (recommended)",
+                    "supportsEffort": true,
+                    "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
+                },
+                {
+                    "value": "claude-fable-5[1m]",
+                    "resolvedModel": "claude-fable-5",
+                    "displayName": "Fable",
+                    "description": "Fable 5 · Most capable",
+                    "supportsEffort": true,
+                    "supportsAdaptiveThinking": true,
+                    "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
+                },
+                {
+                    "value": "haiku",
+                    "resolvedModel": "claude-haiku-4-5-20251001",
+                    "displayName": "Haiku",
+                },
+            ],
+        });
+        let ids = |m: &ModelInfo| {
+            m.reasoning_levels
+                .as_ref()
+                .map(|c| c.iter().map(|c| c.id.clone()).collect::<Vec<_>>())
+        };
+
+        let with = parse_claude_model_list(&result, true);
+        assert_eq!(
+            with.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["claude-fable-5[1m]", "haiku"],
+            "the `default` entry is the composer's null-model row, not a model"
+        );
+        // The versioned name is promoted out of the description's first `·`
+        // segment (the alias ids and `displayName` are unversioned).
+        assert_eq!(with[0].display_name.as_deref(), Some("Fable 5"));
+        assert_eq!(with[0].description.as_deref(), Some("Most capable"));
+        // Claude's unset default is adaptive thinking, not any fixed tier, so
+        // the sentinel row is named for what actually runs — and no concrete
+        // tier is preselected.
+        assert_eq!(
+            with[0].reasoning_levels.as_ref().unwrap()[0].label,
+            "Adaptive"
+        );
+        assert_eq!(with[0].default_reasoning_level, None);
+        // No description → the plain displayName stands.
+        assert_eq!(with[1].display_name.as_deref(), Some("Haiku"));
+        assert_eq!(with[1].description, None);
+        assert_eq!(
+            ids(&with[0]).unwrap(),
+            [
+                "default",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "ultracode"
+            ]
+        );
+        // Haiku: checked, no effort control → empty list → picker hidden. Also
+        // no `ultracode` — the mode needs `xhigh`, which Haiku doesn't reach.
+        assert_eq!(ids(&with[1]).unwrap(), Vec::<String>::new());
+
+        // Probe said no → no ultracode anywhere, catalog otherwise identical.
+        let without = parse_claude_model_list(&result, false);
+        assert_eq!(
+            ids(&without[0]).unwrap(),
+            ["default", "low", "medium", "high", "xhigh", "max"]
+        );
+
+        // Junk shapes parse to nothing rather than panicking.
+        assert!(parse_claude_model_list(&serde_json::json!({}), true).is_empty());
+        assert!(parse_claude_model_list(&serde_json::json!({ "models": "nope" }), true).is_empty());
+    }
+
+    /// The fallback tiers gain `ultracode` only when the parser probe said so.
+    #[test]
+    fn fallback_effort_ids_follow_the_probe() {
+        assert_eq!(
+            claude_effort_ids(false),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            claude_effort_ids(true),
+            ["low", "medium", "high", "xhigh", "max", "ultracode"]
+        );
+    }
+
+    /// Only the sentinel is withheld; everything else forwards. The composer
+    /// offers only catalog-reported tiers (plus a probe-verified `ultracode`),
+    /// and Claude merely warns-and-defaults on a value it doesn't know, so an
+    /// allowlist here would only risk dropping a future catalog tier.
+    #[test]
+    fn effort_is_sent_unless_it_is_the_default_sentinel() {
+        assert_eq!(claude_effort(Some("ultracode")), Some("ultracode"));
+        assert_eq!(claude_effort(Some("max")), Some("max"));
+        assert_eq!(claude_effort(Some("low")), Some("low"));
+        assert_eq!(
+            claude_effort(Some("brand-new-tier")),
+            Some("brand-new-tier")
+        );
+        assert_eq!(claude_effort(Some(REASONING_DEFAULT_ID)), None);
+        assert_eq!(claude_effort(None), None);
+    }
+
+    /// Every id the composer can offer must survive the mapper — catalog
+    /// tiers and the probe-gated fallback alike.
+    #[test]
+    fn advertised_effort_ids_all_map_back() {
+        for id in claude_effort_ids(true) {
+            assert_eq!(claude_effort(Some(id)), Some(id), "{id} was dropped");
+        }
+    }
 
     #[test]
     fn bearer_token_counts_as_a_credential_alongside_the_api_key() {
@@ -1210,15 +1541,6 @@ mod tests {
         // this into an error that keeps the card actionable.
         let (text, _) = synthesize_resume("question", &answer(true, None, &[], None));
         assert!(text.trim().is_empty());
-    }
-
-    #[test]
-    fn effort_accepts_only_claude_tiers() {
-        assert_eq!(claude_effort(Some("xhigh")), Some("xhigh"));
-        assert_eq!(claude_effort(Some("max")), Some("max"));
-        // A Codex-only id like a bare "medium" is fine (shared), but junk is not.
-        assert_eq!(claude_effort(Some("ultra")), None);
-        assert_eq!(claude_effort(None), None);
     }
 
     /// Fold a hand-written stream-json transcript through `apply_event` against a
