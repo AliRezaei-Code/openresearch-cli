@@ -123,11 +123,11 @@ export const searchPapers = (q: string) =>
  * `login` is null when there's no usable token. */
 export const githubAccount = () => get<{ login: string | null }>("/api/github/account");
 
-/** Whether the stored credentials can push to a repo. `known: false` means we
- * couldn't tell (no token / API hiccup) — the server then assumes access, so
- * the UI should too rather than showing a fork choice it won't honour. */
+/** Whether the stored credentials can push to a repo. An unanswerable check
+ * (no token / API hiccup) reports `true`, matching the server's own fallback,
+ * so an outage never shows a fork choice the server wouldn't honour. */
 export const repoAccess = (owner: string, repo: string) =>
-  get<{ canPush: boolean; known: boolean; defaultBranch: string | null }>(
+  get<{ canPush: boolean }>(
     `/api/github/repo-access?owner=${encodeURIComponent(owner)}&repo=${encodeURIComponent(repo)}`,
   );
 

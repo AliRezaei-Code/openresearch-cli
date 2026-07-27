@@ -3,6 +3,8 @@
 //! Token from `GITHUB_TOKEN` or `gh auth token`, same resolution the clone path
 //! uses.
 
+use std::time::Duration;
+
 use serde_json::{json, Value};
 
 use super::git::resolve_github_token;
@@ -23,8 +25,23 @@ pub async fn create_repo(
 /// Whether the token can push to `owner/repo`. `None` means "could not
 /// determine" (no token, network error, auth trouble) — callers should treat
 /// that as access rather than surprise-forking on a transient failure.
-pub async fn has_push_access(owner: &str, repo: &str) -> Option<bool> {
-    repo_meta(owner, repo).await.map(|m| m.can_push)
+/// GET an api.github.com URL with the resolved token. `None` when there's no
+/// token or the request fails — callers decide what that means.
+async fn authed_get(url: &str) -> Option<reqwest::Response> {
+    let token = resolve_github_token()?;
+    reqwest::Client::builder()
+        // Without a timeout a black-holed connection hangs the caller — and
+        // the New project form blocks on this check.
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?
+        .get(url)
+        .bearer_auth(&token)
+        .header("user-agent", UA)
+        .header("accept", "application/vnd.github+json")
+        .send()
+        .await
+        .ok()
 }
 
 /// What the New project form needs about a repo, from one API call.
@@ -38,15 +55,7 @@ pub struct RepoMeta {
 /// The signed-in GitHub login, so the UI can name the account a new repo lands
 /// on instead of guessing "you". `None` when there's no usable token.
 pub async fn viewer_login() -> Option<String> {
-    let token = resolve_github_token()?;
-    let res = reqwest::Client::new()
-        .get("https://api.github.com/user")
-        .bearer_auth(&token)
-        .header("user-agent", UA)
-        .header("accept", "application/vnd.github+json")
-        .send()
-        .await
-        .ok()?;
+    let res = authed_get("https://api.github.com/user").await?;
     if !res.status().is_success() {
         return None;
     }
@@ -61,15 +70,14 @@ pub async fn viewer_login() -> Option<String> {
 /// API hiccup); callers treat that as "assume access" so a check outage never
 /// forces a surprise fork.
 pub async fn repo_meta(owner: &str, repo: &str) -> Option<RepoMeta> {
-    let token = resolve_github_token()?;
-    let res = reqwest::Client::new()
-        .get(format!("https://api.github.com/repos/{owner}/{repo}"))
-        .bearer_auth(&token)
-        .header("user-agent", UA)
-        .header("accept", "application/vnd.github+json")
-        .send()
-        .await
-        .ok()?;
+    // Encoded: owner/repo reach here straight from a text field, and a stray
+    // `/` or `..` would otherwise re-point the request at another endpoint.
+    let res = authed_get(&format!(
+        "https://api.github.com/repos/{}/{}",
+        urlencoding::encode(owner),
+        urlencoding::encode(repo)
+    ))
+    .await?;
     match res.status() {
         // Not visible with this token: definitely can't push.
         reqwest::StatusCode::NOT_FOUND => Some(RepoMeta {

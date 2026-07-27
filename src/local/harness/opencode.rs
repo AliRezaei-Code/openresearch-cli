@@ -69,6 +69,14 @@ impl Harness for OpenCode {
             info.auth_method = Some("oauth");
             info.account = Some(providers.join(", "));
         }
+        // `opencode models` only lists providers it can actually authenticate,
+        // so a non-empty list means credentials resolved even with no
+        // auth.json — env keys or opencode.json. Claude and Codex have the
+        // equivalent env fallback; without this, those users read as signed out.
+        if !info.authenticated && !models.is_empty() {
+            info.authenticated = true;
+            info.auth_method = Some("apiKey");
+        }
 
         info.agent_ready = info.installed && info.authenticated;
         if info.agent_ready {

@@ -68,6 +68,9 @@
   --radius-lg: 10px;
   --radius-xl: 12px;
   --radius-full: 999px;
+  /* Top offset for centred-ish modals. Capped in px so a short laptop screen
+     doesn't give up a third of its height to dead space. */
+  --modal-top: min(30vh, 260px);
 
   /* xterm surface — deliberately dark in both themes; keep in sync with the
      terminal theme in LogTerminal.tsx. */
@@ -2089,8 +2092,9 @@ textarea::placeholder {
   font-size: var(--fs-sm);
   color: var(--subtext);
 }
-/* Commands to type (`claude auth login`) read as a chip, matching `.md code`. */
-.onb-card-meta code {
+/* Inline command chips, wherever renderNote() emits them. */
+.onb-card-meta code,
+.model-more code {
   font-family: var(--mono);
   font-size: var(--fs-xs);
   background: var(--panel);
@@ -2366,15 +2370,15 @@ textarea::placeholder {
      tab, and centering would slide the tab row up/down under the cursor. */
   align-items: flex-start;
   justify-content: center;
-  padding: 30vh 16px 24px;
+  padding: var(--modal-top) 16px 24px;
   overflow-y: auto;
   z-index: 100;
 }
 .modal {
   width: 480px;
   max-width: 94vw;
-  /* Leaves room for the backdrop's 30vh top offset + bottom padding. */
-  max-height: 66vh;
+  /* Derived from the offset so the two can't drift out of sync. */
+  max-height: calc(100vh - var(--modal-top) - 48px);
   overflow-y: auto;
   background: var(--base);
   border: 1px solid var(--border);
@@ -3600,14 +3604,6 @@ a.files-pill:hover {
   padding: 4px 8px 8px;
   font-size: var(--fs-xs);
   color: var(--muted);
-}
-.model-more code {
-  font-family: var(--mono);
-  background: var(--panel);
-  border: 1px solid var(--border-variant);
-  border-radius: var(--radius-xs);
-  padding: 1px 5px;
-  white-space: nowrap;
 }
 /* Mid-session footer: the harness is fixed, so only its models are offered. */
 .model-locked-note {

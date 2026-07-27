@@ -585,6 +585,7 @@ export default function App() {
             onCreated={onProjectCreated}
             onDeleted={onProjectDeleted}
             openNewProject={justOnboarded}
+            onNewProjectOpened={() => setJustOnboarded(false)}
           />
         ) : (
           <Onboarding

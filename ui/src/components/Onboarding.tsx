@@ -26,6 +26,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   const [git, setGit] = useState<GitSettings | null>(null);
   const [telemetry, setTelemetryState] = useState<TelemetrySettings | null>(null);
   const [checking, setChecking] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   // orx can't chat or run autoresearch without a signed-in agent, so step 1 is
   // a hard gate. Null (still detecting) counts as not-ready: better a briefly
@@ -37,13 +38,23 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   // checking) counts as not-connected, same as the agent gate.
   const githubConnected = git?.githubTokenSource != null;
 
+  // A rejected probe must not leave state at null forever: the gates read null
+  // as not-ready, so a transient failure would disable Continue with no hint
+  // and no way out — and onboarding *is* the whole app on first boot.
   const load = (refresh: boolean) => {
     setChecking(true);
+    setLoadError(null);
     void Promise.allSettled([
       getHarnesses(refresh).then(setHarnesses),
       getGitSettings().then(setGit),
       getTelemetry().then(setTelemetryState),
-    ]).finally(() => setChecking(false));
+    ])
+      .then((results) => {
+        if (results.some((r) => r.status === "rejected")) {
+          setLoadError("Couldn't reach orx. Check it's still running, then re-check.");
+        }
+      })
+      .finally(() => setChecking(false));
   };
   useEffect(() => load(false), []);
 
@@ -78,8 +89,13 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 harnesses.map((h) => <AgentCard key={h.id} h={h} />)
               )}
             </div>
-            {harnesses !== null && !anyAgentReady && (
-              <p className="onb-gate-hint">Sign in to at least one agent to continue.</p>
+            {loadError ? (
+              <p className="onb-gate-hint">{loadError}</p>
+            ) : (
+              harnesses !== null &&
+              !anyAgentReady && (
+                <p className="onb-gate-hint">Sign in to at least one agent to continue.</p>
+              )
             )}
             <div className="onb-actions">
               <button className="btn ghost" onClick={() => load(true)} disabled={checking}>
@@ -110,8 +126,8 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
             <div className="onb-cards">
               <GitCard git={git} onUpdate={setGit} />
             </div>
-            {git !== null && !githubConnected && (
-              <p className="onb-gate-hint">Connect GitHub to continue.</p>
+            {(loadError || (git !== null && !githubConnected)) && (
+              <p className="onb-gate-hint">{loadError ?? "Connect GitHub to continue."}</p>
             )}
             <div className="onb-actions">
               <button className="btn ghost" onClick={() => setStep(0)}>

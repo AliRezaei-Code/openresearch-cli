@@ -65,9 +65,6 @@ export function NewProjectForm({
   const [repoInput, setRepoInput] = useState("");
   const [name, setName] = useState("");
   const [nameTouched, setNameTouched] = useState(false);
-  // No branch picker: the server uses the repo's own default branch. It's
-  // write-once, invisible after creation, and right for ~everyone — so it's a
-  // setting, not a question worth asking during project creation.
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -85,7 +82,6 @@ export function NewProjectForm({
   // force-forks when this is false, so the fork choice is only a real choice
   // when it's true — otherwise we state what will happen instead of asking.
   const [canPush, setCanPush] = useState<boolean | null>(null);
-  const [checkingAccess, setCheckingAccess] = useState(false);
   // The signed-in GitHub login, so previews name the real account. Falls back
   // to "you" when there's no usable token.
   const [ghLogin, setGhLogin] = useState<string | null>(null);
@@ -95,7 +91,6 @@ export function NewProjectForm({
       .catch(() => setGhLogin(null));
   }, []);
   const ghOwner = ghLogin ?? "you";
-  const accessSeq = useRef(0);
 
   const parsed = parseRepo(repoInput);
   const valid = Boolean(
@@ -150,35 +145,31 @@ export function NewProjectForm({
   useEffect(() => {
     if (!repoKey) {
       setCanPush(null);
-      setCheckingAccess(false);
       return;
     }
     const [owner, repo] = repoKey.split("/");
+    // null means "asking" — reset so a previous repo's answer never describes
+    // this one while the check is in flight.
+    setCanPush(null);
     let live = true;
-    setCheckingAccess(true);
     const t = setTimeout(() => {
-      // seq is claimed when the request actually starts, not on every
-      // keystroke — otherwise a superseded effect bumps it and the in-flight
-      // response fails its own guard, leaving "checking…" stuck forever.
-      const seq = ++accessSeq.current;
       repoAccess(owner, repo)
         .then((r) => {
-          if (!live || seq !== accessSeq.current) return;
+          if (!live) return;
           setCanPush(r.canPush);
-          // No push access → the server copies regardless; keep the two in sync.
-          if (!r.canPush) setRepoMode("fork");
+          // Keep the toggle in sync with what the server will actually do:
+          // it force-copies without push access, and a stale "fork" left over
+          // from a previous repo would silently copy one the user can push to.
+          setRepoMode(r.canPush ? "use" : "fork");
         })
         .catch(() => {
           // Unreachable check: assume access, matching the server's fallback.
-          if (live && seq === accessSeq.current) setCanPush(true);
-        })
-        .finally(() => {
-          if (live && seq === accessSeq.current) setCheckingAccess(false);
+          if (live) setCanPush(true);
         });
     }, 400);
+    // `live` alone drops superseded responses — the cleanup runs before the
+    // next effect, so no sequence counter is needed.
     return () => {
-      // A newer effect owns the spinner now; never leave it on for a repo key
-      // nobody is waiting for.
       live = false;
       clearTimeout(t);
     };
@@ -250,7 +241,7 @@ export function NewProjectForm({
   // Everything below the repo input is about a *specific* repo, so none of it
   // renders until one is entered and we know whether the user can push to it.
   // Showing "Use this repo" for a repo they can't push to is a false choice.
-  const repoFields = !parsed ? null : checkingAccess || canPush === null ? (
+  const repoFields = !parsed ? null : canPush === null ? (
     <span className="repo-hint">Checking your access to {repoLabel}…</span>
   ) : (
     <>
@@ -289,20 +280,23 @@ export function NewProjectForm({
           </span>
         </>
       )}
-      <div className="row2">
-        <label>
-          Project name
-          <input
-            value={name}
-            onChange={(e) => {
-              setNameTouched(true);
-              setName(e.target.value);
-            }}
-            placeholder="my-research"
-          />
-        </label>
-      </div>
     </>
+  );
+
+  // Outside repoFields: the name doesn't depend on repo access, and burying it
+  // behind the check would leave the form unsubmittable if that request stalls.
+  const nameField = (
+    <label>
+      Project name
+      <input
+        value={name}
+        onChange={(e) => {
+          setNameTouched(true);
+          setName(e.target.value);
+        }}
+        placeholder="my-research"
+      />
+    </label>
   );
 
   return (
@@ -351,6 +345,7 @@ export function NewProjectForm({
             </span>
           </label>
           {repoFields}
+          {parsed && nameField}
         </>
       )}
 
@@ -401,22 +396,6 @@ export function NewProjectForm({
                 Change
               </button>
             </div>
-            {/* Say outright whether the paper had code, so the repo field below
-                is either "here's what we found" or "there wasn't one". */}
-            <span className="repo-hint">
-              {paper.repoUrl && parseRepo(paper.repoUrl) ? (
-                <>
-                  This paper links to <strong>{parseRepo(paper.repoUrl)!.owner}/
-                  {parseRepo(paper.repoUrl)!.repo}</strong>
-                  {paper.repoStars != null ? ` · ★ ${paper.repoStars}` : ""} — orx will clone it.
-                </>
-              ) : (
-                <>
-                  No code is linked to this paper on alphaXiv. Enter a repo yourself, or leave it
-                  blank to start from a blank private repo.
-                </>
-              )}
-            </span>
             <label>
               GitHub repository{paper.repoUrl ? "" : " (optional)"}
               <input
@@ -436,25 +415,14 @@ export function NewProjectForm({
                     : "No code linked to this paper — a blank private repo will be created"}
               </span>
             </label>
-            {parsed ? (
-              repoFields
-            ) : (
-              <label>
-                Project name
-                <input
-                  value={name}
-                  onChange={(e) => {
-                    setNameTouched(true);
-                    setName(e.target.value);
-                  }}
-                  placeholder="my-research"
-                />
-                <span className={`repo-hint mono ${name.trim() ? "ok" : ""}`}>
-                  {name.trim()
-                    ? `Creates github.com/${ghOwner}/${slugify(name)} · private`
-                    : "A blank private repo is created on your GitHub account"}
-                </span>
-              </label>
+            {parsed && repoFields}
+            {nameField}
+            {!parsed && (
+              <span className={`repo-hint mono ${name.trim() ? "ok" : ""}`}>
+                {name.trim()
+                  ? `Creates github.com/${ghOwner}/${slugify(name)} · private`
+                  : "A blank private repo is created on your GitHub account"}
+              </span>
             )}
           </>
         ))}

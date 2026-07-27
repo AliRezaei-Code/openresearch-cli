@@ -1645,10 +1645,7 @@ async fn github_repo_access(Query(q): Query<RepoAccessQuery>) -> ApiResult {
     }
     let meta = local::github::repo_meta(&owner, &repo).await;
     Ok(Json(json!({
-        "canPush": meta.as_ref().map(|m| m.can_push).unwrap_or(true),
-        // Distinguishes "we checked" from "we couldn't tell" for the copy.
-        "known": meta.is_some(),
-        "defaultBranch": meta.as_ref().and_then(|m| m.default_branch.clone()),
+        "canPush": meta.map(|m| m.can_push).unwrap_or(true),
     })))
 }
 
