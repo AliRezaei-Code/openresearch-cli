@@ -276,7 +276,7 @@ the output.
 Follow the auto-research loop from the guide: create the baseline experiment
 first when the project is empty, branch variants off it, fill the user's available
 GPU capacity with useful parallel runs, wait on completions, and analyze each result before deciding
-to refill, promote, or stop.
+to repair, refill, promote, or stop.
 
 ## Prerequisite
 
@@ -301,7 +301,7 @@ module's detail with `orx skill <name>` (e.g. `orx skill experiment-tree`,
 Then carry out the user's research goal, following the auto-research loop from that
 guide: create the baseline experiment first when the project is empty, branch
 variants off it, fill the available GPU capacity with useful parallel runs, wait on completions, and
-analyze each result before deciding to refill, promote, or stop.
+analyze each result before deciding to repair, refill, promote, or stop.
 
 If any command reports `Not logged in`, ask the user to run `orx login` first.
 

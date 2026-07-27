@@ -216,6 +216,9 @@ orx exp wait <expId> --interval 10 --timeout 3600   # tune polling
   when one is known). Provider spin-up failures are usually transient and
   retryable: re-launch, or pick a different flavor or backend, rather than
   treating the experiment as a dead end.
+- **A failed run is not a new node.** Re-launch the same `<expId>` — a failure
+  answered nothing, so the node is still repairable in place
+  (`orx-experiment-tree`).
 
 ## Sizing compute
 
