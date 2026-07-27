@@ -298,9 +298,11 @@ export function NewProjectForm({
     </>
   );
 
-  // Outside repoFields: the name doesn't depend on repo access, so a stalled
-  // check can't leave the form unsubmittable.
-  const nameField = (autoFocus = false) => (
+  // A plain element, not a function returning one: `{cond && nameField()}` and
+  // `{cond && nameField}` both typecheck, and the second silently renders
+  // nothing. Outside repoFields so a stalled access check can't leave the form
+  // unsubmittable.
+  const nameField = (
     <label>
       Project name
       <input
@@ -310,7 +312,6 @@ export function NewProjectForm({
           setName(e.target.value);
         }}
         placeholder="my-research"
-        autoFocus={autoFocus}
       />
     </label>
   );
@@ -441,14 +442,14 @@ export function NewProjectForm({
               </span>
             </label>
             {parsed && repoFields}
-            {nameField()}
+            {nameField}
             {!parsed && blankRepoHint}
           </>
         ))}
 
       {mode === "new" && (
         <>
-          {nameField(true)}
+          {nameField}
           {blankRepoHint}
         </>
       )}

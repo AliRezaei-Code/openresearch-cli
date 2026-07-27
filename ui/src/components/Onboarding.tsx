@@ -1,6 +1,6 @@
 import { ArrowLeft, ArrowRight, Check, Copy, RefreshCw } from "lucide-react";
 import { Wordmark } from "./Wordmark";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   getGitSettings,
   getHarnesses,
@@ -14,14 +14,15 @@ import {
 } from "../api";
 import { GitTokenForm } from "./GitTokenForm";
 
-/** First-run walkthrough: the detected coding agents, then GitHub access, then
- * the usage-analytics choice, then hand off to the (empty) projects page.
- * Steps 1 and 2 are hard gates — orx can't chat or create a project without
- * them. The data-dir choice deliberately lives in Settings → Storage instead:
- * the default suits almost everyone, and Settings can also *move* existing
- * data, which this flow never could. */
 const RETRY_COPY = "Couldn't reach orx. Check it's still running, then re-check.";
 
+/** First-run walkthrough: the detected coding agents, then GitHub access, then
+ * the usage-analytics choice, then hand off to the (empty) projects page.
+ * Step 1 gates — orx can't chat without a signed-in agent. Step 2 doesn't:
+ * cloning and pushing work over SSH keys, so a missing token is a hint, not a
+ * wall. The data-dir choice deliberately lives in Settings → Storage instead:
+ * the default suits almost everyone, and Settings can also *move* existing
+ * data, which this flow never could. */
 export function Onboarding({ onDone }: { onDone: () => void }) {
   const [step, setStep] = useState<0 | 1 | 2>(0);
   const [harnesses, setHarnesses] = useState<Harness[] | null>(null);
@@ -49,16 +50,23 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   // A rejected probe must not leave state at null forever: the gates read null
   // as not-ready, so a transient failure would disable Continue with no hint
   // and no way out — and onboarding *is* the whole app on first boot.
+  // Drops a slow probe whose answer a newer load (or a token save) has already
+  // superseded — otherwise a Save landing mid-refresh gets overwritten by the
+  // pre-save snapshot and the card reads "Not connected" until the next check.
+  const loadSeq = useRef(0);
   const load = (refresh: boolean) => {
+    const seq = ++loadSeq.current;
     setChecking(true);
     setHarnessError(false);
     setGitError(false);
+    const fresh = () => seq === loadSeq.current;
     void Promise.allSettled([
-      getHarnesses(refresh).then(setHarnesses),
-      getGitSettings().then(setGit),
-      getTelemetry().then(setTelemetryState),
+      getHarnesses(refresh).then((h) => fresh() && setHarnesses(h)),
+      getGitSettings().then((g) => fresh() && setGit(g)),
+      getTelemetry().then((t) => fresh() && setTelemetryState(t)),
     ])
       .then(([harness, git]) => {
+        if (!fresh()) return;
         // Clear the stale answer too, so "errored", "loading" and "loaded"
         // stay mutually exclusive — otherwise a failed re-check leaves old
         // cards on screen saying "not signed in" while the gate un-gates.
@@ -71,7 +79,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
           setGit(null);
         }
       })
-      .finally(() => setChecking(false));
+      .finally(() => fresh() && setChecking(false));
   };
   useEffect(() => load(false), []);
 
@@ -142,7 +150,15 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
               {gitError ? (
                 <div className="onb-card-meta">{RETRY_COPY}</div>
               ) : (
-                <GitCard git={git} onUpdate={setGit} />
+                <GitCard
+                  git={git}
+                  onUpdate={(g) => {
+                    // A save is newer than any probe still in flight.
+                    loadSeq.current++;
+                    setGit(g);
+                    setGitError(false);
+                  }}
+                />
               )}
             </div>
             {/* Soft, and honestly so: cloning and pushing work over SSH keys
