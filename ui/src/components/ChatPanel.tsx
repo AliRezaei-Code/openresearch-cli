@@ -1001,41 +1001,57 @@ export function ChatPanel({
     syncChipScroll();
   }, [pickedSkill]);
 
-  // Auto-grow the composer to fit its content, up to the CSS max-height cap
-  // (past it the textarea scrolls internally). An empty draft clears the
-  // inline height instead of measuring: the resting size comes from
-  // rows/min-height, and Chrome counts placeholder overflow in scrollHeight —
-  // measuring before flex layout settles (textarea a few px wide) would bake
-  // in a huge wrapped-placeholder height.
-  const autosizeComposer = useCallback(() => {
+  /** Auto-grow the composer to fit its content, up to the CSS max-height cap
+   * (past it the textarea scrolls internally). `field-sizing: content` would
+   * do this in one CSS line but is still unshipped in Firefox. Reads only
+   * refs, so it's safe to capture in the stable ref callback below.
+   *
+   * Empty value (checked on the DOM, not `draft` — the width observer runs
+   * outside render) hands the height back to CSS (rows/min-height) instead of
+   * measuring: placeholder overflow counts toward scrollHeight, so measuring
+   * the resting box would mis-size it. Non-empty collapses to `auto` first so
+   * the box can also shrink — skipped at zero width (hidden or mid-layout),
+   * where wrapping makes scrollHeight nonsense; the width observer re-measures
+   * once layout lands. */
+  function autosizeComposer() {
     const el = composerRef.current;
     if (!el) return;
     if (el.value === "") {
       el.style.height = "";
-    } else {
+    } else if (el.clientWidth > 0) {
       el.style.height = "auto";
       el.style.height = `${el.scrollHeight}px`;
     }
     syncChipScroll();
-  }, []);
+  }
   // Layout effect so the height lands before paint. chipIndent shifts
   // wrapping (text-indent past the chip), so re-measure when it changes.
-  useLayoutEffect(autosizeComposer, [autosizeComposer, draft, chipIndent]);
-  // Wrapping — and therefore the needed height — changes with the textarea's
-  // width (pane resize, sidebar toggle), so re-measure when it does.
-  useEffect(() => {
-    const el = composerRef.current;
+  useLayoutEffect(() => autosizeComposer(), [draft, chipIndent]);
+  /** Ref callback for the textarea: rebinds the width observer and re-measures
+   * on every mount — the composer unmounts on settings views, and remounting
+   * must re-apply the draft's height (an effect keyed on [draft] would not
+   * re-run). Wrapping — and so the needed height — changes with the width
+   * (pane resize, sidebar toggle), hence the observer. Stable identity so
+   * React doesn't detach/reattach it every render. */
+  const composerRO = useRef<ResizeObserver | null>(null);
+  const attachComposer = useCallback((el: HTMLTextAreaElement | null) => {
+    composerRO.current?.disconnect();
+    composerRO.current = null;
+    composerRef.current = el;
     if (!el) return;
     let lastWidth = el.clientWidth;
     const ro = new ResizeObserver(() => {
-      if (el.clientWidth !== lastWidth) {
-        lastWidth = el.clientWidth;
-        autosizeComposer();
-      }
+      // Width changes only: autosize itself changes the height, which
+      // re-fires the observer — gating on width breaks that feedback loop.
+      const width = el.clientWidth;
+      if (width === 0 || width === lastWidth) return;
+      lastWidth = width;
+      autosizeComposer();
     });
     ro.observe(el);
-    return () => ro.disconnect();
-  }, [autosizeComposer]);
+    composerRO.current = ro;
+    autosizeComposer();
+  }, []);
 
   /** The chip belongs to the first line of *content*, so when the textarea
    * scrolls it must ride along (and clip at the wrapper) instead of sitting
@@ -1860,7 +1876,7 @@ export function ChatPanel({
               </span>
             )}
             <textarea
-              ref={composerRef}
+              ref={attachComposer}
               value={draft}
               style={pickedSkill ? { textIndent: chipIndent } : undefined}
               onScroll={syncChipScroll}

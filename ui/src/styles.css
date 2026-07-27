@@ -1267,6 +1267,9 @@ textarea::placeholder {
   resize: none;
   padding: 10px 12px 4px;
   font-size: var(--fs-md);
+  /* ChatPanel auto-grows the inline height with the draft; min-height floors
+     the cleared empty state and max-height caps the growth (past it the
+     textarea scrolls internally). */
   min-height: 42px;
   max-height: 180px;
 }
