@@ -245,8 +245,13 @@ fn to_wire_part(part: &Value) -> Option<WirePart> {
 /// opencode's `session.created` carries the child's `parentID` (our session) but
 /// not the spawning tool call, so we attribute to the latest unclaimed `task`
 /// row; in the common single-task case this is exact.
+///
+/// Only top-level `task` rows are candidates, so nesting is one level deep: a
+/// sub-agent that spawns its *own* sub-agent emits a `session.created` whose
+/// `parentID` is the child session (not ours), so the grandchild isn't
+/// registered and its events fall through to the foreign-session drop.
 fn newest_task_part_id(parts: &[WirePart], claimed: &HashMap<String, String>) -> Option<String> {
-    let taken: std::collections::HashSet<&str> = claimed.values().map(String::as_str).collect();
+    let taken: HashSet<&str> = claimed.values().map(String::as_str).collect();
     parts
         .iter()
         .rev()
