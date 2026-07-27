@@ -221,7 +221,10 @@ fn parse_model_list(result: &Value) -> Vec<ModelInfo> {
                         .collect()
                 })
                 .unwrap_or_default();
-            Some(ModelInfo::new(id).with_reasoning(&efforts))
+            Some(ModelInfo::new(id).with_reasoning(&efforts).with_label(
+                m.get("displayName").and_then(Value::as_str),
+                m.get("description").and_then(Value::as_str),
+            ))
         })
         .collect()
 }
@@ -2878,6 +2881,8 @@ requires_openai_auth = false
             ids(&models[1]).unwrap(),
             ["default", "low", "medium", "high", "xhigh"]
         );
+        // The catalog's display name rides along for the picker.
+        assert_eq!(models[0].display_name.as_deref(), Some("GPT-5.6 Sol"));
         // Junk shapes parse to nothing rather than panicking.
         assert!(parse_model_list(&serde_json::json!({})).is_empty());
         assert!(parse_model_list(&serde_json::json!({ "data": "nope" })).is_empty());

@@ -2,6 +2,7 @@ import { Check, ChevronDown, Lock } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   getHarnesses,
+  harnessModelLabel,
   modelLabel,
   reasoningFor,
   reconcileReasoning,
@@ -147,9 +148,19 @@ export function ModelPicker({
     setFilter("");
   };
 
+  // Pill label: prefer the catalog's own name for the selected model (the
+  // Claude aliases like `opus[1m]` are meaningless prettified).
+  const selected =
+    value?.model != null
+      ? harnesses
+          .find((h) => h.id === value.harness)
+          ?.models.find((m) => m.id === value.model)
+      : undefined;
   const label = value
     ? value.model
-      ? modelLabel(value.model)
+      ? selected
+        ? harnessModelLabel(selected)
+        : modelLabel(value.model)
       : "Default model"
     : "Model";
 
@@ -196,11 +207,15 @@ export function ModelPicker({
                       <button
                         key={m.id}
                         className="model-item"
+                        title={m.id}
                         onClick={() => pick(harness, m.id)}
                       >
                         <span>
-                          {modelLabel(m.id)}
-                          <span className="model-id">{m.id}</span>
+                          {harnessModelLabel(m)}
+                          {/* The catalog blurb carries what the alias doesn't —
+                              for Claude, the resolved version ("Opus 4.8 with
+                              1M context · …"). Fall back to the raw id. */}
+                          <span className="model-id">{m.description ?? m.id}</span>
                         </span>
                         {value?.harness === harness.id && value?.model === m.id && (
                           <Check size={13} />

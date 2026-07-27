@@ -28,6 +28,16 @@ pub struct ModelInfo {
     /// rather than falling back.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_levels: Option<Vec<super::options::OptionChoice>>,
+    /// The catalog's own human name for the model (`Opus`, `GPT-5.6 Sol`,
+    /// `Big Pickle`). Absent for statically-listed fallback models, where the
+    /// UI derives a label from the id instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// The catalog's one-line blurb — for Claude this is where the resolved
+    /// version lives (`Opus 4.8 with 1M context · Best for everyday, complex
+    /// tasks`), since its picker aliases (`opus[1m]`) are unversioned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 impl ModelInfo {
@@ -37,7 +47,20 @@ impl ModelInfo {
         Self {
             id: id.into(),
             reasoning_levels: None,
+            display_name: None,
+            description: None,
         }
+    }
+
+    /// Attach the catalog's display name / description, when it has them.
+    pub(super) fn with_label(
+        mut self,
+        display_name: Option<&str>,
+        description: Option<&str>,
+    ) -> Self {
+        self.display_name = display_name.map(str::to_string);
+        self.description = description.map(str::to_string);
+        self
     }
 
     /// Attach this model's own reasoning choices, from native ids. An empty

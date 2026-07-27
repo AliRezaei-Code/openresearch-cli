@@ -312,16 +312,20 @@ fn parse_verbose_models(out: &str) -> Vec<super::ModelInfo> {
         }
         // An unparseable block still yields the model, just without variants —
         // never drop a model the CLI reported.
-        let variants = serde_json::from_str::<Value>(&block)
-            .ok()
-            .and_then(|v| variant_ids(&v));
-        models.push(match variants {
+        let parsed = serde_json::from_str::<Value>(&block).ok();
+        let variants = parsed.as_ref().and_then(variant_ids);
+        let name = parsed
+            .as_ref()
+            .and_then(|v| v.get("name"))
+            .and_then(Value::as_str);
+        let model = match variants {
             Some(ids) => {
                 let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
                 super::ModelInfo::new(header).with_reasoning(&refs)
             }
             None => super::ModelInfo::new(header),
-        });
+        };
+        models.push(model.with_label(name, None));
     }
     models
 }

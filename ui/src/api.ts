@@ -704,7 +704,17 @@ export interface HarnessModel {
    * directly.
    */
   reasoningLevels?: OptionChoice[];
+  /** The catalog's own human name ("Opus", "GPT-5.6 Sol"). Absent on
+   * statically-listed fallback models — derive from the id then. */
+  displayName?: string;
+  /** The catalog's one-line blurb. For Claude this carries the resolved
+   * version ("Opus 4.8 with 1M context · …") — its aliases don't. */
+  description?: string;
 }
+
+/** Display label for a harness model: the catalog's own name when it has one,
+ * else prettified from the id. */
+export const harnessModelLabel = (m: HarnessModel) => m.displayName ?? modelLabel(m.id);
 
 /** One selectable value in a composer toggle (permission mode / reasoning). */
 export interface OptionChoice {

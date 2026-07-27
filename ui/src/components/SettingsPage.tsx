@@ -66,7 +66,7 @@ import {
   type SlurmSettings,
   type SshHost,
   type SshPreflight,
-  modelLabel,
+  harnessModelLabel,
 } from "../api";
 import { onDataDirMove } from "../events";
 import { GitTokenForm } from "./GitTokenForm";
@@ -181,7 +181,7 @@ function HarnessesTab() {
               {h.models.length > 0
                 ? `${h.models.length} available — ${h.models
                     .slice(0, 4)
-                    .map((m) => modelLabel(m.id))
+                    .map((m) => harnessModelLabel(m))
                     .join(", ")}${h.models.length > 4 ? ", …" : ""}`
                 : "none"}
             </span>
