@@ -202,11 +202,21 @@ fn parse_claude_model_list(result: &Value, ultracode: bool) -> Vec<ModelInfo> {
                 },
                 None => (m.get("displayName").and_then(Value::as_str), None),
             };
-            Some(
-                ModelInfo::new(value)
-                    .with_reasoning(&efforts)
-                    .with_label(name, blurb),
-            )
+            let mut info = ModelInfo::new(value)
+                .with_reasoning(&efforts)
+                .with_label(name, blurb);
+            // Claude reports no default *tier* because its unset default isn't
+            // one: with adaptive thinking, the CLI scales effort per request.
+            // Name the sentinel row for what actually runs — preselecting a
+            // fixed tier here would pin behavior the user never asked for.
+            if m.get("supportsAdaptiveThinking") == Some(&Value::Bool(true)) {
+                if let Some(choices) = info.reasoning_levels.as_mut() {
+                    if let Some(sentinel) = choices.first_mut() {
+                        sentinel.label = "Adaptive".to_string();
+                    }
+                }
+            }
+            Some(info)
         })
         .collect()
 }
@@ -1279,6 +1289,7 @@ mod tests {
                     "displayName": "Fable",
                     "description": "Fable 5 · Most capable",
                     "supportsEffort": true,
+                    "supportsAdaptiveThinking": true,
                     "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
                 },
                 {
@@ -1304,6 +1315,14 @@ mod tests {
         // segment (the alias ids and `displayName` are unversioned).
         assert_eq!(with[0].display_name.as_deref(), Some("Fable 5"));
         assert_eq!(with[0].description.as_deref(), Some("Most capable"));
+        // Claude's unset default is adaptive thinking, not any fixed tier, so
+        // the sentinel row is named for what actually runs — and no concrete
+        // tier is preselected.
+        assert_eq!(
+            with[0].reasoning_levels.as_ref().unwrap()[0].label,
+            "Adaptive"
+        );
+        assert_eq!(with[0].default_reasoning_level, None);
         // No description → the plain displayName stands.
         assert_eq!(with[1].display_name.as_deref(), Some("Haiku"));
         assert_eq!(with[1].description, None);

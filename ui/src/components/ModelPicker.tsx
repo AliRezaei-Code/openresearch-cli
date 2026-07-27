@@ -334,9 +334,15 @@ export function OptionPicker({
                       genuinely new concept here, and "Default" alone doesn't
                       say that the CLI's own configured effort is what applies. */}
                   <span className="option-default">
-                    {defaultChoice.id === REASONING_DEFAULT_ID
-                      ? " · CLI configuration"
-                      : " · Default"}
+                    {defaultChoice.id === REASONING_DEFAULT_ID &&
+                    defaultChoice.label === "Default"
+                      ? // The unnamed sentinel: nothing better to say than
+                        // where the behavior comes from.
+                        " · CLI configuration"
+                      : // A named default — a concrete tier ("Medium"), a named
+                        // mode ("Adaptive"), or a permission mode — gets the
+                        // standard marker.
+                        " · Default"}
                   </span>
                 </span>
                 {effectiveId === defaultChoice.id && <Check size={13} />}

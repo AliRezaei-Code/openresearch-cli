@@ -130,7 +130,7 @@ fn codex_model_reasoning(model: &str) -> Option<&'static [&'static str]> {
 /// spawn, timeout, old codex without the method — returns `None` and the
 /// caller falls back to the static table. Hidden catalog entries are skipped
 /// (the server already filters them by default; the guard is belt-and-braces).
-async fn codex_model_list(bin: &Path) -> Option<Vec<ModelInfo>> {
+async fn codex_model_list(bin: &Path, configured_effort: Option<&str>) -> Option<Vec<ModelInfo>> {
     let fut = async {
         let mut child = Command::new(bin)
             .arg("app-server")
@@ -188,7 +188,7 @@ async fn codex_model_list(bin: &Path) -> Option<Vec<ModelInfo>> {
         )
         .await?;
         let resp = recv(&mut lines, 2).await?;
-        let models = parse_model_list(resp.get("result")?);
+        let models = parse_model_list(resp.get("result")?, configured_effort);
         (!models.is_empty()).then_some(models)
     };
     tokio::time::timeout(Duration::from_secs(15), fut)
@@ -199,7 +199,14 @@ async fn codex_model_list(bin: &Path) -> Option<Vec<ModelInfo>> {
 
 /// `model/list` result → per-model `ModelInfo`, efforts attached in catalog
 /// order. Split from the transport for testability.
-fn parse_model_list(result: &Value) -> Vec<ModelInfo> {
+///
+/// Each model gets a *concrete* preselected tier rather than a "no override"
+/// sentinel: the tier that actually runs when the user picks nothing, which
+/// codex resolves as the `config.toml` `model_reasoning_effort` override when
+/// that's set (and supported by the model), else the catalog's own
+/// `defaultReasoningEffort`. Preselecting-and-sending that tier is equivalent
+/// to sending nothing, and the picker shows a real value instead of "Default".
+fn parse_model_list(result: &Value, configured_effort: Option<&str>) -> Vec<ModelInfo> {
     let Some(data) = result.get("data").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -221,10 +228,20 @@ fn parse_model_list(result: &Value) -> Vec<ModelInfo> {
                         .collect()
                 })
                 .unwrap_or_default();
-            Some(ModelInfo::new(id).with_reasoning(&efforts).with_label(
+            let catalog_default = m.get("defaultReasoningEffort").and_then(Value::as_str);
+            let default = configured_effort
+                .filter(|e| efforts.contains(e))
+                .or(catalog_default);
+            let info = ModelInfo::new(id).with_label(
                 m.get("displayName").and_then(Value::as_str),
                 m.get("description").and_then(Value::as_str),
-            ))
+            );
+            Some(match default {
+                Some(default) => info.with_reasoning_default(&efforts, default),
+                // No reported default (an older catalog shape) → keep the
+                // sentinel-led list, where "no override" is the safe lead.
+                None => info.with_reasoning(&efforts),
+            })
         })
         .collect()
 }
@@ -236,8 +253,19 @@ pub struct Codex;
 struct CodexConfig {
     model: Option<String>,
     model_provider: Option<String>,
+    /// The user's configured effort override. Codex resolves it above the
+    /// catalog's per-model `defaultReasoningEffort`, so the picker's
+    /// preselected tier must too.
+    model_reasoning_effort: Option<String>,
     #[serde(default)]
     model_providers: HashMap<String, CodexProvider>,
+}
+
+/// The `model_reasoning_effort` the user configured in `config.toml`, if any.
+fn parse_configured_effort(raw: &str) -> Option<String> {
+    toml::from_str::<CodexConfig>(raw)
+        .ok()?
+        .model_reasoning_effort
 }
 
 #[derive(Deserialize)]
@@ -322,11 +350,11 @@ impl Harness for Codex {
             info.bin_path = Some(bin.to_string_lossy().into_owned());
         }
         let home = codex_home();
-        let custom_provider = home
+        let config_raw = home
             .as_ref()
-            .and_then(|home| std::fs::read_to_string(home.join("config.toml")).ok())
-            .as_deref()
-            .and_then(parse_custom_provider);
+            .and_then(|home| std::fs::read_to_string(home.join("config.toml")).ok());
+        let custom_provider = config_raw.as_deref().and_then(parse_custom_provider);
+        let configured_effort = config_raw.as_deref().and_then(parse_configured_effort);
 
         if let Some(provider) = custom_provider.as_ref() {
             // A provider with `requires_openai_auth = false` never writes
@@ -384,7 +412,7 @@ impl Harness for Codex {
                     // old to answer `model/list`.
                     let bin = info.bin_path.as_deref().map(Path::new);
                     let models = match bin {
-                        Some(bin) => codex_model_list(bin).await,
+                        Some(bin) => codex_model_list(bin, configured_effort.as_deref()).await,
                         None => None,
                     };
                     info = info.with_models(models.unwrap_or_else(|| {
@@ -2863,7 +2891,7 @@ requires_openai_auth = false
                 },
             ],
         });
-        let models = parse_model_list(&result);
+        let models = parse_model_list(&result, None);
         assert_eq!(
             models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
             ["gpt-5.6-sol", "gpt-5.4-mini"]
@@ -2873,19 +2901,46 @@ requires_openai_auth = false
                 .as_ref()
                 .map(|c| c.iter().map(|c| c.id.clone()).collect::<Vec<_>>())
         };
+        // A reported default means a concrete preselected tier and NO sentinel
+        // row — the picker shows the value that actually runs.
         assert_eq!(
             ids(&models[0]).unwrap(),
-            ["default", "low", "medium", "high", "xhigh", "max", "ultra"]
+            ["low", "medium", "high", "xhigh", "max", "ultra"]
         );
-        assert_eq!(
-            ids(&models[1]).unwrap(),
-            ["default", "low", "medium", "high", "xhigh"]
-        );
+        assert_eq!(models[0].default_reasoning_level.as_deref(), Some("low"));
+        assert_eq!(ids(&models[1]).unwrap(), ["low", "medium", "high", "xhigh"]);
+        assert_eq!(models[1].default_reasoning_level.as_deref(), Some("medium"));
         // The catalog's display name rides along for the picker.
         assert_eq!(models[0].display_name.as_deref(), Some("GPT-5.6 Sol"));
+
+        // A config.toml `model_reasoning_effort` outranks the catalog default —
+        // codex resolves it that way, so the preselect must too. A configured
+        // value the model doesn't support falls back to the catalog default
+        // rather than preselecting something the model rejects.
+        let configured = parse_model_list(&result, Some("xhigh"));
+        assert_eq!(
+            configured[0].default_reasoning_level.as_deref(),
+            Some("xhigh")
+        );
+        let unsupported = parse_model_list(&result, Some("ultra"));
+        assert_eq!(
+            unsupported[1].default_reasoning_level.as_deref(),
+            Some("medium"),
+            "gpt-5.4-mini has no ultra; the catalog default stands"
+        );
         // Junk shapes parse to nothing rather than panicking.
-        assert!(parse_model_list(&serde_json::json!({})).is_empty());
-        assert!(parse_model_list(&serde_json::json!({ "data": "nope" })).is_empty());
+        assert!(parse_model_list(&serde_json::json!({}), None).is_empty());
+        assert!(parse_model_list(&serde_json::json!({ "data": "nope" }), None).is_empty());
+    }
+
+    #[test]
+    fn configured_effort_reads_config_toml() {
+        assert_eq!(
+            parse_configured_effort("model_reasoning_effort = \"max\"").as_deref(),
+            Some("max")
+        );
+        assert_eq!(parse_configured_effort("model = \"gpt-5.6-sol\""), None);
+        assert_eq!(parse_configured_effort("not toml ==="), None);
     }
 
     /// `Default` must send no `model_reasoning_effort` at all — otherwise a

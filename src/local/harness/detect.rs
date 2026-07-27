@@ -38,6 +38,12 @@ pub struct ModelInfo {
     /// tasks`), since its picker aliases (`opus[1m]`) are unversioned.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// The tier that actually runs when the user picks nothing — set only when
+    /// the CLI reports it (codex's `defaultReasoningEffort`, resolved against a
+    /// `config.toml` override). When present, `reasoning_levels` carries no
+    /// `default` sentinel and the composer preselects this concrete tier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_level: Option<String>,
 }
 
 impl ModelInfo {
@@ -49,7 +55,19 @@ impl ModelInfo {
             reasoning_levels: None,
             display_name: None,
             description: None,
+            default_reasoning_level: None,
         }
+    }
+
+    /// Attach reasoning choices *with a known concrete default*: no sentinel
+    /// row, the default tier preselected instead. For catalogs that report
+    /// which tier runs when nothing is chosen (codex).
+    pub(super) fn with_reasoning_default(mut self, ids: &[&str], default: &str) -> Self {
+        self.reasoning_levels = Some(super::options::reasoning_tiers(ids));
+        // A default outside the advertised tiers would be unselectable — leave
+        // it unset then, and the composer preselects the first tier.
+        self.default_reasoning_level = ids.contains(&default).then(|| default.to_string());
+        self
     }
 
     /// Attach the catalog's display name / description, when it has them.

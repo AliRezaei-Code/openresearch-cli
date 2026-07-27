@@ -142,19 +142,30 @@ fn reasoning_label(id: &str) -> String {
     }
 }
 
+/// Native ids → labeled choices, no sentinel. For models whose *actual*
+/// default tier is known (codex reports `defaultReasoningEffort`), the picker
+/// preselects that concrete tier instead of offering a "no override" row —
+/// sending the tier the CLI would resolve anyway is equivalent, and the user
+/// sees a real value.
+pub fn reasoning_tiers(ids: &[&str]) -> Vec<OptionChoice> {
+    ids.iter()
+        // Skip a native id that collides with the sentinel: it would render
+        // as a second row that selects "no override" instead of the tier.
+        // The ids come from the CLIs' catalogs verbatim, so this is the
+        // catalog's call, not ours.
+        .filter(|id| **id != REASONING_DEFAULT_ID)
+        .map(|id| OptionChoice::new(*id, reasoning_label(id)))
+        .collect()
+}
+
 /// Build a reasoning list from native ids, led by the `Default` choice — which
-/// sends no override at all.
+/// sends no override at all. For harnesses where "no override" is genuinely
+/// different from every listed tier: Claude's unset effort means *adaptive*
+/// (not any fixed level), and opencode reports no per-model default to
+/// preselect.
 pub fn reasoning_choices(ids: &[&str]) -> Vec<OptionChoice> {
     std::iter::once(OptionChoice::new(REASONING_DEFAULT_ID, "Default"))
-        .chain(
-            ids.iter()
-                // Skip a native id that collides with the sentinel: it would
-                // render as a second, identical row that selects "no override"
-                // instead of the variant. OpenCode's ids come from its catalog
-                // verbatim, so this is the catalog's call, not ours.
-                .filter(|id| **id != REASONING_DEFAULT_ID)
-                .map(|id| OptionChoice::new(*id, reasoning_label(id))),
-        )
+        .chain(reasoning_tiers(ids))
         .collect()
 }
 

@@ -710,6 +710,10 @@ export interface HarnessModel {
   /** The catalog's one-line blurb. For Claude this carries the resolved
    * version ("Opus 4.8 with 1M context · …") — its aliases don't. */
   description?: string;
+  /** The tier that actually runs when nothing is chosen — present only when
+   * the CLI reports it (codex). When set, `reasoningLevels` has no `default`
+   * sentinel and the composer preselects this concrete tier. */
+  defaultReasoningLevel?: string;
 }
 
 /** Display label for a harness model: the catalog's own name when it has one,
@@ -754,13 +758,22 @@ export function reasoningFor(
   harness: Harness | undefined,
   modelId: string | null | undefined,
 ): { choices: OptionChoice[]; defaultId: string | null } {
-  const perModel = harness?.models.find((m) => m.id === modelId)?.reasoningLevels;
-  const choices = perModel ?? harness?.options?.reasoningLevels ?? [];
-  // The default is always the sentinel when it's on offer, so the composer
-  // sends no override unless the user picks one.
-  const defaultId = choices.some((c) => c.id === REASONING_DEFAULT_ID)
-    ? REASONING_DEFAULT_ID
-    : (harness?.options?.defaultReasoningLevel ?? null);
+  const model = harness?.models.find((m) => m.id === modelId);
+  const choices = model?.reasoningLevels ?? harness?.options?.reasoningLevels ?? [];
+  // Preselection, in order of how much the CLI actually told us:
+  //  1. the model's reported concrete default (codex) — a real tier, shown as
+  //     the value that will run;
+  //  2. the `default` sentinel when it's on offer — "send no override", for
+  //     harnesses whose unset default isn't any fixed tier (Claude's adaptive
+  //     thinking) or is unknown (opencode);
+  //  3. the harness-wide default, then the first tier.
+  const modelDefault = model?.defaultReasoningLevel;
+  const defaultId =
+    modelDefault && choices.some((c) => c.id === modelDefault)
+      ? modelDefault
+      : choices.some((c) => c.id === REASONING_DEFAULT_ID)
+        ? REASONING_DEFAULT_ID
+        : (harness?.options?.defaultReasoningLevel ?? choices[0]?.id ?? null);
   return { choices, defaultId };
 }
 
