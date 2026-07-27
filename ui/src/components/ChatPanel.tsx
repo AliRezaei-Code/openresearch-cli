@@ -1001,59 +1001,6 @@ export function ChatPanel({
     syncChipScroll();
   }, [pickedSkill]);
 
-  /** Auto-grow the composer to fit its content, up to the CSS max-height cap
-   * (past it the textarea scrolls internally). `field-sizing: content` would
-   * do this in one CSS line but is still unshipped in Firefox. Reads only
-   * refs, so it's safe to capture in the stable ref callback below.
-   *
-   * Empty value (checked on the DOM, not `draft` — the width observer runs
-   * outside render) hands the height back to CSS (rows/min-height) instead of
-   * measuring: placeholder overflow counts toward scrollHeight, so measuring
-   * the resting box would mis-size it. Non-empty collapses to `auto` first so
-   * the box can also shrink — skipped at zero width (hidden or mid-layout),
-   * where wrapping makes scrollHeight nonsense; the width observer re-measures
-   * once layout lands. */
-  function autosizeComposer() {
-    const el = composerRef.current;
-    if (!el) return;
-    if (el.value === "") {
-      el.style.height = "";
-    } else if (el.clientWidth > 0) {
-      el.style.height = "auto";
-      el.style.height = `${el.scrollHeight}px`;
-    }
-    syncChipScroll();
-  }
-  // Layout effect so the height lands before paint. chipIndent shifts
-  // wrapping (text-indent past the chip), so re-measure when it changes.
-  useLayoutEffect(() => autosizeComposer(), [draft, chipIndent]);
-  /** Ref callback for the textarea: rebinds the width observer and re-measures
-   * on every mount — the composer unmounts on settings views, and remounting
-   * must re-apply the draft's height (an effect would need a mount flag keyed
-   * on mainView, cf. threadMounted; the ref callback gets it without one).
-   * Wrapping — and so the needed height — changes with the width (pane
-   * resize, sidebar toggle), hence the observer. Stable identity so React
-   * doesn't detach/reattach it every render. */
-  const composerRO = useRef<ResizeObserver | null>(null);
-  const attachComposer = useCallback((el: HTMLTextAreaElement | null) => {
-    composerRO.current?.disconnect();
-    composerRO.current = null;
-    composerRef.current = el;
-    if (!el) return;
-    let lastWidth = el.clientWidth;
-    const ro = new ResizeObserver(() => {
-      // Width changes only: autosize itself changes the height, which
-      // re-fires the observer — gating on width breaks that feedback loop.
-      const width = el.clientWidth;
-      if (width === 0 || width === lastWidth) return;
-      lastWidth = width;
-      autosizeComposer();
-    });
-    ro.observe(el);
-    composerRO.current = ro;
-    autosizeComposer();
-  }, []);
-
   /** The chip belongs to the first line of *content*, so when the textarea
    * scrolls it must ride along (and clip at the wrapper) instead of sitting
    * fixed over whatever line scrolled to the top. */
@@ -1877,7 +1824,7 @@ export function ChatPanel({
               </span>
             )}
             <textarea
-              ref={attachComposer}
+              ref={composerRef}
               value={draft}
               style={pickedSkill ? { textIndent: chipIndent } : undefined}
               onScroll={syncChipScroll}
