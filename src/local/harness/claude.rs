@@ -99,7 +99,7 @@ impl Harness for ClaudeCode {
                 };
             }
         }
-        if !info.authenticated && std::env::var("ANTHROPIC_API_KEY").is_ok_and(|v| !v.is_empty()) {
+        if !info.authenticated && super::detect::api_key("ANTHROPIC_API_KEY").is_some() {
             info.authenticated = true;
             info.auth_method = Some("apiKey");
         }

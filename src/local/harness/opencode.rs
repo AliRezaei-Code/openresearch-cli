@@ -69,14 +69,26 @@ impl Harness for OpenCode {
             info.auth_method = Some("oauth");
             info.account = Some(providers.join(", "));
         }
-        // opencode also resolves provider credentials straight from the
-        // environment, writing no auth.json — mirrors the ANTHROPIC_API_KEY
-        // fallback in claude.rs. Without this those installs read as signed
-        // out, which the step-1 gate turns into a lockout.
+        // opencode also takes provider keys straight from the environment,
+        // writing no auth.json — same fallback claude.rs has. Checked against
+        // orx's synced env too, since that's a source the harness child gets
+        // but this process may not. Measured, not assumed: `opencode models`
+        // still lists free/bundled models when signed out, so a non-empty
+        // model list can't stand in for a credential.
+        const PROVIDER_KEYS: &[&str] = &[
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "GROQ_API_KEY",
+            "XAI_API_KEY",
+            "DEEPSEEK_API_KEY",
+        ];
         if !info.authenticated
-            && ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"]
+            && PROVIDER_KEYS
                 .iter()
-                .any(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()))
+                .any(|k| super::detect::api_key(k).is_some())
         {
             info.authenticated = true;
             info.auth_method = Some("apiKey");

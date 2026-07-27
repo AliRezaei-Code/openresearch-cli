@@ -37,7 +37,10 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   // orx can't chat or run autoresearch without a signed-in agent, so step 1 is
   // a hard gate. Null (still detecting) counts as not-ready: better a briefly
   // disabled button than one that goes dead under the cursor.
-  const anyAgentReady = harnesses?.some((h) => h.agentReady) ?? false;
+  // A failed probe must not gate: detection fans out to per-binary version and
+  // model commands that can stall, and onboarding is the whole app on first
+  // boot — a stalled check would be an unrecoverable dead end.
+  const anyAgentReady = harnessError || (harnesses?.some((h) => h.agentReady) ?? false);
 
   // Creating a project hits the GitHub API (repo creation, push-access check),
   // which hard-fails without a token — so step 2 gates too. Null (still
@@ -95,11 +98,10 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 harnesses.map((h) => <AgentCard key={h.id} h={h} />)
               )}
             </div>
-            {(harnessError || (harnesses !== null && !anyAgentReady)) && (
-              <p className="onb-gate-hint">
-                {harnessError ? RETRY_COPY : "Sign in to at least one agent to continue."}
-              </p>
+            {(harnessError || harnesses !== null) && !anyAgentReady && (
+              <p className="onb-gate-hint">Sign in to at least one agent to continue.</p>
             )}
+            {harnessError && <p className="onb-aside-text">{RETRY_COPY}</p>}
             <div className="onb-actions">
               <button className="btn ghost" onClick={() => load(true)} disabled={checking}>
                 <RefreshCw size={12} className={checking ? "spin" : ""} /> Re-check
@@ -129,11 +131,10 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
             <div className="onb-cards">
               <GitCard git={git} onUpdate={setGit} />
             </div>
-            {(gitError || (git !== null && !githubConnected)) && (
-              <p className="onb-gate-hint">
-                {gitError ? RETRY_COPY : "Connect GitHub to continue."}
-              </p>
+            {(gitError || git !== null) && !githubConnected && (
+              <p className="onb-gate-hint">Connect GitHub to continue.</p>
             )}
+            {gitError && <p className="onb-aside-text">{RETRY_COPY}</p>}
             <div className="onb-actions">
               <button className="btn ghost" onClick={() => setStep(0)}>
                 <ArrowLeft size={12} /> Back
@@ -142,14 +143,13 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 <RefreshCw size={12} className={checking ? "spin" : ""} /> Re-check
               </button>
               <div style={{ flex: 1 }} />
-              {/* A token isn't strictly required: ensure_clone tries ssh first,
-                  so SSH-key users can clone and push without one. Keep the
-                  nudge, but never trap them — nor anyone whose probe failed. */}
-              {!githubConnected && (
-                <button className="onb-fix-alt" onClick={() => setStep(2)}>
-                  Skip — I use SSH keys
-                </button>
-              )}
+              {/* Always offered, never only when the badge says disconnected:
+                  a stale `gh` token still reads as connected, and that user
+                  needs this more than anyone. A token isn't strictly required —
+                  ensure_clone tries ssh first — so this must not be a trap. */}
+              <button className="btn ghost" onClick={() => setStep(2)}>
+                Skip for now
+              </button>
               <button
                 className="btn primary"
                 onClick={() => setStep(2)}

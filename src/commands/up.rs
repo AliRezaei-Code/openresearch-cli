@@ -448,12 +448,22 @@ async fn create_project(
             return Err(bad_request("githubOwner and githubRepo are required"));
         }
         let branch = req.baseline_branch.filter(|b| !b.trim().is_empty());
-        // One API call answers both questions below.
         let meta = local::github::repo_meta(&owner, &repo).await;
-        // No branch given → use the repo's own default. Falling through to
-        // create_project's hardcoded "main" would break every master/dev repo
-        // with "Branch 'main' not found".
-        let branch = branch.or_else(|| meta.as_ref().and_then(|m| m.default_branch.clone()));
+        // No branch given → the repo's own default. Falling through to
+        // create_project's hardcoded "main" breaks every master/dev repo with
+        // "Branch 'main' not found" — and the form has no branch field to
+        // recover with. The API answer needs a token, so fall back to git's
+        // own credentials for the SSH-only user.
+        let branch = match branch.or_else(|| meta.as_ref().and_then(|m| m.default_branch.clone())) {
+            Some(b) => Some(b),
+            None => {
+                let (o, r) = (owner.clone(), repo.clone());
+                tokio::task::spawn_blocking(move || local::git::remote_default_branch(&o, &r))
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        };
         // Unknown access (no token / API hiccup) counts as access: forking
         // needs a token anyway, and surprise forks are worse than a later
         // push error.
