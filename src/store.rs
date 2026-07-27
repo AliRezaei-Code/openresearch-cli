@@ -313,6 +313,17 @@ impl Store {
                     AND permission_mode IN ('ask', 'accept-edits'))",
             [],
         );
+
+        // NOTE: `reasoning_level` deliberately has NO migration for issue #123,
+        // unlike the permission modes above. Rows written by older builds carry
+        // an implicit effort (`high`), but every value the old builds wrote is
+        // still a value the picker offers, so a blanket reset here would be
+        // indistinguishable from — and would silently destroy — a level the user
+        // just chose, on the very next open. That is the failure mode the NOTE
+        // above warns about. Stale levels are reconciled where the information
+        // to do it safely exists: `reconcileReasoning` in `ui/src/api.ts` drops
+        // one the selected model doesn't offer, and each harness's mapper drops
+        // it again before it can reach a CLI.
         Ok(Self { conn })
     }
 

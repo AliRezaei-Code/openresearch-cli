@@ -695,6 +695,15 @@ export type HarnessId = "claude-code" | "codex" | "opencode";
 
 export interface HarnessModel {
   id: string;
+  /**
+   * Reasoning/effort choices this *specific* model accepts, led by the
+   * `default` sentinel. Absent means "no list of its own" — fall back to the
+   * harness-wide {@link HarnessOptions.reasoningLevels}. An empty array is
+   * different: the model was checked and genuinely has no reasoning control,
+   * so the picker is hidden. Use `reasoningFor` rather than reading this
+   * directly.
+   */
+  reasoningLevels?: OptionChoice[];
 }
 
 /** One selectable value in a composer toggle (permission mode / reasoning). */
@@ -703,12 +712,72 @@ export interface OptionChoice {
   label: string;
 }
 
-/** The toggle vocabulary a harness supports. Empty arrays hide the control. */
+/**
+ * The toggle vocabulary a harness supports. Empty arrays hide the control.
+ *
+ * `reasoningLevels` here is the harness-wide *fallback*; per-model choices ride
+ * on {@link HarnessModel.reasoningLevels} and win. Resolve with `reasoningFor`.
+ */
 export interface HarnessOptions {
   permissionModes: OptionChoice[];
   defaultPermissionMode?: string | null;
   reasoningLevels: OptionChoice[];
   defaultReasoningLevel?: string | null;
+}
+
+/**
+ * Wire id for "send no explicit effort/variant — let the CLI and its own config
+ * decide". Must match `REASONING_DEFAULT_ID` in `src/local/harness/options.rs`.
+ */
+export const REASONING_DEFAULT_ID = "default";
+
+/**
+ * The reasoning choices to show for a harness + model, and the id to treat as
+ * the default.
+ *
+ * Per-model metadata wins when present (Codex's per-model tiers, OpenCode's
+ * `variants`); otherwise the harness-wide list applies. A model that reports an
+ * empty list genuinely has no reasoning control, so the picker is hidden — this
+ * is why the absent/empty distinction matters and `?? []` would be wrong.
+ */
+export function reasoningFor(
+  harness: Harness | undefined,
+  modelId: string | null | undefined,
+): { choices: OptionChoice[]; defaultId: string | null } {
+  const perModel = harness?.models.find((m) => m.id === modelId)?.reasoningLevels;
+  const choices = perModel ?? harness?.options?.reasoningLevels ?? [];
+  // The default is always the sentinel when it's on offer, so the composer
+  // sends no override unless the user picks one.
+  const defaultId = choices.some((c) => c.id === REASONING_DEFAULT_ID)
+    ? REASONING_DEFAULT_ID
+    : (harness?.options?.defaultReasoningLevel ?? null);
+  return { choices, defaultId };
+}
+
+/**
+ * Keep a stored reasoning level only if the given harness+model still offers
+ * it; otherwise fall back to that model's default. This is what makes switching
+ * models drop an effort the new model can't accept (e.g. `ultra` off Sol onto
+ * 5.5) instead of silently sending an invalid value.
+ */
+export function reconcileReasoning(
+  harness: Harness | undefined,
+  modelId: string | null | undefined,
+  current: string | null,
+): string | null {
+  // Harness not resolved yet — detection is async, and it can also fail. "We
+  // don't know what this model offers" is not "this model offers nothing", so
+  // leave the stored level alone; resetting it here would let a send that races
+  // the harness fetch overwrite a deliberate choice.
+  if (!harness) return current;
+  const { choices, defaultId } = reasoningFor(harness, modelId);
+  // A model with no reasoning control: the picker is hidden, so the user can no
+  // longer clear a level themselves. Return the sentinel rather than `null` —
+  // `null` reads as "no override supplied" and leaves whatever the session row
+  // already holds in place, which would keep sending a stale level the model
+  // never offered.
+  if (choices.length === 0) return REASONING_DEFAULT_ID;
+  return current && choices.some((c) => c.id === current) ? current : defaultId;
 }
 
 export interface Harness {

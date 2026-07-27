@@ -35,9 +35,9 @@ use tokio::process::Command;
 
 use super::detect::{
     bin_version, find_on_path, jwt_payload, nonempty_str, read_json, resolve_symlinks, title_case,
-    HarnessInfo,
+    HarnessInfo, ModelInfo,
 };
-use super::options::{HarnessOptions, PermissionMode};
+use super::options::{resolve_reasoning, HarnessOptions, PermissionMode};
 use super::{should_synthesize_plan, synthesize_resume, Harness, ResumeAction};
 use crate::error::{anyhow, Result};
 use crate::local::chat::{
@@ -50,7 +50,33 @@ use crate::local::opencode::ensure_playbook;
 // The 5.6 variants (Sol = frontier, Terra = balanced, Luna = fast) plus 5.5;
 // ChatGPT-account codex rejects bare `gpt-5.6`. Verified against codex-cli
 // 0.144 via `codex exec -m` (5.6 needs >= 0.143; older CLIs get a 400).
-const CODEX_MODELS: [&str; 4] = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"];
+// Each entry is `(model id, the `model_reasoning_effort` values it accepts)`.
+// Codex exposes no machine-readable effort metadata — `--help` says nothing and
+// the value is plain config — so unlike OpenCode the tiers have to be curated.
+// Keeping them in the SAME table as the model ids is what stops the two from
+// drifting: adding a model necessarily means stating its tiers.
+//
+// Getting these wrong is not cosmetic: codex does no local validation and
+// forwards the value, so an unsupported tier comes back as a 400 that kills the
+// turn. All three 5.6 models reach `ultra`; 5.5 stops at `xhigh` (`max` → 400
+// `Invalid value: 'max'`). Verified live against codex-cli 0.144 by running a
+// turn per boundary — issue #123's table claims Luna stops at `max`, which did
+// not reproduce.
+const CODEX_MODELS: [(&str, &[&str]); 4] = [
+    (
+        "gpt-5.6-sol",
+        &["low", "medium", "high", "xhigh", "max", "ultra"],
+    ),
+    (
+        "gpt-5.6-terra",
+        &["low", "medium", "high", "xhigh", "max", "ultra"],
+    ),
+    (
+        "gpt-5.6-luna",
+        &["low", "medium", "high", "xhigh", "max", "ultra"],
+    ),
+    ("gpt-5.5", &["low", "medium", "high", "xhigh"]),
+];
 
 /// Codex usage occupying the context window: `input_tokens + output_tokens`
 /// (`cached_input_tokens` is a subset of `input_tokens`, not additive). Returns
@@ -78,16 +104,19 @@ fn token_count_usage(info: &Value) -> (Option<u64>, Option<u64>) {
     (codex_used_tokens(usage), window)
 }
 
-/// Codex's own reasoning vocabulary (id == the `model_reasoning_effort` config
-/// value) — the common set across CODEX_MODELS (Sol/Terra also take max/ultra;
-/// Luna and 5.5 don't). Reasoning is per-harness (see `options.rs`). Verified
-/// against codex-cli 0.144.
-const CODEX_REASONING_LEVELS: [(&str, &str); 4] = [
-    ("low", "Low"),
-    ("medium", "Medium"),
-    ("high", "High"),
-    ("xhigh", "XHigh"),
-];
+/// The harness-wide fallback list — the conservative intersection, used for a
+/// model that isn't in `CODEX_MODELS` (a `-c model=…` override, or a newer id
+/// this build doesn't know).
+const CODEX_REASONING_LEVELS: [&str; 4] = ["low", "medium", "high", "xhigh"];
+
+/// The effort ids a given codex model accepts, or the conservative fallback.
+fn codex_model_reasoning(model: &str) -> &'static [&'static str] {
+    CODEX_MODELS
+        .iter()
+        .find(|(id, _)| *id == model)
+        .map(|(_, levels)| *levels)
+        .unwrap_or(&CODEX_REASONING_LEVELS)
+}
 
 pub struct Codex;
 
@@ -150,7 +179,12 @@ impl Harness for Codex {
 
         info.agent_ready = info.installed && info.authenticated;
         if info.agent_ready {
-            info = info.with_models(&CODEX_MODELS);
+            info = info.with_models(
+                CODEX_MODELS
+                    .iter()
+                    .map(|(id, levels)| ModelInfo::new(*id).with_reasoning(levels))
+                    .collect(),
+            );
             // Old CLIs still work via the legacy exec path, but miss the
             // app-server wins (permission prompts on sandbox escalations;
             // thread resume).
@@ -214,8 +248,12 @@ impl Harness for Codex {
                 ],
                 PermissionMode::Auto,
             )
-            // Codex's own reasoning tiers via `-c model_reasoning_effort`.
-            .with_reasoning_levels(&CODEX_REASONING_LEVELS, "high")
+            // Harness-wide fallback only — the real per-model lists ride on each
+            // `ModelInfo` (see `CODEX_MODELS`). The default is
+            // `Default`, so a configured `model_reasoning_effort` in
+            // `~/.codex/config.toml` is no longer overridden by an implicit
+            // per-turn `high` (issue #123).
+            .with_reasoning_levels(&CODEX_REASONING_LEVELS)
     }
 
     /// Three prompt kinds resume differently:
@@ -988,7 +1026,7 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
     if let Some(model) = &ctx.model {
         turn_params["model"] = Value::String(model.clone());
     }
-    let effort = codex_reasoning(ctx.reasoning_level.as_deref());
+    let effort = codex_reasoning(ctx.reasoning_level.as_deref(), ctx.model.as_deref());
     if let Some(effort) = effort {
         turn_params["effort"] = Value::String(effort.to_string());
     }
@@ -1584,15 +1622,18 @@ pub(crate) fn ensure_orx_data_dir() -> Option<PathBuf> {
     dir.canonicalize().ok()
 }
 
-/// Session reasoning id → Codex `model_reasoning_effort` value. The composer only
-/// offers ids from `CODEX_REASONING_LEVELS`; an unrecognized/absent value omits
-/// the override and lets Codex apply its configured default.
-fn codex_reasoning(level: Option<&str>) -> Option<&str> {
-    let level = level?;
-    CODEX_REASONING_LEVELS
-        .iter()
-        .any(|(id, _)| *id == level)
-        .then_some(level)
+/// Session reasoning id → Codex `model_reasoning_effort` value, validated
+/// against the *selected model's* tiers (`ultra` is Sol/Terra-only). See
+/// [`resolve_reasoning`] for what a `None` result means.
+fn codex_reasoning<'a>(level: Option<&'a str>, model: Option<&str>) -> Option<&'a str> {
+    // No explicit model → the CLI's own configured default model, whose tiers
+    // we can't know. That's the common case, not an exotic one, so it falls
+    // back to the conservative intersection rather than guessing.
+    let allowed = match model {
+        Some(m) => codex_model_reasoning(m),
+        None => &CODEX_REASONING_LEVELS,
+    };
+    resolve_reasoning(level, allowed)
 }
 
 fn command_string(v: &Value) -> String {
@@ -1738,7 +1779,7 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
         }
     };
     // Reasoning level → Codex's own `model_reasoning_effort` config override.
-    if let Some(effort) = codex_reasoning(ctx.reasoning_level.as_deref()) {
+    if let Some(effort) = codex_reasoning(ctx.reasoning_level.as_deref(), ctx.model.as_deref()) {
         cmd.args(["-c", &format!("model_reasoning_effort=\"{effort}\"")]);
     }
     if let Some(model) = &ctx.model {
@@ -1968,6 +2009,7 @@ fn handle_item(ctx: &mut TurnCtx, item: &Value, next_id: &mut impl FnMut(&str) -
 
 #[cfg(test)]
 mod tests {
+    use super::super::options::REASONING_DEFAULT_ID;
     use super::*;
 
     #[test]
@@ -2464,14 +2506,67 @@ mod tests {
 
     #[test]
     fn reasoning_accepts_only_codex_ids() {
-        assert_eq!(codex_reasoning(Some("low")), Some("low"));
-        assert_eq!(codex_reasoning(Some("high")), Some("high"));
-        assert_eq!(codex_reasoning(Some("xhigh")), Some("xhigh"));
-        // Tiers outside the common set and junk are dropped (the flag is
-        // omitted → CLI default), never forwarded as an invalid
-        // `model_reasoning_effort`.
-        assert_eq!(codex_reasoning(Some("max")), None);
-        assert_eq!(codex_reasoning(None), None);
+        let sol = Some("gpt-5.6-sol");
+        assert_eq!(codex_reasoning(Some("low"), sol), Some("low"));
+        assert_eq!(codex_reasoning(Some("high"), sol), Some("high"));
+        assert_eq!(codex_reasoning(Some("xhigh"), sol), Some("xhigh"));
+        // Junk is dropped (the flag is omitted → CLI default), never forwarded
+        // as an invalid `model_reasoning_effort`.
+        assert_eq!(codex_reasoning(Some("nonsense"), sol), None);
+        assert_eq!(codex_reasoning(None, sol), None);
+    }
+
+    /// The point of issue #123: the top tiers are model-specific, so the same
+    /// stored level resolves differently per model rather than being clamped to
+    /// one hard-coded intersection.
+    #[test]
+    fn reasoning_is_model_specific() {
+        // Every 5.6 model reaches `ultra` (verified live — see CODEX_MODELS).
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(codex_reasoning(Some("max"), Some(model)), Some("max"));
+            assert_eq!(codex_reasoning(Some("ultra"), Some(model)), Some("ultra"));
+        }
+        // 5.5 stops at `xhigh`. An unsupported tier is dropped rather than sent
+        // — this is the "changing models clears a stale effort" guarantee,
+        // enforced backend-side too, and it matters because codex answers an
+        // unsupported effort with a 400 that kills the turn.
+        assert_eq!(
+            codex_reasoning(Some("xhigh"), Some("gpt-5.5")),
+            Some("xhigh")
+        );
+        assert_eq!(codex_reasoning(Some("max"), Some("gpt-5.5")), None);
+        // Unknown model / no model → the conservative fallback.
+        assert_eq!(codex_reasoning(Some("xhigh"), Some("gpt-9")), Some("xhigh"));
+        assert_eq!(codex_reasoning(Some("ultra"), Some("gpt-9")), None);
+        assert_eq!(codex_reasoning(Some("max"), None), None);
+    }
+
+    /// `Default` must send no `model_reasoning_effort` at all — otherwise a
+    /// user's configured `max` in `~/.codex/config.toml` is silently overridden
+    /// by the composer (the concrete bug in issue #123).
+    #[test]
+    fn reasoning_default_sends_no_override() {
+        for model in [Some("gpt-5.6-sol"), Some("gpt-5.5"), None] {
+            assert_eq!(codex_reasoning(Some(REASONING_DEFAULT_ID), model), None);
+        }
+    }
+
+    /// Every advertised per-model choice must survive the mapper for that same
+    /// model — the picker can never offer an effort `run_turn` would drop.
+    /// Iterating `CODEX_MODELS` also means a model added without tiers fails
+    /// here rather than silently degrading to the fallback.
+    #[test]
+    fn advertised_model_choices_all_map_back() {
+        for (model, levels) in CODEX_MODELS {
+            assert!(!levels.is_empty(), "{model} has no reasoning tiers");
+            for level in levels {
+                assert_eq!(
+                    codex_reasoning(Some(level), Some(model)),
+                    Some(*level),
+                    "{model} advertises {level} but the mapper drops it"
+                );
+            }
+        }
     }
 
     fn answer(

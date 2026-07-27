@@ -17,6 +17,39 @@ pub(super) const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 #[serde(rename_all = "camelCase")]
 pub struct ModelInfo {
     pub id: String,
+    /// Reasoning/effort choices this *specific* model accepts, led by the
+    /// `Default` sentinel. `None` means "this model has no list of its own" —
+    /// the composer then falls back to the harness-wide
+    /// [`HarnessOptions::reasoning_levels`](super::HarnessOptions).
+    ///
+    /// `Some(vec![])` is meaningfully different from `None`: it means the model
+    /// was *checked* and genuinely exposes no reasoning control (an OpenCode
+    /// model with an empty `variants` map), so the picker is hidden entirely
+    /// rather than falling back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_levels: Option<Vec<super::options::OptionChoice>>,
+}
+
+impl ModelInfo {
+    /// A model with no per-model reasoning metadata (falls back to the
+    /// harness-wide list).
+    pub(super) fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            reasoning_levels: None,
+        }
+    }
+
+    /// Attach this model's own reasoning choices, from native ids. An empty
+    /// `ids` yields an empty (not absent) list — "checked, none supported".
+    pub(super) fn with_reasoning(mut self, ids: &[&str]) -> Self {
+        self.reasoning_levels = Some(if ids.is_empty() {
+            Vec::new()
+        } else {
+            super::options::reasoning_choices(ids)
+        });
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -68,12 +101,10 @@ impl HarnessInfo {
         }
     }
 
-    /// Attach the chat model list from a set of static ids.
-    pub(super) fn with_models(mut self, ids: &[&str]) -> Self {
-        self.models = ids
-            .iter()
-            .map(|id| ModelInfo { id: id.to_string() })
-            .collect();
+    /// Attach the chat model list. Each `ModelInfo` carries its own reasoning
+    /// choices where the harness knows them (issue #123).
+    pub(super) fn with_models(mut self, models: Vec<ModelInfo>) -> Self {
+        self.models = models;
         self
     }
 }

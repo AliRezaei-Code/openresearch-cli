@@ -21,8 +21,8 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use super::detect::{bin_version, find_on_path, nonempty_str, read_json, HarnessInfo};
-use super::options::{HarnessOptions, PermissionMode};
+use super::detect::{bin_version, find_on_path, nonempty_str, read_json, HarnessInfo, ModelInfo};
+use super::options::{resolve_reasoning, HarnessOptions, PermissionMode};
 use super::{Harness, ResumeAction};
 use crate::error::{anyhow, Result};
 use crate::local::chat::{
@@ -41,15 +41,61 @@ const CLAUDE_MODELS: [&str; 4] = [
     "claude-haiku-4-5",
 ];
 
-/// Claude Code's `--effort` tiers (id == the CLI value). `xhigh`/`max` are
-/// Claude-specific — the reasoning vocabulary is per-harness, not global.
-const CLAUDE_EFFORT_LEVELS: [(&str, &str); 5] = [
-    ("low", "Low"),
-    ("medium", "Medium"),
-    ("high", "High"),
-    ("xhigh", "XHigh"),
-    ("max", "Max"),
-];
+/// Claude Code's ordinary `--effort` tiers (id == the CLI value). `xhigh`/`max`
+/// are Claude-specific — the reasoning vocabulary is per-harness, not global.
+/// Every supported CLI version accepts these five.
+const CLAUDE_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// `ultracode` — the effort-menu setting that selects `xhigh` and lets Claude
+/// use dynamic workflows. NOT the same as `ultrathink` (a prompt keyword) or
+/// Codex's `ultra` (which Claude rejects outright).
+const CLAUDE_ULTRACODE: &str = "ultracode";
+
+/// Earliest Claude Code release we have confirmation accepts `--effort
+/// ultracode`. NOT known to be the exact boundary: 2.1.197 was observed to
+/// reject it and issue #123 reports 2.1.217 accepting it, so the true cutoff is
+/// somewhere in (197, 217]. Lowering it needs a version actually tested.
+///
+/// The gate is load-bearing, not defensive. An older CLI does not fail loudly
+/// on an unknown effort — 2.1.197 warns on stderr that it is ignoring the value
+/// and then runs the turn at its *default* effort. Advertising `ultracode`
+/// unconditionally would therefore offer a choice that silently does nothing.
+const CLAUDE_ULTRACODE_MIN_VERSION: (u32, u32, u32) = (2, 1, 217);
+
+/// Parse the leading `x.y.z` out of a `claude --version` line
+/// (e.g. `"2.1.197 (Claude Code)"`). Returns `None` when the shape is
+/// unfamiliar, which the caller treats as "don't offer `ultracode`".
+fn parse_semver(version: &str) -> Option<(u32, u32, u32)> {
+    let head = version.split_whitespace().next()?;
+    let mut parts = head.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    // A trailing pre-release suffix (`3-beta.1`) still yields its numeric patch.
+    let patch = parts
+        .next()?
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    Some((major, minor, patch))
+}
+
+/// Whether this installed CLI accepts `--effort ultracode`. Unknown/unparseable
+/// versions are treated as unsupported: a missing choice is a smaller harm than
+/// a choice that silently downgrades to the default effort.
+fn supports_ultracode(version: Option<&str>) -> bool {
+    parse_semver(version.unwrap_or_default()).is_some_and(|v| v >= CLAUDE_ULTRACODE_MIN_VERSION)
+}
+
+/// The effort ids to advertise for this install — the ordinary five, plus
+/// `ultracode` when the CLI is new enough.
+fn claude_effort_ids(version: Option<&str>) -> Vec<&'static str> {
+    let mut ids: Vec<&'static str> = CLAUDE_EFFORT_LEVELS.to_vec();
+    if supports_ultracode(version) {
+        ids.push(CLAUDE_ULTRACODE);
+    }
+    ids
+}
 
 pub struct ClaudeCode;
 
@@ -106,7 +152,17 @@ impl Harness for ClaudeCode {
 
         info.agent_ready = info.installed && info.authenticated;
         if info.agent_ready {
-            info = info.with_models(&CLAUDE_MODELS);
+            // Effort is a property of the installed CLI, not of the model, so
+            // every model gets the same version-gated list. Attaching it
+            // per-model (rather than leaning on the harness-wide fallback) keeps
+            // the composer on one code path for all three harnesses.
+            let ids = claude_effort_ids(info.version.as_deref());
+            info = info.with_models(
+                CLAUDE_MODELS
+                    .iter()
+                    .map(|id| ModelInfo::new(*id).with_reasoning(&ids))
+                    .collect(),
+            );
         } else if info.installed {
             info.agent_note =
                 Some("Sign in with `claude auth login` to chat with it here.".to_string());
@@ -145,8 +201,12 @@ impl Harness for ClaudeCode {
                 ],
                 PermissionMode::Auto,
             )
-            // Claude Code's `--effort` tiers (default `high` on current models).
-            .with_reasoning_levels(&CLAUDE_EFFORT_LEVELS, "high")
+            // Harness-wide fallback only, and deliberately the conservative
+            // five: `options()` is static and can't see the detected CLI
+            // version, so `ultracode` is added per-model in `detect` where the
+            // version IS known. The default is `Default` (no `--effort` at all),
+            // so the CLI's own configured effort survives (issue #123).
+            .with_reasoning_levels(&CLAUDE_EFFORT_LEVELS)
     }
 
     /// Two resume paths. A card the permission bridge surfaced mid-turn
@@ -396,15 +456,20 @@ pub(crate) fn write_mcp_config(
     Ok(path)
 }
 
-/// Session reasoning id → Claude Code `--effort` value. The composer only
-/// offers ids from `CLAUDE_EFFORT_LEVELS`, so an unrecognized/absent value just
-/// omits the flag and lets the CLI apply its own default (`high`).
+/// Session reasoning id → Claude's `--effort` value.
+///
+/// `ultracode` passes through (a real `--effort` value on new enough CLIs — see
+/// [`CLAUDE_ULTRACODE_MIN_VERSION`]); Codex's `ultra`, which Claude rejects
+/// outright, does not. See [`resolve_reasoning`] for what `None` means.
+///
+/// The allowed set here is deliberately version-*un*gated: this validates the
+/// vocabulary, not the install. Gating it would silently rewrite a level the
+/// user picked while their CLI supported it, and passing `ultracode` to an
+/// older CLI merely warns and runs at the default.
 fn claude_effort(level: Option<&str>) -> Option<&str> {
-    let level = level?;
-    CLAUDE_EFFORT_LEVELS
-        .iter()
-        .any(|(id, _)| *id == level)
-        .then_some(level)
+    let mut allowed = CLAUDE_EFFORT_LEVELS.to_vec();
+    allowed.push(CLAUDE_ULTRACODE);
+    resolve_reasoning(level, &allowed)
 }
 
 /// The follow-up message + resume mode for an answered Claude prompt — Claude's
@@ -1034,7 +1099,73 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::options::REASONING_DEFAULT_ID;
     use super::*;
+
+    /// `ultracode` is a real `--effort` value only on new-enough CLIs. An older
+    /// one does NOT error — it warns to stderr that it is ignoring the value and
+    /// then runs at the default effort — so offering the choice there would be a
+    /// lie. Observed against the locally installed 2.1.197.
+    #[test]
+    fn ultracode_is_version_gated() {
+        assert!(!supports_ultracode(Some("2.1.197 (Claude Code)")));
+        assert!(!supports_ultracode(Some("2.1.216")));
+        assert!(supports_ultracode(Some("2.1.217 (Claude Code)")));
+        assert!(supports_ultracode(Some("2.1.300")));
+        assert!(supports_ultracode(Some("2.2.0")));
+        assert!(supports_ultracode(Some("3.0.0")));
+        // Unknown/unparseable versions stay conservative.
+        assert!(!supports_ultracode(None));
+        assert!(!supports_ultracode(Some("")));
+        assert!(!supports_ultracode(Some("not-a-version")));
+    }
+
+    #[test]
+    fn effort_ids_gain_ultracode_only_when_supported() {
+        assert_eq!(
+            claude_effort_ids(Some("2.1.197")),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            claude_effort_ids(Some("2.1.217")),
+            ["low", "medium", "high", "xhigh", "max", "ultracode"]
+        );
+    }
+
+    #[test]
+    fn parse_semver_handles_real_version_lines() {
+        assert_eq!(parse_semver("2.1.197 (Claude Code)"), Some((2, 1, 197)));
+        assert_eq!(parse_semver("2.1.217"), Some((2, 1, 217)));
+        // A pre-release suffix still yields its numeric patch.
+        assert_eq!(parse_semver("2.2.0-beta.1"), Some((2, 2, 0)));
+        assert_eq!(parse_semver("nonsense"), None);
+        assert_eq!(parse_semver("2.1"), None);
+    }
+
+    /// `ultracode` passes through; Codex's `ultra` never does (Claude rejects
+    /// it outright), and `default` sends no flag at all.
+    #[test]
+    fn effort_accepts_ultracode_but_not_ultra() {
+        assert_eq!(claude_effort(Some("ultracode")), Some("ultracode"));
+        assert_eq!(claude_effort(Some("max")), Some("max"));
+        assert_eq!(claude_effort(Some("low")), Some("low"));
+        assert_eq!(claude_effort(Some("ultra")), None);
+        assert_eq!(claude_effort(Some("nonsense")), None);
+        assert_eq!(claude_effort(None), None);
+    }
+
+    #[test]
+    fn effort_default_sends_no_flag() {
+        assert_eq!(claude_effort(Some(REASONING_DEFAULT_ID)), None);
+    }
+
+    /// Every id the composer can offer must survive the mapper.
+    #[test]
+    fn advertised_effort_ids_all_map_back() {
+        for id in claude_effort_ids(Some("2.1.217")) {
+            assert_eq!(claude_effort(Some(id)), Some(id), "{id} was dropped");
+        }
+    }
 
     #[test]
     fn plan_card_synthesized_only_for_cardless_texty_plan_turns() {
@@ -1146,15 +1277,6 @@ mod tests {
         // this into an error that keeps the card actionable.
         let (text, _) = synthesize_resume("question", &answer(true, None, &[], None));
         assert!(text.trim().is_empty());
-    }
-
-    #[test]
-    fn effort_accepts_only_claude_tiers() {
-        assert_eq!(claude_effort(Some("xhigh")), Some("xhigh"));
-        assert_eq!(claude_effort(Some("max")), Some("max"));
-        // A Codex-only id like a bare "medium" is fine (shared), but junk is not.
-        assert_eq!(claude_effort(Some("ultra")), None);
-        assert_eq!(claude_effort(None), None);
     }
 
     /// Fold a hand-written stream-json transcript through `apply_event` against a

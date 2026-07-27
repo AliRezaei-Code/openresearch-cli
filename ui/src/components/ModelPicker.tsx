@@ -3,6 +3,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   getHarnesses,
   modelLabel,
+  reasoningFor,
+  reconcileReasoning,
+  REASONING_DEFAULT_ID,
   type Harness,
   type HarnessId,
   type OptionChoice,
@@ -29,11 +32,14 @@ export const HARNESS_LABELS: Record<HarnessId, string> = {
 export function defaultSelection(harnesses: Harness[]): ModelSelection | null {
   const ready = harnesses.find((h) => h.agentReady);
   if (!ready) return null;
+  const model = ready.models[0]?.id ?? null;
   return {
     harness: ready.id,
-    model: ready.models[0]?.id ?? null,
+    model,
     permissionMode: ready.options?.defaultPermissionMode ?? null,
-    reasoningLevel: ready.options?.defaultReasoningLevel ?? null,
+    // Seed from the *model's* default, not the harness's — they differ once
+    // reasoning is model-aware.
+    reasoningLevel: reasoningFor(ready, model).defaultId,
   };
 }
 
@@ -114,7 +120,12 @@ export function ModelPicker({
     });
   }, [harnesses, filter, lockHarness, value]);
 
-  /** Switch harness → reseed model + mode/reasoning defaults for that harness. */
+  /** Switch harness → reseed mode defaults for that harness.
+   *
+   * Reasoning is reconciled against the *newly selected model* in both cases:
+   * choices are per-model now, so an effort the previous model allowed may not
+   * exist on this one (`ultra` on Sol → 5.5). Keeping it would send a value the
+   * model rejects, so it falls back to that model's default. */
   const pick = (harness: Harness, model: string | null) => {
     const sameHarness = value?.harness === harness.id;
     onSelect({
@@ -123,9 +134,11 @@ export function ModelPicker({
       permissionMode: sameHarness
         ? value!.permissionMode
         : harness.options?.defaultPermissionMode ?? null,
-      reasoningLevel: sameHarness
-        ? value!.reasoningLevel
-        : harness.options?.defaultReasoningLevel ?? null,
+      reasoningLevel: reconcileReasoning(
+        harness,
+        model,
+        sameHarness ? value!.reasoningLevel : null,
+      ),
     });
     setOpen(false);
     setFilter("");
@@ -239,6 +252,8 @@ export function OptionPicker({
   const effectiveId = value ?? defaultId ?? choices[0]?.id ?? null;
   const current = choices.find((c) => c.id === effectiveId);
   const defaultChoice = choices.find((c) => c.id === defaultId);
+  // Everything except the pinned default row (see below).
+  const rest = choices.filter((c) => c.id !== defaultChoice?.id);
   const label = current?.label ?? choices[0]?.label ?? "";
 
   const choose = (id: string) => {
@@ -264,14 +279,27 @@ export function OptionPicker({
             <>
               <button className="model-item" onClick={() => choose(defaultChoice.id)}>
                 <span>
-                  {defaultChoice.label} <span className="option-default">· Default</span>
+                  {defaultChoice.label}
+                  {/* The reasoning sentinel's label already IS "Default", so the
+                      usual marker would read "Default · Default". Spend the row
+                      on what the choice actually means instead — it's the one
+                      genuinely new concept here, and "Default" alone doesn't
+                      say that the CLI's own configured effort is what applies. */}
+                  <span className="option-default">
+                    {defaultChoice.id === REASONING_DEFAULT_ID
+                      ? " · CLI configuration"
+                      : " · Default"}
+                  </span>
                 </span>
                 {effectiveId === defaultChoice.id && <Check size={13} />}
               </button>
               <div className="option-sep" />
             </>
           )}
-          {choices.map((c, i) => (
+          {/* The default is already pinned above; listing it again would show
+              the same row twice (the reasoning lists now carry an explicit
+              `default` choice, so this is no longer hypothetical). */}
+          {rest.map((c, i) => (
             <button key={c.id} className="model-item" onClick={() => choose(c.id)}>
               <span>{c.label}</span>
               {effectiveId === c.id ? (
