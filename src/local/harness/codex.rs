@@ -2089,6 +2089,44 @@ requires_openai_auth = true
     }
 
     #[test]
+    fn custom_provider_is_read_off_disk_without_an_auth_json() {
+        // End-to-end over the same file read `detect` performs: a CODEX_HOME
+        // holding only config.toml (no auth.json, as the bug report describes)
+        // still yields a provider whose env_key gates readiness.
+        let dir = std::env::temp_dir().join("orx-codex-detect-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.toml");
+        std::fs::write(
+            &config,
+            r#"
+model = "gateway-model"
+model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://gateway.example/v1"
+env_key = "ORX_TEST_UNSET_CREDENTIAL"
+requires_openai_auth = false
+"#,
+        )
+        .unwrap();
+
+        assert!(!dir.join("auth.json").exists());
+        let provider = std::fs::read_to_string(&config)
+            .ok()
+            .as_deref()
+            .and_then(parse_custom_provider)
+            .expect("config.toml should yield a custom provider");
+
+        assert_eq!(provider.model.as_deref(), Some("gateway-model"));
+        // The credential is absent, so detection reports not-ready and the note
+        // names the variable to set instead of telling the user to run
+        // `codex login` (which would be the wrong instruction here).
+        assert!(!provider.is_ready());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn version_parses_cli_output_and_gates() {
         assert_eq!(parse_codex_version("codex-cli 0.144.0"), Some((0, 144, 0)));
         assert_eq!(parse_codex_version("0.150.2"), Some((0, 150, 2)));
