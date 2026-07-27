@@ -40,7 +40,7 @@ use super::detect::{
     bin_version, find_on_path, jwt_payload, nonempty_str, parse_version, read_json,
     resolve_symlinks, title_case, HarnessInfo, ModelInfo,
 };
-use super::options::{resolve_reasoning, HarnessOptions, PermissionMode};
+use super::options::{resolve_reasoning, HarnessOptions, PermissionMode, REASONING_DEFAULT_ID};
 use super::{should_synthesize_plan, synthesize_resume, Harness, ResumeAction};
 use crate::error::{anyhow, Result};
 use crate::local::chat::{
@@ -50,21 +50,19 @@ use crate::local::chat::{
 use crate::local::codex::{CodexClient, ServerReqKind, TurnEvent};
 use crate::local::opencode::ensure_playbook;
 
-// The 5.6 variants (Sol = frontier, Terra = balanced, Luna = fast) plus 5.5;
-// ChatGPT-account codex rejects bare `gpt-5.6`. Verified against codex-cli
-// 0.144 via `codex exec -m` (5.6 needs >= 0.143; older CLIs get a 400).
-// Each entry is `(model id, the `model_reasoning_effort` values it accepts)`.
-// Codex exposes no machine-readable effort metadata — `--help` says nothing and
-// the value is plain config — so unlike OpenCode the tiers have to be curated.
-// Keeping them in the SAME table as the model ids is what stops the two from
-// drifting: adding a model necessarily means stating its tiers.
+// FALLBACK model table, used only when the app-server catalog is unreachable
+// (codex < 0.144's legacy exec path, or a failed/timed-out `model/list`). The
+// primary source is `codex_model_list`: the app-server's `model/list` reports
+// every model with its `supportedReasoningEfforts`, exactly like opencode's
+// `models --verbose` — so models and tiers are normally *queried*, not curated.
 //
-// Getting these wrong is not cosmetic: codex does no local validation and
-// forwards the value, so an unsupported tier comes back as a 400 that kills the
-// turn. All three 5.6 models reach `ultra`; 5.5 stops at `xhigh` (`max` → 400
-// `Invalid value: 'max'`). Verified live against codex-cli 0.144 by running a
-// turn per boundary — issue #123's table claims Luna stops at `max`, which did
-// not reproduce.
+// Each entry is `(model id, the `model_reasoning_effort` values it accepts)`,
+// mirroring the catalog as of codex-cli 0.144. Sol/Terra reach `ultra`; Luna
+// stops at `max`; 5.5 stops at `xhigh`. (A live `codex exec` turn on Luna
+// tolerated `ultra`, but the catalog is what codex's own picker offers — the
+// catalog wins for what WE offer.) Getting a tier wrong is not cosmetic: codex
+// forwards the value unvalidated and an unsupported one comes back as a 400
+// that kills the turn (observed: 5.5 + `max`).
 const CODEX_MODELS: [(&str, &[&str]); 4] = [
     (
         "gpt-5.6-sol",
@@ -74,10 +72,7 @@ const CODEX_MODELS: [(&str, &[&str]); 4] = [
         "gpt-5.6-terra",
         &["low", "medium", "high", "xhigh", "max", "ultra"],
     ),
-    (
-        "gpt-5.6-luna",
-        &["low", "medium", "high", "xhigh", "max", "ultra"],
-    ),
+    ("gpt-5.6-luna", &["low", "medium", "high", "xhigh", "max"]),
     ("gpt-5.5", &["low", "medium", "high", "xhigh"]),
 ];
 
@@ -112,13 +107,123 @@ fn token_count_usage(info: &Value) -> (Option<u64>, Option<u64>) {
 /// this build doesn't know).
 const CODEX_REASONING_LEVELS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 
-/// The effort ids a given codex model accepts, or the conservative fallback.
-fn codex_model_reasoning(model: &str) -> &'static [&'static str] {
+/// The effort ids a given codex model accepts per the FALLBACK table, or the
+/// conservative intersection. Send-time validation only — detection prefers
+/// the live catalog (`codex_model_list`).
+fn codex_model_reasoning(model: &str) -> Option<&'static [&'static str]> {
     CODEX_MODELS
         .iter()
         .find(|(id, _)| *id == model)
         .map(|(_, levels)| *levels)
-        .unwrap_or(&CODEX_REASONING_LEVELS)
+}
+
+/// Query the app-server's `model/list` — codex's own catalog, the same data its
+/// TUI picker renders: every model with its `supportedReasoningEfforts` and
+/// default. This is the primary model source (the static table is only the
+/// fallback), for the same reason opencode parses `models --verbose`: the
+/// installed CLI knows its catalog and we don't — a curated table here shipped
+/// missing three models and a wrong Luna tier before this existed.
+///
+/// Protocol: spawn `codex app-server`, `initialize` → `initialized` (the same
+/// handshake `local::codex` uses, incl. `experimentalApi` — `model/list` is
+/// part of the v2 surface), then one `model/list` request. Any failure —
+/// spawn, timeout, old codex without the method — returns `None` and the
+/// caller falls back to the static table. Hidden catalog entries are skipped
+/// (the server already filters them by default; the guard is belt-and-braces).
+async fn codex_model_list(bin: &Path) -> Option<Vec<ModelInfo>> {
+    let fut = async {
+        let mut child = Command::new(bin)
+            .arg("app-server")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take()?;
+        let mut lines = BufReader::new(child.stdout.take()?).lines();
+
+        use tokio::io::AsyncWriteExt;
+        async fn send(stdin: &mut tokio::process::ChildStdin, v: Value) -> Option<()> {
+            let mut line = v.to_string();
+            line.push('\n');
+            stdin.write_all(line.as_bytes()).await.ok()
+        }
+        // Read until the response with this id (skipping notifications).
+        async fn recv(
+            lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+            id: u64,
+        ) -> Option<Value> {
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                    if v.get("id").and_then(Value::as_u64) == Some(id) {
+                        return Some(v);
+                    }
+                }
+            }
+            None
+        }
+
+        send(
+            &mut stdin,
+            serde_json::json!({
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "orx",
+                        "title": "OpenResearch",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                    "capabilities": { "experimentalApi": true },
+                },
+            }),
+        )
+        .await?;
+        recv(&mut lines, 1).await?;
+        send(&mut stdin, serde_json::json!({ "method": "initialized" })).await?;
+        send(
+            &mut stdin,
+            serde_json::json!({ "id": 2, "method": "model/list", "params": {} }),
+        )
+        .await?;
+        let resp = recv(&mut lines, 2).await?;
+        let models = parse_model_list(resp.get("result")?);
+        (!models.is_empty()).then_some(models)
+    };
+    tokio::time::timeout(Duration::from_secs(15), fut)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// `model/list` result → per-model `ModelInfo`, efforts attached in catalog
+/// order. Split from the transport for testability.
+fn parse_model_list(result: &Value) -> Vec<ModelInfo> {
+    let Some(data) = result.get("data").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    data.iter()
+        .filter(|m| !m.get("hidden").and_then(Value::as_bool).unwrap_or(false))
+        .filter_map(|m| {
+            // `model` is the slug the turn passes as `-m`/`model`; `id` equals
+            // it in practice but `model` is the documented carrier.
+            let id = m
+                .get("model")
+                .or_else(|| m.get("id"))
+                .and_then(Value::as_str)?;
+            let efforts: Vec<&str> = m
+                .get("supportedReasoningEfforts")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|e| e.get("reasoningEffort").and_then(Value::as_str))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(ModelInfo::new(id).with_reasoning(&efforts))
+        })
+        .collect()
 }
 
 pub struct Codex;
@@ -270,12 +375,21 @@ impl Harness for Codex {
                 Some(Some(model)) => info = info.with_models(vec![ModelInfo::new(model)]),
                 Some(None) => info = info.with_models(Vec::new()),
                 None => {
-                    info = info.with_models(
+                    // First-party account: ask the installed CLI for its own
+                    // catalog (models + per-model efforts, the data codex's TUI
+                    // picker renders). The static table only covers a codex too
+                    // old to answer `model/list`.
+                    let bin = info.bin_path.as_deref().map(Path::new);
+                    let models = match bin {
+                        Some(bin) => codex_model_list(bin).await,
+                        None => None,
+                    };
+                    info = info.with_models(models.unwrap_or_else(|| {
                         CODEX_MODELS
                             .iter()
                             .map(|(id, levels)| ModelInfo::new(*id).with_reasoning(levels))
-                            .collect(),
-                    )
+                            .collect()
+                    }));
                 }
             }
             // Old CLIs still work via the legacy exec path, but miss the
@@ -1696,18 +1810,29 @@ pub(crate) fn ensure_orx_data_dir() -> Option<PathBuf> {
     dir.canonicalize().ok()
 }
 
-/// Session reasoning id → Codex `model_reasoning_effort` value, validated
-/// against the *selected model's* tiers (`ultra` is Sol/Terra-only). See
+/// Session reasoning id → Codex `model_reasoning_effort` value. See
 /// [`resolve_reasoning`] for what a `None` result means.
+///
+/// Validation is per model, from the fallback table:
+///   * a model the table knows → validate against its tiers;
+///   * a model it doesn't (the catalog is discovered live now, so this is any
+///     model outside the frozen four) → forward the value. The composer only
+///     offered what `model/list` reported for that model, so an allowlist here
+///     would drop genuinely supported tiers — the same reasoning as
+///     `opencode_variant`. A stale/wrong value comes back as a codex 400,
+///     which is surfaced to the chat, not swallowed;
+///   * no model at all → the CLI's own configured default model, whose tiers
+///     we can't know. Conservative intersection; matches what the composer
+///     offers in that state, so nothing advertised is dropped.
 fn codex_reasoning<'a>(level: Option<&'a str>, model: Option<&str>) -> Option<&'a str> {
-    // No explicit model → the CLI's own configured default model, whose tiers
-    // we can't know. That's the common case, not an exotic one, so it falls
-    // back to the conservative intersection rather than guessing.
-    let allowed = match model {
-        Some(m) => codex_model_reasoning(m),
-        None => &CODEX_REASONING_LEVELS,
-    };
-    resolve_reasoning(level, allowed)
+    match model {
+        Some(m) => match codex_model_reasoning(m) {
+            Some(allowed) => resolve_reasoning(level, allowed),
+            // Catalog-discovered model: forward anything but the sentinel.
+            None => level.filter(|l| *l != REASONING_DEFAULT_ID),
+        },
+        None => resolve_reasoning(level, &CODEX_REASONING_LEVELS),
+    }
 }
 
 fn command_string(v: &Value) -> String {
@@ -2664,11 +2789,16 @@ requires_openai_auth = false
     /// one hard-coded intersection.
     #[test]
     fn reasoning_is_model_specific() {
-        // Every 5.6 model reaches `ultra` (verified live — see CODEX_MODELS).
-        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
-            assert_eq!(codex_reasoning(Some("max"), Some(model)), Some("max"));
+        // Sol/Terra reach `ultra`; Luna stops at `max` (the catalog's word —
+        // codex's own picker doesn't offer Luna `ultra`, so neither do we).
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra"] {
             assert_eq!(codex_reasoning(Some("ultra"), Some(model)), Some("ultra"));
         }
+        assert_eq!(
+            codex_reasoning(Some("max"), Some("gpt-5.6-luna")),
+            Some("max")
+        );
+        assert_eq!(codex_reasoning(Some("ultra"), Some("gpt-5.6-luna")), None);
         // 5.5 stops at `xhigh`. An unsupported tier is dropped rather than sent
         // — this is the "changing models clears a stale effort" guarantee,
         // enforced backend-side too, and it matters because codex answers an
@@ -2678,10 +2808,79 @@ requires_openai_auth = false
             Some("xhigh")
         );
         assert_eq!(codex_reasoning(Some("max"), Some("gpt-5.5")), None);
-        // Unknown model / no model → the conservative fallback.
-        assert_eq!(codex_reasoning(Some("xhigh"), Some("gpt-9")), Some("xhigh"));
-        assert_eq!(codex_reasoning(Some("ultra"), Some("gpt-9")), None);
+        // A model outside the fallback table is catalog-discovered: the
+        // composer offered only what `model/list` reported for it, so the value
+        // is forwarded rather than clamped (same reasoning as opencode).
+        assert_eq!(codex_reasoning(Some("ultra"), Some("gpt-9")), Some("ultra"));
+        assert_eq!(
+            codex_reasoning(Some(REASONING_DEFAULT_ID), Some("gpt-9")),
+            None
+        );
+        // No model at all → the conservative fallback intersection.
+        assert_eq!(codex_reasoning(Some("xhigh"), None), Some("xhigh"));
         assert_eq!(codex_reasoning(Some("max"), None), None);
+    }
+
+    /// The `model/list` parser against the live 0.144 response shape (headers
+    /// trimmed to the fields we read). Efforts come out in catalog order,
+    /// hidden entries are skipped, and every model leads with the sentinel.
+    #[test]
+    fn model_list_parses_catalog_models_and_efforts() {
+        let result = serde_json::json!({
+            "data": [
+                {
+                    "id": "gpt-5.6-sol", "model": "gpt-5.6-sol",
+                    "displayName": "GPT-5.6 Sol", "hidden": false, "isDefault": true,
+                    "defaultReasoningEffort": "low",
+                    "supportedReasoningEfforts": [
+                        { "reasoningEffort": "low", "description": "" },
+                        { "reasoningEffort": "medium", "description": "" },
+                        { "reasoningEffort": "high", "description": "" },
+                        { "reasoningEffort": "xhigh", "description": "" },
+                        { "reasoningEffort": "max", "description": "" },
+                        { "reasoningEffort": "ultra", "description": "" },
+                    ],
+                },
+                {
+                    "id": "gpt-5.4-mini", "model": "gpt-5.4-mini",
+                    "displayName": "GPT-5.4 mini", "hidden": false, "isDefault": false,
+                    "defaultReasoningEffort": "medium",
+                    "supportedReasoningEfforts": [
+                        { "reasoningEffort": "low", "description": "" },
+                        { "reasoningEffort": "medium", "description": "" },
+                        { "reasoningEffort": "high", "description": "" },
+                        { "reasoningEffort": "xhigh", "description": "" },
+                    ],
+                },
+                {
+                    "id": "secret", "model": "secret", "displayName": "hidden one",
+                    "hidden": true, "isDefault": false,
+                    "defaultReasoningEffort": "medium",
+                    "supportedReasoningEfforts": [],
+                },
+            ],
+        });
+        let models = parse_model_list(&result);
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["gpt-5.6-sol", "gpt-5.4-mini"]
+        );
+        let ids = |m: &ModelInfo| {
+            m.reasoning_levels
+                .as_ref()
+                .map(|c| c.iter().map(|c| c.id.clone()).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            ids(&models[0]).unwrap(),
+            ["default", "low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(
+            ids(&models[1]).unwrap(),
+            ["default", "low", "medium", "high", "xhigh"]
+        );
+        // Junk shapes parse to nothing rather than panicking.
+        assert!(parse_model_list(&serde_json::json!({})).is_empty());
+        assert!(parse_model_list(&serde_json::json!({ "data": "nope" })).is_empty());
     }
 
     /// `Default` must send no `model_reasoning_effort` at all — otherwise a
