@@ -1267,7 +1267,13 @@ textarea::placeholder {
   resize: none;
   padding: 10px 12px 4px;
   font-size: var(--fs-md);
-  min-height: 42px;
+  /* Auto-grow with the draft (Firefox doesn't ship field-sizing yet and
+     falls back to the fixed two-row box). min-height keeps the two-row
+     resting look — field-sizing ignores rows — and max-height caps the
+     growth, past which the textarea scrolls internally. Also matches the
+     plan strip's revise textarea, which grows the same way. */
+  field-sizing: content;
+  min-height: 52px;
   max-height: 180px;
 }
 /* pasted images waiting to be sent */
