@@ -53,6 +53,37 @@ fn cap_tool_text(text: &mut String) {
     text.push_str(TOOL_TEXT_TRUNCATION_MARKER);
 }
 
+/// Find a part by id anywhere in the tree (depth-first), returning `&mut` to it.
+/// Shared by the harnesses that route sub-agent events into a spawn part's
+/// `children`.
+pub fn find_part_mut<'a>(parts: &'a mut [WirePart], id: &str) -> Option<&'a mut WirePart> {
+    for part in parts.iter_mut() {
+        if part.id == id {
+            return Some(part);
+        }
+        if let Some(found) = find_part_mut(&mut part.children, id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Upsert by id, carrying forward the existing part's `children`. Used for spawn
+/// parts: a fresh build has empty children, but the sub-agent transcript already
+/// streamed into the on-transcript part — replacing the whole part would drop it.
+/// Non-spawn parts have no children, so this is equivalent to a plain upsert.
+pub fn upsert_preserving_children(parts: &mut Vec<WirePart>, mut part: WirePart) {
+    match parts.iter_mut().find(|p| p.id == part.id) {
+        Some(existing) => {
+            if part.children.is_empty() {
+                part.children = std::mem::take(&mut existing.children);
+            }
+            *existing = part;
+        }
+        None => parts.push(part),
+    }
+}
+
 /// Cap every tool part's `output`/`error` in place. Applied on each flush —
 /// this covers every adapter (they all land parts on the turn's
 /// `assistant.parts`, some by direct mutation); an adapter that re-upserts a
@@ -1721,6 +1752,37 @@ impl TurnCtx {
         if let Some(part) = self.assistant.parts.iter_mut().find(|p| p.id == part_id) {
             let text = part.text.get_or_insert_with(String::new);
             text.push_str(delta);
+        }
+    }
+
+    /// Upsert a part into the `children` of the part with `parent_id` (anywhere
+    /// in the tree), carrying forward existing children — for a sub-agent's
+    /// transcript hung under its spawn row. No-op if the parent isn't found yet.
+    /// Shared by every harness that streams sub-agent activity (Codex threadId,
+    /// Claude parent_tool_use_id, OpenCode child sessionID).
+    pub fn upsert_child(&mut self, parent_id: &str, part: WirePart) {
+        if let Some(parent) = find_part_mut(&mut self.assistant.parts, parent_id) {
+            upsert_preserving_children(&mut parent.children, part);
+        }
+    }
+
+    /// Append streamed text to a child part (creating it via `make` on the first
+    /// delta) inside `parent_id`'s children. No-op if the parent isn't found.
+    pub fn append_child_text(
+        &mut self,
+        parent_id: &str,
+        child_id: &str,
+        delta: &str,
+        make: impl FnOnce() -> WirePart,
+    ) {
+        let Some(parent) = find_part_mut(&mut self.assistant.parts, parent_id) else {
+            return;
+        };
+        if !parent.children.iter().any(|p| p.id == child_id) {
+            parent.children.push(make());
+        }
+        if let Some(child) = parent.children.iter_mut().find(|p| p.id == child_id) {
+            child.text.get_or_insert_with(String::new).push_str(delta);
         }
     }
 

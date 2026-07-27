@@ -686,8 +686,10 @@ function renderParts(
   };
   for (const part of parts) {
     // A sub-agent spawn part streams its own transcript in `children` — render
-    // it as a standalone nested block, not folded into a tool run.
-    if (part.type === "tool" && part.tool === "subagent") {
+    // it as a standalone nested block, not folded into a tool run. The signal is
+    // harness-agnostic: Codex tags the row `subagent`, while Claude's `Task` /
+    // OpenCode's `task` rows are spawns whenever they carry children.
+    if (part.type === "tool" && (part.tool === "subagent" || (part.children?.length ?? 0) > 0)) {
       flushTools();
       rendered.push(
         <SubagentBlock

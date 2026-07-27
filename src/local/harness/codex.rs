@@ -41,8 +41,8 @@ use super::options::{HarnessOptions, PermissionMode};
 use super::{should_synthesize_plan, synthesize_resume, Harness, ResumeAction};
 use crate::error::{anyhow, Result};
 use crate::local::chat::{
-    prepare_env, set_chat_session_env, ContextUsage, PromptAnswer, ResumeCtx, TurnCtx, WirePart,
-    WirePrompt, WireQuestionOption, WireToolState,
+    find_part_mut, prepare_env, set_chat_session_env, upsert_preserving_children, ContextUsage,
+    PromptAnswer, ResumeCtx, TurnCtx, WirePart, WirePrompt, WireQuestionOption, WireToolState,
 };
 use crate::local::codex::{CodexClient, ServerReqKind, TurnEvent};
 use crate::local::opencode::ensure_playbook;
@@ -678,23 +678,6 @@ fn apply_item(ctx: &mut TurnCtx, item: &Value, completed: bool) {
     upsert_preserving_children(&mut ctx.assistant.parts, part);
 }
 
-/// Upsert by id, carrying forward the existing part's `children`. Used for
-/// spawn parts: a fresh `item_to_part` build has empty children, but the sub-
-/// agent transcript already streamed into the on-transcript part — replacing
-/// the whole part would drop it. Non-spawn parts have no children, so this is
-/// equivalent to a plain upsert for them.
-fn upsert_preserving_children(parts: &mut Vec<WirePart>, mut part: WirePart) {
-    match parts.iter_mut().find(|p| p.id == part.id) {
-        Some(existing) => {
-            if part.children.is_empty() {
-                part.children = std::mem::take(&mut existing.children);
-            }
-            *existing = part;
-        }
-        None => parts.push(part),
-    }
-}
-
 /// The three item types whose text streams token-by-token via `item/*/delta`
 /// before the completed item arrives (agentMessage, reasoning, plan). For these,
 /// a completed item carrying empty text must not clobber the streamed part.
@@ -1005,19 +988,6 @@ fn classify_event_thread(
         Some(tid) if sub_threads.contains_key(tid) => EventScope::SubAgent(tid.to_string()),
         _ => EventScope::Stale,
     }
-}
-
-/// Find a part by id anywhere in the tree (depth-first), returning `&mut` to it.
-fn find_part_mut<'a>(parts: &'a mut [WirePart], id: &str) -> Option<&'a mut WirePart> {
-    for part in parts.iter_mut() {
-        if part.id == id {
-            return Some(part);
-        }
-        if let Some(found) = find_part_mut(&mut part.children, id) {
-            return Some(found);
-        }
-    }
-    None
 }
 
 /// The sub-agent equivalent of `apply_notification`, routing into `bucket` (the
