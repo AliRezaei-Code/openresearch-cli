@@ -441,7 +441,7 @@ export function NewProjectForm({
                     : "No code linked to this paper — a blank private repo will be created"}
               </span>
             </label>
-            {parsed && repoFields}
+            {repoFields}
             {nameField}
             {!parsed && blankRepoHint}
           </>

@@ -13,6 +13,7 @@ import {
   type TelemetrySettings,
 } from "../api";
 import { GitTokenForm } from "./GitTokenForm";
+import { renderNote } from "./agentNote";
 
 const RETRY_COPY = "Couldn't reach orx. Check it's still running, then re-check.";
 
@@ -35,24 +36,19 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   const [harnessError, setHarnessError] = useState(false);
   const [gitError, setGitError] = useState(false);
 
-  // orx can't chat or run autoresearch without a signed-in agent, so step 1 is
-  // a hard gate. Null (still detecting) counts as not-ready: better a briefly
-  // disabled button than one that goes dead under the cursor.
-  // A failed probe must not gate: detection fans out to per-binary version and
-  // model commands that can stall, and onboarding is the whole app on first
-  // boot — a stalled check would be an unrecoverable dead end.
+  // Step 1 gates on a signed-in agent. Null (still detecting) counts as
+  // not-ready; a *failed* probe counts as ready, because detection fans out to
+  // per-binary subprocesses that can stall and onboarding is the whole app on
+  // first boot — a stalled check must not be an unrecoverable dead end.
   const anyAgentReady = harnessError || (harnesses?.some((h) => h.agentReady) ?? false);
 
   // Drives the nudge on step 2 only — that step doesn't gate, so an unknown
   // answer costs nothing.
   const githubConnected = git?.githubTokenSource != null;
 
-  // A rejected probe must not leave state at null forever: the gates read null
-  // as not-ready, so a transient failure would disable Continue with no hint
-  // and no way out — and onboarding *is* the whole app on first boot.
-  // Drops a slow probe whose answer a newer load (or a token save) has already
-  // superseded — otherwise a Save landing mid-refresh gets overwritten by the
-  // pre-save snapshot and the card reads "Not connected" until the next check.
+  // Drops a slow probe whose answer a newer load — or a token save — has
+  // already superseded, so a Save landing mid-refresh isn't overwritten by the
+  // pre-save snapshot.
   const loadSeq = useRef(0);
   const load = (refresh: boolean) => {
     const seq = ++loadSeq.current;
@@ -79,7 +75,11 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
           setGit(null);
         }
       })
-      .finally(() => fresh() && setChecking(false));
+      // Not sequence-guarded: this is "a load is running", not data a stale
+      // response could corrupt. Guarding it meant a token save (which bumps
+      // loadSeq to supersede the probe) left `checking` true forever, with
+      // both Re-check buttons dead for the rest of the session.
+      .finally(() => setChecking(false));
   };
   useEffect(() => load(false), []);
 
@@ -247,19 +247,6 @@ function CmdChip({ cmd }: { cmd: string }) {
 
 /** Agent notes carry the command to run in backticks (`claude auth login`) —
  * render those spans as code so they read as something to type, not prose. */
-export function renderNote(note: string | undefined) {
-  if (!note) return null;
-  return note.split(/`([^`]+)`/).map((part, i) =>
-    i % 2 === 1 ? (
-      <code key={i} className="mono">
-        {part}
-      </code>
-    ) : (
-      part
-    ),
-  );
-}
-
 function agentBadge(h: Harness): { cls: string; label: string } {
   if (h.agentReady) return { cls: "st-done", label: "Connected" };
   if (h.installed) return { cls: "st-starting", label: "Not signed in" };

@@ -7,7 +7,7 @@ import {
   type HarnessId,
   type OptionChoice,
 } from "../api";
-import { renderNote } from "./Onboarding";
+import { renderNote } from "./agentNote";
 
 export interface ModelSelection {
   harness: HarnessId;

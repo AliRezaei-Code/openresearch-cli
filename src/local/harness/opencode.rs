@@ -94,6 +94,12 @@ impl Harness for OpenCode {
             info.auth_method = Some("apiKey");
         }
 
+        // Tightened from `installed` alone — opencode with no credential can't
+        // actually run a turn, and it was the one harness reporting Connected
+        // regardless. Behaviour change on upgrade: an install with neither
+        // auth.json nor a provider key above now reads "Not signed in", and
+        // since step 1 of onboarding gates on this, an opencode-only user is
+        // asked to sign in before continuing.
         info.agent_ready = info.installed && info.authenticated;
         if info.agent_ready {
             info.models = models

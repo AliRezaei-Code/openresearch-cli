@@ -2153,8 +2153,6 @@ textarea::placeholder {
   white-space: normal;
   word-break: break-word;
 }
-/* Names what the command/form below it is for, so the action is never a bare
-   chip with no instruction. */
 /* The call to action. Full-strength text so it's unmissable, but regular
    weight at body size — semibold would tie it with the `GitHub` row label
    above and read as a second heading. */
