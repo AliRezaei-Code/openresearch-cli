@@ -164,9 +164,13 @@ impl Harness for Codex {
                     "This Codex version chats via the legacy exec path — update to 0.144+ for plan mode & permission prompts.".to_string(),
                 );
             }
+        } else if info.installed {
+            info.agent_note = Some("Sign in with `codex login` to chat with it here.".to_string());
         } else {
-            info.agent_note =
-                Some("Install Codex and sign in (`codex login`) to chat with it here.".to_string());
+            info.agent_note = Some(
+                "Install Codex (developers.openai.com/codex), then sign in with `codex login`."
+                    .to_string(),
+            );
         }
         Some(info)
     }

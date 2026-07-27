@@ -99,7 +99,7 @@ impl Harness for ClaudeCode {
                 };
             }
         }
-        if !info.authenticated && std::env::var("ANTHROPIC_API_KEY").is_ok_and(|v| !v.is_empty()) {
+        if !info.authenticated && super::detect::api_key("ANTHROPIC_API_KEY").is_some() {
             info.authenticated = true;
             info.auth_method = Some("apiKey");
         }
@@ -107,9 +107,13 @@ impl Harness for ClaudeCode {
         info.agent_ready = info.installed && info.authenticated;
         if info.agent_ready {
             info = info.with_models(&CLAUDE_MODELS);
+        } else if info.installed {
+            info.agent_note =
+                Some("Sign in with `claude auth login` to chat with it here.".to_string());
         } else {
             info.agent_note = Some(
-                "Install Claude Code and sign in (`claude`) to chat with it here.".to_string(),
+                "Install Claude Code (claude.com/download), then sign in with `claude auth login`."
+                    .to_string(),
             );
         }
         Some(info)

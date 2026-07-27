@@ -69,16 +69,49 @@ impl Harness for OpenCode {
             info.auth_method = Some("oauth");
             info.account = Some(providers.join(", "));
         }
+        // opencode also takes provider keys straight from the environment,
+        // writing no auth.json — same fallback claude.rs has. Checked against
+        // orx's synced env too, since that's a source the harness child gets
+        // but this process may not. Measured, not assumed: `opencode models`
+        // still lists free/bundled models when signed out, so a non-empty
+        // model list can't stand in for a credential.
+        const PROVIDER_KEYS: &[&str] = &[
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "GROQ_API_KEY",
+            "XAI_API_KEY",
+            "DEEPSEEK_API_KEY",
+        ];
+        if !info.authenticated
+            && PROVIDER_KEYS
+                .iter()
+                .any(|k| super::detect::api_key(k).is_some())
+        {
+            info.authenticated = true;
+            info.auth_method = Some("apiKey");
+        }
 
-        info.agent_ready = info.installed;
+        // Tightened from `installed` alone — opencode with no credential can't
+        // actually run a turn, and it was the one harness reporting Connected
+        // regardless. Behaviour change on upgrade: an install with neither
+        // auth.json nor a provider key above now reads "Not signed in", and
+        // since step 1 of onboarding gates on this, an opencode-only user is
+        // asked to sign in before continuing.
+        info.agent_ready = info.installed && info.authenticated;
         if info.agent_ready {
             info.models = models
                 .into_iter()
                 .map(|id| super::ModelInfo { id })
                 .collect();
+        } else if info.installed {
+            info.agent_note =
+                Some("Sign in with `opencode auth login` to chat with it here.".to_string());
         } else {
             info.agent_note = Some(
-                "Install opencode (curl -fsSL https://opencode.ai/install | bash) to chat with it here."
+                "Install opencode (curl -fsSL https://opencode.ai/install | bash), then sign in with `opencode auth login`."
                     .to_string(),
             );
         }

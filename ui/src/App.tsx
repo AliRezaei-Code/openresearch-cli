@@ -248,6 +248,9 @@ export default function App() {
       return true; // storage unavailable — don't loop the walkthrough
     }
   });
+  // Set only when the walkthrough hands off, so the New project modal opens
+  // once — a later visit to Projects starts closed as usual.
+  const [justOnboarded, setJustOnboarded] = useState(false);
   // The spotlight tour of the workspace (Tour.tsx). Starting it normalizes
   // the layout so every tour target exists; those are the defaults, so
   // nothing needs restoring on finish/skip.
@@ -581,6 +584,8 @@ export default function App() {
             onOpen={setProjectId}
             onCreated={onProjectCreated}
             onDeleted={onProjectDeleted}
+            openNewProject={justOnboarded}
+            onNewProjectOpened={() => setJustOnboarded(false)}
           />
         ) : (
           <Onboarding
@@ -590,6 +595,7 @@ export default function App() {
               } catch {
                 // private mode etc. — the flow just replays next boot
               }
+              setJustOnboarded(true);
               setOnboarded(true);
             }}
           />

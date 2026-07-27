@@ -119,6 +119,18 @@ export const searchPapers = (q: string) =>
     (r) => r.papers,
   );
 
+/** The signed-in GitHub login, for naming the account a new repo lands on.
+ * `login` is null when there's no usable token. */
+export const githubAccount = () => get<{ login: string | null }>("/api/github/account");
+
+/** Whether the stored credentials can push to a repo. An unanswerable check
+ * (no token / API hiccup) reports `true`, matching the server's own fallback,
+ * so an outage never shows a fork choice the server wouldn't honour. */
+export const repoAccess = (owner: string, repo: string) =>
+  get<{ canPush: boolean }>(
+    `/api/github/repo-access?owner=${encodeURIComponent(owner)}&repo=${encodeURIComponent(repo)}`,
+  );
+
 /** Resolve an arXiv id / URL to title + linked GitHub repo. May take a few
  * seconds for papers alphaXiv hasn't indexed yet (it scrapes arXiv on a miss). */
 export const resolvePaper = (id: string) =>

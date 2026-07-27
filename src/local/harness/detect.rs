@@ -117,6 +117,17 @@ pub(super) async fn bin_version(bin: &PathBuf) -> Option<String> {
     (!line.is_empty()).then_some(line)
 }
 
+/// An API key from the process env, else orx's own synced env file — the two
+/// sources `prepare_env` actually hands the harness child. Detecting only the
+/// former would report a working setup as signed out.
+pub(super) fn api_key(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| crate::config::synced_env_var(key))
+}
+
 pub(super) fn read_json(path: PathBuf) -> Option<Value> {
     let raw = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
