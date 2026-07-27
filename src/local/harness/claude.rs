@@ -14,7 +14,8 @@
 //! continues the same turn.
 //!
 //! Detection: `~/.claude.json` carries the signed-in OAuth account (no secrets
-//! read); `ANTHROPIC_API_KEY` is the api-key fallback.
+//! read); `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` are credential
+//! fallbacks, and are what a custom `ANTHROPIC_BASE_URL` gateway uses.
 
 use std::path::PathBuf;
 
@@ -53,6 +54,22 @@ const CLAUDE_EFFORT_LEVELS: [(&str, &str); 5] = [
 
 pub struct ClaudeCode;
 
+/// Either credential Claude Code accepts. `ANTHROPIC_AUTH_TOKEN` is the one a
+/// custom `ANTHROPIC_BASE_URL` gateway uses, so detecting only the api key
+/// reports those working setups as signed out.
+const CLAUDE_CREDENTIAL_VARS: [&str; 2] = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+
+fn has_api_credential() -> bool {
+    CLAUDE_CREDENTIAL_VARS
+        .iter()
+        .any(|key| super::detect::api_key(key).is_some())
+}
+
+/// Whether Claude Code is pointed at a non-first-party endpoint.
+fn custom_base_url() -> bool {
+    super::detect::api_key("ANTHROPIC_BASE_URL").is_some()
+}
+
 /// `claude` on PATH, else the common install drop locations.
 pub(crate) fn find_claude() -> Option<PathBuf> {
     find_on_path("claude").or_else(|| {
@@ -85,8 +102,17 @@ impl Harness for ClaudeCode {
             info.version = bin_version(&bin).await;
             info.bin_path = Some(bin.to_string_lossy().into_owned());
         }
+        // A custom `ANTHROPIC_BASE_URL` gateway authenticates with an env
+        // credential and never writes OAuth metadata, so a leftover
+        // `~/.claude.json` from an earlier first-party login would otherwise
+        // mislabel the account. Only a custom base url takes that precedence —
+        // an api key alongside a live OAuth login still shows the account.
+        if custom_base_url() && has_api_credential() {
+            info.authenticated = true;
+            info.auth_method = Some("apiKey");
+        }
         // ~/.claude.json carries the signed-in OAuth account (no secrets read).
-        if let Some(cfg) = dirs::home_dir().and_then(|h| read_json(h.join(".claude.json"))) {
+        else if let Some(cfg) = dirs::home_dir().and_then(|h| read_json(h.join(".claude.json"))) {
             if let Some(acct) = cfg.get("oauthAccount") {
                 info.authenticated = true;
                 info.auth_method = Some("oauth");
@@ -99,7 +125,7 @@ impl Harness for ClaudeCode {
                 };
             }
         }
-        if !info.authenticated && super::detect::api_key("ANTHROPIC_API_KEY").is_some() {
+        if !info.authenticated && has_api_credential() {
             info.authenticated = true;
             info.auth_method = Some("apiKey");
         }
@@ -1035,6 +1061,16 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bearer_token_counts_as_a_credential_alongside_the_api_key() {
+        // Both names are checked through the same `detect::api_key` lookup, so
+        // a gateway that only sets ANTHROPIC_AUTH_TOKEN still reads as signed
+        // in. (Asserted on the name list rather than by setting env vars, which
+        // would race with the other tests in this process.)
+        assert!(CLAUDE_CREDENTIAL_VARS.contains(&"ANTHROPIC_API_KEY"));
+        assert!(CLAUDE_CREDENTIAL_VARS.contains(&"ANTHROPIC_AUTH_TOKEN"));
+    }
 
     #[test]
     fn plan_card_synthesized_only_for_cardless_texty_plan_turns() {

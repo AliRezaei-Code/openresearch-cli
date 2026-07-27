@@ -31,7 +31,10 @@ export function defaultSelection(harnesses: Harness[]): ModelSelection | null {
   if (!ready) return null;
   return {
     harness: ready.id,
-    model: ready.models[0]?.id ?? null,
+    // null = send no `--model`, so the CLI uses whatever it is configured with.
+    // Forcing the first advertised id breaks custom providers, whose real model
+    // list lives behind the gateway rather than in our catalog.
+    model: null,
     permissionMode: ready.options?.defaultPermissionMode ?? null,
     reasoningLevel: ready.options?.defaultReasoningLevel ?? null,
   };
@@ -167,6 +170,15 @@ export function ModelPicker({
                   </div>
                 ) : (
                   <>
+                    <button className="model-item" onClick={() => pick(harness, null)}>
+                      <span>
+                        Default model
+                        <span className="model-id">CLI configuration</span>
+                      </span>
+                      {value?.harness === harness.id && value?.model === null && (
+                        <Check size={13} />
+                      )}
+                    </button>
                     {models.map((m) => (
                       <button
                         key={m.id}
