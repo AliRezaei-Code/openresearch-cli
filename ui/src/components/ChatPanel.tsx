@@ -1100,8 +1100,11 @@ export function ChatPanel({
   // top tiers appear only on the models that accept them.
   const reasoning = reasoningFor(activeHarness, composerSelection?.model);
 
-  // Editing the pickers: a session-scoped tweak when a session is open (applied
-  // on next send), else an update to the sticky global preference.
+  // Editing the pickers: every change updates the sticky global preference —
+  // the config a "New session" composer opens with is whatever the user chose
+  // LAST, whether they chose it on an empty composer or inside a session. With
+  // a session open the change additionally lands as that session's unsent
+  // tweak (applied on the next send).
   //
   // The session override is *merged*, never replaced. It has to be: the pickers
   // build their `next` by spreading `composerSelection`, whose reasoning level
@@ -1110,13 +1113,11 @@ export function ChatPanel({
   // permission mode would write a reasoning level the user never chose, and the
   // next send would persist it over their real setting.
   const selectModel = (next: Partial<ModelSelection>) => {
-    if (openSession) {
-      setSessionOverride((cur) => ({ ...cur, ...next }));
-    } else if (composerSelection) {
-      const merged = { ...composerSelection, ...next };
-      setSelection(merged);
-      localStorage.setItem(SELECTION_STORAGE_KEY, JSON.stringify(merged));
-    }
+    if (!composerSelection) return;
+    const merged = { ...composerSelection, ...next };
+    setSelection(merged);
+    localStorage.setItem(SELECTION_STORAGE_KEY, JSON.stringify(merged));
+    if (openSession) setSessionOverride((cur) => ({ ...cur, ...next }));
   };
   const setPermissionMode = (id: string) => selectModel({ permissionMode: id });
   const setReasoningLevel = (id: string) => selectModel({ reasoningLevel: id });
