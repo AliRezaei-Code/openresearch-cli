@@ -20,8 +20,10 @@
 //! multi-turn via `codex exec resume <session>`, playbook injected as tagged
 //! context on the first turn. `ORX_CODEX_EXEC=1` forces the fallback.
 //!
-//! Detection: `~/.codex/auth.json` holds either an `OPENAI_API_KEY` or an OAuth
-//! `id_token` JWT we decode (unverified) for the account email and plan.
+//! Detection follows the active provider in `$CODEX_HOME/config.toml`. A custom
+//! provider authenticates with its declared `env_key`; otherwise
+//! `auth.json` holds either an `OPENAI_API_KEY` or an OAuth `id_token` JWT we
+//! decode (unverified) for the account email and plan.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,13 +31,14 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 use super::detect::{
-    bin_version, find_on_path, jwt_payload, nonempty_str, read_json, resolve_symlinks, title_case,
-    HarnessInfo, ModelInfo,
+    bin_version, find_on_path, jwt_payload, nonempty_str, parse_version, read_json,
+    resolve_symlinks, title_case, HarnessInfo, ModelInfo,
 };
 use super::options::{resolve_reasoning, HarnessOptions, PermissionMode};
 use super::{should_synthesize_plan, synthesize_resume, Harness, ResumeAction};
@@ -120,6 +123,61 @@ fn codex_model_reasoning(model: &str) -> &'static [&'static str] {
 
 pub struct Codex;
 
+/// Only the fields detection needs off `config.toml`; codex has many more.
+#[derive(Deserialize)]
+struct CodexConfig {
+    model: Option<String>,
+    model_provider: Option<String>,
+    #[serde(default)]
+    model_providers: HashMap<String, CodexProvider>,
+}
+
+#[derive(Deserialize)]
+struct CodexProvider {
+    env_key: Option<String>,
+    #[serde(default)]
+    requires_openai_auth: bool,
+}
+
+struct CustomProvider {
+    model: Option<String>,
+    env_key: Option<String>,
+}
+
+impl CustomProvider {
+    /// A provider that declares no `env_key` carries its credential elsewhere
+    /// (or needs none), so treat it as usable rather than blocking on a var we
+    /// were never told the name of.
+    fn is_ready(&self) -> bool {
+        match self.env_key.as_deref() {
+            Some(key) => super::detect::api_key(key).is_some(),
+            None => true,
+        }
+    }
+}
+
+/// The active provider, when it is a custom one that bypasses OpenAI auth.
+/// `None` means first-party detection (auth.json) applies.
+fn parse_custom_provider(raw: &str) -> Option<CustomProvider> {
+    let cfg: CodexConfig = toml::from_str(raw).ok()?;
+    let provider = cfg.model_providers.get(cfg.model_provider.as_deref()?)?;
+    if provider.requires_openai_auth {
+        return None;
+    }
+    Some(CustomProvider {
+        model: cfg.model.filter(|model| !model.trim().is_empty()),
+        env_key: provider.env_key.clone(),
+    })
+}
+
+/// `$CODEX_HOME` when set (the same two env sources the harness child sees),
+/// else `~/.codex`.
+fn codex_home() -> Option<PathBuf> {
+    super::detect::api_key("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+}
+
 /// `codex` on PATH, symlinks resolved (see `resolve_symlinks` — codex needs to
 /// find its `codex-code-mode-host` helper next to the real binary).
 pub fn find_codex() -> Option<PathBuf> {
@@ -155,9 +213,25 @@ impl Harness for Codex {
             info.version = bin_version(&bin).await;
             info.bin_path = Some(bin.to_string_lossy().into_owned());
         }
-        if let Some(auth) =
-            dirs::home_dir().and_then(|h| read_json(h.join(".codex").join("auth.json")))
-        {
+        let home = codex_home();
+        let custom_provider = home
+            .as_ref()
+            .and_then(|home| std::fs::read_to_string(home.join("config.toml")).ok())
+            .as_deref()
+            .and_then(parse_custom_provider);
+
+        if let Some(provider) = custom_provider.as_ref() {
+            // A provider with `requires_openai_auth = false` never writes
+            // auth.json; its declared `env_key` is the credential.
+            if provider.is_ready() {
+                info.authenticated = true;
+                info.auth_method = provider.env_key.as_ref().map(|_| "apiKey");
+            } else if let Some(key) = provider.env_key.as_deref() {
+                info.agent_note = Some(format!(
+                    "Set `{key}` for the configured Codex model provider."
+                ));
+            }
+        } else if let Some(auth) = home.and_then(|home| read_json(home.join("auth.json"))) {
             if nonempty_str(&auth, "OPENAI_API_KEY").is_some() {
                 info.authenticated = true;
                 info.auth_method = Some("apiKey");
@@ -179,25 +253,47 @@ impl Harness for Codex {
 
         info.agent_ready = info.installed && info.authenticated;
         if info.agent_ready {
-            info = info.with_models(
-                CODEX_MODELS
-                    .iter()
-                    .map(|(id, levels)| ModelInfo::new(*id).with_reasoning(levels))
-                    .collect(),
-            );
+            // The first-party catalog is meaningless for a custom provider, so
+            // offer only the model that provider is configured with (the
+            // picker's "Default model" entry covers the unset case).
+            //
+            // A custom provider's model gets no reasoning list of its own: the
+            // curated tiers below describe OpenAI's models, and we know nothing
+            // about what an arbitrary provider accepts. `ModelInfo::new` leaves
+            // `reasoning_levels` absent, so the composer falls back to the
+            // conservative harness-wide list rather than offering `ultra` to a
+            // provider that would reject it.
+            match custom_provider
+                .as_ref()
+                .map(|provider| provider.model.as_deref())
+            {
+                Some(Some(model)) => info = info.with_models(vec![ModelInfo::new(model)]),
+                Some(None) => info = info.with_models(Vec::new()),
+                None => {
+                    info = info.with_models(
+                        CODEX_MODELS
+                            .iter()
+                            .map(|(id, levels)| ModelInfo::new(*id).with_reasoning(levels))
+                            .collect(),
+                    )
+                }
+            }
             // Old CLIs still work via the legacy exec path, but miss the
             // app-server wins (permission prompts on sandbox escalations;
             // thread resume).
             let too_old = info
                 .version
                 .as_deref()
-                .and_then(parse_codex_version)
+                .and_then(parse_version)
                 .is_some_and(|v| v < MIN_APP_SERVER_VERSION);
             if too_old {
                 info.agent_note = Some(
                     "This Codex version chats via the legacy exec path — update to 0.144+ for plan mode & permission prompts.".to_string(),
                 );
             }
+        } else if info.agent_note.is_some() {
+            // A configured custom provider already said which env var to set;
+            // `codex login` is the wrong instruction for it.
         } else if info.installed {
             info.agent_note = Some("Sign in with `codex login` to chat with it here.".to_string());
         } else {
@@ -356,7 +452,7 @@ impl Harness for Codex {
     }
 
     fn config_home(&self) -> Option<PathBuf> {
-        Some(dirs::home_dir()?.join(".codex"))
+        codex_home()
     }
 
     fn skill_target(&self) -> Option<PathBuf> {
@@ -381,11 +477,8 @@ impl Harness for Codex {
     fn extra_skill_targets(&self) -> Vec<(PathBuf, &'static str)> {
         // Keep the legacy `/orx` prompt for codex versions that don't yet read
         // `~/.agents/skills/`.
-        match dirs::home_dir() {
-            Some(home) => vec![(
-                home.join(".codex").join("prompts").join("orx.md"),
-                super::CODEX_PROMPT,
-            )],
+        match codex_home() {
+            Some(home) => vec![(home.join("prompts").join("orx.md"), super::CODEX_PROMPT)],
             None => Vec::new(),
         }
     }
@@ -408,25 +501,6 @@ const MIN_APP_SERVER_VERSION: (u64, u64, u64) = (0, 144, 0);
 /// bound; the interruption is a clear, recoverable error either way.
 const TURN_WATCHDOG: Duration = Duration::from_secs(30 * 60);
 
-/// `codex --version` output → (major, minor, patch). The first token that
-/// parses wins, so "codex-cli 0.144.0", bare "0.144.0", and a future
-/// "codex-cli 0.150.0 (abc123)" all resolve; a `-suffix` on the patch is
-/// tolerated.
-fn parse_codex_version(version: &str) -> Option<(u64, u64, u64)> {
-    version.split_whitespace().find_map(|token| {
-        let mut parts = token.splitn(3, '.');
-        let major = parts.next()?.parse().ok()?;
-        let minor = parts.next()?.parse().ok()?;
-        let patch = parts
-            .next()?
-            .split(|c: char| !c.is_ascii_digit())
-            .next()?
-            .parse()
-            .ok()?;
-        Some((major, minor, patch))
-    })
-}
-
 /// Whether the installed codex speaks the validated app-server protocol.
 /// Probed once per process (a codex upgrade mid-run takes an `orx up` restart
 /// to notice — acceptable).
@@ -440,7 +514,7 @@ async fn app_server_supported() -> bool {
             bin_version(&bin)
                 .await
                 .as_deref()
-                .and_then(parse_codex_version)
+                .and_then(parse_version)
                 .is_some_and(|v| v >= MIN_APP_SERVER_VERSION)
         })
         .await
@@ -2013,18 +2087,87 @@ mod tests {
     use super::*;
 
     #[test]
+    fn custom_provider_uses_its_env_key_and_configured_model() {
+        // The exact shape from the bug report: a gateway provider that opts out
+        // of OpenAI auth, so there is deliberately no auth.json to find.
+        let provider = parse_custom_provider(
+            r#"
+model = "gateway-model"
+model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://gateway.example/v1"
+env_key = "CUSTOM_API_KEY"
+wire_api = "responses"
+requires_openai_auth = false
+"#,
+        )
+        .unwrap();
+        assert_eq!(provider.model.as_deref(), Some("gateway-model"));
+        assert_eq!(provider.env_key.as_deref(), Some("CUSTOM_API_KEY"));
+
+        // A provider that still wants OpenAI auth falls through to auth.json.
+        assert!(parse_custom_provider(
+            r#"
+model_provider = "openai"
+[model_providers.openai]
+requires_openai_auth = true
+"#
+        )
+        .is_none());
+
+        // So does a config that names no provider at all.
+        assert!(parse_custom_provider("model = \"gpt-5.6-sol\"").is_none());
+    }
+
+    #[test]
+    fn custom_provider_is_read_off_disk_without_an_auth_json() {
+        // End-to-end over the same file read `detect` performs: a CODEX_HOME
+        // holding only config.toml (no auth.json, as the bug report describes)
+        // still yields a provider whose env_key gates readiness.
+        let dir = std::env::temp_dir().join("orx-codex-detect-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.toml");
+        std::fs::write(
+            &config,
+            r#"
+model = "gateway-model"
+model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://gateway.example/v1"
+env_key = "ORX_TEST_UNSET_CREDENTIAL"
+requires_openai_auth = false
+"#,
+        )
+        .unwrap();
+
+        assert!(!dir.join("auth.json").exists());
+        let provider = std::fs::read_to_string(&config)
+            .ok()
+            .as_deref()
+            .and_then(parse_custom_provider)
+            .expect("config.toml should yield a custom provider");
+
+        assert_eq!(provider.model.as_deref(), Some("gateway-model"));
+        // The credential is absent, so detection reports not-ready and the note
+        // names the variable to set instead of telling the user to run
+        // `codex login` (which would be the wrong instruction here).
+        assert!(!provider.is_ready());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn version_parses_cli_output_and_gates() {
-        assert_eq!(parse_codex_version("codex-cli 0.144.0"), Some((0, 144, 0)));
-        assert_eq!(parse_codex_version("0.150.2"), Some((0, 150, 2)));
-        assert_eq!(
-            parse_codex_version("codex-cli 1.0.3-nightly"),
-            Some((1, 0, 3))
-        );
-        assert_eq!(parse_codex_version("codex-cli"), None);
-        assert_eq!(parse_codex_version(""), None);
+        assert_eq!(parse_version("codex-cli 0.144.0"), Some((0, 144, 0)));
+        assert_eq!(parse_version("0.150.2"), Some((0, 150, 2)));
+        assert_eq!(parse_version("codex-cli 1.0.3-nightly"), Some((1, 0, 3)));
+        assert_eq!(parse_version("codex-cli"), None);
+        assert_eq!(parse_version(""), None);
         // The gate itself: tuple ordering does the right thing.
-        assert!(parse_codex_version("codex-cli 0.143.9").unwrap() < MIN_APP_SERVER_VERSION);
-        assert!(parse_codex_version("codex-cli 0.144.0").unwrap() >= MIN_APP_SERVER_VERSION);
+        assert!(parse_version("codex-cli 0.143.9").unwrap() < MIN_APP_SERVER_VERSION);
+        assert!(parse_version("codex-cli 0.144.0").unwrap() >= MIN_APP_SERVER_VERSION);
     }
 
     #[test]

@@ -14,14 +14,17 @@
 //! continues the same turn.
 //!
 //! Detection: `~/.claude.json` carries the signed-in OAuth account (no secrets
-//! read); `ANTHROPIC_API_KEY` is the api-key fallback.
+//! read); `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` are credential
+//! fallbacks, and are what a custom `ANTHROPIC_BASE_URL` gateway uses.
 
 use std::path::PathBuf;
 
 use async_trait::async_trait;
 use serde_json::Value;
 
-use super::detect::{bin_version, find_on_path, nonempty_str, read_json, HarnessInfo, ModelInfo};
+use super::detect::{
+    bin_version, find_on_path, nonempty_str, parse_version, read_json, HarnessInfo, ModelInfo,
+};
 use super::options::{resolve_reasoning, HarnessOptions, PermissionMode};
 use super::{Harness, ResumeAction};
 use crate::error::{anyhow, Result};
@@ -60,31 +63,13 @@ const CLAUDE_ULTRACODE: &str = "ultracode";
 /// on an unknown effort — 2.1.197 warns on stderr that it is ignoring the value
 /// and then runs the turn at its *default* effort. Advertising `ultracode`
 /// unconditionally would therefore offer a choice that silently does nothing.
-const CLAUDE_ULTRACODE_MIN_VERSION: (u32, u32, u32) = (2, 1, 217);
-
-/// Parse the leading `x.y.z` out of a `claude --version` line
-/// (e.g. `"2.1.197 (Claude Code)"`). Returns `None` when the shape is
-/// unfamiliar, which the caller treats as "don't offer `ultracode`".
-fn parse_semver(version: &str) -> Option<(u32, u32, u32)> {
-    let head = version.split_whitespace().next()?;
-    let mut parts = head.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    // A trailing pre-release suffix (`3-beta.1`) still yields its numeric patch.
-    let patch = parts
-        .next()?
-        .split(|c: char| !c.is_ascii_digit())
-        .next()?
-        .parse()
-        .ok()?;
-    Some((major, minor, patch))
-}
+const CLAUDE_ULTRACODE_MIN_VERSION: (u64, u64, u64) = (2, 1, 217);
 
 /// Whether this installed CLI accepts `--effort ultracode`. Unknown/unparseable
 /// versions are treated as unsupported: a missing choice is a smaller harm than
 /// a choice that silently downgrades to the default effort.
 fn supports_ultracode(version: Option<&str>) -> bool {
-    parse_semver(version.unwrap_or_default()).is_some_and(|v| v >= CLAUDE_ULTRACODE_MIN_VERSION)
+    parse_version(version.unwrap_or_default()).is_some_and(|v| v >= CLAUDE_ULTRACODE_MIN_VERSION)
 }
 
 /// The effort ids to advertise for this install — the ordinary five, plus
@@ -98,6 +83,22 @@ fn claude_effort_ids(version: Option<&str>) -> Vec<&'static str> {
 }
 
 pub struct ClaudeCode;
+
+/// Either credential Claude Code accepts. `ANTHROPIC_AUTH_TOKEN` is the one a
+/// custom `ANTHROPIC_BASE_URL` gateway uses, so detecting only the api key
+/// reports those working setups as signed out.
+const CLAUDE_CREDENTIAL_VARS: [&str; 2] = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+
+fn has_api_credential() -> bool {
+    CLAUDE_CREDENTIAL_VARS
+        .iter()
+        .any(|key| super::detect::api_key(key).is_some())
+}
+
+/// Whether Claude Code is pointed at a non-first-party endpoint.
+fn custom_base_url() -> bool {
+    super::detect::api_key("ANTHROPIC_BASE_URL").is_some()
+}
 
 /// `claude` on PATH, else the common install drop locations.
 pub(crate) fn find_claude() -> Option<PathBuf> {
@@ -131,8 +132,17 @@ impl Harness for ClaudeCode {
             info.version = bin_version(&bin).await;
             info.bin_path = Some(bin.to_string_lossy().into_owned());
         }
+        // A custom `ANTHROPIC_BASE_URL` gateway authenticates with an env
+        // credential and never writes OAuth metadata, so a leftover
+        // `~/.claude.json` from an earlier first-party login would otherwise
+        // mislabel the account. Only a custom base url takes that precedence —
+        // an api key alongside a live OAuth login still shows the account.
+        if custom_base_url() && has_api_credential() {
+            info.authenticated = true;
+            info.auth_method = Some("apiKey");
+        }
         // ~/.claude.json carries the signed-in OAuth account (no secrets read).
-        if let Some(cfg) = dirs::home_dir().and_then(|h| read_json(h.join(".claude.json"))) {
+        else if let Some(cfg) = dirs::home_dir().and_then(|h| read_json(h.join(".claude.json"))) {
             if let Some(acct) = cfg.get("oauthAccount") {
                 info.authenticated = true;
                 info.auth_method = Some("oauth");
@@ -145,7 +155,7 @@ impl Harness for ClaudeCode {
                 };
             }
         }
-        if !info.authenticated && super::detect::api_key("ANTHROPIC_API_KEY").is_some() {
+        if !info.authenticated && has_api_credential() {
             info.authenticated = true;
             info.auth_method = Some("apiKey");
         }
@@ -1133,13 +1143,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_semver_handles_real_version_lines() {
-        assert_eq!(parse_semver("2.1.197 (Claude Code)"), Some((2, 1, 197)));
-        assert_eq!(parse_semver("2.1.217"), Some((2, 1, 217)));
+    fn parse_version_handles_real_claude_version_lines() {
+        assert_eq!(parse_version("2.1.197 (Claude Code)"), Some((2, 1, 197)));
+        assert_eq!(parse_version("2.1.217"), Some((2, 1, 217)));
         // A pre-release suffix still yields its numeric patch.
-        assert_eq!(parse_semver("2.2.0-beta.1"), Some((2, 2, 0)));
-        assert_eq!(parse_semver("nonsense"), None);
-        assert_eq!(parse_semver("2.1"), None);
+        assert_eq!(parse_version("2.2.0-beta.1"), Some((2, 2, 0)));
+        assert_eq!(parse_version("nonsense"), None);
+        assert_eq!(parse_version("2.1"), None);
     }
 
     /// `ultracode` passes through; Codex's `ultra` never does (Claude rejects
@@ -1165,6 +1175,16 @@ mod tests {
         for id in claude_effort_ids(Some("2.1.217")) {
             assert_eq!(claude_effort(Some(id)), Some(id), "{id} was dropped");
         }
+    }
+
+    #[test]
+    fn bearer_token_counts_as_a_credential_alongside_the_api_key() {
+        // Both names are checked through the same `detect::api_key` lookup, so
+        // a gateway that only sets ANTHROPIC_AUTH_TOKEN still reads as signed
+        // in. (Asserted on the name list rather than by setting env vars, which
+        // would race with the other tests in this process.)
+        assert!(CLAUDE_CREDENTIAL_VARS.contains(&"ANTHROPIC_API_KEY"));
+        assert!(CLAUDE_CREDENTIAL_VARS.contains(&"ANTHROPIC_AUTH_TOKEN"));
     }
 
     #[test]

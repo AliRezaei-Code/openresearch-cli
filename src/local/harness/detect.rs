@@ -183,6 +183,26 @@ pub(super) fn jwt_payload(token: &str) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Parse a `major.minor.patch` triple out of a `--version` line. The first
+/// whitespace-separated token that parses wins, so `"codex-cli 0.144.0"`,
+/// `"2.1.197 (Claude Code)"`, and a bare `"0.144.0"` all resolve; a `-suffix`
+/// on the patch is tolerated. `None` when no token has the shape, which each
+/// caller treats as "assume the older behaviour".
+pub(super) fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
+    version.split_whitespace().find_map(|token| {
+        let mut parts = token.splitn(3, '.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts
+            .next()?
+            .split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()?;
+        Some((major, minor, patch))
+    })
+}
+
 pub(super) fn title_case(word: &str) -> String {
     let mut chars = word.chars();
     match chars.next() {

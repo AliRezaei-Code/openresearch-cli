@@ -32,14 +32,17 @@ export const HARNESS_LABELS: Record<HarnessId, string> = {
 export function defaultSelection(harnesses: Harness[]): ModelSelection | null {
   const ready = harnesses.find((h) => h.agentReady);
   if (!ready) return null;
-  const model = ready.models[0]?.id ?? null;
   return {
     harness: ready.id,
-    model,
+    // null = send no `--model`, so the CLI uses whatever it is configured with.
+    // Forcing the first advertised id breaks custom providers, whose real model
+    // list lives behind the gateway rather than in our catalog.
+    model: null,
     permissionMode: ready.options?.defaultPermissionMode ?? null,
-    // Seed from the *model's* default, not the harness's — they differ once
-    // reasoning is model-aware.
-    reasoningLevel: reasoningFor(ready, model).defaultId,
+    // Seeded for that same null model, so it resolves against the harness-wide
+    // fallback list — the model-specific lists only apply once a model is
+    // actually picked.
+    reasoningLevel: reasoningFor(ready, null).defaultId,
   };
 }
 
@@ -180,6 +183,15 @@ export function ModelPicker({
                   </div>
                 ) : (
                   <>
+                    <button className="model-item" onClick={() => pick(harness, null)}>
+                      <span>
+                        Default model
+                        <span className="model-id">CLI configuration</span>
+                      </span>
+                      {value?.harness === harness.id && value?.model === null && (
+                        <Check size={13} />
+                      )}
+                    </button>
                     {models.map((m) => (
                       <button
                         key={m.id}
