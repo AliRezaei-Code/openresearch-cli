@@ -10,9 +10,10 @@ import {
 } from "@xyflow/react";
 import { FolderTree, GitBranch, Terminal } from "lucide-react";
 import { GitHubMark } from "./BackendLogos";
-import { memo, useMemo } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { githubBranchUrl, timeAgo, type Experiment, type Project, type Run } from "../api";
 import type { ExperimentView } from "./DetailDrawer";
+import { ExpHoverCard } from "./ExpHoverCard";
 import { StatusBadge } from "./StatusBadge";
 
 const NODE_W = 264;
@@ -26,6 +27,7 @@ type ExpNodeData = {
   latestRun: Run | null;
   runs: Run[]; // oldest → newest
   isBaseline: boolean;
+  parentSlug: string | null;
   githubOwner: string;
   githubRepo: string;
   onOpenView: (id: string, view: ExperimentView) => void;
@@ -71,14 +73,57 @@ function runSquareClass(status: string): string {
   return "other";
 }
 
+// Hover-intent timings for the detail card: long enough that sweeping the
+// cursor across the tree opens nothing, short enough to feel deliberate. The
+// close grace lets the cursor cross the gap onto the card itself.
+const HOVER_OPEN_MS = 350;
+const HOVER_CLOSE_MS = 150;
+
 const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
-  const { exp, latestRun, runs, isBaseline, githubOwner, githubRepo, onOpenView, onOpenCodeBranch } = data;
+  const { exp, latestRun, runs, isBaseline, parentSlug, githubOwner, githubRepo, onOpenView, onOpenCodeBranch } = data;
   const status = latestRun?.status;
   const live = status === "running" || status === "starting";
   const kind = isBaseline ? "Baseline" : live ? "Running" : "Experiment";
   const squares = runs.slice(-MAX_SQUARES);
+
+  const rootRef = useRef<HTMLDivElement>(null);
+  const openTimer = useRef<number | undefined>(undefined);
+  const closeTimer = useRef<number | undefined>(undefined);
+  const [anchor, setAnchor] = useState<DOMRect | null>(null);
+  useEffect(
+    () => () => {
+      window.clearTimeout(openTimer.current);
+      window.clearTimeout(closeTimer.current);
+    },
+    [],
+  );
+  const enter = useCallback(() => {
+    window.clearTimeout(closeTimer.current);
+    window.clearTimeout(openTimer.current);
+    openTimer.current = window.setTimeout(() => {
+      const rect = rootRef.current?.getBoundingClientRect();
+      if (rect) setAnchor(rect);
+    }, HOVER_OPEN_MS);
+  }, []);
+  const leave = useCallback(() => {
+    window.clearTimeout(openTimer.current);
+    window.clearTimeout(closeTimer.current);
+    closeTimer.current = window.setTimeout(() => setAnchor(null), HOVER_CLOSE_MS);
+  }, []);
+  const cardEnter = useCallback(() => window.clearTimeout(closeTimer.current), []);
+  const close = useCallback(() => {
+    window.clearTimeout(openTimer.current);
+    window.clearTimeout(closeTimer.current);
+    setAnchor(null);
+  }, []);
+
   return (
-    <div className={`exp-node ${live ? "live" : ""}`}>
+    <div
+      ref={rootRef}
+      className={`exp-node ${live ? "live" : ""}`}
+      onMouseEnter={enter}
+      onMouseLeave={leave}
+    >
       <Handle type="target" position={Position.Top} />
       <div className="node-eyebrow">
         <span>{kind}</span>
@@ -146,6 +191,18 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
         </a>
       </div>
       <Handle type="source" position={Position.Bottom} />
+      {anchor && (
+        <ExpHoverCard
+          exp={exp}
+          runs={runs}
+          latestRun={latestRun}
+          parentSlug={parentSlug}
+          anchor={anchor}
+          onMouseEnter={cardEnter}
+          onMouseLeave={leave}
+          onClose={close}
+        />
+      )}
     </div>
   );
 });
@@ -185,6 +242,7 @@ export function TreeView({
     const nodes: ExpFlowNode[] = [];
     const edges: Edge[] = [];
     const roots = buildForest(experiments);
+    const slugById = new Map(experiments.map((e) => [e.id, e.slug]));
 
     function layout(node: TreeNode, cx: number, y: number) {
       const expRuns = runsByExp.get(node.exp.id) ?? [];
@@ -197,6 +255,9 @@ export function TreeView({
           latestRun: expRuns[expRuns.length - 1] ?? null,
           runs: expRuns,
           isBaseline: !node.exp.parentExperimentId,
+          parentSlug: node.exp.parentExperimentId
+            ? (slugById.get(node.exp.parentExperimentId) ?? null)
+            : null,
           githubOwner: project.githubOwner,
           githubRepo: project.githubRepo,
           onOpenView,
