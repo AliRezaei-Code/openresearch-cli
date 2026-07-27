@@ -22,9 +22,6 @@ pub async fn create_repo(
     create_repo_api(repo, true, organization).await
 }
 
-/// Whether the token can push to `owner/repo`. `None` means "could not
-/// determine" (no token, network error, auth trouble) — callers should treat
-/// that as access rather than surprise-forking on a transient failure.
 /// GET an api.github.com URL with the resolved token. `None` when there's no
 /// token or the request fails — callers decide what that means.
 async fn authed_get(url: &str) -> Option<reqwest::Response> {

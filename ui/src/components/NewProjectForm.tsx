@@ -102,6 +102,9 @@ export function NewProjectForm({
 
   const onRepoChange = (value: string) => {
     setRepoInput(value);
+    // A forced copy belonged to the old repo — start the new one back at the
+    // default so an unpushable repo can't leave "Private copy" stuck on.
+    setRepoMode("use");
     // Name follows the repo until the user edits it themselves.
     if (!nameTouched) setName(parseRepo(value)?.repo ?? "");
   };
@@ -157,10 +160,10 @@ export function NewProjectForm({
         .then((r) => {
           if (!live) return;
           setCanPush(r.canPush);
-          // Keep the toggle in sync with what the server will actually do:
-          // it force-copies without push access, and a stale "fork" left over
-          // from a previous repo would silently copy one the user can push to.
-          setRepoMode(r.canPush ? "use" : "fork");
+          // Only force the copy — the server does too, without push access.
+          // Never force "use": that would undo selectPaper's deliberate
+          // fork default for the rare writable paper repo.
+          if (!r.canPush) setRepoMode("fork");
         })
         .catch(() => {
           // Unreachable check: assume access, matching the server's fallback.

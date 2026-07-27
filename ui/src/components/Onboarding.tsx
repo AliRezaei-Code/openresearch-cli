@@ -20,13 +20,19 @@ import { GitTokenForm } from "./GitTokenForm";
  * them. The data-dir choice deliberately lives in Settings → Storage instead:
  * the default suits almost everyone, and Settings can also *move* existing
  * data, which this flow never could. */
+const RETRY_COPY = "Couldn't reach orx. Check it's still running, then re-check.";
+
 export function Onboarding({ onDone }: { onDone: () => void }) {
   const [step, setStep] = useState<0 | 1 | 2>(0);
   const [harnesses, setHarnesses] = useState<Harness[] | null>(null);
   const [git, setGit] = useState<GitSettings | null>(null);
   const [telemetry, setTelemetryState] = useState<TelemetrySettings | null>(null);
   const [checking, setChecking] = useState(false);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  // Per-probe, not one shared flag: a telemetry failure must not put a
+  // connectivity error on a gate it has nothing to do with — or worse, hide
+  // the actionable "sign in" hint behind it.
+  const [harnessError, setHarnessError] = useState(false);
+  const [gitError, setGitError] = useState(false);
 
   // orx can't chat or run autoresearch without a signed-in agent, so step 1 is
   // a hard gate. Null (still detecting) counts as not-ready: better a briefly
@@ -43,16 +49,16 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   // and no way out — and onboarding *is* the whole app on first boot.
   const load = (refresh: boolean) => {
     setChecking(true);
-    setLoadError(null);
+    setHarnessError(false);
+    setGitError(false);
     void Promise.allSettled([
       getHarnesses(refresh).then(setHarnesses),
       getGitSettings().then(setGit),
       getTelemetry().then(setTelemetryState),
     ])
-      .then((results) => {
-        if (results.some((r) => r.status === "rejected")) {
-          setLoadError("Couldn't reach orx. Check it's still running, then re-check.");
-        }
+      .then(([harness, git]) => {
+        setHarnessError(harness.status === "rejected");
+        setGitError(git.status === "rejected");
       })
       .finally(() => setChecking(false));
   };
@@ -89,13 +95,10 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 harnesses.map((h) => <AgentCard key={h.id} h={h} />)
               )}
             </div>
-            {loadError ? (
-              <p className="onb-gate-hint">{loadError}</p>
-            ) : (
-              harnesses !== null &&
-              !anyAgentReady && (
-                <p className="onb-gate-hint">Sign in to at least one agent to continue.</p>
-              )
+            {(harnessError || (harnesses !== null && !anyAgentReady)) && (
+              <p className="onb-gate-hint">
+                {harnessError ? RETRY_COPY : "Sign in to at least one agent to continue."}
+              </p>
             )}
             <div className="onb-actions">
               <button className="btn ghost" onClick={() => load(true)} disabled={checking}>
@@ -126,8 +129,10 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
             <div className="onb-cards">
               <GitCard git={git} onUpdate={setGit} />
             </div>
-            {(loadError || (git !== null && !githubConnected)) && (
-              <p className="onb-gate-hint">{loadError ?? "Connect GitHub to continue."}</p>
+            {(gitError || (git !== null && !githubConnected)) && (
+              <p className="onb-gate-hint">
+                {gitError ? RETRY_COPY : "Connect GitHub to continue."}
+              </p>
             )}
             <div className="onb-actions">
               <button className="btn ghost" onClick={() => setStep(0)}>
@@ -137,6 +142,14 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 <RefreshCw size={12} className={checking ? "spin" : ""} /> Re-check
               </button>
               <div style={{ flex: 1 }} />
+              {/* A token isn't strictly required: ensure_clone tries ssh first,
+                  so SSH-key users can clone and push without one. Keep the
+                  nudge, but never trap them — nor anyone whose probe failed. */}
+              {!githubConnected && (
+                <button className="onb-fix-alt" onClick={() => setStep(2)}>
+                  Skip — I use SSH keys
+                </button>
+              )}
               <button
                 className="btn primary"
                 onClick={() => setStep(2)}

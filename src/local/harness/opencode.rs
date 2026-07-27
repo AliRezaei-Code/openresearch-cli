@@ -69,11 +69,15 @@ impl Harness for OpenCode {
             info.auth_method = Some("oauth");
             info.account = Some(providers.join(", "));
         }
-        // `opencode models` only lists providers it can actually authenticate,
-        // so a non-empty list means credentials resolved even with no
-        // auth.json — env keys or opencode.json. Claude and Codex have the
-        // equivalent env fallback; without this, those users read as signed out.
-        if !info.authenticated && !models.is_empty() {
+        // opencode also resolves provider credentials straight from the
+        // environment, writing no auth.json — mirrors the ANTHROPIC_API_KEY
+        // fallback in claude.rs. Without this those installs read as signed
+        // out, which the step-1 gate turns into a lockout.
+        if !info.authenticated
+            && ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"]
+                .iter()
+                .any(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()))
+        {
             info.authenticated = true;
             info.auth_method = Some("apiKey");
         }
