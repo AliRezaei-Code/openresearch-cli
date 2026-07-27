@@ -26,12 +26,12 @@ These four govern everything below. Breaking any one silently invalidates your
 results — they are not style preferences. The `orx-experiment-tree` module
 expands on the why; these are the non-negotiables.
 
-1. **Never edit a node that has produced a measurement.** A node freezes the
-   moment a run computes a metric — that includes the root — and freezing is
-   permanent: a disappointing number is a result, not a reason to repair. Until
-   then it is **provisional**: seeding it, fixing its deps, and making it run
-   all happen on its own branch (`orx-experiment-tree`). To try an idea, branch
-   a **child** and edit the child.
+1. **Never edit a node once a run has answered it.** A node freezes the moment
+   a run establishes its baseline or tests its hypothesis — that includes the
+   root — and freezing is permanent: a disappointing result is still a result.
+   Until then it is **provisional**: seeding it, fixing its deps, and making it
+   run all happen on its own branch (`orx-experiment-tree`). To try an idea,
+   branch a **child** and edit the child.
 2. **The run command *and* the environment are a fixed contract — identical on
    every node.** A child inherits its parent's run command verbatim; leave it
    alone. Do **not** give nodes different start commands, and do **not** vary
@@ -156,5 +156,5 @@ orx logs <runId>                 # read its output
 To actually **drive** a project toward a goal — edit each node's code on its git
 branch and keep the GPU capacity saturated — follow the auto-research loop in
 the `orx-experiment-tree` module. Every completed run is a decision point with
-four moves: **repair** the same node when a run computed no metric, **refill**
+four moves: **repair** the same node when a run answered nothing, **refill**
 the round with another sibling, **promote** the winner and descend, or **stop**.

@@ -68,10 +68,8 @@ The contract orx enforces at submit (loud, before anything runs):
 - Everything downstream is identical (`orx exp wait` / `orx runs` /
   `orx logs`, cancel via `orx exp cancel`). A detached `orx supervise`
   watches the Job via kubectl; don't kill it.
-- **A rejected submit or a failed Job is not an experiment result.** Manifest
-  errors, unschedulable pods, and image-pull failures are repairs: fix
-  `.orx/k8s.yaml` on the **same** branch and re-run the same `<expId>`. An
-  **OOMKilled** container is not automatically a repair — if the run computed a
-  metric first, that OOM *is* its result (`orx-experiment-tree`: the freeze
-  test). The hardware shape is part of the fixed environment contract (cardinal
-  rule 2): size it once for the round.
+- **A rejected submit or a failed Job is not a result.** Manifest errors,
+  unschedulable pods, image-pull failures, OOMKilled — implementation and
+  hardware details, not answers. Fix `.orx/k8s.yaml` on the **same** branch and
+  re-run the same `<expId>`; the hardware shape stays fixed for the round
+  (cardinal rule 2).

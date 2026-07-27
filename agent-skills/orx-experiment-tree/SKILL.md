@@ -7,33 +7,76 @@ A project is a **tree of experiment nodes**. The root (**baseline**) holds the
 starting code and a **run command** — the single shell command that trains or
 evaluates the node and writes an `EVAL.md` with its results. Every other node is a
 **child** branched off a parent, inheriting its code and its run command. The two
-rules this depends on — **never edit a node that has measured something** and
+rules this depends on — **never edit a node a run has answered** and
 **the run command + env is a fixed contract** — are the cardinal rules;
 everything below assumes them.
 
-## Provisional until it measures — repair, don't branch
+## Provisional until it answers — repair, don't branch
 
-A node answers **one question** and is finished when a run produces the
-measurement that answers it. Judge what a run produced, not what caused it to
-fail:
+Every node exists to establish a baseline or test a hypothesis. A run that dies
+on an error does **neither** — nothing was established, nothing was tested — so
+there is nothing to protect: fix that node's branch in place and re-run the
+same node. Successive runs on one node are how you get it working; a new node
+is for a new question.
 
-- a **quality metric** (loss, perplexity, accuracy, reward, eval score) — in
-  the log, an uploaded artifact, or a linked W&B run: **FROZEN**, whatever
-  ended the run, even a bad number or a `nan`;
-- **only an error**, or nothing judgeable: **provisional** — repair its branch
-  in place and re-run the same node, never branch a child for a fix.
+Once a run *does* answer the node — it produced the result the node was after,
+good, bad, or `nan` — the node is **frozen**. Its branch is the code that
+result came from: never edit it again, branch a child instead. That holds
+however the run ended, and it is permanent — a disappointing number is a
+result, not a reason to repair.
 
-Operational figures are not metrics: LR, throughput, `it/s`, grad-norm,
-wall-clock, step counters, allocator byte counts, config echoes, progress bars.
+Unintended behaviour is not an answer. An OOM, a timeout, a divergence from a
+bug, a missing dep — those are implementation and hardware details, and the
+node is still provisional (unless the node's hypothesis *is* about memory or
+runtime, in which case that outcome is exactly its result).
 
-Freezing is **permanent** — a bad number is a result, not a reason to repair.
-When ambiguous, freeze: a spurious freeze costs one cheap node, a spurious
-repair rewrites the branch a recorded `commit_sha` points at.
-
-**Repair cap:** two runs in a row measuring nothing on one node, then ask the
+**Repair cap:** two runs in a row that answer nothing on one node, then ask the
 user. Different errors still count; a bare relaunch or a flavor/backend switch
 is a repair. If the same failure hits a second node, that is one setup problem
 — ask then. (Separate from the "~3 failed or regressed runs" scientific stop.)
+
+## Shape the tree — stacked bushes, not a flat fan or a noodle
+
+The single most common way to drive a project badly is to get the **shape** wrong.
+There are two opposite failures, and the right shape sits between them:
+
+```
+FLAT FAN (wrong)            NOODLE (wrong)            STACKED BUSHES (right)
+root                        root                      root
+├ a ├ b ├ c ... ├ n         └ a                       └ lr-head        ┐ round 1:
+                              └ b                        ├ lr 2e-5     │ a small fan of
+                                └ c                      └ lr 3e-5     ┘ co-equal options
+                                  └ d ...                   └ winner ── arch-head   ┐ round 2
+                                                               ├ arch-A             │ descends onto
+                                                               └ arch-B             ┘ round 1's winner
+```
+
+- **Flat fan** (your whole sweep hanging off the root): every result is measured
+  against the *start*, so wins never accumulate and the tree never makes progress.
+- **Noodle** (a long single-child chain): depth manufactured for its own sake —
+  each step doesn't actually build on the one above it.
+- **Stacked bushes** (correct): a *small fan within a round* (the options of one
+  decision), then **descend onto that round's winner** for the next round.
+
+**The one rule that produces this shape.** Before you make X a child of Y, name
+what Y established that X builds on:
+
+- **You can name it** ("Y is the LR winner; X keeps that LR and changes the
+  architecture") → real depth. X is a **child** of Y. Descend.
+- **You can't — X and Y are co-equal options you're trying at the same time**
+  (lr 2e-5 vs lr 3e-5) → they don't build on each other. They're **siblings** in
+  the same bush. Fan, don't chain.
+
+So: **width = the open options of one decision** (fan freely — a 3-way LR sweep
+*should* be three siblings under a common head); **depth = decisions already
+resolved, stacked** (one level down per winner kept). A new *round* never hangs off
+the root — it hangs off the previous round's winner. That keeps the tree moving
+**downward** as research progresses, without stringing unrelated nodes into a line.
+
+Re-read `orx experiments` each round and check the shape: a wide row of direct
+children off the root with no grandchildren means you're fanning when you should be
+descending; a long depth-N chain with no branching means you're chaining co-equal
+variants that should have been siblings.
 
 ## The auto-research loop
 
@@ -143,7 +186,8 @@ the run command:
    changed, use the local git diff recipe `orx exp status <expId>` prints (see
    the `orx-git` skill). Don't infer from status alone. Each
    completion is a decision point with four moves:
-   - **Repair** — no metric: fix this node's branch and re-launch it (above).
+   - **Repair** — the run answered nothing: fix this node's branch and
+     re-launch the same node (above).
    - **Refill** — result is mediocre or inconclusive: launch the next queued child to
      keep the GPU capacity saturated (step 5).
    - **Promote** — result is a clear win: this node becomes the **parent for the next

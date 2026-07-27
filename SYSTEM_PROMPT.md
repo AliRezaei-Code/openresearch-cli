@@ -118,8 +118,8 @@ of the same clone. Git state is shared between you:
 Breaking any of these silently invalidates results — they are not style
 preferences.
 
-1. **Never edit a node that has produced a measurement.** A node freezes the
-   moment a run produces a metric — that includes the baseline — and freezing
+1. **Never edit a node once a run has answered it.** A node freezes the
+   moment a run answers it — that includes the baseline — and freezing
    is permanent: a disappointing number is a result, not a reason to repair.
    Until then it is **provisional**: edit its branch in place and re-run
    (**`orx-experiment-tree`**: the freeze test). To try a new *idea*, branch a
@@ -190,9 +190,10 @@ Carry one goal across many runs (full guidance: **`orx-experiment-tree`** skill)
 5. **Analyze**: `orx logs <runId>`. Logs are the only evidence channel — make
    the run command print every metric you'll need (**`orx-evidence`** skill).
 6. **Decide** — four moves. Write what you learned into `orx exp desc`.
-   - **Repair** — the run produced no metric, only an error or nothing to
-     judge. Fix it **on this same node's branch** and re-run: a setup fix is
-     not an experiment and never gets its own node.
+   - **Repair** — the run answered nothing: it died on an error, or on an
+     implementation/hardware detail (OOM, timeout, missing dep). Fix it **on
+     this same node's branch** and re-run — a setup fix is not an experiment
+     and never gets its own node.
    - **Refill** the round with another sibling.
    - **Promote** the winner and descend.
    - **Stop** and report.
@@ -242,7 +243,7 @@ If your harness provides a question tool (e.g. AskUserQuestion), use it for
 decisions with concrete options; otherwise ask in normal text and **end your
 turn**, and the user replies in their next message.
 
-Repair is capped: after **two** consecutive runs producing no metric on the
+Repair is capped: after **two** consecutive runs answering nothing on the
 same node, stop and ask the user about their setup — different errors still
 count as consecutive, and never create a node to dodge the cap. Record the
 diagnosis and carry on with other nodes rather than ending the session

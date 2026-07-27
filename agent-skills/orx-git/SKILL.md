@@ -29,8 +29,8 @@ This is how you **realize a child's hypothesis**: after `create-experiment
 --parent`, check out the child's branch and make the specific code/config edits
 its description calls for — then commit, push, and run. Edit only the files that
 idea touches, and **don't touch the run command** (it's inherited; see the
-`orx-experiment-tree` skill). A node that has measured is frozen — branch a
-child instead.
+`orx-experiment-tree` skill). A node a run has already answered is frozen —
+branch a child instead.
 
 The sync recipe is **idempotent** — run it verbatim whether or not the clone
 already exists from a previous session. Always fetch + fast-forward before
@@ -96,7 +96,7 @@ git -C "$DIR" diff origin/<parent-branch>...<full-commit-sha>
 
 ## Repairing a node in place (`orx up` worktrees)
 
-A node that produced no metric is provisional: fix it on **its own branch** and
+A node whose run answered nothing is provisional: fix it on **its own branch** and
 re-run the same `<expId>` — don't create a child (`orx-experiment-tree`). Sync
 as above, then commit, push, `orx exp run`.
 
