@@ -518,7 +518,10 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
                     if let Some(parts) = message.get("parts").and_then(Value::as_array) {
                         for part in parts {
                             if let Some(wire) = to_wire_part(part) {
-                                ctx.upsert_part(wire);
+                                // Preserve children: the final `task` part carries
+                                // none, but its row already streamed the sub-agent
+                                // transcript into `children`.
+                                ctx.upsert_part_preserving_children(wire);
                             }
                         }
                     }
@@ -570,12 +573,21 @@ fn handle_event(
         }
         Some("message.updated") => {
             let info = props.get("info").unwrap_or(&Value::Null);
-            if info.get("sessionID").and_then(Value::as_str) == Some(native_id)
-                && info.get("role").and_then(Value::as_str) == Some("assistant")
-            {
+            let session = info.get("sessionID").and_then(Value::as_str);
+            let is_assistant = info.get("role").and_then(Value::as_str) == Some("assistant");
+            // Record assistant message ids for the main session AND registered
+            // sub-sessions, so a session's user parts (e.g. the task prompt echo)
+            // can be filtered out — for both the transcript and sub-agent nesting.
+            let ours =
+                session == Some(native_id) || session.is_some_and(|s| sub_sessions.contains_key(s));
+            if ours && is_assistant {
                 if let Some(id) = info.get("id").and_then(Value::as_str) {
                     assistant_msgs.insert(id.to_string());
                 }
+            }
+            // Only the MAIN session's tokens drive the context meter; a
+            // sub-agent's smaller counts must not overwrite it.
+            if session == Some(native_id) && is_assistant {
                 // Several `message.updated` fire per message; the early ones have
                 // no tokens yet, so skip a report until real numbers land. The
                 // context window isn't in this event (provider config only), so
@@ -591,24 +603,24 @@ fn handle_event(
         Some("message.part.updated") => {
             let part = props.get("part").unwrap_or(&Value::Null);
             let session = part.get("sessionID").and_then(Value::as_str);
-            // A sub-agent's part (foreign sessionID we've registered) streams
-            // into its owning `task` row's children, with a namespaced id.
-            if let Some(spawn) = session.and_then(|s| sub_sessions.get(s)).cloned() {
-                if let Some(mut wire) = to_wire_part(part) {
-                    wire.id = format!("{spawn}:{}", wire.id);
-                    ctx.upsert_child(&spawn, wire);
-                    ctx.maybe_flush();
-                }
-                return;
-            }
-            if session != Some(native_id) {
-                return;
-            }
             let owned_by_assistant = part
                 .get("messageID")
                 .and_then(Value::as_str)
                 .is_some_and(|mid| assistant_msgs.contains(mid));
-            if !owned_by_assistant {
+            // A sub-agent's part (foreign sessionID we've registered) streams
+            // into its owning `task` row's children, with a namespaced id — but
+            // only assistant-owned parts (skip the child's user prompt echo).
+            if let Some(spawn) = session.and_then(|s| sub_sessions.get(s)).cloned() {
+                if owned_by_assistant {
+                    if let Some(mut wire) = to_wire_part(part) {
+                        wire.id = format!("{spawn}:{}", wire.id);
+                        ctx.upsert_child(&spawn, wire);
+                        ctx.maybe_flush();
+                    }
+                }
+                return;
+            }
+            if session != Some(native_id) || !owned_by_assistant {
                 return;
             }
             if let Some(wire) = to_wire_part(part) {
@@ -928,5 +940,22 @@ mod tests {
             .find(|p| p.id == "prt_task:prt_bash")
             .expect("sub bash nested under the task row");
         assert_eq!(bash.state.as_ref().unwrap().output.as_deref(), Some("a.rs"));
+
+        // The turn-end merge re-upserts the main message's parts (incl. the task
+        // row, rebuilt with empty children) authoritatively. It MUST preserve the
+        // accrued children — a plain upsert would wipe the sub-agent transcript.
+        let final_task = to_wire_part(&json!({
+            "id":"prt_task","type":"tool","tool":"task","sessionID":"ses_main","messageID":"msg_1",
+            "state":{"status":"completed","input":{"description":"analyze"},"output":"done"}
+        }))
+        .unwrap();
+        assert!(
+            final_task.children.is_empty(),
+            "rebuilt part has no children"
+        );
+        ctx.upsert_part_preserving_children(final_task);
+        let task = &ctx.assistant.parts[0];
+        assert_eq!(task.state.as_ref().unwrap().status, "completed");
+        assert_eq!(task.children.len(), 1, "children survive the final merge");
     }
 }

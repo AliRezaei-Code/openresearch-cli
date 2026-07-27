@@ -1748,6 +1748,14 @@ impl TurnCtx {
         }
     }
 
+    /// Like `upsert_part`, but carries forward an existing part's `children` when
+    /// the incoming part has none — so re-upserting a spawn row (e.g. an
+    /// authoritative final-message merge) doesn't drop the sub-agent transcript
+    /// that streamed into it.
+    pub fn upsert_part_preserving_children(&mut self, part: WirePart) {
+        upsert_preserving_children(&mut self.assistant.parts, part);
+    }
+
     pub fn append_part_text(&mut self, part_id: &str, delta: &str) {
         if let Some(part) = self.assistant.parts.iter_mut().find(|p| p.id == part_id) {
             let text = part.text.get_or_insert_with(String::new);

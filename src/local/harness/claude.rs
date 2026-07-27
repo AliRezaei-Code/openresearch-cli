@@ -810,7 +810,11 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                             state.saw_prompt = true;
                             ctx.upsert_part(WirePart::prompt(id, prompt));
                         } else {
-                            ctx.upsert_part(WirePart {
+                            // Preserve children: a Task tool_use re-sent after its
+                            // sub-agent already streamed must not drop the nested
+                            // transcript. (Plain tools have no children, so this is
+                            // an ordinary upsert for them.)
+                            ctx.upsert_part_preserving_children(WirePart {
                                 id,
                                 kind: "tool".into(),
                                 text: None,
@@ -1373,6 +1377,9 @@ mod tests {
             r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ing…"}},"parent_tool_use_id":"toolu_1"}"#,
             r#"{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"id":"sub","content":[{"type":"tool_use","id":"call_a","name":"Bash","input":{"command":"ls"}}]}}"#,
             r#"{"type":"user","parent_tool_use_id":"toolu_1","message":{"content":[{"type":"tool_result","tool_use_id":"call_a","content":"a.rs"}]}}"#,
+            // The Task's own result is a MAIN-session user event (no parent) —
+            // it completes the top-level Task row, and must not wipe children.
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"done: 3 runs"}]}}"#,
             r#"{"type":"result","subtype":"success","session_id":"s","is_error":false}"#,
         ];
         let mut ctx = TurnCtx::test_stub();
@@ -1382,6 +1389,10 @@ mod tests {
         let task = &ctx.assistant.parts[0];
         assert_eq!(task.id, "toolu_1");
         assert_eq!(task.tool.as_deref(), Some("Task"));
+        // The Task row itself completed (its main-session tool_result), and its
+        // children survived that completion.
+        assert_eq!(task.state.as_ref().unwrap().status, "completed");
+        assert_eq!(task.children.len(), 2, "children survive completion");
         // The sub-agent's streamed text + bash call nested under it (namespaced).
         let child_text = task
             .children
