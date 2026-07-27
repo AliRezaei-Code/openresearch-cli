@@ -9,7 +9,7 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { GitBranch } from "lucide-react";
-import { parseDiff } from "react-diff-view";
+import { parseDiff, type FileData } from "react-diff-view";
 import {
   backendKind,
   fmtDuration,
@@ -33,24 +33,52 @@ const MAX_FILES_SHOWN = 3;
 const HOVER_OPEN_MS = 350;
 const HOVER_CLOSE_MS = 150;
 
+// Broadcast channel for canvas pan/zoom: TreeView's onMoveStart pings it and
+// every open card dismisses. A single top-level subscriber is deliberate —
+// @xyflow's useOnViewportChange stores ONE callback globally, so per-node
+// registrations silently overwrite each other.
+const treeViewportMoves = new EventTarget();
+export function dismissTreeHoverCards() {
+  treeViewportMoves.dispatchEvent(new Event("move"));
+}
+
 /** Hover-intent state for a node's detail card. `rect` is non-null while the
  * card should be open; it re-measures whenever `refreshKey` changes so SSE
  * updates that re-lay-out the tree can't leave the card pointing at a stale
- * position. Dismissal on canvas pan/zoom is the caller's job (it has the
- * ReactFlow context; see ExpNode). */
+ * position, and closes on any canvas pan/zoom (dismissTreeHoverCards). */
 export function useHoverIntent(ref: RefObject<HTMLElement | null>, refreshKey: unknown) {
   const [rect, setRect] = useState<DOMRect | null>(null);
   const openTimer = useRef<number | undefined>(undefined);
   const closeTimer = useRef<number | undefined>(undefined);
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    const dismiss = () => {
       window.clearTimeout(openTimer.current);
       window.clearTimeout(closeTimer.current);
-    },
-    [],
-  );
+      setRect(null);
+    };
+    treeViewportMoves.addEventListener("move", dismiss);
+    return () => {
+      treeViewportMoves.removeEventListener("move", dismiss);
+      window.clearTimeout(openTimer.current);
+      window.clearTimeout(closeTimer.current);
+    };
+  }, []);
   useEffect(() => {
-    setRect((prev) => (prev ? (ref.current?.getBoundingClientRect() ?? null) : prev));
+    setRect((prev) => {
+      if (!prev) return prev;
+      const next = ref.current?.getBoundingClientRect() ?? null;
+      // Keep the old rect when nothing moved, so SSE ticks that change data
+      // without re-laying-out the tree don't churn renders.
+      if (
+        next &&
+        prev.x === next.x &&
+        prev.y === next.y &&
+        prev.width === next.width &&
+        prev.height === next.height
+      )
+        return prev;
+      return next;
+    });
   }, [ref, refreshKey]);
   const onMouseEnter = useCallback(() => {
     window.clearTimeout(closeTimer.current);
@@ -65,12 +93,7 @@ export function useHoverIntent(ref: RefObject<HTMLElement | null>, refreshKey: u
     closeTimer.current = window.setTimeout(() => setRect(null), HOVER_CLOSE_MS);
   }, []);
   const keepOpen = useCallback(() => window.clearTimeout(closeTimer.current), []);
-  const close = useCallback(() => {
-    window.clearTimeout(openTimer.current);
-    window.clearTimeout(closeTimer.current);
-    setRect(null);
-  }, []);
-  return { rect, onMouseEnter, onMouseLeave, keepOpen, close };
+  return { rect, onMouseEnter, onMouseLeave, keepOpen };
 }
 
 interface DiffStat {
@@ -108,7 +131,18 @@ export function ExpHoverCard({
   onMouseLeave: () => void;
 }) {
   const measure = useMeasure();
-  const side = anchor.right + GAP + CARD_W <= window.innerWidth ? "right" : "left";
+  // Prefer beside the node; on windows too narrow for either side, go
+  // above/below — usePopoverPosition only clamps, and a clamped side
+  // placement would sit the card on top of the node it describes.
+  const fitsRight = anchor.right + GAP + CARD_W <= window.innerWidth;
+  const fitsLeft = anchor.x - GAP - CARD_W >= 0;
+  const side = fitsRight
+    ? "right"
+    : fitsLeft
+      ? "left"
+      : anchor.y > window.innerHeight / 2
+        ? "above"
+        : "below";
   const { x, y } = usePopoverPosition(
     { x: anchor.x, y: anchor.y, width: anchor.width, height: anchor.height, anchor: side, distance: GAP },
     measure,
@@ -123,9 +157,22 @@ export function ExpHoverCard({
     let stale = false;
     getRunDiff(diffRunId)
       .then((p) => {
-        // Same parser as the Changes tab, so renames/quoted paths/binary
-        // files count identically in both places.
-        const files = parseDiff(p.diff);
+        // Same parser and counting helpers as the Changes tab, so renames,
+        // quoted paths and binary files are counted and labeled identically.
+        let text = p.diff;
+        if (p.truncated) {
+          // The backend byte-caps mid-line, which can crash the parser (a cut
+          // inside an @@ header) — drop the trailing partial file so the
+          // counts stay honest lower bounds.
+          const cut = text.lastIndexOf("\ndiff --git ");
+          text = cut !== -1 ? text.slice(0, cut + 1) : text.slice(0, text.lastIndexOf("\n") + 1);
+        }
+        let files: FileData[] = [];
+        try {
+          files = text.trim() ? parseDiff(text) : [];
+        } catch {
+          return; // malformed even after trimming — skip the row
+        }
         let additions = 0;
         let deletions = 0;
         for (const f of files) {
@@ -213,7 +260,7 @@ export function ExpHoverCard({
             </span>
           )}
         </div>
-        {diffStat && (
+        {diffStat && diffStat.files.length > 0 && (
           <div
             className="hc-git-row"
             title={`Committed changes vs ${parentSlug ?? "parent"}${diffStat.truncated ? " (diff truncated — counts are lower bounds)" : ""}`}

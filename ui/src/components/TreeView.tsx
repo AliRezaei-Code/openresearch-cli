@@ -4,7 +4,6 @@ import {
   Handle,
   Position,
   ReactFlow,
-  useOnViewportChange,
   type Edge,
   type Node,
   type NodeProps,
@@ -14,7 +13,7 @@ import { GitHubMark } from "./BackendLogos";
 import { memo, useMemo, useRef } from "react";
 import { githubBranchUrl, timeAgo, type Experiment, type Project, type Run } from "../api";
 import type { ExperimentView } from "./DetailDrawer";
-import { ExpHoverCard, useHoverIntent } from "./ExpHoverCard";
+import { ExpHoverCard, dismissTreeHoverCards, useHoverIntent } from "./ExpHoverCard";
 import { StatusBadge } from "./StatusBadge";
 
 const NODE_W = 264;
@@ -81,12 +80,12 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
   const kind = isBaseline ? "Baseline" : live ? "Running" : "Experiment";
   const squares = runs.slice(-MAX_SQUARES);
 
-  // `data` is rebuilt whenever the tree re-lays-out, so it doubles as the
-  // hover card's re-measure key. Any canvas pan/zoom (wheel, drag, pinch,
-  // fitView) moves the node out from under the card's anchor — dismiss.
+  // `data` is rebuilt on every experiments/runs change (a superset of the
+  // re-layouts that matter), so it doubles as the hover card's re-measure
+  // key. Canvas pan/zoom dismissal arrives via dismissTreeHoverCards, wired
+  // to the ReactFlow onMoveStart prop below.
   const rootRef = useRef<HTMLDivElement>(null);
   const hover = useHoverIntent(rootRef, data);
-  useOnViewportChange({ onStart: hover.close });
 
   return (
     <div
@@ -162,6 +161,8 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
         </a>
       </div>
       <Handle type="source" position={Position.Bottom} />
+      {/* Node and card share one leave handler — React's enter/leave pairing
+        * across the portal (fiber-tree walk) relies on it; don't split them. */}
       {hover.rect && (
         <ExpHoverCard
           exp={exp}
@@ -278,6 +279,7 @@ export function TreeView({
       nodesDraggable={false}
       nodesConnectable={false}
       nodesFocusable={false}
+      onMoveStart={dismissTreeHoverCards}
       minZoom={0.15}
       fitView
       fitViewOptions={{ padding: 0.25, maxZoom: 1 }}
