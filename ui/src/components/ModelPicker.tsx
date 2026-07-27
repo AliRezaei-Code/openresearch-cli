@@ -300,8 +300,14 @@ export function OptionPicker({
   const effectiveId = value ?? defaultId ?? choices[0]?.id ?? null;
   const current = choices.find((c) => c.id === effectiveId);
   const defaultChoice = choices.find((c) => c.id === defaultId);
-  // Everything except the pinned default row (see below).
-  const rest = choices.filter((c) => c.id !== defaultChoice?.id);
+  // Only the `default` sentinel gets pinned above a separator — it isn't a
+  // point on the tier ramp, it's a different kind of choice (Claude's Adaptive,
+  // opencode's "let the model decide"). A *concrete* default (codex's resolved
+  // tier, a permission mode) stays inline in its natural position with just
+  // the "· Default" marker, so the ramp reads in order.
+  const pinned =
+    defaultChoice && defaultChoice.id === REASONING_DEFAULT_ID ? defaultChoice : undefined;
+  const rest = pinned ? choices.filter((c) => c.id !== pinned.id) : choices;
   const label = current?.label ?? choices[0]?.label ?? "";
 
   const choose = (id: string) => {
@@ -323,39 +329,35 @@ export function OptionPicker({
       {open && (
         <div className={`option-menu ${align === "right" ? "align-right" : ""}`}>
           {header && <div className="model-group">{header}</div>}
-          {defaultChoice && (
+          {pinned && (
             <>
-              <button className="model-item" onClick={() => choose(defaultChoice.id)}>
+              <button className="model-item" onClick={() => choose(pinned.id)}>
                 <span>
-                  {defaultChoice.label}
-                  {/* The reasoning sentinel's label already IS "Default", so the
-                      usual marker would read "Default · Default". Spend the row
-                      on what the choice actually means instead — it's the one
-                      genuinely new concept here, and "Default" alone doesn't
-                      say that the CLI's own configured effort is what applies. */}
+                  {pinned.label}
+                  {/* An unnamed sentinel's label already IS "Default", so the
+                      usual marker would read "Default · Default" — say where
+                      the behavior comes from instead. A named one ("Adaptive")
+                      gets the standard marker. */}
                   <span className="option-default">
-                    {defaultChoice.id === REASONING_DEFAULT_ID &&
-                    defaultChoice.label === "Default"
-                      ? // The unnamed sentinel: nothing better to say than
-                        // where the behavior comes from.
-                        " · CLI configuration"
-                      : // A named default — a concrete tier ("Medium"), a named
-                        // mode ("Adaptive"), or a permission mode — gets the
-                        // standard marker.
-                        " · Default"}
+                    {pinned.label === "Default" ? " · CLI configuration" : " · Default"}
                   </span>
                 </span>
-                {effectiveId === defaultChoice.id && <Check size={13} />}
+                {effectiveId === pinned.id && <Check size={13} />}
               </button>
               <div className="option-sep" />
             </>
           )}
-          {/* The default is already pinned above; listing it again would show
-              the same row twice (the reasoning lists now carry an explicit
-              `default` choice, so this is no longer hypothetical). */}
           {rest.map((c, i) => (
             <button key={c.id} className="model-item" onClick={() => choose(c.id)}>
-              <span>{c.label}</span>
+              <span>
+                {c.label}
+                {/* A concrete default renders inline, in ramp order, with just
+                    the marker — it's one of the tiers, not a separate kind of
+                    choice like the pinned sentinel above. */}
+                {!pinned && c.id === defaultId && (
+                  <span className="option-default"> · Default</span>
+                )}
+              </span>
               {effectiveId === c.id ? (
                 <Check size={13} />
               ) : (
