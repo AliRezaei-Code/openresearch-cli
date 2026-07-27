@@ -176,6 +176,9 @@ export function ExpHoverCard({
         } catch {
           return; // malformed even after trimming — skip the row
         }
+        // A truncated single-file diff can trim down to a bare header that
+        // parses as one file with no hunks; "≥ +0 −0 · 1+ files" is noise.
+        if (p.truncated && files.every((f) => f.hunks.length === 0)) return;
         let additions = 0;
         let deletions = 0;
         for (const f of files) {
