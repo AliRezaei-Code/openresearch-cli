@@ -5,7 +5,7 @@ import {
   getGitSettings,
   getHarnesses,
   getTelemetry,
-  modelLabel,
+  harnessModelLabel,
   recordTelemetryConsent,
   setTelemetry,
   type GitSettings,
@@ -277,7 +277,7 @@ function AgentCard({ h }: { h: Harness }) {
               h.models.length > 0 &&
                 `${h.models.length} model${h.models.length === 1 ? "" : "s"} — ${h.models
                   .slice(0, 3)
-                  .map((m) => modelLabel(m.id))
+                  .map((m) => harnessModelLabel(m))
                   .join(", ")}${h.models.length > 3 ? ", …" : ""}`,
             ]
               .filter(Boolean)
