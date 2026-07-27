@@ -276,7 +276,7 @@ the output.
 Follow the auto-research loop from the guide: create the baseline experiment
 first when the project is empty, branch variants off it, fill the user's available
 GPU capacity with useful parallel runs, wait on completions, and analyze each result before deciding
-to refill, promote, or stop.
+to repair, refill, promote, or stop.
 
 ## Prerequisite
 
@@ -301,7 +301,7 @@ module's detail with `orx skill <name>` (e.g. `orx skill experiment-tree`,
 Then carry out the user's research goal, following the auto-research loop from that
 guide: create the baseline experiment first when the project is empty, branch
 variants off it, fill the available GPU capacity with useful parallel runs, wait on completions, and
-analyze each result before deciding to refill, promote, or stop.
+analyze each result before deciding to repair, refill, promote, or stop.
 
 If any command reports `Not logged in`, ask the user to run `orx login` first.
 
@@ -311,6 +311,7 @@ $ARGUMENTS
 
 #[cfg(test)]
 mod tests {
+    use super::options::REASONING_DEFAULT_ID;
     use super::*;
 
     fn options_for(id: &str) -> HarnessOptions {
@@ -322,10 +323,10 @@ mod tests {
     }
 
     fn mode_ids(o: &HarnessOptions) -> Vec<&str> {
-        o.permission_modes.iter().map(|c| c.id).collect()
+        o.permission_modes.iter().map(|c| c.id.as_str()).collect()
     }
     fn reasoning_ids(o: &HarnessOptions) -> Vec<&str> {
-        o.reasoning_levels.iter().map(|c| c.id).collect()
+        o.reasoning_levels.iter().map(|c| c.id.as_str()).collect()
     }
 
     /// Pin each harness's advertised composer vocabulary — this is the wire
@@ -340,9 +341,17 @@ mod tests {
         let claude = options_for("claude-code");
         assert_eq!(mode_ids(&claude), ["plan", "auto", "bypass"]);
         assert_eq!(claude.default_permission_mode, Some("auto"));
+        // The harness-wide list is the *fallback* and always leads with
+        // `default` (no `--effort` sent). `ultracode` is deliberately absent
+        // here — it's version-gated and added per-model in `detect`, where the
+        // installed CLI version is known.
         assert_eq!(
             reasoning_ids(&claude),
-            ["low", "medium", "high", "xhigh", "max"]
+            ["default", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            claude.default_reasoning_level.as_deref(),
+            Some(REASONING_DEFAULT_ID)
         );
 
         // Codex: Plan + Auto + Bypass. Plan is a native collaboration mode over
@@ -353,11 +362,22 @@ mod tests {
         let codex = options_for("codex");
         assert_eq!(mode_ids(&codex), ["plan", "auto", "bypass"]);
         assert_eq!(codex.default_permission_mode, Some("auto"));
-        assert_eq!(reasoning_ids(&codex), ["low", "medium", "high", "xhigh"]);
+        // Only the conservative fallback intersection — per-model tiers
+        // (`max`/`ultra` on Sol/Terra) ride on each `ModelInfo`.
+        assert_eq!(
+            reasoning_ids(&codex),
+            ["default", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(
+            codex.default_reasoning_level.as_deref(),
+            Some(REASONING_DEFAULT_ID)
+        );
 
         // OpenCode: Plan (the native plan agent) + Auto (its permissive default)
         // + Bypass. No `ask` — opencode's default rarely prompts, so a dedicated
-        // ask mode would be hollow. No reasoning axis.
+        // ask mode would be hollow. Still no harness-wide reasoning axis: in
+        // opencode reasoning is genuinely per-model (`variants`), so the choices
+        // come from each `ModelInfo` and a model without variants shows none.
         let opencode = options_for("opencode");
         assert_eq!(mode_ids(&opencode), ["plan", "auto", "bypass"]);
         assert_eq!(opencode.default_permission_mode, Some("auto"));
@@ -372,7 +392,7 @@ mod tests {
         for h in registry() {
             for choice in h.options().permission_modes {
                 assert!(
-                    PermissionMode::from_id(choice.id).is_some(),
+                    PermissionMode::from_id(&choice.id).is_some(),
                     "{} advertises unparseable mode {:?}",
                     h.id(),
                     choice.id

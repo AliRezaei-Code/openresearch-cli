@@ -25,7 +25,7 @@ import {
   type ProjectFiles,
 } from "../api";
 import { CodeView } from "./CodeView";
-import { mdCodeComponents, normalizeMathDelimiters } from "./Md";
+import { mdCodeComponents, normalizeMathDelimiters, remarkMathOptions } from "./Md";
 
 /** Top-level folder reserved for project-wide reports (mirrors the backend). */
 const PROJECT_NAMESPACE = "project";
@@ -108,7 +108,7 @@ export function ReportMd({
   return (
     <div className="md report-md">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkMath]}
+        remarkPlugins={[remarkGfm, [remarkMath, remarkMathOptions]]}
         rehypePlugins={[rehypeKatex]}
         components={{
           // In-page anchors (headings, GFM footnotes) keep their hash href

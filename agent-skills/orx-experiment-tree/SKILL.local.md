@@ -7,8 +7,33 @@ A project is a **tree of experiment nodes**. The root (**baseline**) holds the
 starting code and a **run command** — the single shell command that trains or
 evaluates the node and prints its results to the run log. Every other node is a
 **child** branched off a parent, inheriting its code and its run command. The two
-rules this depends on — **never edit the baseline** and **the run command + env is
-a fixed contract** — are the cardinal rules; everything below assumes them.
+rules this depends on — **never edit a node a run has answered** and
+**the run command + env is a fixed contract** — are the cardinal rules;
+everything below assumes them.
+
+## Provisional until it answers — repair, don't branch
+
+Every node exists to establish a baseline or test a hypothesis. A run that dies
+on an error does **neither** — nothing was established, nothing was tested — so
+there is nothing to protect: fix that node's branch in place and re-run the
+same node. Successive runs on one node are how you get it working; a new node
+is for a new question.
+
+Once a run *does* answer the node — it produced the result the node was after,
+good, bad, or `nan` — the node is **frozen**. Its branch is the code that
+result came from: never edit it again, branch a child instead. That holds
+however the run ended, and it is permanent — a disappointing number is a
+result, not a reason to repair.
+
+Unintended behaviour is not an answer. An OOM, a timeout, a divergence from a
+bug, a missing dep — those are implementation and hardware details, and the
+node is still provisional (unless the node's hypothesis *is* about memory or
+runtime, in which case that outcome is exactly its result).
+
+**Repair cap:** two runs in a row that answer nothing on one node, then ask the
+user. Different errors still count; a bare relaunch or a flavor/backend switch
+is a repair. If the same failure hits a second node, that is one setup problem
+— ask then. (Separate from the "~3 failed or regressed runs" scientific stop.)
 
 ## Shape the tree — stacked bushes, not a flat fan or a noodle
 
@@ -57,7 +82,7 @@ co-equal variants that should have been siblings.
 ## The auto-research loop
 
 To drive a project toward a goal (e.g. "best convergence for d=8"), this is the
-intended flow — do **not** edit the baseline or rewrite the run command:
+intended flow — do **not** edit a frozen node or rewrite the run command:
 
 1. **Read the baseline's code.** You already sit in a private git worktree of the
    project's repo — `git fetch origin && git checkout <branch>` and read it with
@@ -93,6 +118,7 @@ intended flow — do **not** edit the baseline or rewrite the run command:
    prints the child's branch (`orx/<slug>`); in your worktree:
    ```sh
    git fetch origin && git checkout orx/<child-slug>
+   git merge --ff-only origin/orx/<child-slug>
    #   …edit only the files that idea touches…
    git commit -am "cosine LR + warmup" && git push
    ```
@@ -145,7 +171,9 @@ intended flow — do **not** edit the baseline or rewrite the run command:
    **actually read its results**: `orx logs <runId>` (see the `orx-evidence`
    skill). To see exactly what a finished node changed, diff its branch against
    its parent's (see the `orx-git` skill). Don't infer from status alone. Each
-   completion is a decision point with three moves:
+   completion is a decision point with four moves:
+   - **Repair** — the run answered nothing: fix this node's branch and
+     re-launch the same node (above).
    - **Refill** — result is mediocre or inconclusive: launch the next queued child to
      keep the round moving (step 5).
    - **Promote** — result is a clear win: this node becomes the **parent for the next
@@ -154,8 +182,8 @@ intended flow — do **not** edit the baseline or rewrite the run command:
      the tree grow deeper; skipping it is what produces a flat, sweep-only tree.
    - **Stop** — goal met, or the branch is exhausted.
 
-   The baseline stays untouched throughout — promotion moves the *focal parent* down the
-   tree, it never edits the root.
+   Frozen nodes stay untouched throughout — promotion moves the *focal parent*
+   down the tree, it never rewrites a node that already measured something.
 
 Stop when the goal is met, or after ~3 consecutive failed or regressed runs.
 When you stop, write up the tree as a report in the project's files dir — see

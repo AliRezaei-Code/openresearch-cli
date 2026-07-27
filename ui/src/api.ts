@@ -119,6 +119,18 @@ export const searchPapers = (q: string) =>
     (r) => r.papers,
   );
 
+/** The signed-in GitHub login, for naming the account a new repo lands on.
+ * `login` is null when there's no usable token. */
+export const githubAccount = () => get<{ login: string | null }>("/api/github/account");
+
+/** Whether the stored credentials can push to a repo. An unanswerable check
+ * (no token / API hiccup) reports `true`, matching the server's own fallback,
+ * so an outage never shows a fork choice the server wouldn't honour. */
+export const repoAccess = (owner: string, repo: string) =>
+  get<{ canPush: boolean }>(
+    `/api/github/repo-access?owner=${encodeURIComponent(owner)}&repo=${encodeURIComponent(repo)}`,
+  );
+
 /** Resolve an arXiv id / URL to title + linked GitHub repo. May take a few
  * seconds for papers alphaXiv hasn't indexed yet (it scrapes arXiv on a miss). */
 export const resolvePaper = (id: string) =>
@@ -518,6 +530,12 @@ export type ComputeTargetId =
 export interface ComputeTargetSummary {
   id: ComputeTargetId;
   configured: boolean;
+  /**
+   * The readiness check couldn't run (offline, unreadable ~/.ssh), so
+   * `configured` is a guess rather than an answer. Absent for backends whose
+   * state is decidable locally.
+   */
+  unverified?: boolean;
   summary: string;
 }
 
@@ -559,8 +577,14 @@ export interface OpenResearchSettings {
   loggedIn: boolean;
   apiUrl: string | null;
   orgs: string[];
-  /** null = signed in but the key check failed (see error). */
-  sshKeyRegistered: boolean | null;
+  /**
+   * Whether a registered key's private half is on THIS machine — `matched` is
+   * the only state that can actually reach a box. Optional: an older `orx`
+   * binary serving a newer ui omits it.
+   */
+  sshKeyStatus?: "matched" | "no_local_match" | "none_registered" | "unknown";
+  /** The `.pub` on this machine worth registering; null if there isn't one. */
+  sshKeyPath?: string | null;
   error: string | null;
 }
 
@@ -671,7 +695,30 @@ export type HarnessId = "claude-code" | "codex" | "opencode";
 
 export interface HarnessModel {
   id: string;
+  /**
+   * Reasoning/effort choices this *specific* model accepts, led by the
+   * `default` sentinel. Absent means "no list of its own" — fall back to the
+   * harness-wide {@link HarnessOptions.reasoningLevels}. An empty array is
+   * different: the model was checked and genuinely has no reasoning control,
+   * so the picker is hidden. Use `reasoningFor` rather than reading this
+   * directly.
+   */
+  reasoningLevels?: OptionChoice[];
+  /** The catalog's own human name ("Opus", "GPT-5.6 Sol"). Absent on
+   * statically-listed fallback models — derive from the id then. */
+  displayName?: string;
+  /** The catalog's one-line blurb. For Claude this carries the resolved
+   * version ("Opus 4.8 with 1M context · …") — its aliases don't. */
+  description?: string;
+  /** The tier that actually runs when nothing is chosen — present only when
+   * the CLI reports it (codex). When set, `reasoningLevels` has no `default`
+   * sentinel and the composer preselects this concrete tier. */
+  defaultReasoningLevel?: string;
 }
+
+/** Display label for a harness model: the catalog's own name when it has one,
+ * else prettified from the id. */
+export const harnessModelLabel = (m: HarnessModel) => m.displayName ?? modelLabel(m.id);
 
 /** One selectable value in a composer toggle (permission mode / reasoning). */
 export interface OptionChoice {
@@ -679,12 +726,81 @@ export interface OptionChoice {
   label: string;
 }
 
-/** The toggle vocabulary a harness supports. Empty arrays hide the control. */
+/**
+ * The toggle vocabulary a harness supports. Empty arrays hide the control.
+ *
+ * `reasoningLevels` here is the harness-wide *fallback*; per-model choices ride
+ * on {@link HarnessModel.reasoningLevels} and win. Resolve with `reasoningFor`.
+ */
 export interface HarnessOptions {
   permissionModes: OptionChoice[];
   defaultPermissionMode?: string | null;
   reasoningLevels: OptionChoice[];
   defaultReasoningLevel?: string | null;
+}
+
+/**
+ * Wire id for "send no explicit effort/variant — let the CLI and its own config
+ * decide". Must match `REASONING_DEFAULT_ID` in `src/local/harness/options.rs`.
+ */
+export const REASONING_DEFAULT_ID = "default";
+
+/**
+ * The reasoning choices to show for a harness + model, and the id to treat as
+ * the default.
+ *
+ * Per-model metadata wins when present (Codex's per-model tiers, OpenCode's
+ * `variants`); otherwise the harness-wide list applies. A model that reports an
+ * empty list genuinely has no reasoning control, so the picker is hidden — this
+ * is why the absent/empty distinction matters and `?? []` would be wrong.
+ */
+export function reasoningFor(
+  harness: Harness | undefined,
+  modelId: string | null | undefined,
+): { choices: OptionChoice[]; defaultId: string | null } {
+  const model = harness?.models.find((m) => m.id === modelId);
+  const choices = model?.reasoningLevels ?? harness?.options?.reasoningLevels ?? [];
+  // Preselection, in order of how much the CLI actually told us:
+  //  1. the model's reported concrete default (codex) — a real tier, shown as
+  //     the value that will run;
+  //  2. the `default` sentinel when it's on offer — "send no override", for
+  //     harnesses whose unset default isn't any fixed tier (Claude's adaptive
+  //     thinking) or is unknown (opencode);
+  //  3. the harness-wide default, then the first tier.
+  const modelDefault = model?.defaultReasoningLevel;
+  const defaultId =
+    modelDefault && choices.some((c) => c.id === modelDefault)
+      ? modelDefault
+      : choices.some((c) => c.id === REASONING_DEFAULT_ID)
+        ? REASONING_DEFAULT_ID
+        : (harness?.options?.defaultReasoningLevel ?? choices[0]?.id ?? null);
+  return { choices, defaultId };
+}
+
+/**
+ * Keep a stored reasoning level only if the given harness+model still offers
+ * it; otherwise fall back to that model's default. This is what makes switching
+ * models drop an effort the new model can't accept (e.g. `ultra` off Sol onto
+ * 5.5) instead of silently sending an invalid value.
+ */
+export function reconcileReasoning(
+  harness: Harness | undefined,
+  modelId: string | null | undefined,
+  current: string | null,
+): string | null {
+  // Harness not resolved yet — detection is async, and it can also fail. "We
+  // don't know what this model offers" is not "this model offers nothing", so
+  // leave the stored level alone; resetting it here would let a send that races
+  // the harness fetch overwrite a deliberate choice.
+  if (!harness) return current;
+  const { choices, defaultId } = reasoningFor(harness, modelId);
+  // A model with no reasoning control: the picker is hidden, so the user can no
+  // longer clear a level themselves. Return the sentinel rather than `null` —
+  // `null` reads as "no override supplied" and leaves whatever the session row
+  // already holds in place, which would keep sending a stale level the model
+  // never offered.
+  if (choices.length === 0) return REASONING_DEFAULT_ID;
+  return current && choices.some((c) => c.id === current) ? current : defaultId;
 }
 
 export interface Harness {

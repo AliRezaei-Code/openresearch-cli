@@ -2,11 +2,16 @@ import { Check, ChevronDown, Lock } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   getHarnesses,
+  harnessModelLabel,
   modelLabel,
+  reasoningFor,
+  reconcileReasoning,
+  REASONING_DEFAULT_ID,
   type Harness,
   type HarnessId,
   type OptionChoice,
 } from "../api";
+import { renderNote } from "./agentNote";
 
 export interface ModelSelection {
   harness: HarnessId;
@@ -28,11 +33,15 @@ export const HARNESS_LABELS: Record<HarnessId, string> = {
 export function defaultSelection(harnesses: Harness[]): ModelSelection | null {
   const ready = harnesses.find((h) => h.agentReady);
   if (!ready) return null;
+  // Seed the catalog's first model — the catalogs are CLI-discovered now, so
+  // it's a real, current id. Custom providers advertise no models; they seed
+  // null (= send no `--model`, the CLI uses whatever it is configured with).
+  const model = ready.models[0]?.id ?? null;
   return {
     harness: ready.id,
-    model: ready.models[0]?.id ?? null,
+    model,
     permissionMode: ready.options?.defaultPermissionMode ?? null,
-    reasoningLevel: ready.options?.defaultReasoningLevel ?? null,
+    reasoningLevel: reasoningFor(ready, model).defaultId,
   };
 }
 
@@ -113,7 +122,12 @@ export function ModelPicker({
     });
   }, [harnesses, filter, lockHarness, value]);
 
-  /** Switch harness → reseed model + mode/reasoning defaults for that harness. */
+  /** Switch harness → reseed mode defaults for that harness.
+   *
+   * Reasoning is reconciled against the *newly selected model* in both cases:
+   * choices are per-model now, so an effort the previous model allowed may not
+   * exist on this one (`ultra` on Sol → 5.5). Keeping it would send a value the
+   * model rejects, so it falls back to that model's default. */
   const pick = (harness: Harness, model: string | null) => {
     const sameHarness = value?.harness === harness.id;
     onSelect({
@@ -122,17 +136,29 @@ export function ModelPicker({
       permissionMode: sameHarness
         ? value!.permissionMode
         : harness.options?.defaultPermissionMode ?? null,
-      reasoningLevel: sameHarness
-        ? value!.reasoningLevel
-        : harness.options?.defaultReasoningLevel ?? null,
+      reasoningLevel: reconcileReasoning(
+        harness,
+        model,
+        sameHarness ? value!.reasoningLevel : null,
+      ),
     });
     setOpen(false);
     setFilter("");
   };
 
+  // Pill label: prefer the catalog's own name for the selected model (the
+  // Claude aliases like `opus[1m]` are meaningless prettified).
+  const selected =
+    value?.model != null
+      ? harnesses
+          .find((h) => h.id === value.harness)
+          ?.models.find((m) => m.id === value.model)
+      : undefined;
   const label = value
     ? value.model
-      ? modelLabel(value.model)
+      ? selected
+        ? harnessModelLabel(selected)
+        : modelLabel(value.model)
       : "Default model"
     : "Model";
 
@@ -161,18 +187,40 @@ export function ModelPicker({
               <div key={harness.id}>
                 <div className="model-group">{harness.name}</div>
                 {!harness.agentReady ? (
-                  <div className="model-more">{harness.agentNote ?? "Not available"}</div>
+                  <div className="model-more">
+                    {harness.agentNote ? renderNote(harness.agentNote) : "Not available"}
+                  </div>
                 ) : (
                   <>
+                    {/* "Default model" (= send no --model, the CLI decides)
+                        only where the CLI advertises no catalog — a custom
+                        provider whose real models live behind its gateway.
+                        With a discovered catalog the row is redundant noise:
+                        the catalog's own default leads the list. */}
+                    {harness.models.length === 0 && (
+                      <button className="model-item" onClick={() => pick(harness, null)}>
+                        <span>
+                          Default model
+                          <span className="model-id">CLI configuration</span>
+                        </span>
+                        {value?.harness === harness.id && value?.model === null && (
+                          <Check size={13} />
+                        )}
+                      </button>
+                    )}
                     {models.map((m) => (
                       <button
                         key={m.id}
                         className="model-item"
+                        title={m.id}
                         onClick={() => pick(harness, m.id)}
                       >
                         <span>
-                          {modelLabel(m.id)}
-                          <span className="model-id">{m.id}</span>
+                          {harnessModelLabel(m)}
+                          {/* The catalog blurb carries what the alias doesn't —
+                              for Claude, the resolved version ("Opus 4.8 with
+                              1M context · …"). Fall back to the raw id. */}
+                          <span className="model-id">{m.description ?? m.id}</span>
                         </span>
                         {value?.harness === harness.id && value?.model === m.id && (
                           <Check size={13} />
@@ -182,6 +230,22 @@ export function ModelPicker({
                     {hidden > 0 && (
                       <div className="model-more">{hidden} more — search to find</div>
                     )}
+                    {/* Free-form escape hatch: the catalogs are curated menus,
+                        not the set of ids the CLIs accept — `--model
+                        claude-opus-5` works on a CLI whose menu doesn't list
+                        it. Typing an id not in the list offers it directly. */}
+                    {filter.trim().length > 0 &&
+                      !harness.models.some((m) => m.id === filter.trim()) && (
+                        <button
+                          className="model-item"
+                          onClick={() => pick(harness, filter.trim())}
+                        >
+                          <span>
+                            Use “{filter.trim()}”
+                            <span className="model-id">pass as the model id</span>
+                          </span>
+                        </button>
+                      )}
                   </>
                 )}
               </div>
@@ -236,6 +300,14 @@ export function OptionPicker({
   const effectiveId = value ?? defaultId ?? choices[0]?.id ?? null;
   const current = choices.find((c) => c.id === effectiveId);
   const defaultChoice = choices.find((c) => c.id === defaultId);
+  // Only the `default` sentinel gets pinned above a separator — it isn't a
+  // point on the tier ramp, it's a different kind of choice (Claude's Adaptive,
+  // opencode's "let the model decide"). A *concrete* default (codex's resolved
+  // tier, a permission mode) stays inline in its natural position with just
+  // the "· Default" marker, so the ramp reads in order.
+  const pinned =
+    defaultChoice && defaultChoice.id === REASONING_DEFAULT_ID ? defaultChoice : undefined;
+  const rest = pinned ? choices.filter((c) => c.id !== pinned.id) : choices;
   const label = current?.label ?? choices[0]?.label ?? "";
 
   const choose = (id: string) => {
@@ -257,20 +329,35 @@ export function OptionPicker({
       {open && (
         <div className={`option-menu ${align === "right" ? "align-right" : ""}`}>
           {header && <div className="model-group">{header}</div>}
-          {defaultChoice && (
+          {pinned && (
             <>
-              <button className="model-item" onClick={() => choose(defaultChoice.id)}>
+              <button className="model-item" onClick={() => choose(pinned.id)}>
                 <span>
-                  {defaultChoice.label} <span className="option-default">· Default</span>
+                  {pinned.label}
+                  {/* An unnamed sentinel's label already IS "Default", so the
+                      usual marker would read "Default · Default" — say where
+                      the behavior comes from instead. A named one ("Adaptive")
+                      gets the standard marker. */}
+                  <span className="option-default">
+                    {pinned.label === "Default" ? " · CLI configuration" : " · Default"}
+                  </span>
                 </span>
-                {effectiveId === defaultChoice.id && <Check size={13} />}
+                {effectiveId === pinned.id && <Check size={13} />}
               </button>
               <div className="option-sep" />
             </>
           )}
-          {choices.map((c, i) => (
+          {rest.map((c, i) => (
             <button key={c.id} className="model-item" onClick={() => choose(c.id)}>
-              <span>{c.label}</span>
+              <span>
+                {c.label}
+                {/* A concrete default renders inline, in ramp order, with just
+                    the marker — it's one of the tiers, not a separate kind of
+                    choice like the pinned sentinel above. */}
+                {!pinned && c.id === defaultId && (
+                  <span className="option-default"> · Default</span>
+                )}
+              </span>
               {effectiveId === c.id ? (
                 <Check size={13} />
               ) : (

@@ -14,15 +14,21 @@
 //! continues the same turn.
 //!
 //! Detection: `~/.claude.json` carries the signed-in OAuth account (no secrets
-//! read); `ANTHROPIC_API_KEY` is the api-key fallback.
+//! read); `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` are credential
+//! fallbacks, and are what a custom `ANTHROPIC_BASE_URL` gateway uses.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
 
-use super::detect::{bin_version, find_on_path, nonempty_str, read_json, HarnessInfo};
-use super::options::{HarnessOptions, PermissionMode};
+use super::detect::{bin_version, find_on_path, nonempty_str, read_json, HarnessInfo, ModelInfo};
+use super::options::{HarnessOptions, PermissionMode, REASONING_DEFAULT_ID};
 use super::{Harness, ResumeAction};
 use crate::error::{anyhow, Result};
 use crate::local::chat::{
@@ -32,8 +38,10 @@ use crate::local::chat::{
 use crate::local::claude::{SpawnConfig, SpawnSpec, TurnEvent};
 use crate::local::opencode::ensure_playbook;
 
-/// Each harness runs directly (its own CLI, the user's own login), so its
-/// model list is its own: static ids for the Claude Code CLI.
+/// FALLBACK model list, used only when the `list_models` control request fails
+/// (a CLI too old to answer it, or a spawn/timeout failure). The primary source
+/// is [`claude_list_models`]: the same catalog the CLI's own `/model` menu
+/// renders, with per-model `supportedEffortLevels`.
 const CLAUDE_MODELS: [&str; 4] = [
     "claude-fable-5",
     "claude-sonnet-5",
@@ -41,17 +49,206 @@ const CLAUDE_MODELS: [&str; 4] = [
     "claude-haiku-4-5",
 ];
 
-/// Claude Code's `--effort` tiers (id == the CLI value). `xhigh`/`max` are
-/// Claude-specific — the reasoning vocabulary is per-harness, not global.
-const CLAUDE_EFFORT_LEVELS: [(&str, &str); 5] = [
-    ("low", "Low"),
-    ("medium", "Medium"),
-    ("high", "High"),
-    ("xhigh", "XHigh"),
-    ("max", "Max"),
-];
+/// FALLBACK effort tiers, paired with `CLAUDE_MODELS` above — the base five
+/// every supported CLI accepts. The primary source is per-model
+/// `supportedEffortLevels` from `list_models`.
+const CLAUDE_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// `ultracode` — the session mode that selects `xhigh` effort plus standing
+/// dynamic-workflow orchestration. NOT the same as `ultrathink` (a prompt
+/// keyword) or Codex's `ultra`. The CLI models it as a *mode*, not an effort
+/// level: `list_models` never includes it in `supportedEffortLevels`, even on
+/// versions whose `--effort` accepts it — which is why support is detected by
+/// [`claude_accepts_ultracode`] rather than read from the catalog.
+const CLAUDE_ULTRACODE: &str = "ultracode";
+
+/// Ask the installed CLI's own argument parser whether it accepts
+/// `--effort ultracode`. `--version` still runs the parser, which prints
+/// `Warning: Unknown --effort value …` for a value it doesn't know and exits
+/// without touching the network (~0.2s); absence of the warning is acceptance.
+///
+/// The parser is the only truthful surface. Every enumeration the CLI offers
+/// lies about this value: `--help` lists five tiers on versions that accept
+/// six; the warning's own "Valid values:" list omits `ultracode` on versions
+/// that accept it; and `list_models` never advertises it (see
+/// [`CLAUDE_ULTRACODE`]). Probing the parser replaces a hard-coded version
+/// gate — the boundary (2.1.202 rejects / 2.1.203 accepts, bisected across
+/// every published version in between) is now discovered per install instead
+/// of pinned.
+///
+/// Any failure reports unsupported: a missing choice is a smaller harm than a
+/// choice that silently runs at the default effort.
+async fn claude_accepts_ultracode(bin: &Path) -> bool {
+    let fut = Command::new(bin)
+        .args(["--effort", CLAUDE_ULTRACODE, "--version"])
+        .stdin(Stdio::null())
+        .output();
+    match tokio::time::timeout(Duration::from_secs(10), fut).await {
+        Ok(Ok(out)) => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.status.success() && !text.contains("Unknown --effort value")
+        }
+        _ => false,
+    }
+}
+
+/// Query the CLI's own model catalog — the `list_models` control request over
+/// `--print` stream-json, the same data its `/model` menu renders: every model
+/// with its `supportedEffortLevels`. This is the Claude analogue of codex's
+/// `model/list` and opencode's `models --verbose`; a curated table here shipped
+/// effort tiers on Haiku, which the catalog says supports none.
+///
+/// One shot: spawn, write the control request, read until its
+/// `control_response` (skipping stream noise), kill the child. Any failure —
+/// spawn, timeout, a CLI too old for the subtype — returns `None` and the
+/// caller falls back to the static table.
+async fn claude_list_models(bin: &Path, ultracode: bool) -> Option<Vec<ModelInfo>> {
+    let fut = async {
+        let mut child = Command::new(bin)
+            .args([
+                "--print",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take()?;
+        let mut lines = BufReader::new(child.stdout.take()?).lines();
+
+        use tokio::io::AsyncWriteExt;
+        let req = serde_json::json!({
+            "type": "control_request",
+            "request_id": "orx_list_models",
+            "request": { "subtype": "list_models" },
+        });
+        let mut line = req.to_string();
+        line.push('\n');
+        stdin.write_all(line.as_bytes()).await.ok()?;
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if v.get("type").and_then(Value::as_str) != Some("control_response") {
+                continue;
+            }
+            let resp = v.get("response")?;
+            if resp.get("request_id").and_then(Value::as_str) != Some("orx_list_models") {
+                continue;
+            }
+            // An `error` subtype has no inner response — `?` falls through to
+            // the static fallback.
+            let models = parse_claude_model_list(resp.get("response")?, ultracode);
+            return (!models.is_empty()).then_some(models);
+        }
+        None
+    };
+    tokio::time::timeout(Duration::from_secs(15), fut)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// `list_models` response → per-model `ModelInfo`. Split from the transport
+/// for testability.
+///
+/// * `value` is the id the CLI's own picker submits (aliases like `sonnet`,
+///   `opus[1m]`), so it's what we store and pass back as `--model`.
+/// * The `default` entry is skipped — the composer's "Default model" row (a
+///   null model) already means "let the CLI pick".
+/// * A model without `supportedEffortLevels` (Haiku) gets an empty list, which
+///   hides the reasoning picker — same absent-vs-empty contract as opencode.
+/// * `ultracode` is appended where the CLI accepts it (see
+///   [`claude_accepts_ultracode`]) and the model reaches `xhigh`, since the
+///   mode is documented as `xhigh` + dynamic workflows.
+fn parse_claude_model_list(result: &Value, ultracode: bool) -> Vec<ModelInfo> {
+    let Some(models) = result.get("models").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    models
+        .iter()
+        .filter_map(|m| {
+            let value = m.get("value").and_then(Value::as_str)?;
+            if value == "default" {
+                return None;
+            }
+            let mut efforts: Vec<&str> = m
+                .get("supportedEffortLevels")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if ultracode && efforts.contains(&"xhigh") {
+                efforts.push(CLAUDE_ULTRACODE);
+            }
+            // The catalog's `displayName` is unversioned ("Opus"); the version
+            // lives in the description's first `·` segment ("Opus 4.8 with 1M
+            // context · Best for everyday, complex tasks"). Promote that
+            // segment to the display name and keep the rest as the blurb, so
+            // the picker leads with the resolved version.
+            let (name, blurb) = match m.get("description").and_then(Value::as_str) {
+                Some(desc) => match desc.split_once('·') {
+                    Some((head, tail)) => (Some(head.trim()), Some(tail.trim())),
+                    None => (m.get("displayName").and_then(Value::as_str), Some(desc)),
+                },
+                None => (m.get("displayName").and_then(Value::as_str), None),
+            };
+            let mut info = ModelInfo::new(value)
+                .with_reasoning(&efforts)
+                .with_label(name, blurb);
+            // Claude reports no default *tier* because its unset default isn't
+            // one: with adaptive thinking, the CLI scales effort per request.
+            // Name the sentinel row for what actually runs — preselecting a
+            // fixed tier here would pin behavior the user never asked for.
+            if m.get("supportsAdaptiveThinking") == Some(&Value::Bool(true)) {
+                if let Some(choices) = info.reasoning_levels.as_mut() {
+                    if let Some(sentinel) = choices.first_mut() {
+                        sentinel.label = "Adaptive".to_string();
+                    }
+                }
+            }
+            Some(info)
+        })
+        .collect()
+}
+
+/// The FALLBACK effort ids (see `CLAUDE_EFFORT_LEVELS`), plus `ultracode` when
+/// the parser probe accepted it.
+fn claude_effort_ids(ultracode: bool) -> Vec<&'static str> {
+    let mut ids: Vec<&'static str> = CLAUDE_EFFORT_LEVELS.to_vec();
+    if ultracode {
+        ids.push(CLAUDE_ULTRACODE);
+    }
+    ids
+}
 
 pub struct ClaudeCode;
+
+/// Either credential Claude Code accepts. `ANTHROPIC_AUTH_TOKEN` is the one a
+/// custom `ANTHROPIC_BASE_URL` gateway uses, so detecting only the api key
+/// reports those working setups as signed out.
+const CLAUDE_CREDENTIAL_VARS: [&str; 2] = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+
+fn has_api_credential() -> bool {
+    CLAUDE_CREDENTIAL_VARS
+        .iter()
+        .any(|key| super::detect::api_key(key).is_some())
+}
+
+/// Whether Claude Code is pointed at a non-first-party endpoint.
+fn custom_base_url() -> bool {
+    super::detect::api_key("ANTHROPIC_BASE_URL").is_some()
+}
 
 /// `claude` on PATH, else the common install drop locations.
 pub(crate) fn find_claude() -> Option<PathBuf> {
@@ -85,8 +282,17 @@ impl Harness for ClaudeCode {
             info.version = bin_version(&bin).await;
             info.bin_path = Some(bin.to_string_lossy().into_owned());
         }
+        // A custom `ANTHROPIC_BASE_URL` gateway authenticates with an env
+        // credential and never writes OAuth metadata, so a leftover
+        // `~/.claude.json` from an earlier first-party login would otherwise
+        // mislabel the account. Only a custom base url takes that precedence —
+        // an api key alongside a live OAuth login still shows the account.
+        if custom_base_url() && has_api_credential() {
+            info.authenticated = true;
+            info.auth_method = Some("apiKey");
+        }
         // ~/.claude.json carries the signed-in OAuth account (no secrets read).
-        if let Some(cfg) = dirs::home_dir().and_then(|h| read_json(h.join(".claude.json"))) {
+        else if let Some(cfg) = dirs::home_dir().and_then(|h| read_json(h.join(".claude.json"))) {
             if let Some(acct) = cfg.get("oauthAccount") {
                 info.authenticated = true;
                 info.auth_method = Some("oauth");
@@ -99,17 +305,40 @@ impl Harness for ClaudeCode {
                 };
             }
         }
-        if !info.authenticated && std::env::var("ANTHROPIC_API_KEY").is_ok_and(|v| !v.is_empty()) {
+        if !info.authenticated && has_api_credential() {
             info.authenticated = true;
             info.auth_method = Some("apiKey");
         }
 
         info.agent_ready = info.installed && info.authenticated;
         if info.agent_ready {
-            info = info.with_models(&CLAUDE_MODELS);
+            // Ask the installed CLI for its own catalog: `list_models` for the
+            // models and their per-model effort tiers, and the parser probe for
+            // `ultracode` (a session mode the catalog never advertises — see
+            // `claude_accepts_ultracode`). The static table only covers a CLI
+            // too old to answer.
+            let bin = info.bin_path.as_deref().map(Path::new);
+            let (ultracode, models) = match bin {
+                Some(bin) => {
+                    let ultracode = claude_accepts_ultracode(bin).await;
+                    (ultracode, claude_list_models(bin, ultracode).await)
+                }
+                None => (false, None),
+            };
+            info = info.with_models(models.unwrap_or_else(|| {
+                let ids = claude_effort_ids(ultracode);
+                CLAUDE_MODELS
+                    .iter()
+                    .map(|id| ModelInfo::new(*id).with_reasoning(&ids))
+                    .collect()
+            }));
+        } else if info.installed {
+            info.agent_note =
+                Some("Sign in with `claude auth login` to chat with it here.".to_string());
         } else {
             info.agent_note = Some(
-                "Install Claude Code and sign in (`claude`) to chat with it here.".to_string(),
+                "Install Claude Code (claude.com/download), then sign in with `claude auth login`."
+                    .to_string(),
             );
         }
         Some(info)
@@ -141,8 +370,12 @@ impl Harness for ClaudeCode {
                 ],
                 PermissionMode::Auto,
             )
-            // Claude Code's `--effort` tiers (default `high` on current models).
-            .with_reasoning_levels(&CLAUDE_EFFORT_LEVELS, "high")
+            // Harness-wide fallback only, and deliberately the conservative
+            // five: `options()` is static and can't see the detected CLI
+            // version, so `ultracode` is added per-model in `detect` where the
+            // version IS known. The default is `Default` (no `--effort` at all),
+            // so the CLI's own configured effort survives (issue #123).
+            .with_reasoning_levels(&CLAUDE_EFFORT_LEVELS)
     }
 
     /// Two resume paths. A card the permission bridge surfaced mid-turn
@@ -392,15 +625,17 @@ pub(crate) fn write_mcp_config(
     Ok(path)
 }
 
-/// Session reasoning id → Claude Code `--effort` value. The composer only
-/// offers ids from `CLAUDE_EFFORT_LEVELS`, so an unrecognized/absent value just
-/// omits the flag and lets the CLI apply its own default (`high`).
+/// Session reasoning id → Claude's `--effort` value.
+///
+/// Only the `default` sentinel (and an absent level) send nothing; every other
+/// value is forwarded. The composer only offers what `list_models` reported
+/// for the selected model (plus a probe-verified `ultracode`), so an allowlist
+/// here would drop tiers a future catalog genuinely advertises — the same
+/// policy as `codex_reasoning` for catalog models and `opencode_variant`.
+/// Claude is also the gentlest harness to forward into: an unknown value warns
+/// on stderr and runs at the default effort rather than failing the turn.
 fn claude_effort(level: Option<&str>) -> Option<&str> {
-    let level = level?;
-    CLAUDE_EFFORT_LEVELS
-        .iter()
-        .any(|(id, _)| *id == level)
-        .then_some(level)
+    level.filter(|l| *l != REASONING_DEFAULT_ID)
 }
 
 /// The follow-up message + resume mode for an answered Claude prompt — Claude's
@@ -600,6 +835,10 @@ struct TurnState {
     /// that sub-agent's stream — the child equivalent of `stream_mid`, so two
     /// concurrent sub-agents' deltas key to distinct child part ids.
     sub_stream_mid: std::collections::HashMap<String, String>,
+    /// Content blocks already consumed from prior `assistant` events, keyed
+    /// per message id (subagent events namespaced by `parent_tool_use_id`) —
+    /// see the `assistant` arm for why this offset exists.
+    assistant_blocks_seen: HashMap<String, usize>,
 }
 
 /// The spawning `Task` tool_use id for a sub-agent event (`parent_tool_use_id`),
@@ -614,9 +853,11 @@ fn subagent_parent(event: &Value) -> Option<&str> {
 /// Route a sub-agent `assistant` message's content blocks into the spawning Task
 /// part's `children` (ids namespaced by `parent` so concurrent sub-agents can't
 /// collide). Mirrors the main-loop block handling minus the interactive-prompt /
-/// bridge special-casing, which only applies to the main session.
-fn apply_subagent_blocks(ctx: &mut TurnCtx, parent: &str, mid: &str, blocks: &[Value]) {
-    for (i, block) in blocks.iter().enumerate() {
+/// bridge special-casing, which only applies to the main session. `start` is the
+/// index of the first not-yet-seen block (the thinking-model dedup offset), so a
+/// re-sent `assistant` event doesn't duplicate the sub-agent's earlier blocks.
+fn apply_subagent_blocks(ctx: &mut TurnCtx, parent: &str, mid: &str, start: usize, blocks: &[Value]) {
+    for (i, block) in blocks.iter().enumerate().skip(start) {
         let ns = |id: &str| format!("{parent}:{id}");
         match block.get("type").and_then(Value::as_str) {
             Some("text") => {
@@ -670,12 +911,13 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
         // Partial-message deltas (opt-in via --include-partial-messages): the
         // text/thinking streams token by token instead of landing as one block
         // when the complete `assistant` event arrives. Deltas build a part
-        // under the same `{mid}-{index}` id that the final event upserts, so
-        // the authoritative full text simply overwrites the accumulated one.
-        // That overwrite (and part ordering) leans on two stream-protocol
-        // invariants: the stream's message id equals the final assistant
-        // event's, and a block's `index` is its position in the final content
-        // array, with blocks streamed in ascending order.
+        // under the same `{mid}-{index}` id that the assistant event upserts,
+        // so the authoritative full text simply overwrites the accumulated
+        // one (the `assistant` arm reconstructs the block index from a
+        // running offset). That overwrite (and part ordering) leans on two stream-protocol
+        // invariants: the stream's message id equals the assistant events',
+        // and a block's `index` is its position in the message's content,
+        // with blocks streamed in ascending order.
         Some("stream_event") => {
             // A subagent's nested stream carries `parent_tool_use_id` (the id of
             // the spawning Task tool_use — which is the Task part's own id). Its
@@ -763,15 +1005,37 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
+            // The CLI emits one `assistant` event per content block (a
+            // single-element `content` array), so each event continues the
+            // message where the last left off; a message's first event starts
+            // at offset 0, so a single full-content array behaves the same.
+            // The counter trusts the CLI to emit each block exactly once, in
+            // order — the events carry no wire index to cross-check. A
+            // subagent's events (parent_tool_use_id set) get their own
+            // namespace so they can never advance the main message's offset.
+            let parent = subagent_parent(event).map(str::to_string);
+            let offset_key = match parent.as_deref() {
+                Some(parent) => format!("{parent}:{mid}"),
+                None => mid.clone(),
+            };
+            let offset = state
+                .assistant_blocks_seen
+                .get(&offset_key)
+                .copied()
+                .unwrap_or(0);
             // A sub-agent's message: route its blocks into the spawning Task
-            // part's `children` (namespaced ids), never into the top-level
-            // transcript, and skip prompt-card / usage handling (a sub-agent
-            // doesn't drive the main session's interactive flow or its meter).
-            if let Some(parent) = subagent_parent(event) {
-                apply_subagent_blocks(ctx, parent, &mid, &blocks);
+            // part's `children` (namespaced ids, same offset), never into the
+            // top-level transcript, and skip prompt-card / usage handling (a
+            // sub-agent drives neither the main interactive flow nor its meter).
+            if let Some(parent) = parent.as_deref() {
+                apply_subagent_blocks(ctx, parent, &mid, offset, &blocks);
+                state
+                    .assistant_blocks_seen
+                    .insert(offset_key, offset + blocks.len());
                 return false;
             }
-            for (i, block) in blocks.iter().enumerate() {
+            for (n, block) in blocks.iter().enumerate() {
+                let i = offset + n;
                 match block.get("type").and_then(Value::as_str) {
                     Some("text") => {
                         let text = block.get("text").and_then(Value::as_str).unwrap_or("");
@@ -788,8 +1052,7 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                         let id = block
                             .get("id")
                             .and_then(Value::as_str)
-                            .unwrap_or(&format!("{mid}-{i}"))
-                            .to_string();
+                            .map_or_else(|| format!("{mid}-{i}"), str::to_string);
                         let name = block.get("name").and_then(Value::as_str).unwrap_or("");
                         let input = block.get("input");
                         // ExitPlanMode / AskUserQuestion surface as interactive
@@ -834,6 +1097,12 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                     _ => {}
                 }
             }
+            // Advance by the content-array length, not a render count: a
+            // bridge-suppressed ExitPlanMode/AskUserQuestion or an unknown
+            // block type still occupies its position in the message.
+            state
+                .assistant_blocks_seen
+                .insert(offset_key, offset + blocks.len());
             // Per-message usage gives live updates during multi-step turns; the
             // window arrives later on `result`, so report the token count only.
             // (Sub-agent messages returned early above, so their smaller counts
@@ -1135,7 +1404,144 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::options::REASONING_DEFAULT_ID;
     use super::*;
+
+    /// A `list_models` response in the live 2.1.212 shape (fields we don't
+    /// read trimmed). Covers the four things the parser decides: the `default`
+    /// entry is skipped, `value` (the alias the CLI's own picker submits) is
+    /// the id, a model without `supportedEffortLevels` hides the picker, and
+    /// `ultracode` is appended only when probed AND the model reaches `xhigh`.
+    #[test]
+    fn model_list_parses_catalog_models_and_efforts() {
+        let result = serde_json::json!({
+            "models": [
+                {
+                    "value": "default",
+                    "resolvedModel": "claude-opus-4-8[1m]",
+                    "displayName": "Default (recommended)",
+                    "supportsEffort": true,
+                    "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
+                },
+                {
+                    "value": "claude-fable-5[1m]",
+                    "resolvedModel": "claude-fable-5",
+                    "displayName": "Fable",
+                    "description": "Fable 5 · Most capable",
+                    "supportsEffort": true,
+                    "supportsAdaptiveThinking": true,
+                    "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
+                },
+                {
+                    "value": "haiku",
+                    "resolvedModel": "claude-haiku-4-5-20251001",
+                    "displayName": "Haiku",
+                },
+            ],
+        });
+        let ids = |m: &ModelInfo| {
+            m.reasoning_levels
+                .as_ref()
+                .map(|c| c.iter().map(|c| c.id.clone()).collect::<Vec<_>>())
+        };
+
+        let with = parse_claude_model_list(&result, true);
+        assert_eq!(
+            with.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["claude-fable-5[1m]", "haiku"],
+            "the `default` entry is the composer's null-model row, not a model"
+        );
+        // The versioned name is promoted out of the description's first `·`
+        // segment (the alias ids and `displayName` are unversioned).
+        assert_eq!(with[0].display_name.as_deref(), Some("Fable 5"));
+        assert_eq!(with[0].description.as_deref(), Some("Most capable"));
+        // Claude's unset default is adaptive thinking, not any fixed tier, so
+        // the sentinel row is named for what actually runs — and no concrete
+        // tier is preselected.
+        assert_eq!(
+            with[0].reasoning_levels.as_ref().unwrap()[0].label,
+            "Adaptive"
+        );
+        assert_eq!(with[0].default_reasoning_level, None);
+        // No description → the plain displayName stands.
+        assert_eq!(with[1].display_name.as_deref(), Some("Haiku"));
+        assert_eq!(with[1].description, None);
+        assert_eq!(
+            ids(&with[0]).unwrap(),
+            [
+                "default",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "ultracode"
+            ]
+        );
+        // Haiku: checked, no effort control → empty list → picker hidden. Also
+        // no `ultracode` — the mode needs `xhigh`, which Haiku doesn't reach.
+        assert_eq!(ids(&with[1]).unwrap(), Vec::<String>::new());
+
+        // Probe said no → no ultracode anywhere, catalog otherwise identical.
+        let without = parse_claude_model_list(&result, false);
+        assert_eq!(
+            ids(&without[0]).unwrap(),
+            ["default", "low", "medium", "high", "xhigh", "max"]
+        );
+
+        // Junk shapes parse to nothing rather than panicking.
+        assert!(parse_claude_model_list(&serde_json::json!({}), true).is_empty());
+        assert!(parse_claude_model_list(&serde_json::json!({ "models": "nope" }), true).is_empty());
+    }
+
+    /// The fallback tiers gain `ultracode` only when the parser probe said so.
+    #[test]
+    fn fallback_effort_ids_follow_the_probe() {
+        assert_eq!(
+            claude_effort_ids(false),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            claude_effort_ids(true),
+            ["low", "medium", "high", "xhigh", "max", "ultracode"]
+        );
+    }
+
+    /// Only the sentinel is withheld; everything else forwards. The composer
+    /// offers only catalog-reported tiers (plus a probe-verified `ultracode`),
+    /// and Claude merely warns-and-defaults on a value it doesn't know, so an
+    /// allowlist here would only risk dropping a future catalog tier.
+    #[test]
+    fn effort_is_sent_unless_it_is_the_default_sentinel() {
+        assert_eq!(claude_effort(Some("ultracode")), Some("ultracode"));
+        assert_eq!(claude_effort(Some("max")), Some("max"));
+        assert_eq!(claude_effort(Some("low")), Some("low"));
+        assert_eq!(
+            claude_effort(Some("brand-new-tier")),
+            Some("brand-new-tier")
+        );
+        assert_eq!(claude_effort(Some(REASONING_DEFAULT_ID)), None);
+        assert_eq!(claude_effort(None), None);
+    }
+
+    /// Every id the composer can offer must survive the mapper — catalog
+    /// tiers and the probe-gated fallback alike.
+    #[test]
+    fn advertised_effort_ids_all_map_back() {
+        for id in claude_effort_ids(true) {
+            assert_eq!(claude_effort(Some(id)), Some(id), "{id} was dropped");
+        }
+    }
+
+    #[test]
+    fn bearer_token_counts_as_a_credential_alongside_the_api_key() {
+        // Both names are checked through the same `detect::api_key` lookup, so
+        // a gateway that only sets ANTHROPIC_AUTH_TOKEN still reads as signed
+        // in. (Asserted on the name list rather than by setting env vars, which
+        // would race with the other tests in this process.)
+        assert!(CLAUDE_CREDENTIAL_VARS.contains(&"ANTHROPIC_API_KEY"));
+        assert!(CLAUDE_CREDENTIAL_VARS.contains(&"ANTHROPIC_AUTH_TOKEN"));
+    }
 
     #[test]
     fn plan_card_synthesized_only_for_cardless_texty_plan_turns() {
@@ -1249,15 +1655,6 @@ mod tests {
         assert!(text.trim().is_empty());
     }
 
-    #[test]
-    fn effort_accepts_only_claude_tiers() {
-        assert_eq!(claude_effort(Some("xhigh")), Some("xhigh"));
-        assert_eq!(claude_effort(Some("max")), Some("max"));
-        // A Codex-only id like a bare "medium" is fine (shared), but junk is not.
-        assert_eq!(claude_effort(Some("ultra")), None);
-        assert_eq!(claude_effort(None), None);
-    }
-
     /// Fold a hand-written stream-json transcript through `apply_event` against a
     /// bare `TurnCtx::test_stub()` — the store-free property. Returns the final
     /// state; asserts the fold stops on the `result` event and no earlier.
@@ -1339,10 +1736,13 @@ mod tests {
     }
 
     #[test]
-    fn stream_deltas_paint_parts_and_the_final_event_overwrites_them() {
-        // Deltas accumulate under {mid}-{index}; the complete assistant event
-        // then upserts the authoritative text over the very same part — one
-        // part, no duplicate, final text wins.
+    fn stream_deltas_paint_parts_and_a_whole_message_event_overwrites_them() {
+        // Deltas accumulate under {mid}-{index}; an assistant event carrying
+        // the whole content array (the offset-0 degenerate case — the live
+        // CLI splits per block, see
+        // `per_block_assistant_events_land_on_the_delta_parts`) upserts the
+        // authoritative text over the very same parts — no duplicate, final
+        // text wins.
         let transcript = [
             r#"{"type":"system","subtype":"init","session_id":"sd1"}"#,
             r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"m9"}},"parent_tool_use_id":null}"#,
@@ -1362,6 +1762,111 @@ mod tests {
         assert_eq!(parts[1].text.as_deref(), Some("Rivers flow."));
         // The final assistant event still feeds last_text (plan synthesis).
         assert_eq!(state.last_text, "Rivers flow.");
+    }
+
+    #[test]
+    fn per_block_assistant_events_land_on_the_delta_parts() {
+        // The CLI emits one `assistant` event per completed content block,
+        // each with a single-element content array (captured live from the
+        // claude CLI). Without the running block offset, the text block's
+        // event would key to {mid}-0, clobbering the reasoning part while the
+        // delta-built text at {mid}-1 survived as a duplicate.
+        let transcript = [
+            r#"{"type":"system","subtype":"init","session_id":"sd2"}"#,
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"m9"}},"parent_tool_use_id":null}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}},"parent_tool_use_id":null}"#,
+            r#"{"type":"assistant","message":{"id":"m9","content":[{"type":"thinking","thinking":"hmm"}]}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Riv"}},"parent_tool_use_id":null}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"ers flow."}},"parent_tool_use_id":null}"#,
+            r#"{"type":"assistant","message":{"id":"m9","content":[{"type":"text","text":"Rivers flow."}]}}"#,
+            r#"{"type":"result","subtype":"success","session_id":"sd2","is_error":false}"#,
+        ];
+        let mut ctx = TurnCtx::test_stub();
+        let state = fold(&mut ctx, false, &transcript);
+        let parts = &ctx.assistant.parts;
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert_eq!(parts[0].id, "m9-0");
+        assert_eq!(parts[0].kind, "reasoning");
+        assert_eq!(parts[0].text.as_deref(), Some("hmm"));
+        assert_eq!(parts[1].id, "m9-1");
+        assert_eq!(parts[1].kind, "text");
+        assert_eq!(parts[1].text.as_deref(), Some("Rivers flow."));
+        assert_eq!(state.last_text, "Rivers flow.");
+    }
+
+    #[test]
+    fn block_offsets_are_keyed_per_message_id() {
+        // A multi-iteration turn has several assistant messages, each with
+        // its own id — each id gets its own offset, so the second message's
+        // first block keys to {mid2}-0, not a continuation of message one
+        // (a single running counter would break here).
+        let transcript = [
+            r#"{"type":"system","subtype":"init","session_id":"sd3"}"#,
+            r#"{"type":"assistant","message":{"id":"mA","content":[{"type":"thinking","thinking":"t1"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"mA","content":[{"type":"text","text":"first"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"mB","content":[{"type":"text","text":"second"}]}}"#,
+            r#"{"type":"result","subtype":"success","session_id":"sd3","is_error":false}"#,
+        ];
+        let mut ctx = TurnCtx::test_stub();
+        let state = fold(&mut ctx, false, &transcript);
+        let parts = &ctx.assistant.parts;
+        assert_eq!(parts.len(), 3, "{parts:?}");
+        assert_eq!(parts[0].id, "mA-0");
+        assert_eq!(parts[1].id, "mA-1");
+        assert_eq!(parts[1].text.as_deref(), Some("first"));
+        assert_eq!(parts[2].id, "mB-0");
+        assert_eq!(parts[2].text.as_deref(), Some("second"));
+        assert_eq!(state.last_text, "second");
+    }
+
+    #[test]
+    fn bridge_suppressed_blocks_still_advance_the_offset() {
+        // A bridge-suppressed ExitPlanMode renders nothing but still occupies
+        // its position in the message — the text block after it must land at
+        // {mid}-1, overwriting its delta-built part, not at {mid}-0.
+        let transcript = [
+            r#"{"type":"system","subtype":"init","session_id":"sd4"}"#,
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"mC"}},"parent_tool_use_id":null}"#,
+            r#"{"type":"assistant","message":{"id":"mC","content":[{"type":"tool_use","id":"toolu_p","name":"ExitPlanMode","input":{}}]}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"after"}},"parent_tool_use_id":null}"#,
+            r#"{"type":"assistant","message":{"id":"mC","content":[{"type":"text","text":"after"}]}}"#,
+            r#"{"type":"result","subtype":"success","session_id":"sd4","is_error":false}"#,
+        ];
+        let mut ctx = TurnCtx::test_stub();
+        fold(&mut ctx, true, &transcript);
+        let parts = &ctx.assistant.parts;
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert_eq!(parts[0].id, "mC-1");
+        assert_eq!(parts[0].text.as_deref(), Some("after"));
+    }
+
+    #[test]
+    fn subagent_assistant_events_do_not_share_the_main_offset() {
+        // A Task subagent's assistant events (parent_tool_use_id set) route
+        // into the spawning Task part's children, NOT the top-level parts, and
+        // advance a per-parent offset namespace — so even a subagent message
+        // reusing the main message's id (synthetic here; real API ids are
+        // globally unique) can't push the main message's next block off the
+        // part id its stream deltas built. Without the namespace the main text
+        // would land at mD-2. Here there's no `toolu_1` Task part, so the
+        // subagent block simply no-ops (nowhere to nest) — either way it never
+        // touches the main transcript.
+        let transcript = [
+            r#"{"type":"system","subtype":"init","session_id":"sd5"}"#,
+            r#"{"type":"assistant","message":{"id":"mD","content":[{"type":"thinking","thinking":"t"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"mD","content":[{"type":"text","text":"sub"}]},"parent_tool_use_id":"toolu_1"}"#,
+            r#"{"type":"assistant","message":{"id":"mD","content":[{"type":"text","text":"main"}]}}"#,
+            r#"{"type":"result","subtype":"success","session_id":"sd5","is_error":false}"#,
+        ];
+        let mut ctx = TurnCtx::test_stub();
+        fold(&mut ctx, false, &transcript);
+        let parts = &ctx.assistant.parts;
+        // Only the two MAIN blocks land top-level, at their own offsets; the
+        // subagent "sub" block never appears here.
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert_eq!(parts[0].id, "mD-0");
+        assert_eq!(parts[1].id, "mD-1");
+        assert_eq!(parts[1].text.as_deref(), Some("main"));
     }
 
     #[test]

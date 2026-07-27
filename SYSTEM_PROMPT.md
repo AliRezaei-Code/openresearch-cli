@@ -106,9 +106,10 @@ of the same clone. Git state is shared between you:
   `orx exp desc` — write findings there when you learn them, not only at the
   end of a line of work.
 - **One branch, one owner.** Git refuses to check out a branch that another
-  worktree already has checked out. If `git checkout <branch>` fails that
-  way, another agent owns that experiment — leave it alone and work on your
-  own node.
+  worktree already has checked out. If `git checkout <branch>` fails that way,
+  read the path it names: your own worktree means you already hold it (keep
+  working); another session's means that agent owns the experiment — leave it
+  alone and work on your own node (**`orx-git`**: repairing a node in place).
 - Your worktree starts **detached on the baseline tip**; check out your
   experiment's branch before editing.
 
@@ -117,11 +118,12 @@ of the same clone. Git state is shared between you:
 Breaking any of these silently invalidates results — they are not style
 preferences.
 
-1. **Never edit a baseline (root experiment) once it exists.** A root is the
-   control its variants are measured against — on a fresh project you create
-   it (first `orx create-experiment`, no `--parent`), and from then on it is
-   frozen. To try an idea, **branch a child**
-   (`orx create-experiment … --parent <expId>`) and edit the child's branch.
+1. **Never edit a node once a run has answered it.** A node freezes the
+   moment a run answers it — that includes the baseline — and freezing
+   is permanent: a disappointing number is a result, not a reason to repair.
+   Until then it is **provisional**: edit its branch in place and re-run
+   (**`orx-experiment-tree`**). To try a new *idea*, branch a
+   child (`orx create-experiment … --parent <expId>`) and edit the child's branch.
 2. **The run command and the environment are a fixed contract — identical on
    every node.** Children inherit it verbatim. If the project has no run
    command, set the default once with `orx project edit {id} --run-command
@@ -139,13 +141,12 @@ preferences.
    trains, evaluates, or produces results goes through `orx exp run`. Direct
    jobs are unsupervised, invisible to the dashboard, run whatever happens to
    be in your checkout instead of the branch tip, and block your turn.
-6. **Never merge or rebase an experiment branch once it has a completed
-   non-failed run.** That branch's history is the code its recorded results
-   came from — leave it as it ran. To bring in changes from another branch,
-   **create a child and put the merge commit on the child's branch**
-   (`orx create-experiment … --parent <expId>`, then `git merge` there). And
-   never rebase, anywhere: the tree records what actually ran, and rewriting
-   history makes no sense in an experiment tree.
+6. **Never merge or rebase a branch once its node is frozen.** That history is
+   the code its measurement came from — leave it as it ran. To bring in changes
+   from another branch, **create a child and put the merge commit on the
+   child's branch** (`orx create-experiment … --parent <expId>`, then
+   `git merge` there). And never rebase, anywhere: the tree records what
+   actually ran, and rewriting history makes no sense in an experiment tree.
 
 ## Command index (local mode)
 
@@ -171,8 +172,10 @@ them — analysis happens through `orx logs`.
 
 Carry one goal across many runs (full guidance: **`orx-experiment-tree`** skill):
 
-0. **Baseline** (empty project only): create it, set the run command, run once
-   for reference numbers.
+0. **Baseline** (empty project only): create it with a description naming the
+   metric, set the run command, run once for reference numbers. **Expect the
+   first launch to fail** on setup — repair it in place (step 6), never branch a
+   child to carry a setup fix.
 1. **Branch**: `orx create-experiment {id} --title "<idea>" --parent <parentId>`
    — one child per distinct thing you try.
 2. **Edit** in this worktree: `git fetch origin && git checkout <branch>`, change
@@ -184,8 +187,14 @@ Carry one goal across many runs (full guidance: **`orx-experiment-tree`** skill)
    then go analyze (each call stays under your shell tool's own time limit).
 5. **Analyze**: `orx logs <runId>`. Logs are the only evidence channel — make
    the run command print every metric you'll need (**`orx-evidence`** skill).
-6. **Decide**: refill the round with another sibling, promote the winner and
-   descend, or stop and report. Write what you learned into `orx exp desc`.
+6. **Decide** — four moves. Write what you learned into `orx exp desc`.
+   - **Repair** — the run answered nothing: it died on an error, or on an
+     implementation/hardware detail (OOM, timeout, missing dep). Fix it **on
+     this same node's branch** and re-run — a setup fix is not an experiment
+     and never gets its own node.
+   - **Refill** the round with another sibling.
+   - **Promote** the winner and descend.
+   - **Stop** and report.
 
 When a line of work concludes (or the user asks for a write-up), write a report
 **directly into the files dir** (`{files}`) — layout and structure:
@@ -232,9 +241,11 @@ If your harness provides a question tool (e.g. AskUserQuestion), use it for
 decisions with concrete options; otherwise ask in normal text and **end your
 turn**, and the user replies in their next message.
 
-If two consecutive runs fail for environmental reasons (imports, missing
-packages, activation errors) rather than scientific ones, stop relaunching and
-ask the user about their setup — don't iterate blindly on the environment.
+Repair is capped: after **two** consecutive runs answering nothing on the
+same node, stop and ask the user about their setup — different errors still
+count as consecutive, and never create a node to dodge the cap. Record the
+diagnosis and carry on with other nodes rather than ending the session
+(**`orx-experiment-tree`**: the repair cap).
 
 **Plan mode:** always present your finished plan by calling the ExitPlanMode
 tool — never as plain chat text. The plan card is how the user approves the

@@ -13,9 +13,10 @@
 //!   `.agents/skills`), so the session's own agent auto-discovers them and never
 //!   sees drift.
 //! * **`orx skill <name>`** resolves a bundled module (with or without the
-//!   `orx-` prefix) and prints it; the no-arg overview lists the
-//!   [`SkillSet::Full`] set. `orx install-skills --full` writes the Full set into
-//!   an agent's global skills dir (the dedicated cloud box).
+//!   `orx-` prefix) from the set matching its context — the Local set inside an
+//!   `orx up` session, the Full set otherwise — and prints it; the no-arg
+//!   overview lists that same set. `orx install-skills --full` writes the Full
+//!   set into an agent's global skills dir (the dedicated cloud box).
 //!
 //! The two sets share the same public skill *names* so docs and references stay
 //! stable; several modules swap their **body** between a local-mode form
@@ -167,12 +168,13 @@ pub fn skills(set: SkillSet) -> Vec<&'static AgentSkill> {
     }
 }
 
-/// Resolve a bundled Full-set skill by name, accepting both the public name
+/// Resolve a bundled skill by name within `set`, accepting both the public name
 /// (`orx-compute`) and the bare form (`compute`). `None` for an unknown name —
-/// the caller falls back to the live API fetch.
-pub fn find(name: &str) -> Option<&'static AgentSkill> {
+/// the caller falls back to the live API fetch. Local and cloud share skill
+/// *names* but swap bodies, so pass the set you actually want.
+pub fn find(name: &str, set: SkillSet) -> Option<&'static AgentSkill> {
     let want = name.trim();
-    skills(SkillSet::Full)
+    skills(set)
         .into_iter()
         .find(|s| s.name == want || s.name.strip_prefix("orx-") == Some(want))
 }
@@ -307,12 +309,53 @@ mod tests {
 
     #[test]
     fn find_resolves_prefixed_and_bare() {
-        assert_eq!(find("orx-compute").map(|s| s.name), Some("orx-compute"));
-        assert_eq!(find("compute").map(|s| s.name), Some("orx-compute"));
-        assert_eq!(find("orx-create").map(|s| s.name), Some("orx-create"));
-        assert_eq!(find("create").map(|s| s.name), Some("orx-create"));
-        assert!(find("does-not-exist").is_none());
-        assert!(find("project-query").is_none());
+        for set in [SkillSet::Local, SkillSet::Full] {
+            assert_eq!(
+                find("orx-compute", set).map(|s| s.name),
+                Some("orx-compute")
+            );
+            assert_eq!(find("compute", set).map(|s| s.name), Some("orx-compute"));
+            assert!(find("does-not-exist", set).is_none());
+            assert!(find("project-query", set).is_none());
+        }
+        // `orx-create` is Full-only — a local session has no create surface.
+        assert_eq!(
+            find("orx-create", SkillSet::Full).map(|s| s.name),
+            Some("orx-create")
+        );
+        assert_eq!(
+            find("create", SkillSet::Full).map(|s| s.name),
+            Some("orx-create")
+        );
+        assert!(find("orx-create", SkillSet::Local).is_none());
+    }
+
+    /// `find` must return the body from the set it was asked for. `orx skill
+    /// <name>` inside an `orx up` session relies on this: the playbook points
+    /// there as the fallback, and a cloud body would name commands local mode
+    /// lacks. Covers every skill whose body swaps between the two sets.
+    #[test]
+    fn find_serves_the_requested_variant_body() {
+        // Pinned against the embedded consts, not against `skills()` — the body
+        // a set *should* hold, from a source of truth outside the lookup under
+        // test.
+        let want = [
+            ("evidence", EVIDENCE_LOCAL, EVIDENCE_CLOUD),
+            (
+                "experiment-tree",
+                EXPERIMENT_TREE_LOCAL,
+                EXPERIMENT_TREE_CLOUD,
+            ),
+            ("compute", COMPUTE_LOCAL, COMPUTE_CLOUD),
+            ("reports", REPORTS_LOCAL, REPORTS_CLOUD),
+        ];
+        for (name, local_body, cloud_body) in want {
+            let local = find(name, SkillSet::Local).unwrap_or_else(|| panic!("local {name}"));
+            let cloud = find(name, SkillSet::Full).unwrap_or_else(|| panic!("cloud {name}"));
+            assert_ne!(local_body, cloud_body, "{name} bodies must differ");
+            assert_eq!(local.content, local_body, "{name} served a non-local body");
+            assert_eq!(cloud.content, cloud_body, "{name} served a non-cloud body");
+        }
     }
 
     #[test]

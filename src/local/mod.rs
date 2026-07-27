@@ -32,6 +32,7 @@ pub mod resolve;
 pub mod skills;
 pub mod slurm;
 pub mod ssh;
+pub mod ssh_identity;
 
 use crate::error::{anyhow, Error, Result};
 use crate::store::{now_ms, Store, StoredRun};

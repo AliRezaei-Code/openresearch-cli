@@ -20,8 +20,10 @@
 //! multi-turn via `codex exec resume <session>`, playbook injected as tagged
 //! context on the first turn. `ORX_CODEX_EXEC=1` forces the fallback.
 //!
-//! Detection: `~/.codex/auth.json` holds either an `OPENAI_API_KEY` or an OAuth
-//! `id_token` JWT we decode (unverified) for the account email and plan.
+//! Detection follows the active provider in `$CODEX_HOME/config.toml`. A custom
+//! provider authenticates with its declared `env_key`; otherwise
+//! `auth.json` holds either an `OPENAI_API_KEY` or an OAuth `id_token` JWT we
+//! decode (unverified) for the account email and plan.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,15 +31,16 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 use super::detect::{
-    bin_version, find_on_path, jwt_payload, nonempty_str, read_json, resolve_symlinks, title_case,
-    HarnessInfo,
+    bin_version, find_on_path, jwt_payload, nonempty_str, parse_version, read_json,
+    resolve_symlinks, title_case, HarnessInfo, ModelInfo,
 };
-use super::options::{HarnessOptions, PermissionMode};
+use super::options::{resolve_reasoning, HarnessOptions, PermissionMode, REASONING_DEFAULT_ID};
 use super::{should_synthesize_plan, synthesize_resume, Harness, ResumeAction};
 use crate::error::{anyhow, Result};
 use crate::local::chat::{
@@ -47,10 +50,31 @@ use crate::local::chat::{
 use crate::local::codex::{CodexClient, ServerReqKind, TurnEvent};
 use crate::local::opencode::ensure_playbook;
 
-// The 5.6 variants (Sol = frontier, Terra = balanced, Luna = fast) plus 5.5;
-// ChatGPT-account codex rejects bare `gpt-5.6`. Verified against codex-cli
-// 0.144 via `codex exec -m` (5.6 needs >= 0.143; older CLIs get a 400).
-const CODEX_MODELS: [&str; 4] = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"];
+// FALLBACK model table, used only when the app-server catalog is unreachable
+// (codex < 0.144's legacy exec path, or a failed/timed-out `model/list`). The
+// primary source is `codex_model_list`: the app-server's `model/list` reports
+// every model with its `supportedReasoningEfforts`, exactly like opencode's
+// `models --verbose` — so models and tiers are normally *queried*, not curated.
+//
+// Each entry is `(model id, the `model_reasoning_effort` values it accepts)`,
+// mirroring the catalog as of codex-cli 0.144. Sol/Terra reach `ultra`; Luna
+// stops at `max`; 5.5 stops at `xhigh`. (A live `codex exec` turn on Luna
+// tolerated `ultra`, but the catalog is what codex's own picker offers — the
+// catalog wins for what WE offer.) Getting a tier wrong is not cosmetic: codex
+// forwards the value unvalidated and an unsupported one comes back as a 400
+// that kills the turn (observed: 5.5 + `max`).
+const CODEX_MODELS: [(&str, &[&str]); 4] = [
+    (
+        "gpt-5.6-sol",
+        &["low", "medium", "high", "xhigh", "max", "ultra"],
+    ),
+    (
+        "gpt-5.6-terra",
+        &["low", "medium", "high", "xhigh", "max", "ultra"],
+    ),
+    ("gpt-5.6-luna", &["low", "medium", "high", "xhigh", "max"]),
+    ("gpt-5.5", &["low", "medium", "high", "xhigh"]),
+];
 
 /// Codex usage occupying the context window: `input_tokens + output_tokens`
 /// (`cached_input_tokens` is a subset of `input_tokens`, not additive). Returns
@@ -78,18 +102,217 @@ fn token_count_usage(info: &Value) -> (Option<u64>, Option<u64>) {
     (codex_used_tokens(usage), window)
 }
 
-/// Codex's own reasoning vocabulary (id == the `model_reasoning_effort` config
-/// value) — the common set across CODEX_MODELS (Sol/Terra also take max/ultra;
-/// Luna and 5.5 don't). Reasoning is per-harness (see `options.rs`). Verified
-/// against codex-cli 0.144.
-const CODEX_REASONING_LEVELS: [(&str, &str); 4] = [
-    ("low", "Low"),
-    ("medium", "Medium"),
-    ("high", "High"),
-    ("xhigh", "XHigh"),
-];
+/// The harness-wide fallback list — the conservative intersection, used for a
+/// model that isn't in `CODEX_MODELS` (a `-c model=…` override, or a newer id
+/// this build doesn't know).
+const CODEX_REASONING_LEVELS: [&str; 4] = ["low", "medium", "high", "xhigh"];
+
+/// The effort ids a given codex model accepts per the FALLBACK table, or the
+/// conservative intersection. Send-time validation only — detection prefers
+/// the live catalog (`codex_model_list`).
+fn codex_model_reasoning(model: &str) -> Option<&'static [&'static str]> {
+    CODEX_MODELS
+        .iter()
+        .find(|(id, _)| *id == model)
+        .map(|(_, levels)| *levels)
+}
+
+/// Query the app-server's `model/list` — codex's own catalog, the same data its
+/// TUI picker renders: every model with its `supportedReasoningEfforts` and
+/// default. This is the primary model source (the static table is only the
+/// fallback), for the same reason opencode parses `models --verbose`: the
+/// installed CLI knows its catalog and we don't — a curated table here shipped
+/// missing three models and a wrong Luna tier before this existed.
+///
+/// Protocol: spawn `codex app-server`, `initialize` → `initialized` (the same
+/// handshake `local::codex` uses, incl. `experimentalApi` — `model/list` is
+/// part of the v2 surface), then one `model/list` request. Any failure —
+/// spawn, timeout, old codex without the method — returns `None` and the
+/// caller falls back to the static table. Hidden catalog entries are skipped
+/// (the server already filters them by default; the guard is belt-and-braces).
+async fn codex_model_list(bin: &Path, configured_effort: Option<&str>) -> Option<Vec<ModelInfo>> {
+    let fut = async {
+        let mut child = Command::new(bin)
+            .arg("app-server")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take()?;
+        let mut lines = BufReader::new(child.stdout.take()?).lines();
+
+        use tokio::io::AsyncWriteExt;
+        async fn send(stdin: &mut tokio::process::ChildStdin, v: Value) -> Option<()> {
+            let mut line = v.to_string();
+            line.push('\n');
+            stdin.write_all(line.as_bytes()).await.ok()
+        }
+        // Read until the response with this id (skipping notifications).
+        async fn recv(
+            lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+            id: u64,
+        ) -> Option<Value> {
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                    if v.get("id").and_then(Value::as_u64) == Some(id) {
+                        return Some(v);
+                    }
+                }
+            }
+            None
+        }
+
+        send(
+            &mut stdin,
+            serde_json::json!({
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "orx",
+                        "title": "OpenResearch",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                    "capabilities": { "experimentalApi": true },
+                },
+            }),
+        )
+        .await?;
+        recv(&mut lines, 1).await?;
+        send(&mut stdin, serde_json::json!({ "method": "initialized" })).await?;
+        send(
+            &mut stdin,
+            serde_json::json!({ "id": 2, "method": "model/list", "params": {} }),
+        )
+        .await?;
+        let resp = recv(&mut lines, 2).await?;
+        let models = parse_model_list(resp.get("result")?, configured_effort);
+        (!models.is_empty()).then_some(models)
+    };
+    tokio::time::timeout(Duration::from_secs(15), fut)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// `model/list` result → per-model `ModelInfo`, efforts attached in catalog
+/// order. Split from the transport for testability.
+///
+/// Each model gets a *concrete* preselected tier rather than a "no override"
+/// sentinel: the tier that actually runs when the user picks nothing, which
+/// codex resolves as the `config.toml` `model_reasoning_effort` override when
+/// that's set (and supported by the model), else the catalog's own
+/// `defaultReasoningEffort`. Preselecting-and-sending that tier is equivalent
+/// to sending nothing, and the picker shows a real value instead of "Default".
+fn parse_model_list(result: &Value, configured_effort: Option<&str>) -> Vec<ModelInfo> {
+    let Some(data) = result.get("data").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    data.iter()
+        .filter(|m| !m.get("hidden").and_then(Value::as_bool).unwrap_or(false))
+        .filter_map(|m| {
+            // `model` is the slug the turn passes as `-m`/`model`; `id` equals
+            // it in practice but `model` is the documented carrier.
+            let id = m
+                .get("model")
+                .or_else(|| m.get("id"))
+                .and_then(Value::as_str)?;
+            let efforts: Vec<&str> = m
+                .get("supportedReasoningEfforts")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|e| e.get("reasoningEffort").and_then(Value::as_str))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let catalog_default = m.get("defaultReasoningEffort").and_then(Value::as_str);
+            let default = configured_effort
+                .filter(|e| efforts.contains(e))
+                .or(catalog_default);
+            let info = ModelInfo::new(id).with_label(
+                m.get("displayName").and_then(Value::as_str),
+                m.get("description").and_then(Value::as_str),
+            );
+            Some(match default {
+                Some(default) => info.with_reasoning_default(&efforts, default),
+                // No reported default (an older catalog shape) → keep the
+                // sentinel-led list, where "no override" is the safe lead.
+                None => info.with_reasoning(&efforts),
+            })
+        })
+        .collect()
+}
 
 pub struct Codex;
+
+/// Only the fields detection needs off `config.toml`; codex has many more.
+#[derive(Deserialize)]
+struct CodexConfig {
+    model: Option<String>,
+    model_provider: Option<String>,
+    /// The user's configured effort override. Codex resolves it above the
+    /// catalog's per-model `defaultReasoningEffort`, so the picker's
+    /// preselected tier must too.
+    model_reasoning_effort: Option<String>,
+    #[serde(default)]
+    model_providers: HashMap<String, CodexProvider>,
+}
+
+/// The `model_reasoning_effort` the user configured in `config.toml`, if any.
+fn parse_configured_effort(raw: &str) -> Option<String> {
+    toml::from_str::<CodexConfig>(raw)
+        .ok()?
+        .model_reasoning_effort
+}
+
+#[derive(Deserialize)]
+struct CodexProvider {
+    env_key: Option<String>,
+    #[serde(default)]
+    requires_openai_auth: bool,
+}
+
+struct CustomProvider {
+    model: Option<String>,
+    env_key: Option<String>,
+}
+
+impl CustomProvider {
+    /// A provider that declares no `env_key` carries its credential elsewhere
+    /// (or needs none), so treat it as usable rather than blocking on a var we
+    /// were never told the name of.
+    fn is_ready(&self) -> bool {
+        match self.env_key.as_deref() {
+            Some(key) => super::detect::api_key(key).is_some(),
+            None => true,
+        }
+    }
+}
+
+/// The active provider, when it is a custom one that bypasses OpenAI auth.
+/// `None` means first-party detection (auth.json) applies.
+fn parse_custom_provider(raw: &str) -> Option<CustomProvider> {
+    let cfg: CodexConfig = toml::from_str(raw).ok()?;
+    let provider = cfg.model_providers.get(cfg.model_provider.as_deref()?)?;
+    if provider.requires_openai_auth {
+        return None;
+    }
+    Some(CustomProvider {
+        model: cfg.model.filter(|model| !model.trim().is_empty()),
+        env_key: provider.env_key.clone(),
+    })
+}
+
+/// `$CODEX_HOME` when set (the same two env sources the harness child sees),
+/// else `~/.codex`.
+fn codex_home() -> Option<PathBuf> {
+    super::detect::api_key("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+}
 
 /// `codex` on PATH, symlinks resolved (see `resolve_symlinks` — codex needs to
 /// find its `codex-code-mode-host` helper next to the real binary).
@@ -126,9 +349,25 @@ impl Harness for Codex {
             info.version = bin_version(&bin).await;
             info.bin_path = Some(bin.to_string_lossy().into_owned());
         }
-        if let Some(auth) =
-            dirs::home_dir().and_then(|h| read_json(h.join(".codex").join("auth.json")))
-        {
+        let home = codex_home();
+        let config_raw = home
+            .as_ref()
+            .and_then(|home| std::fs::read_to_string(home.join("config.toml")).ok());
+        let custom_provider = config_raw.as_deref().and_then(parse_custom_provider);
+        let configured_effort = config_raw.as_deref().and_then(parse_configured_effort);
+
+        if let Some(provider) = custom_provider.as_ref() {
+            // A provider with `requires_openai_auth = false` never writes
+            // auth.json; its declared `env_key` is the credential.
+            if provider.is_ready() {
+                info.authenticated = true;
+                info.auth_method = provider.env_key.as_ref().map(|_| "apiKey");
+            } else if let Some(key) = provider.env_key.as_deref() {
+                info.agent_note = Some(format!(
+                    "Set `{key}` for the configured Codex model provider."
+                ));
+            }
+        } else if let Some(auth) = home.and_then(|home| read_json(home.join("auth.json"))) {
             if nonempty_str(&auth, "OPENAI_API_KEY").is_some() {
                 info.authenticated = true;
                 info.auth_method = Some("apiKey");
@@ -150,23 +389,63 @@ impl Harness for Codex {
 
         info.agent_ready = info.installed && info.authenticated;
         if info.agent_ready {
-            info = info.with_models(&CODEX_MODELS);
+            // The first-party catalog is meaningless for a custom provider, so
+            // offer only the model that provider is configured with (the
+            // picker's "Default model" entry covers the unset case).
+            //
+            // A custom provider's model gets no reasoning list of its own: the
+            // curated tiers below describe OpenAI's models, and we know nothing
+            // about what an arbitrary provider accepts. `ModelInfo::new` leaves
+            // `reasoning_levels` absent, so the composer falls back to the
+            // conservative harness-wide list rather than offering `ultra` to a
+            // provider that would reject it.
+            match custom_provider
+                .as_ref()
+                .map(|provider| provider.model.as_deref())
+            {
+                Some(Some(model)) => info = info.with_models(vec![ModelInfo::new(model)]),
+                Some(None) => info = info.with_models(Vec::new()),
+                None => {
+                    // First-party account: ask the installed CLI for its own
+                    // catalog (models + per-model efforts, the data codex's TUI
+                    // picker renders). The static table only covers a codex too
+                    // old to answer `model/list`.
+                    let bin = info.bin_path.as_deref().map(Path::new);
+                    let models = match bin {
+                        Some(bin) => codex_model_list(bin, configured_effort.as_deref()).await,
+                        None => None,
+                    };
+                    info = info.with_models(models.unwrap_or_else(|| {
+                        CODEX_MODELS
+                            .iter()
+                            .map(|(id, levels)| ModelInfo::new(*id).with_reasoning(levels))
+                            .collect()
+                    }));
+                }
+            }
             // Old CLIs still work via the legacy exec path, but miss the
             // app-server wins (permission prompts on sandbox escalations;
             // thread resume).
             let too_old = info
                 .version
                 .as_deref()
-                .and_then(parse_codex_version)
+                .and_then(parse_version)
                 .is_some_and(|v| v < MIN_APP_SERVER_VERSION);
             if too_old {
                 info.agent_note = Some(
                     "This Codex version chats via the legacy exec path — update to 0.144+ for plan mode & permission prompts.".to_string(),
                 );
             }
+        } else if info.agent_note.is_some() {
+            // A configured custom provider already said which env var to set;
+            // `codex login` is the wrong instruction for it.
+        } else if info.installed {
+            info.agent_note = Some("Sign in with `codex login` to chat with it here.".to_string());
         } else {
-            info.agent_note =
-                Some("Install Codex and sign in (`codex login`) to chat with it here.".to_string());
+            info.agent_note = Some(
+                "Install Codex (developers.openai.com/codex), then sign in with `codex login`."
+                    .to_string(),
+            );
         }
         Some(info)
     }
@@ -210,8 +489,12 @@ impl Harness for Codex {
                 ],
                 PermissionMode::Auto,
             )
-            // Codex's own reasoning tiers via `-c model_reasoning_effort`.
-            .with_reasoning_levels(&CODEX_REASONING_LEVELS, "high")
+            // Harness-wide fallback only — the real per-model lists ride on each
+            // `ModelInfo` (see `CODEX_MODELS`). The default is
+            // `Default`, so a configured `model_reasoning_effort` in
+            // `~/.codex/config.toml` is no longer overridden by an implicit
+            // per-turn `high` (issue #123).
+            .with_reasoning_levels(&CODEX_REASONING_LEVELS)
     }
 
     /// Three prompt kinds resume differently:
@@ -314,7 +597,7 @@ impl Harness for Codex {
     }
 
     fn config_home(&self) -> Option<PathBuf> {
-        Some(dirs::home_dir()?.join(".codex"))
+        codex_home()
     }
 
     fn skill_target(&self) -> Option<PathBuf> {
@@ -339,11 +622,8 @@ impl Harness for Codex {
     fn extra_skill_targets(&self) -> Vec<(PathBuf, &'static str)> {
         // Keep the legacy `/orx` prompt for codex versions that don't yet read
         // `~/.agents/skills/`.
-        match dirs::home_dir() {
-            Some(home) => vec![(
-                home.join(".codex").join("prompts").join("orx.md"),
-                super::CODEX_PROMPT,
-            )],
+        match codex_home() {
+            Some(home) => vec![(home.join("prompts").join("orx.md"), super::CODEX_PROMPT)],
             None => Vec::new(),
         }
     }
@@ -366,25 +646,6 @@ const MIN_APP_SERVER_VERSION: (u64, u64, u64) = (0, 144, 0);
 /// bound; the interruption is a clear, recoverable error either way.
 const TURN_WATCHDOG: Duration = Duration::from_secs(30 * 60);
 
-/// `codex --version` output → (major, minor, patch). The first token that
-/// parses wins, so "codex-cli 0.144.0", bare "0.144.0", and a future
-/// "codex-cli 0.150.0 (abc123)" all resolve; a `-suffix` on the patch is
-/// tolerated.
-fn parse_codex_version(version: &str) -> Option<(u64, u64, u64)> {
-    version.split_whitespace().find_map(|token| {
-        let mut parts = token.splitn(3, '.');
-        let major = parts.next()?.parse().ok()?;
-        let minor = parts.next()?.parse().ok()?;
-        let patch = parts
-            .next()?
-            .split(|c: char| !c.is_ascii_digit())
-            .next()?
-            .parse()
-            .ok()?;
-        Some((major, minor, patch))
-    })
-}
-
 /// Whether the installed codex speaks the validated app-server protocol.
 /// Probed once per process (a codex upgrade mid-run takes an `orx up` restart
 /// to notice — acceptable).
@@ -398,7 +659,7 @@ async fn app_server_supported() -> bool {
             bin_version(&bin)
                 .await
                 .as_deref()
-                .and_then(parse_codex_version)
+                .and_then(parse_version)
                 .is_some_and(|v| v >= MIN_APP_SERVER_VERSION)
         })
         .await
@@ -1330,7 +1591,7 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
     if let Some(model) = &ctx.model {
         turn_params["model"] = Value::String(model.clone());
     }
-    let effort = codex_reasoning(ctx.reasoning_level.as_deref());
+    let effort = codex_reasoning(ctx.reasoning_level.as_deref(), ctx.model.as_deref());
     if let Some(effort) = effort {
         turn_params["effort"] = Value::String(effort.to_string());
     }
@@ -1952,15 +2213,29 @@ pub(crate) fn ensure_orx_data_dir() -> Option<PathBuf> {
     dir.canonicalize().ok()
 }
 
-/// Session reasoning id → Codex `model_reasoning_effort` value. The composer only
-/// offers ids from `CODEX_REASONING_LEVELS`; an unrecognized/absent value omits
-/// the override and lets Codex apply its configured default.
-fn codex_reasoning(level: Option<&str>) -> Option<&str> {
-    let level = level?;
-    CODEX_REASONING_LEVELS
-        .iter()
-        .any(|(id, _)| *id == level)
-        .then_some(level)
+/// Session reasoning id → Codex `model_reasoning_effort` value. See
+/// [`resolve_reasoning`] for what a `None` result means.
+///
+/// Validation is per model, from the fallback table:
+///   * a model the table knows → validate against its tiers;
+///   * a model it doesn't (the catalog is discovered live now, so this is any
+///     model outside the frozen four) → forward the value. The composer only
+///     offered what `model/list` reported for that model, so an allowlist here
+///     would drop genuinely supported tiers — the same reasoning as
+///     `opencode_variant`. A stale/wrong value comes back as a codex 400,
+///     which is surfaced to the chat, not swallowed;
+///   * no model at all → the CLI's own configured default model, whose tiers
+///     we can't know. Conservative intersection; matches what the composer
+///     offers in that state, so nothing advertised is dropped.
+fn codex_reasoning<'a>(level: Option<&'a str>, model: Option<&str>) -> Option<&'a str> {
+    match model {
+        Some(m) => match codex_model_reasoning(m) {
+            Some(allowed) => resolve_reasoning(level, allowed),
+            // Catalog-discovered model: forward anything but the sentinel.
+            None => level.filter(|l| *l != REASONING_DEFAULT_ID),
+        },
+        None => resolve_reasoning(level, &CODEX_REASONING_LEVELS),
+    }
 }
 
 fn command_string(v: &Value) -> String {
@@ -2106,7 +2381,7 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
         }
     };
     // Reasoning level → Codex's own `model_reasoning_effort` config override.
-    if let Some(effort) = codex_reasoning(ctx.reasoning_level.as_deref()) {
+    if let Some(effort) = codex_reasoning(ctx.reasoning_level.as_deref(), ctx.model.as_deref()) {
         cmd.args(["-c", &format!("model_reasoning_effort=\"{effort}\"")]);
     }
     if let Some(model) = &ctx.model {
@@ -2338,22 +2613,92 @@ fn handle_item(ctx: &mut TurnCtx, item: &Value, next_id: &mut impl FnMut(&str) -
 
 #[cfg(test)]
 mod tests {
+    use super::super::options::REASONING_DEFAULT_ID;
     use super::*;
     use serde_json::json;
 
     #[test]
+    fn custom_provider_uses_its_env_key_and_configured_model() {
+        // The exact shape from the bug report: a gateway provider that opts out
+        // of OpenAI auth, so there is deliberately no auth.json to find.
+        let provider = parse_custom_provider(
+            r#"
+model = "gateway-model"
+model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://gateway.example/v1"
+env_key = "CUSTOM_API_KEY"
+wire_api = "responses"
+requires_openai_auth = false
+"#,
+        )
+        .unwrap();
+        assert_eq!(provider.model.as_deref(), Some("gateway-model"));
+        assert_eq!(provider.env_key.as_deref(), Some("CUSTOM_API_KEY"));
+
+        // A provider that still wants OpenAI auth falls through to auth.json.
+        assert!(parse_custom_provider(
+            r#"
+model_provider = "openai"
+[model_providers.openai]
+requires_openai_auth = true
+"#
+        )
+        .is_none());
+
+        // So does a config that names no provider at all.
+        assert!(parse_custom_provider("model = \"gpt-5.6-sol\"").is_none());
+    }
+
+    #[test]
+    fn custom_provider_is_read_off_disk_without_an_auth_json() {
+        // End-to-end over the same file read `detect` performs: a CODEX_HOME
+        // holding only config.toml (no auth.json, as the bug report describes)
+        // still yields a provider whose env_key gates readiness.
+        let dir = std::env::temp_dir().join("orx-codex-detect-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.toml");
+        std::fs::write(
+            &config,
+            r#"
+model = "gateway-model"
+model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://gateway.example/v1"
+env_key = "ORX_TEST_UNSET_CREDENTIAL"
+requires_openai_auth = false
+"#,
+        )
+        .unwrap();
+
+        assert!(!dir.join("auth.json").exists());
+        let provider = std::fs::read_to_string(&config)
+            .ok()
+            .as_deref()
+            .and_then(parse_custom_provider)
+            .expect("config.toml should yield a custom provider");
+
+        assert_eq!(provider.model.as_deref(), Some("gateway-model"));
+        // The credential is absent, so detection reports not-ready and the note
+        // names the variable to set instead of telling the user to run
+        // `codex login` (which would be the wrong instruction here).
+        assert!(!provider.is_ready());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn version_parses_cli_output_and_gates() {
-        assert_eq!(parse_codex_version("codex-cli 0.144.0"), Some((0, 144, 0)));
-        assert_eq!(parse_codex_version("0.150.2"), Some((0, 150, 2)));
-        assert_eq!(
-            parse_codex_version("codex-cli 1.0.3-nightly"),
-            Some((1, 0, 3))
-        );
-        assert_eq!(parse_codex_version("codex-cli"), None);
-        assert_eq!(parse_codex_version(""), None);
+        assert_eq!(parse_version("codex-cli 0.144.0"), Some((0, 144, 0)));
+        assert_eq!(parse_version("0.150.2"), Some((0, 150, 2)));
+        assert_eq!(parse_version("codex-cli 1.0.3-nightly"), Some((1, 0, 3)));
+        assert_eq!(parse_version("codex-cli"), None);
+        assert_eq!(parse_version(""), None);
         // The gate itself: tuple ordering does the right thing.
-        assert!(parse_codex_version("codex-cli 0.143.9").unwrap() < MIN_APP_SERVER_VERSION);
-        assert!(parse_codex_version("codex-cli 0.144.0").unwrap() >= MIN_APP_SERVER_VERSION);
+        assert!(parse_version("codex-cli 0.143.9").unwrap() < MIN_APP_SERVER_VERSION);
+        assert!(parse_version("codex-cli 0.144.0").unwrap() >= MIN_APP_SERVER_VERSION);
     }
 
     #[test]
@@ -3030,14 +3375,170 @@ mod tests {
 
     #[test]
     fn reasoning_accepts_only_codex_ids() {
-        assert_eq!(codex_reasoning(Some("low")), Some("low"));
-        assert_eq!(codex_reasoning(Some("high")), Some("high"));
-        assert_eq!(codex_reasoning(Some("xhigh")), Some("xhigh"));
-        // Tiers outside the common set and junk are dropped (the flag is
-        // omitted → CLI default), never forwarded as an invalid
-        // `model_reasoning_effort`.
-        assert_eq!(codex_reasoning(Some("max")), None);
-        assert_eq!(codex_reasoning(None), None);
+        let sol = Some("gpt-5.6-sol");
+        assert_eq!(codex_reasoning(Some("low"), sol), Some("low"));
+        assert_eq!(codex_reasoning(Some("high"), sol), Some("high"));
+        assert_eq!(codex_reasoning(Some("xhigh"), sol), Some("xhigh"));
+        // Junk is dropped (the flag is omitted → CLI default), never forwarded
+        // as an invalid `model_reasoning_effort`.
+        assert_eq!(codex_reasoning(Some("nonsense"), sol), None);
+        assert_eq!(codex_reasoning(None, sol), None);
+    }
+
+    /// The point of issue #123: the top tiers are model-specific, so the same
+    /// stored level resolves differently per model rather than being clamped to
+    /// one hard-coded intersection.
+    #[test]
+    fn reasoning_is_model_specific() {
+        // Sol/Terra reach `ultra`; Luna stops at `max` (the catalog's word —
+        // codex's own picker doesn't offer Luna `ultra`, so neither do we).
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra"] {
+            assert_eq!(codex_reasoning(Some("ultra"), Some(model)), Some("ultra"));
+        }
+        assert_eq!(
+            codex_reasoning(Some("max"), Some("gpt-5.6-luna")),
+            Some("max")
+        );
+        assert_eq!(codex_reasoning(Some("ultra"), Some("gpt-5.6-luna")), None);
+        // 5.5 stops at `xhigh`. An unsupported tier is dropped rather than sent
+        // — this is the "changing models clears a stale effort" guarantee,
+        // enforced backend-side too, and it matters because codex answers an
+        // unsupported effort with a 400 that kills the turn.
+        assert_eq!(
+            codex_reasoning(Some("xhigh"), Some("gpt-5.5")),
+            Some("xhigh")
+        );
+        assert_eq!(codex_reasoning(Some("max"), Some("gpt-5.5")), None);
+        // A model outside the fallback table is catalog-discovered: the
+        // composer offered only what `model/list` reported for it, so the value
+        // is forwarded rather than clamped (same reasoning as opencode).
+        assert_eq!(codex_reasoning(Some("ultra"), Some("gpt-9")), Some("ultra"));
+        assert_eq!(
+            codex_reasoning(Some(REASONING_DEFAULT_ID), Some("gpt-9")),
+            None
+        );
+        // No model at all → the conservative fallback intersection.
+        assert_eq!(codex_reasoning(Some("xhigh"), None), Some("xhigh"));
+        assert_eq!(codex_reasoning(Some("max"), None), None);
+    }
+
+    /// The `model/list` parser against the live 0.144 response shape (headers
+    /// trimmed to the fields we read). Efforts come out in catalog order,
+    /// hidden entries are skipped, and every model leads with the sentinel.
+    #[test]
+    fn model_list_parses_catalog_models_and_efforts() {
+        let result = serde_json::json!({
+            "data": [
+                {
+                    "id": "gpt-5.6-sol", "model": "gpt-5.6-sol",
+                    "displayName": "GPT-5.6 Sol", "hidden": false, "isDefault": true,
+                    "defaultReasoningEffort": "low",
+                    "supportedReasoningEfforts": [
+                        { "reasoningEffort": "low", "description": "" },
+                        { "reasoningEffort": "medium", "description": "" },
+                        { "reasoningEffort": "high", "description": "" },
+                        { "reasoningEffort": "xhigh", "description": "" },
+                        { "reasoningEffort": "max", "description": "" },
+                        { "reasoningEffort": "ultra", "description": "" },
+                    ],
+                },
+                {
+                    "id": "gpt-5.4-mini", "model": "gpt-5.4-mini",
+                    "displayName": "GPT-5.4 mini", "hidden": false, "isDefault": false,
+                    "defaultReasoningEffort": "medium",
+                    "supportedReasoningEfforts": [
+                        { "reasoningEffort": "low", "description": "" },
+                        { "reasoningEffort": "medium", "description": "" },
+                        { "reasoningEffort": "high", "description": "" },
+                        { "reasoningEffort": "xhigh", "description": "" },
+                    ],
+                },
+                {
+                    "id": "secret", "model": "secret", "displayName": "hidden one",
+                    "hidden": true, "isDefault": false,
+                    "defaultReasoningEffort": "medium",
+                    "supportedReasoningEfforts": [],
+                },
+            ],
+        });
+        let models = parse_model_list(&result, None);
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["gpt-5.6-sol", "gpt-5.4-mini"]
+        );
+        let ids = |m: &ModelInfo| {
+            m.reasoning_levels
+                .as_ref()
+                .map(|c| c.iter().map(|c| c.id.clone()).collect::<Vec<_>>())
+        };
+        // A reported default means a concrete preselected tier and NO sentinel
+        // row — the picker shows the value that actually runs.
+        assert_eq!(
+            ids(&models[0]).unwrap(),
+            ["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(models[0].default_reasoning_level.as_deref(), Some("low"));
+        assert_eq!(ids(&models[1]).unwrap(), ["low", "medium", "high", "xhigh"]);
+        assert_eq!(models[1].default_reasoning_level.as_deref(), Some("medium"));
+        // The catalog's display name rides along for the picker.
+        assert_eq!(models[0].display_name.as_deref(), Some("GPT-5.6 Sol"));
+
+        // A config.toml `model_reasoning_effort` outranks the catalog default —
+        // codex resolves it that way, so the preselect must too. A configured
+        // value the model doesn't support falls back to the catalog default
+        // rather than preselecting something the model rejects.
+        let configured = parse_model_list(&result, Some("xhigh"));
+        assert_eq!(
+            configured[0].default_reasoning_level.as_deref(),
+            Some("xhigh")
+        );
+        let unsupported = parse_model_list(&result, Some("ultra"));
+        assert_eq!(
+            unsupported[1].default_reasoning_level.as_deref(),
+            Some("medium"),
+            "gpt-5.4-mini has no ultra; the catalog default stands"
+        );
+        // Junk shapes parse to nothing rather than panicking.
+        assert!(parse_model_list(&serde_json::json!({}), None).is_empty());
+        assert!(parse_model_list(&serde_json::json!({ "data": "nope" }), None).is_empty());
+    }
+
+    #[test]
+    fn configured_effort_reads_config_toml() {
+        assert_eq!(
+            parse_configured_effort("model_reasoning_effort = \"max\"").as_deref(),
+            Some("max")
+        );
+        assert_eq!(parse_configured_effort("model = \"gpt-5.6-sol\""), None);
+        assert_eq!(parse_configured_effort("not toml ==="), None);
+    }
+
+    /// `Default` must send no `model_reasoning_effort` at all — otherwise a
+    /// user's configured `max` in `~/.codex/config.toml` is silently overridden
+    /// by the composer (the concrete bug in issue #123).
+    #[test]
+    fn reasoning_default_sends_no_override() {
+        for model in [Some("gpt-5.6-sol"), Some("gpt-5.5"), None] {
+            assert_eq!(codex_reasoning(Some(REASONING_DEFAULT_ID), model), None);
+        }
+    }
+
+    /// Every advertised per-model choice must survive the mapper for that same
+    /// model — the picker can never offer an effort `run_turn` would drop.
+    /// Iterating `CODEX_MODELS` also means a model added without tiers fails
+    /// here rather than silently degrading to the fallback.
+    #[test]
+    fn advertised_model_choices_all_map_back() {
+        for (model, levels) in CODEX_MODELS {
+            assert!(!levels.is_empty(), "{model} has no reasoning tiers");
+            for level in levels {
+                assert_eq!(
+                    codex_reasoning(Some(level), Some(model)),
+                    Some(*level),
+                    "{model} advertises {level} but the mapper drops it"
+                );
+            }
+        }
     }
 
     fn answer(

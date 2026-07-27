@@ -29,12 +29,14 @@ This is how you **realize a child's hypothesis**: after `create-experiment
 --parent`, check out the child's branch and make the specific code/config edits
 its description calls for — then commit, push, and run. Edit only the files that
 idea touches, and **don't touch the run command** (it's inherited; see the
-`orx-experiment-tree` skill). Edit children, never the baseline.
+`orx-experiment-tree` skill). A node a run has already answered is frozen —
+branch a child instead.
 
 The sync recipe is **idempotent** — run it verbatim whether or not the clone
-already exists from a previous session. Always fetch + reset before editing, so a
-reused clone is never stale (and the experiment's branch, created server-side, is
-fetched even when it's brand-new and not in your local clone yet):
+already exists from a previous session. Always fetch + fast-forward before
+editing, so a reused clone is never stale (and the experiment's branch, created
+server-side, is fetched even when it's brand-new and not in your local clone
+yet):
 
 ```sh
 DIR=~/.cache/openresearch/repos/<owner>/<repo>
@@ -42,7 +44,8 @@ DIR=~/.cache/openresearch/repos/<owner>/<repo>
 # Clone once (skips if it already exists), then ALWAYS sync before touching a branch:
 [ -d "$DIR" ] || git clone https://github.com/<owner>/<repo> "$DIR"
 git -C "$DIR" fetch origin
-git -C "$DIR" checkout -B orx/<slug> origin/orx/<slug>   # create, or reset to origin if it exists
+git -C "$DIR" checkout orx/<slug>                 # creates a tracking branch if it's remote-only
+git -C "$DIR" merge --ff-only origin/orx/<slug>   # fails loudly rather than discarding unpushed work
 
 #   …edit files under "$DIR" with your normal tools…
 git -C "$DIR" commit -am "tune lr"     # one or more commits — your call
@@ -50,12 +53,12 @@ git -C "$DIR" push                     # push so runs and the tree see the chang
 ```
 
 Rules and notes:
-- **Always sync first.** `git -C "$DIR" fetch origin && git -C "$DIR" checkout -B
-  orx/<slug> origin/orx/<slug>` is mandatory every time — `-B …origin` creates the
-  branch or resets an existing local one to the GitHub tip, so a persistent clone
-  never edits a stale base. It discards uncommitted/unpushed local work on that
-  branch, which is exactly what you don't want to carry across sessions (the
-  contract is commit + push before moving on).
+- **Always sync first — but never blow away unpushed work.** `merge --ff-only`
+  fails loudly instead of silently discarding commits you never pushed — a real
+  hazard when a push has failed and you're returning to a branch to repair it.
+  Never use `checkout -B <branch> origin/<branch>`: it hard-resets to the GitHub
+  tip and throws that work away. The contract is still commit + push before
+  moving on.
 - **Auth is your own git.** Clone/push use whatever GitHub credentials your `git`
   already has — the repo lives under your account or your org, so access is the
   same as any of your repos. If a clone or push fails on auth, authenticate git
@@ -63,11 +66,11 @@ Rules and notes:
 - **Push before you run.** `orx exp run` launches from the branch's pushed tip on
   GitHub — uncommitted or unpushed edits won't be in the run. Commit and push
   first.
-- **Never merge or rebase a branch that has a completed non-failed run** (cardinal
-  rule): its history is the code those results came from. To bring in changes
-  from another branch, create a **child** experiment and put the merge commit on
-  the child's branch. And never rebase, anywhere — the tree records what actually
-  ran, and rewriting history makes no sense in an experiment tree.
+- **Never merge or rebase a branch once its node is frozen** (cardinal rule):
+  its history is the code those results came from. Bring changes in on a
+  **child** instead. On a *provisional* node a plain `git merge
+  origin/<parent-branch>` is fine. Never rewrite history anywhere — no rebase,
+  amend, `reset --hard`, or force-push.
 - **Reading another node's code** without disturbing your checkout: that branch is
   already in the clone after a fetch — `git -C "$DIR" show origin/orx/<slug>:<path>`.
 
@@ -90,3 +93,13 @@ git -C "$DIR" diff origin/<parent-branch>...<full-commit-sha>
 - Fetch first is mandatory: the run's commit and the parent's tip exist on
   GitHub and may not be in your clone yet.
 - Root experiments have no parent — there is no diff base, by definition.
+
+## Repairing a node in place (`orx up` worktrees)
+
+A node whose run answered nothing is provisional: fix it on **its own branch** and
+re-run the same `<expId>` — don't create a child (`orx-experiment-tree`). Sync
+as above, then commit, push, `orx exp run`.
+
+If the checkout fails with "already checked out at …", read the path: your own
+worktree means you already hold it. Another session's means that agent owns the
+node — leave it alone; never break the lock or branch a child to dodge it.

@@ -66,7 +66,7 @@ import {
   type SlurmSettings,
   type SshHost,
   type SshPreflight,
-  modelLabel,
+  harnessModelLabel,
 } from "../api";
 import { onDataDirMove } from "../events";
 import { GitTokenForm } from "./GitTokenForm";
@@ -181,7 +181,7 @@ function HarnessesTab() {
               {h.models.length > 0
                 ? `${h.models.length} available — ${h.models
                     .slice(0, 4)
-                    .map((m) => modelLabel(m.id))
+                    .map((m) => harnessModelLabel(m))
                     .join(", ")}${h.models.length > 4 ? ", …" : ""}`
                 : "none"}
             </span>
@@ -825,21 +825,42 @@ function OpenResearchSection() {
             <span className="v">{s.orgs.length > 0 ? s.orgs.join(", ") : "—"}</span>
             <span className="k">SSH key</span>
             <span className="v">
-              {s.sshKeyRegistered === true ? (
-                <span className="badge ok">Registered</span>
-              ) : s.sshKeyRegistered === false ? (
+              {s.sshKeyStatus === "matched" ? (
+                <span className="badge ok">On this computer</span>
+              ) : s.sshKeyStatus === "no_local_match" ? (
+                <span className="badge warn">Not on this computer</span>
+              ) : s.sshKeyStatus === "none_registered" ? (
                 <span className="badge err">None registered</span>
               ) : (
                 <span className="badge">Unknown</span>
               )}
             </span>
           </div>
-          {s.sshKeyRegistered === false && (
-            <p className="settings-note">
-              Launches need a registered SSH key. Add one with{" "}
-              <code>orx ssh-key add ~/.ssh/id_ed25519.pub</code>.
-            </p>
-          )}
+          {s.sshKeyStatus === "none_registered" &&
+            (s.sshKeyPath ? (
+              <p className="settings-note">
+                Add one with <code>orx ssh-key add {s.sshKeyPath}</code>.
+              </p>
+            ) : (
+              <p className="settings-note">
+                No key on this computer yet — create one with{" "}
+                <code>ssh-keygen -t ed25519</code>, then add it with{" "}
+                <code>orx ssh-key add</code>.
+              </p>
+            ))}
+          {s.sshKeyStatus === "no_local_match" &&
+            (s.sshKeyPath ? (
+              <p className="settings-note">
+                Register this computer with <code>orx ssh-key add {s.sshKeyPath}</code>,
+                or load a registered key with <code>ssh-add</code>.
+              </p>
+            ) : (
+              <p className="settings-note">
+                No key on this computer to register — load a registered key with{" "}
+                <code>ssh-add</code>, or create one with{" "}
+                <code>ssh-keygen -t ed25519</code>.
+              </p>
+            ))}
           {s.error && <p className="settings-note">{s.error}</p>}
         </>
       )}
@@ -884,6 +905,8 @@ const FLAVOR_SUGGESTIONS: Partial<Record<ComputeTargetId, string[]>> = {
 
 function TargetStatusBadge({ t, isDefault }: { t: ComputeTargetSummary; isDefault: boolean }) {
   if (t.id === "local") return <span className="badge ok">Ready</span>;
+  // Don't claim either answer when the check couldn't run.
+  if (t.unverified) return <span className="badge">Unknown</span>;
   if (!t.configured && isDefault) return <span className="badge warn">Not configured</span>;
   if (!t.configured) return <span className="badge">Not set up</span>;
   return <span className="badge ok">Configured</span>;

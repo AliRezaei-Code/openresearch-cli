@@ -43,10 +43,9 @@ and seeding the baseline from that repo is faster, more faithful, and a far
 better control than something typed from memory. Reproductions should start from
 the authors' (or a strong community) implementation, not a blank file.
 
-This is the one legitimate time you put code *on the baseline itself* (cardinal
-rule 1's only exception): it applies **only while the baseline is still the empty
-stub.** Once it holds real code, the baseline is frozen — vary code on children
-from then on.
+This is cardinal rule 1 working as written: the baseline is **provisional**
+until a run establishes the control, so seeding it and making it run are part
+of building it.
 
 **Find the code to seed from, in priority order:**
 
@@ -75,10 +74,13 @@ as one squashed commit, so the baseline keeps clean provenance and stays rooted
 on the project repo:
 
 ```sh
+set -e   # MANDATORY: a failed checkout leaves the clone on the project's base
+         # branch (README/notebook surface) and the wipe below would destroy it
 DIR=~/.cache/openresearch/repos/<owner>/<repo>          # the PROJECT's repo, from `orx projects`
 [ -d "$DIR" ] || git clone https://github.com/<owner>/<repo> "$DIR"
 git -C "$DIR" fetch origin
-git -C "$DIR" checkout -B orx/<baseline-slug> origin/orx/<baseline-slug>   # the baseline's branch
+git -C "$DIR" checkout orx/<baseline-slug>                 # the baseline's branch
+git -C "$DIR" merge --ff-only origin/orx/<baseline-slug>   # never seed onto a stale local tip
 
 src=$(mktemp -d) && git clone --depth 1 https://github.com/<srcOwner>/<srcRepo> "$src"
 SHA=$(git -C "$src" rev-parse --short HEAD) && rm -rf "$src/.git"
@@ -93,10 +95,11 @@ Then make the baseline runnable and proceed normally:
 
 - read the seeded code, find its entry point, and set the run command **once**:
   `orx exp cmd <baselineId> --set "bash run.sh"` (rule 2's one legitimate `--set`);
-- run the baseline first for a control `EVAL.md`, then branch children and vary
-  code per the auto-research loop. The baseline is **frozen** the moment it holds
-  real code — shrink to the smallest config that still shows the paper's claim by
-  editing a **child**, never by trimming the root.
+- run the baseline first for a control `EVAL.md`. **Expect the first launch to
+  fail** on setup — repair it on the baseline's own branch, don't branch a child
+  (`orx-experiment-tree`). Once it has produced reference numbers it is
+  **frozen**: shrink to the smallest config that shows the claim on a **child**,
+  never by trimming the root.
 
 ## `orx create-experiment` — add a node to the tree
 
@@ -119,7 +122,9 @@ orx create-experiment <projectId> --title "Baseline v2" --baseline
   bound to. Once a root exists, a parentless create attaches under the oldest
   root on local projects (server projects create another baseline); pass
   `--baseline` to explicitly add another root — projects may hold multiple
-  baselines, each the control for its own subtree. The repo a project works
+  baselines, each the control for its own subtree. Never create a second
+  baseline to escape a failing setup — that is a repair wearing a root's hat.
+  The repo a project works
   on is chosen when the **project** is created (`orx create-project` or the
   web), so there is no `--repo` flag here.
 - **A `--parent` child inherits the parent's run command** (and branches off its
@@ -132,7 +137,8 @@ orx create-experiment <projectId> --title "Baseline v2" --baseline
   Piling round after round of children onto the root is the flat-fan failure (see
   "Shape the tree" in the `orx-experiment-tree` skill). Co-equal options of the
   same decision are siblings under one parent — don't chain them into a line either.
-- `--description` is optional but **strongly recommended for children**: use it to
+- `--description` **should name the measurement the node owes** — so a later
+  reader knows what to compare it against. Use it to
   record the hypothesis / the concrete change this node makes. It's the node's
   free-form notes field (the same one `orx exp desc` reads/writes), and it's how
   you and the analysis tools tell sibling variants apart.

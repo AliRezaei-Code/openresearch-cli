@@ -2025,6 +2025,16 @@ pub fn launching_chat_session() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Whether this process is running inside a local `orx up` session.
+/// [`CHAT_SESSION_ENV`] is exported only by [`set_chat_session_env`] onto
+/// `orx up` harness children, so its presence means this process is one (or a
+/// subprocess of one). Commands that take a project or run id should prefer
+/// `…is_local()` on the resolved entity; this is for the ones that take
+/// neither (e.g. `orx skill <name>`).
+pub fn in_local_session() -> bool {
+    launching_chat_session().is_some()
+}
+
 /// Append-only stderr sink for a harness child (startup/debug diagnostics).
 pub fn harness_log(name: &str) -> Result<std::fs::File> {
     let path = crate::store::data_dir().join(format!("agent-{name}.log"));

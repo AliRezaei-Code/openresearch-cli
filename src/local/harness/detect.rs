@@ -17,6 +17,80 @@ pub(super) const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 #[serde(rename_all = "camelCase")]
 pub struct ModelInfo {
     pub id: String,
+    /// Reasoning/effort choices this *specific* model accepts, led by the
+    /// `Default` sentinel. `None` means "this model has no list of its own" —
+    /// the composer then falls back to the harness-wide
+    /// [`HarnessOptions::reasoning_levels`](super::HarnessOptions).
+    ///
+    /// `Some(vec![])` is meaningfully different from `None`: it means the model
+    /// was *checked* and genuinely exposes no reasoning control (an OpenCode
+    /// model with an empty `variants` map), so the picker is hidden entirely
+    /// rather than falling back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_levels: Option<Vec<super::options::OptionChoice>>,
+    /// The catalog's own human name for the model (`Opus`, `GPT-5.6 Sol`,
+    /// `Big Pickle`). Absent for statically-listed fallback models, where the
+    /// UI derives a label from the id instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// The catalog's one-line blurb — for Claude this is where the resolved
+    /// version lives (`Opus 4.8 with 1M context · Best for everyday, complex
+    /// tasks`), since its picker aliases (`opus[1m]`) are unversioned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The tier that actually runs when the user picks nothing — set only when
+    /// the CLI reports it (codex's `defaultReasoningEffort`, resolved against a
+    /// `config.toml` override). When present, `reasoning_levels` carries no
+    /// `default` sentinel and the composer preselects this concrete tier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_level: Option<String>,
+}
+
+impl ModelInfo {
+    /// A model with no per-model reasoning metadata (falls back to the
+    /// harness-wide list).
+    pub(super) fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            reasoning_levels: None,
+            display_name: None,
+            description: None,
+            default_reasoning_level: None,
+        }
+    }
+
+    /// Attach reasoning choices *with a known concrete default*: no sentinel
+    /// row, the default tier preselected instead. For catalogs that report
+    /// which tier runs when nothing is chosen (codex).
+    pub(super) fn with_reasoning_default(mut self, ids: &[&str], default: &str) -> Self {
+        self.reasoning_levels = Some(super::options::reasoning_tiers(ids));
+        // A default outside the advertised tiers would be unselectable — leave
+        // it unset then, and the composer preselects the first tier.
+        self.default_reasoning_level = ids.contains(&default).then(|| default.to_string());
+        self
+    }
+
+    /// Attach the catalog's display name / description, when it has them.
+    pub(super) fn with_label(
+        mut self,
+        display_name: Option<&str>,
+        description: Option<&str>,
+    ) -> Self {
+        self.display_name = display_name.map(str::to_string);
+        self.description = description.map(str::to_string);
+        self
+    }
+
+    /// Attach this model's own reasoning choices, from native ids. An empty
+    /// `ids` yields an empty (not absent) list — "checked, none supported".
+    pub(super) fn with_reasoning(mut self, ids: &[&str]) -> Self {
+        self.reasoning_levels = Some(if ids.is_empty() {
+            Vec::new()
+        } else {
+            super::options::reasoning_choices(ids)
+        });
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -68,12 +142,10 @@ impl HarnessInfo {
         }
     }
 
-    /// Attach the chat model list from a set of static ids.
-    pub(super) fn with_models(mut self, ids: &[&str]) -> Self {
-        self.models = ids
-            .iter()
-            .map(|id| ModelInfo { id: id.to_string() })
-            .collect();
+    /// Attach the chat model list. Each `ModelInfo` carries its own reasoning
+    /// choices where the harness knows them (issue #123).
+    pub(super) fn with_models(mut self, models: Vec<ModelInfo>) -> Self {
+        self.models = models;
         self
     }
 }
@@ -117,6 +189,17 @@ pub(super) async fn bin_version(bin: &PathBuf) -> Option<String> {
     (!line.is_empty()).then_some(line)
 }
 
+/// An API key from the process env, else orx's own synced env file — the two
+/// sources `prepare_env` actually hands the harness child. Detecting only the
+/// former would report a working setup as signed out.
+pub(super) fn api_key(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| crate::config::synced_env_var(key))
+}
+
 pub(super) fn read_json(path: PathBuf) -> Option<Value> {
     let raw = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
@@ -139,6 +222,26 @@ pub(super) fn jwt_payload(token: &str) -> Option<Value> {
         .decode(payload)
         .ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// Parse a `major.minor.patch` triple out of a `--version` line. The first
+/// whitespace-separated token that parses wins, so `"codex-cli 0.144.0"`,
+/// `"2.1.197 (Claude Code)"`, and a bare `"0.144.0"` all resolve; a `-suffix`
+/// on the patch is tolerated. `None` when no token has the shape, which each
+/// caller treats as "assume the older behaviour".
+pub(super) fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
+    version.split_whitespace().find_map(|token| {
+        let mut parts = token.splitn(3, '.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts
+            .next()?
+            .split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()?;
+        Some((major, minor, patch))
+    })
 }
 
 pub(super) fn title_case(word: &str) -> String {

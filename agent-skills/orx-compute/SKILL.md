@@ -328,6 +328,9 @@ orx exp wait <expId> --interval 10 --timeout 3600   # tune polling
   line points at `orx logs <runId>`, where the traceback/OOM/setup error lives.
   The same `reason:` line appears under `orx exp status <expId>` and beneath the
   `orx runs <projectId>` table.
+- **A failed run is not a new node.** Re-launch the same `<expId>` — a failure
+  answered nothing, so the node is still repairable in place
+  (`orx-experiment-tree`).
 
 ## Sizing compute
 

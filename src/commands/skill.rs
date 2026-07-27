@@ -7,11 +7,21 @@ use crate::local::agent_skills::{self, SkillSet};
 // compile time from the repo-root SKILL.md.
 const SKILL_MD: &str = include_str!("../../SKILL.md");
 
+/// Which bundled skill set this invocation serves: the Local bodies inside an
+/// `orx up` session, the Full ones for a human at a terminal or a cloud box.
+fn current_skill_set() -> SkillSet {
+    if crate::local::chat::in_local_session() {
+        SkillSet::Local
+    } else {
+        SkillSet::Full
+    }
+}
+
 pub async fn run(args: crate::SkillArgs) -> Result<()> {
     if let Some(path) = args.path {
         // First: a bundled module (with or without the `orx-` prefix). These
         // ship in the binary, so they resolve offline and never drift.
-        if let Some(skill) = agent_skills::find(&path) {
+        if let Some(skill) = agent_skills::find(&path, current_skill_set()) {
             println!("{}", skill.content.trim_end());
             return Ok(());
         }
@@ -28,7 +38,7 @@ pub async fn run(args: crate::SkillArgs) -> Result<()> {
     println!("{}", SKILL_MD);
 
     println!("\nBundled modules (orx skill <name>):");
-    for s in agent_skills::skills(SkillSet::Full) {
+    for s in agent_skills::skills(current_skill_set()) {
         println!("  {:<20} {}", s.name, s.description);
     }
 

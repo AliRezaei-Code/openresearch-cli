@@ -196,6 +196,8 @@ fn router(state: AppState) -> Router {
         )
         .route("/api/settings/data-dir/validate", post(validate_data_dir))
         .route("/api/settings/data-dir/move", post(move_data_dir))
+        .route("/api/github/repo-access", get(github_repo_access))
+        .route("/api/github/account", get(github_account))
         .route(
             "/api/settings/git",
             get(git_settings).post(set_git_settings),
@@ -446,13 +448,34 @@ async fn create_project(
             return Err(bad_request("githubOwner and githubRepo are required"));
         }
         let branch = req.baseline_branch.filter(|b| !b.trim().is_empty());
+        let meta = local::github::repo_meta(&owner, &repo).await;
+        // No branch given → the repo's own default. Falling through to
+        // create_project's hardcoded "main" breaks every master/dev repo with
+        // "Branch 'main' not found" — and the form has no branch field to
+        // recover with. The API answer needs a token, so fall back to git's
+        // own credentials for the SSH-only user.
+        let branch = match branch.or_else(|| meta.as_ref().and_then(|m| m.default_branch.clone())) {
+            Some(b) => Some(b),
+            None => {
+                let (o, r) = (owner.clone(), repo.clone());
+                // Bounded like authed_get: ls-remote tries ssh then https, and
+                // a black-holed host blocks on TCP connect for ~75s each. A
+                // stall degrades to create_project's "main" instead of hanging
+                // the create request.
+                tokio::time::timeout(
+                    Duration::from_secs(15),
+                    tokio::task::spawn_blocking(move || local::git::remote_default_branch(&o, &r)),
+                )
+                .await
+                .ok()
+                .and_then(|joined| joined.ok())
+                .flatten()
+            }
+        };
         // Unknown access (no token / API hiccup) counts as access: forking
         // needs a token anyway, and surprise forks are worse than a later
         // push error.
-        let fork = req.fork_repo
-            || !local::github::has_push_access(&owner, &repo)
-                .await
-                .unwrap_or(true);
+        let fork = req.fork_repo || !meta.as_ref().map(|m| m.can_push).unwrap_or(true);
         if fork {
             // The entered branch picks what gets copied; the fork itself
             // starts at its default branch.
@@ -1614,6 +1637,36 @@ fn data_dir_json() -> Value {
     })
 }
 
+/// The signed-in GitHub login, so "creates github.com/you/x" can name the real
+/// account. `null` when there's no usable token — the UI keeps saying "you".
+async fn github_account() -> ApiResult {
+    Ok(Json(
+        json!({ "login": local::github::viewer_login().await }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct RepoAccessQuery {
+    owner: String,
+    repo: String,
+}
+
+/// Whether the stored credentials can push to `owner/repo`, so the New project
+/// form can drop the fork choice when it isn't one. Mirrors the create path:
+/// unknown (no token / API hiccup) counts as access, so the UI never nags about
+/// a fork the server wouldn't make.
+async fn github_repo_access(Query(q): Query<RepoAccessQuery>) -> ApiResult {
+    let owner = q.owner.trim().to_string();
+    let repo = q.repo.trim().to_string();
+    if owner.is_empty() || repo.is_empty() {
+        return Err(bad_request("owner and repo are required"));
+    }
+    let meta = local::github::repo_meta(&owner, &repo).await;
+    Ok(Json(json!({
+        "canPush": meta.map(|m| m.can_push).unwrap_or(true),
+    })))
+}
+
 async fn data_dir_settings() -> ApiResult {
     tokio::task::spawn_blocking(|| Ok(Json(data_dir_json())))
         .await
@@ -2235,7 +2288,65 @@ async fn slurm_preflight(Json(req): Json<SlurmPreflightReq>) -> ApiResult {
 /// or the modal python import. `configured` means "worth trying", not
 /// "healthy"; deep health stays in each backend's own settings endpoint,
 /// fetched when a row is expanded.
-fn compute_settings_json() -> Value {
+/// Whether a box would accept this machine. Three-valued on purpose: the check
+/// needs the api, so "we couldn't ask" is a different answer from "no" and the
+/// badge shouldn't have to pick one of the two. Each arm carries what the row
+/// needs to say — guessing a key path would send the user to a file that may
+/// not exist.
+#[derive(Clone, PartialEq)]
+enum SshReadiness {
+    Ready,
+    /// The `.pub` on this machine worth registering, if there is one.
+    NoUsableKey {
+        pub_path: Option<String>,
+    },
+    Unverified {
+        reason: String,
+    },
+}
+
+async fn openresearch_ssh_readiness() -> SshReadiness {
+    use crate::local::ssh_identity::{preferred_local, tilde, KeyStatus};
+    let Ok(Some(creds)) = crate::config::load_credentials().await else {
+        // Signed-out is reported by the row's own `or_logged_in`.
+        return SshReadiness::NoUsableKey { pub_path: None };
+    };
+    let named = |local: &[crate::local::ssh_identity::LocalKey]| SshReadiness::NoUsableKey {
+        pub_path: preferred_local(local)
+            .and_then(|k| k.path.as_deref())
+            .map(tilde),
+    };
+    match crate::local::ssh_identity::check(&creds).await {
+        KeyStatus::Matched => SshReadiness::Ready,
+        KeyStatus::NoLocalMatch { local, .. } | KeyStatus::NoneRegistered { local } => {
+            named(&local)
+        }
+        KeyStatus::Unknown { reason } => SshReadiness::Unverified { reason },
+    }
+}
+
+/// The openresearch row's one-line status. Every branch that tells the user to
+/// run something names a path we actually found — never a guessed one.
+fn openresearch_summary(logged_in: bool, ssh: &SshReadiness) -> String {
+    if !logged_in {
+        return "Not signed in — run orx login".to_string();
+    }
+    match ssh {
+        SshReadiness::Ready => "Signed in — ephemeral boxes billed to your org".to_string(),
+        SshReadiness::NoUsableKey {
+            pub_path: Some(path),
+        } => format!("No usable SSH key — run orx ssh-key add {path}"),
+        SshReadiness::NoUsableKey { pub_path: None } => {
+            "No SSH key on this computer — run ssh-keygen -t ed25519, then orx ssh-key add"
+                .to_string()
+        }
+        SshReadiness::Unverified { reason } => {
+            format!("Signed in — couldn't check your SSH key ({reason})")
+        }
+    }
+}
+
+fn compute_settings_json(ssh: SshReadiness) -> Value {
     let default = crate::config::compute_default();
     let (default_backend, default_flavor) = match &default {
         Some((b, f)) => (Some(b.as_str()), f.as_deref()),
@@ -2315,12 +2426,12 @@ fn compute_settings_json() -> Value {
         },
         {
             "id": "openresearch",
-            "configured": or_logged_in,
-            "summary": if or_logged_in {
-                "Signed in — ephemeral boxes billed to your org"
-            } else {
-                "Not signed in — run orx login"
-            },
+            // Signed in alone would be a green light on a backend that can't
+            // connect — the box authorizes your *registered* keys, so one of
+            // them has to be on this machine too.
+            "configured": or_logged_in && ssh == SshReadiness::Ready,
+            "unverified": or_logged_in && matches!(ssh, SshReadiness::Unverified { .. }),
+            "summary": openresearch_summary(or_logged_in, &ssh),
         },
     ]);
     json!({
@@ -2331,8 +2442,9 @@ fn compute_settings_json() -> Value {
 }
 
 async fn compute_settings() -> ApiResult {
+    let ssh = openresearch_ssh_readiness().await;
     // fs/env probes only, but keep them off the async runtime anyway.
-    let payload = tokio::task::spawn_blocking(compute_settings_json)
+    let payload = tokio::task::spawn_blocking(move || compute_settings_json(ssh))
         .await
         .map_err(|e| ApiError::from(anyhow!("compute settings task failed: {e}")))?;
     Ok(Json(payload))
@@ -2361,12 +2473,15 @@ async fn set_compute_default(Json(req): Json<SetComputeDefaultReq>) -> ApiResult
     if let Some(b) = &backend {
         local::validate_compute_default(b, flavor.as_deref()).map_err(bad_request)?;
     }
+    // Picking openresearch as the default is the moment to answer "will this
+    // actually work?", so the row that comes back is honest about the SSH key.
+    let ssh = openresearch_ssh_readiness().await;
     // Validation already ran above, so a failure in here is a server-side
     // fault (io error, corrupt settings.json refusal) — surface it as 500 via
     // the plain ApiError conversion, not as a 400 blaming the request.
     let payload = tokio::task::spawn_blocking(move || -> Result<Value> {
         crate::config::set_compute_default(backend, flavor)?;
-        Ok(compute_settings_json())
+        Ok(compute_settings_json(ssh))
     })
     .await
     .map_err(|e| ApiError::from(anyhow!("compute default task failed: {e}")))??;
@@ -2391,7 +2506,7 @@ async fn openresearch_settings() -> ApiResult {
             "loggedIn": false,
             "apiUrl": null,
             "orgs": [],
-            "sshKeyRegistered": null,
+            "sshKeyStatus": "unknown",
             "error": null,
         })));
     };
@@ -2403,18 +2518,39 @@ async fn openresearch_settings() -> ApiResult {
             Vec::new()
         }
     };
-    let ssh_key_registered = match crate::client::list_ssh_keys(&creds).await {
-        Ok(k) => Some(!k.ssh_keys.is_empty()),
-        Err(e) => {
-            error.get_or_insert(e.to_string());
-            None
+    // "Registered" alone is a misleading green: a key registered from another
+    // laptop leaves this machine unable to reach any box. Report whether the
+    // private half is actually here.
+    use crate::local::ssh_identity::{preferred_local, tilde, KeyStatus};
+    // Hand back the .pub we actually found so the note can name a real file
+    // rather than guessing at ~/.ssh/id_ed25519.pub.
+    let mut ssh_key_path: Option<String> = None;
+    let mut note_key = |local: &[crate::local::ssh_identity::LocalKey]| {
+        ssh_key_path = preferred_local(local)
+            .and_then(|k| k.path.as_deref())
+            .map(tilde);
+    };
+    let ssh_key_status = match crate::local::ssh_identity::check(&creds).await {
+        KeyStatus::Matched => "matched",
+        KeyStatus::NoLocalMatch { local, .. } => {
+            note_key(&local);
+            "no_local_match"
+        }
+        KeyStatus::NoneRegistered { local } => {
+            note_key(&local);
+            "none_registered"
+        }
+        KeyStatus::Unknown { reason } => {
+            error.get_or_insert(reason);
+            "unknown"
         }
     };
     Ok(Json(json!({
         "loggedIn": true,
         "apiUrl": creds.api_url,
         "orgs": orgs,
-        "sshKeyRegistered": ssh_key_registered,
+        "sshKeyStatus": ssh_key_status,
+        "sshKeyPath": ssh_key_path,
         "error": error,
     })))
 }
@@ -2968,5 +3104,49 @@ async fn spa(uri: Uri) -> Response {
     match UiDist::get("index.html") {
         Some(file) => asset_response("index.html", file),
         None => Html(NOT_BUILT_PAGE).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn no_key(path: Option<&str>) -> SshReadiness {
+        SshReadiness::NoUsableKey {
+            pub_path: path.map(str::to_string),
+        }
+    }
+
+    /// The row used to hardcode `~/.ssh/id_ed25519.pub`, which is wrong on any
+    /// machine whose key is named something else.
+    #[test]
+    fn names_the_key_file_we_actually_found() {
+        let s = openresearch_summary(true, &no_key(Some("~/.ssh/work_ed25519.pub")));
+        assert!(s.contains("orx ssh-key add ~/.ssh/work_ed25519.pub"));
+        assert!(!s.contains("id_ed25519"), "no guessed default");
+    }
+
+    /// Nothing on disk to register, so `ssh-key add` alone would fail.
+    #[test]
+    fn tells_you_to_generate_one_when_there_is_no_key() {
+        let s = openresearch_summary(true, &no_key(None));
+        assert!(s.contains("ssh-keygen"));
+    }
+
+    #[test]
+    fn signed_out_beats_every_key_state() {
+        assert!(openresearch_summary(false, &SshReadiness::Ready).contains("orx login"));
+        assert!(openresearch_summary(false, &no_key(None)).contains("orx login"));
+    }
+
+    #[test]
+    fn unverified_says_why_it_could_not_check() {
+        let s = openresearch_summary(
+            true,
+            &SshReadiness::Unverified {
+                reason: "timed out".to_string(),
+            },
+        );
+        assert!(s.contains("timed out"), "surfaces the cause: {s}");
     }
 }

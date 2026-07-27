@@ -1010,7 +1010,7 @@ async fn run_openresearch(
             store.update_status(&run_id, "failed", Some(now_ms()), None)?;
             store.set_result_markdown(
                 &run_id,
-                &format!("Could not launch the run on box {sandbox_id}: {err}"),
+                &crate::local::ssh_identity::explain_launch_failure(&sandbox_id, &err.to_string()),
             )?;
             teardown_box(&store, &lifecycle, &sandbox_id, &run_id).await;
             return Ok(());
