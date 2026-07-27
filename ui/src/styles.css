@@ -1267,10 +1267,13 @@ textarea::placeholder {
   resize: none;
   padding: 10px 12px 4px;
   font-size: var(--fs-md);
-  /* ChatPanel auto-grows the inline height with the draft; min-height floors
-     the cleared empty state and max-height caps the growth (past it the
-     textarea scrolls internally). */
-  min-height: 42px;
+  /* ChatPanel auto-grows the composer's inline height with the draft;
+     max-height caps the growth (past it the textarea scrolls internally) and
+     min-height matches the rows=2 resting size so the box doesn't dip ~10px
+     when a one-line draft replaces the cleared empty state. (The rule also
+     lands on the plan strip's revise textarea, which doesn't autosize; its
+     rows=2 natural height already clears this floor.) */
+  min-height: 52px;
   max-height: 180px;
 }
 /* pasted images waiting to be sent */

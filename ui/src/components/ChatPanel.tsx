@@ -1029,10 +1029,11 @@ export function ChatPanel({
   useLayoutEffect(() => autosizeComposer(), [draft, chipIndent]);
   /** Ref callback for the textarea: rebinds the width observer and re-measures
    * on every mount — the composer unmounts on settings views, and remounting
-   * must re-apply the draft's height (an effect keyed on [draft] would not
-   * re-run). Wrapping — and so the needed height — changes with the width
-   * (pane resize, sidebar toggle), hence the observer. Stable identity so
-   * React doesn't detach/reattach it every render. */
+   * must re-apply the draft's height (an effect would need a mount flag keyed
+   * on mainView, cf. threadMounted; the ref callback gets it without one).
+   * Wrapping — and so the needed height — changes with the width (pane
+   * resize, sidebar toggle), hence the observer. Stable identity so React
+   * doesn't detach/reattach it every render. */
   const composerRO = useRef<ResizeObserver | null>(null);
   const attachComposer = useCallback((el: HTMLTextAreaElement | null) => {
     composerRO.current?.disconnect();
