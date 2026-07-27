@@ -1679,14 +1679,22 @@ textarea::placeholder {
  * disturbs the tree layout. */
 .exp-hover-card {
   position: fixed;
-  z-index: 100;
+  /* Must clear the maximized right pane (.floating-panel.max, z 60) that
+   * hosts the tree; the portal's end-of-body DOM order breaks the tie in the
+   * card's favor. Still below the modal tier (100). */
+  z-index: 60;
   background: var(--base);
   border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
   padding: 14px 16px;
   font-size: var(--fs-sm);
   color: var(--text);
+}
+/* Scoped mono: font family only, so the row's own size scale wins (the global
+ * .mono class pins font-size and would break the 10px foot row). */
+.exp-hover-card .hc-mono {
+  font-family: var(--mono);
 }
 .exp-hover-card .hc-head {
   display: flex;
@@ -1763,17 +1771,15 @@ textarea::placeholder {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.exp-hover-card .hc-add {
-  color: var(--accent-green);
-}
-.exp-hover-card .hc-del {
-  color: var(--accent-red);
-}
 .exp-hover-card .hc-files {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* Kept outside the ellipsised file list so it never gets clipped away. */
+.exp-hover-card .hc-more {
+  flex-shrink: 0;
 }
 .exp-hover-card .hc-foot {
   margin-top: 8px;
@@ -1784,7 +1790,7 @@ textarea::placeholder {
   font-size: var(--fs-2xs);
   color: var(--muted);
 }
-.exp-hover-card .hc-foot .mono {
+.exp-hover-card .hc-foot .hc-mono {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;

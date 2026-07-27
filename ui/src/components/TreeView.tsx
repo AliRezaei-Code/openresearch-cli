@@ -4,16 +4,17 @@ import {
   Handle,
   Position,
   ReactFlow,
+  useOnViewportChange,
   type Edge,
   type Node,
   type NodeProps,
 } from "@xyflow/react";
 import { FolderTree, GitBranch, Terminal } from "lucide-react";
 import { GitHubMark } from "./BackendLogos";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useMemo, useRef } from "react";
 import { githubBranchUrl, timeAgo, type Experiment, type Project, type Run } from "../api";
 import type { ExperimentView } from "./DetailDrawer";
-import { ExpHoverCard } from "./ExpHoverCard";
+import { ExpHoverCard, useHoverIntent } from "./ExpHoverCard";
 import { StatusBadge } from "./StatusBadge";
 
 const NODE_W = 264;
@@ -73,12 +74,6 @@ function runSquareClass(status: string): string {
   return "other";
 }
 
-// Hover-intent timings for the detail card: long enough that sweeping the
-// cursor across the tree opens nothing, short enough to feel deliberate. The
-// close grace lets the cursor cross the gap onto the card itself.
-const HOVER_OPEN_MS = 350;
-const HOVER_CLOSE_MS = 150;
-
 const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
   const { exp, latestRun, runs, isBaseline, parentSlug, githubOwner, githubRepo, onOpenView, onOpenCodeBranch } = data;
   const status = latestRun?.status;
@@ -86,43 +81,19 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
   const kind = isBaseline ? "Baseline" : live ? "Running" : "Experiment";
   const squares = runs.slice(-MAX_SQUARES);
 
+  // `data` is rebuilt whenever the tree re-lays-out, so it doubles as the
+  // hover card's re-measure key. Any canvas pan/zoom (wheel, drag, pinch,
+  // fitView) moves the node out from under the card's anchor — dismiss.
   const rootRef = useRef<HTMLDivElement>(null);
-  const openTimer = useRef<number | undefined>(undefined);
-  const closeTimer = useRef<number | undefined>(undefined);
-  const [anchor, setAnchor] = useState<DOMRect | null>(null);
-  useEffect(
-    () => () => {
-      window.clearTimeout(openTimer.current);
-      window.clearTimeout(closeTimer.current);
-    },
-    [],
-  );
-  const enter = useCallback(() => {
-    window.clearTimeout(closeTimer.current);
-    window.clearTimeout(openTimer.current);
-    openTimer.current = window.setTimeout(() => {
-      const rect = rootRef.current?.getBoundingClientRect();
-      if (rect) setAnchor(rect);
-    }, HOVER_OPEN_MS);
-  }, []);
-  const leave = useCallback(() => {
-    window.clearTimeout(openTimer.current);
-    window.clearTimeout(closeTimer.current);
-    closeTimer.current = window.setTimeout(() => setAnchor(null), HOVER_CLOSE_MS);
-  }, []);
-  const cardEnter = useCallback(() => window.clearTimeout(closeTimer.current), []);
-  const close = useCallback(() => {
-    window.clearTimeout(openTimer.current);
-    window.clearTimeout(closeTimer.current);
-    setAnchor(null);
-  }, []);
+  const hover = useHoverIntent(rootRef, data);
+  useOnViewportChange({ onStart: hover.close });
 
   return (
     <div
       ref={rootRef}
       className={`exp-node ${live ? "live" : ""}`}
-      onMouseEnter={enter}
-      onMouseLeave={leave}
+      onMouseEnter={hover.onMouseEnter}
+      onMouseLeave={hover.onMouseLeave}
     >
       <Handle type="target" position={Position.Top} />
       <div className="node-eyebrow">
@@ -191,16 +162,15 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
         </a>
       </div>
       <Handle type="source" position={Position.Bottom} />
-      {anchor && (
+      {hover.rect && (
         <ExpHoverCard
           exp={exp}
           runs={runs}
           latestRun={latestRun}
           parentSlug={parentSlug}
-          anchor={anchor}
-          onMouseEnter={cardEnter}
-          onMouseLeave={leave}
-          onClose={close}
+          anchor={hover.rect}
+          onMouseEnter={hover.keepOpen}
+          onMouseLeave={hover.onMouseLeave}
         />
       )}
     </div>

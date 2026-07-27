@@ -30,7 +30,7 @@ function getUnifiedLineNumber(change: ChangeData): number {
   return change.lineNumber;
 }
 
-function countChanges(file: FileData) {
+export function countChanges(file: FileData) {
   let additions = 0;
   let deletions = 0;
   for (const hunk of file.hunks) {
@@ -48,7 +48,7 @@ function getHighlightPath(file: FileData): string | null {
   return file.newPath;
 }
 
-function formatDiffFilePath(file: FileData): string {
+export function formatDiffFilePath(file: FileData): string {
   switch (file.type) {
     case "delete":
       return file.oldPath;
