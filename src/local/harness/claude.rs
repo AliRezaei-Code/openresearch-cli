@@ -190,12 +190,23 @@ fn parse_claude_model_list(result: &Value, ultracode: bool) -> Vec<ModelInfo> {
             if ultracode && efforts.contains(&"xhigh") {
                 efforts.push(CLAUDE_ULTRACODE);
             }
-            Some(ModelInfo::new(value).with_reasoning(&efforts).with_label(
-                m.get("displayName").and_then(Value::as_str),
-                // The description carries the resolved version ("Opus 4.8
-                // with 1M context · …") — the aliases themselves don't.
-                m.get("description").and_then(Value::as_str),
-            ))
+            // The catalog's `displayName` is unversioned ("Opus"); the version
+            // lives in the description's first `·` segment ("Opus 4.8 with 1M
+            // context · Best for everyday, complex tasks"). Promote that
+            // segment to the display name and keep the rest as the blurb, so
+            // the picker leads with the resolved version.
+            let (name, blurb) = match m.get("description").and_then(Value::as_str) {
+                Some(desc) => match desc.split_once('·') {
+                    Some((head, tail)) => (Some(head.trim()), Some(tail.trim())),
+                    None => (m.get("displayName").and_then(Value::as_str), Some(desc)),
+                },
+                None => (m.get("displayName").and_then(Value::as_str), None),
+            };
+            Some(
+                ModelInfo::new(value)
+                    .with_reasoning(&efforts)
+                    .with_label(name, blurb),
+            )
         })
         .collect()
 }
@@ -1289,13 +1300,13 @@ mod tests {
             ["claude-fable-5[1m]", "haiku"],
             "the `default` entry is the composer's null-model row, not a model"
         );
-        // The catalog's own name/blurb ride along — the blurb is where the
-        // resolved version lives, since the alias ids are unversioned.
-        assert_eq!(with[0].display_name.as_deref(), Some("Fable"));
-        assert_eq!(
-            with[0].description.as_deref(),
-            Some("Fable 5 · Most capable")
-        );
+        // The versioned name is promoted out of the description's first `·`
+        // segment (the alias ids and `displayName` are unversioned).
+        assert_eq!(with[0].display_name.as_deref(), Some("Fable 5"));
+        assert_eq!(with[0].description.as_deref(), Some("Most capable"));
+        // No description → the plain displayName stands.
+        assert_eq!(with[1].display_name.as_deref(), Some("Haiku"));
+        assert_eq!(with[1].description, None);
         assert_eq!(
             ids(&with[0]).unwrap(),
             [

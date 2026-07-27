@@ -33,17 +33,15 @@ export const HARNESS_LABELS: Record<HarnessId, string> = {
 export function defaultSelection(harnesses: Harness[]): ModelSelection | null {
   const ready = harnesses.find((h) => h.agentReady);
   if (!ready) return null;
+  // Seed the catalog's first model — the catalogs are CLI-discovered now, so
+  // it's a real, current id. Custom providers advertise no models; they seed
+  // null (= send no `--model`, the CLI uses whatever it is configured with).
+  const model = ready.models[0]?.id ?? null;
   return {
     harness: ready.id,
-    // null = send no `--model`, so the CLI uses whatever it is configured with.
-    // Forcing the first advertised id breaks custom providers, whose real model
-    // list lives behind the gateway rather than in our catalog.
-    model: null,
+    model,
     permissionMode: ready.options?.defaultPermissionMode ?? null,
-    // Seeded for that same null model, so it resolves against the harness-wide
-    // fallback list — the model-specific lists only apply once a model is
-    // actually picked.
-    reasoningLevel: reasoningFor(ready, null).defaultId,
+    reasoningLevel: reasoningFor(ready, model).defaultId,
   };
 }
 
@@ -194,15 +192,22 @@ export function ModelPicker({
                   </div>
                 ) : (
                   <>
-                    <button className="model-item" onClick={() => pick(harness, null)}>
-                      <span>
-                        Default model
-                        <span className="model-id">CLI configuration</span>
-                      </span>
-                      {value?.harness === harness.id && value?.model === null && (
-                        <Check size={13} />
-                      )}
-                    </button>
+                    {/* "Default model" (= send no --model, the CLI decides)
+                        only where the CLI advertises no catalog — a custom
+                        provider whose real models live behind its gateway.
+                        With a discovered catalog the row is redundant noise:
+                        the catalog's own default leads the list. */}
+                    {harness.models.length === 0 && (
+                      <button className="model-item" onClick={() => pick(harness, null)}>
+                        <span>
+                          Default model
+                          <span className="model-id">CLI configuration</span>
+                        </span>
+                        {value?.harness === harness.id && value?.model === null && (
+                          <Check size={13} />
+                        )}
+                      </button>
+                    )}
                     {models.map((m) => (
                       <button
                         key={m.id}
@@ -225,6 +230,22 @@ export function ModelPicker({
                     {hidden > 0 && (
                       <div className="model-more">{hidden} more — search to find</div>
                     )}
+                    {/* Free-form escape hatch: the catalogs are curated menus,
+                        not the set of ids the CLIs accept — `--model
+                        claude-opus-5` works on a CLI whose menu doesn't list
+                        it. Typing an id not in the list offers it directly. */}
+                    {filter.trim().length > 0 &&
+                      !harness.models.some((m) => m.id === filter.trim()) && (
+                        <button
+                          className="model-item"
+                          onClick={() => pick(harness, filter.trim())}
+                        >
+                          <span>
+                            Use “{filter.trim()}”
+                            <span className="model-id">pass as the model id</span>
+                          </span>
+                        </button>
+                      )}
                   </>
                 )}
               </div>
