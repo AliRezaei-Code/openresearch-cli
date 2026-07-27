@@ -100,13 +100,23 @@ export function NewProjectForm({
         (mode === "paper" && paper !== null && (repoInput.trim() === "" || parsed !== null))),
   );
 
+  // Leaving paper mode carries the paper's repo over into the field, but not
+  // its deliberate copy default — the user never chose that for this mode, and
+  // a pre-filled field means onRepoChange never fires to reset it.
+  const chooseMode = (next: Mode) => {
+    setMode(next);
+    if (next !== "paper") setRepoMode("use");
+  };
+
   const onRepoChange = (value: string) => {
     setRepoInput(value);
     // A forced copy belonged to the old repo — start the new one back at the
-    // default so an unpushable repo can't leave "Private copy" stuck on. Not
-    // in paper mode: selectPaper deliberately defaults to a copy, and editing
-    // the auto-filled repo shouldn't quietly retarget pushes upstream.
-    if (!paper) setRepoMode("use");
+    // default so an unpushable repo can't leave "Private copy" stuck on. Keyed
+    // on the mode, not on `paper`: a leftover paper selection would otherwise
+    // suppress the reset after switching to "Existing repo". In paper mode
+    // selectPaper deliberately defaults to a copy, and editing the auto-filled
+    // repo shouldn't quietly retarget pushes upstream.
+    if (mode !== "paper") setRepoMode("use");
     // Name follows the repo until the user edits it themselves.
     if (!nameTouched) setName(parseRepo(value)?.repo ?? "");
   };
@@ -288,9 +298,9 @@ export function NewProjectForm({
     </>
   );
 
-  // Outside repoFields: the name doesn't depend on repo access, and burying it
-  // behind the check would leave the form unsubmittable if that request stalls.
-  const nameField = (
+  // Outside repoFields: the name doesn't depend on repo access, so a stalled
+  // check can't leave the form unsubmittable.
+  const nameField = (autoFocus = false) => (
     <label>
       Project name
       <input
@@ -300,8 +310,18 @@ export function NewProjectForm({
           setName(e.target.value);
         }}
         placeholder="my-research"
+        autoFocus={autoFocus}
       />
     </label>
+  );
+
+  // Shown wherever a blank repo is what gets created.
+  const blankRepoHint = (
+    <span className={`repo-hint mono ${name.trim() ? "ok" : ""}`}>
+      {name.trim()
+        ? `Creates github.com/${ghOwner}/${slugify(name)} · private`
+        : "A blank private repo is created on your GitHub account"}
+    </span>
   );
 
   return (
@@ -310,21 +330,21 @@ export function NewProjectForm({
         <button
           type="button"
           className={mode === "paper" ? "active" : ""}
-          onClick={() => setMode("paper")}
+          onClick={() => chooseMode("paper")}
         >
           From a paper
         </button>
         <button
           type="button"
           className={mode === "existing" ? "active" : ""}
-          onClick={() => setMode("existing")}
+          onClick={() => chooseMode("existing")}
         >
           Existing repo
         </button>
         <button
           type="button"
           className={mode === "new" ? "active" : ""}
-          onClick={() => setMode("new")}
+          onClick={() => chooseMode("new")}
         >
           New blank repo
         </button>
@@ -421,35 +441,16 @@ export function NewProjectForm({
               </span>
             </label>
             {parsed && repoFields}
-            {nameField}
-            {!parsed && (
-              <span className={`repo-hint mono ${name.trim() ? "ok" : ""}`}>
-                {name.trim()
-                  ? `Creates github.com/${ghOwner}/${slugify(name)} · private`
-                  : "A blank private repo is created on your GitHub account"}
-              </span>
-            )}
+            {nameField()}
+            {!parsed && blankRepoHint}
           </>
         ))}
 
       {mode === "new" && (
-        <label>
-          Project name
-          <input
-            value={name}
-            onChange={(e) => {
-              setNameTouched(true);
-              setName(e.target.value);
-            }}
-            placeholder="my-research"
-            autoFocus
-          />
-          <span className={`repo-hint mono ${name.trim() ? "ok" : ""}`}>
-            {name.trim()
-              ? `Creates github.com/${ghOwner}/${slugify(name)} · private`
-              : "A blank private repo is created on your GitHub account"}
-          </span>
-        </label>
+        <>
+          {nameField(true)}
+          {blankRepoHint}
+        </>
       )}
 
       {error && <div className="error">{error}</div>}

@@ -42,9 +42,8 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   // boot — a stalled check would be an unrecoverable dead end.
   const anyAgentReady = harnessError || (harnesses?.some((h) => h.agentReady) ?? false);
 
-  // Creating a project hits the GitHub API (repo creation, push-access check),
-  // which hard-fails without a token — so step 2 gates too. Null (still
-  // checking) counts as not-connected, same as the agent gate.
+  // Drives the nudge on step 2 only — that step doesn't gate, so an unknown
+  // answer costs nothing.
   const githubConnected = git?.githubTokenSource != null;
 
   // A rejected probe must not leave state at null forever: the gates read null
@@ -60,8 +59,17 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
       getTelemetry().then(setTelemetryState),
     ])
       .then(([harness, git]) => {
-        setHarnessError(harness.status === "rejected");
-        setGitError(git.status === "rejected");
+        // Clear the stale answer too, so "errored", "loading" and "loaded"
+        // stay mutually exclusive — otherwise a failed re-check leaves old
+        // cards on screen saying "not signed in" while the gate un-gates.
+        if (harness.status === "rejected") {
+          setHarnessError(true);
+          setHarnesses(null);
+        }
+        if (git.status === "rejected") {
+          setGitError(true);
+          setGit(null);
+        }
       })
       .finally(() => setChecking(false));
   };
@@ -137,8 +145,15 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 <GitCard git={git} onUpdate={setGit} />
               )}
             </div>
+            {/* Soft, and honestly so: cloning and pushing work over SSH keys
+                (ensure_clone tries ssh first), so a token is a convenience,
+                not a requirement. State what's missing; never block on it. A
+                disabled Continue beside an enabled Skip just reads as a bug. */}
             {git !== null && !githubConnected && (
-              <p className="onb-gate-hint">Connect GitHub to continue.</p>
+              <p className="onb-gate-hint">
+                Without GitHub access, orx can&apos;t create repos for you — cloning and pushing
+                still work if you have SSH keys.
+              </p>
             )}
             <div className="onb-actions">
               <button className="btn ghost" onClick={() => setStep(0)}>
@@ -148,19 +163,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 <RefreshCw size={12} className={checking ? "spin" : ""} /> Re-check
               </button>
               <div style={{ flex: 1 }} />
-              {/* Always offered, never only when the badge says disconnected:
-                  a stale `gh` token still reads as connected, and that user
-                  needs this more than anyone. A token isn't strictly required —
-                  ensure_clone tries ssh first — so this must not be a trap. */}
-              <button className="btn ghost" onClick={() => setStep(2)}>
-                Skip for now
-              </button>
-              <button
-                className="btn primary"
-                onClick={() => setStep(2)}
-                disabled={!githubConnected}
-                title={githubConnected ? undefined : "Connect GitHub to continue"}
-              >
+              <button className="btn primary" onClick={() => setStep(2)}>
                 Continue <ArrowRight size={13} />
               </button>
             </div>
