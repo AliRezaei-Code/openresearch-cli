@@ -54,16 +54,21 @@ const CLAUDE_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"
 /// Codex's `ultra` (which Claude rejects outright).
 const CLAUDE_ULTRACODE: &str = "ultracode";
 
-/// Earliest Claude Code release we have confirmation accepts `--effort
-/// ultracode`. NOT known to be the exact boundary: 2.1.197 was observed to
-/// reject it and issue #123 reports 2.1.217 accepting it, so the true cutoff is
-/// somewhere in (197, 217]. Lowering it needs a version actually tested.
+/// First Claude Code release whose `--effort` accepts `ultracode`. This IS the
+/// exact boundary: every published version in 2.1.197..=2.1.212 was installed
+/// and probed, and 2.1.198–2.1.202 all reject while 2.1.203 and up all accept.
 ///
 /// The gate is load-bearing, not defensive. An older CLI does not fail loudly
-/// on an unknown effort — 2.1.197 warns on stderr that it is ignoring the value
-/// and then runs the turn at its *default* effort. Advertising `ultracode`
-/// unconditionally would therefore offer a choice that silently does nothing.
-const CLAUDE_ULTRACODE_MIN_VERSION: (u64, u64, u64) = (2, 1, 217);
+/// on an unknown effort — it warns on stderr (`Warning: Unknown --effort value
+/// 'ultracode' — ignoring it and using the default effort`) and then runs the
+/// turn at its *default* effort. Advertising `ultracode` unconditionally would
+/// therefore offer a choice that silently does nothing.
+///
+/// The acceptance is specific to this value, not a newer CLI simply dropping
+/// the warning: on 2.1.206, `ultra`, `ultrathink`, and `ultracode123` all still
+/// warn while `ultracode` does not. `--help` lists only the five ordinary tiers
+/// on every version tested, so help output can't be used to detect support.
+const CLAUDE_ULTRACODE_MIN_VERSION: (u64, u64, u64) = (2, 1, 203);
 
 /// Whether this installed CLI accepts `--effort ultracode`. Unknown/unparseable
 /// versions are treated as unsupported: a missing choice is a smaller harm than
@@ -1115,12 +1120,19 @@ mod tests {
     /// `ultracode` is a real `--effort` value only on new-enough CLIs. An older
     /// one does NOT error — it warns to stderr that it is ignoring the value and
     /// then runs at the default effort — so offering the choice there would be a
-    /// lie. Observed against the locally installed 2.1.197.
+    /// lie.
+    ///
+    /// The 2.1.202/2.1.203 pair is the measured boundary, not a guess: every
+    /// published version in 2.1.197..=2.1.212 was installed and probed. Moving
+    /// the constant without re-probing breaks these two assertions.
     #[test]
     fn ultracode_is_version_gated() {
+        // Rejecting side (observed to warn and fall back to default effort).
         assert!(!supports_ultracode(Some("2.1.197 (Claude Code)")));
-        assert!(!supports_ultracode(Some("2.1.216")));
-        assert!(supports_ultracode(Some("2.1.217 (Claude Code)")));
+        assert!(!supports_ultracode(Some("2.1.202")));
+        // Accepting side.
+        assert!(supports_ultracode(Some("2.1.203 (Claude Code)")));
+        assert!(supports_ultracode(Some("2.1.212")));
         assert!(supports_ultracode(Some("2.1.300")));
         assert!(supports_ultracode(Some("2.2.0")));
         assert!(supports_ultracode(Some("3.0.0")));
@@ -1133,11 +1145,11 @@ mod tests {
     #[test]
     fn effort_ids_gain_ultracode_only_when_supported() {
         assert_eq!(
-            claude_effort_ids(Some("2.1.197")),
+            claude_effort_ids(Some("2.1.202")),
             ["low", "medium", "high", "xhigh", "max"]
         );
         assert_eq!(
-            claude_effort_ids(Some("2.1.217")),
+            claude_effort_ids(Some("2.1.203")),
             ["low", "medium", "high", "xhigh", "max", "ultracode"]
         );
     }
@@ -1145,7 +1157,7 @@ mod tests {
     #[test]
     fn parse_version_handles_real_claude_version_lines() {
         assert_eq!(parse_version("2.1.197 (Claude Code)"), Some((2, 1, 197)));
-        assert_eq!(parse_version("2.1.217"), Some((2, 1, 217)));
+        assert_eq!(parse_version("2.1.212 (Claude Code)"), Some((2, 1, 212)));
         // A pre-release suffix still yields its numeric patch.
         assert_eq!(parse_version("2.2.0-beta.1"), Some((2, 2, 0)));
         assert_eq!(parse_version("nonsense"), None);
@@ -1172,7 +1184,7 @@ mod tests {
     /// Every id the composer can offer must survive the mapper.
     #[test]
     fn advertised_effort_ids_all_map_back() {
-        for id in claude_effort_ids(Some("2.1.217")) {
+        for id in claude_effort_ids(Some("2.1.203")) {
             assert_eq!(claude_effort(Some(id)), Some(id), "{id} was dropped");
         }
     }
