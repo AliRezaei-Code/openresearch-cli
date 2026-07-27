@@ -1001,6 +1001,42 @@ export function ChatPanel({
     syncChipScroll();
   }, [pickedSkill]);
 
+  // Auto-grow the composer to fit its content, up to the CSS max-height cap
+  // (past it the textarea scrolls internally). An empty draft clears the
+  // inline height instead of measuring: the resting size comes from
+  // rows/min-height, and Chrome counts placeholder overflow in scrollHeight —
+  // measuring before flex layout settles (textarea a few px wide) would bake
+  // in a huge wrapped-placeholder height.
+  const autosizeComposer = useCallback(() => {
+    const el = composerRef.current;
+    if (!el) return;
+    if (el.value === "") {
+      el.style.height = "";
+    } else {
+      el.style.height = "auto";
+      el.style.height = `${el.scrollHeight}px`;
+    }
+    syncChipScroll();
+  }, []);
+  // Layout effect so the height lands before paint. chipIndent shifts
+  // wrapping (text-indent past the chip), so re-measure when it changes.
+  useLayoutEffect(autosizeComposer, [autosizeComposer, draft, chipIndent]);
+  // Wrapping — and therefore the needed height — changes with the textarea's
+  // width (pane resize, sidebar toggle), so re-measure when it does.
+  useEffect(() => {
+    const el = composerRef.current;
+    if (!el) return;
+    let lastWidth = el.clientWidth;
+    const ro = new ResizeObserver(() => {
+      if (el.clientWidth !== lastWidth) {
+        lastWidth = el.clientWidth;
+        autosizeComposer();
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [autosizeComposer]);
+
   /** The chip belongs to the first line of *content*, so when the textarea
    * scrolls it must ride along (and clip at the wrapper) instead of sitting
    * fixed over whatever line scrolled to the top. */
