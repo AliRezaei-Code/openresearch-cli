@@ -328,13 +328,9 @@ orx exp wait <expId> --interval 10 --timeout 3600   # tune polling
   line points at `orx logs <runId>`, where the traceback/OOM/setup error lives.
   The same `reason:` line appears under `orx exp status <expId>` and beneath the
   `orx runs <projectId>` table.
-- **A failed run never creates a node.** Provisioning failures are setup, not
-  results — fix them and **re-launch the same `<expId>`**: transient spin-up →
-  re-launch or a different flavor/provider; OOM or timeout → bigger flavor or
-  longer `--timeout`; dep/import/env error → fix the code on that node's branch
-  (`orx-git`). An OOM or timeout is an implementation detail, not an answer —
-  unless the node's hypothesis *is* about memory or runtime, in which case that
-  outcome is its result (`orx-experiment-tree`).
+- **A failed run is not a new node.** Re-launch the same `<expId>` — a failure
+  answered nothing, so the node is still repairable in place
+  (`orx-experiment-tree`).
 
 ## Sizing compute
 
@@ -342,6 +338,6 @@ orx exp wait <expId> --interval 10 --timeout 3600   # tune polling
   papers run fine (and far cheaper) on a CPU flavor.
 - **Pick the smallest flavor that fits** the model and a minimal batch; don't
   reflexively grab the biggest.
-- **Let a real failure escalate you.** An OOM or hopeless slowness that left
-  **no answer** → move up a tier. That's expected, not a mistake.
+- **Let a real failure escalate you.** OOM or hopelessly-slow → move up a
+  tier. That's expected, not a mistake.
 - Raise `--timeout` (`--timeout 1d`) only for genuinely long runs.

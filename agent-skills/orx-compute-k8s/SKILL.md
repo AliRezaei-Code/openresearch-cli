@@ -68,8 +68,3 @@ The contract orx enforces at submit (loud, before anything runs):
 - Everything downstream is identical (`orx exp wait` / `orx runs` /
   `orx logs`, cancel via `orx exp cancel`). A detached `orx supervise`
   watches the Job via kubectl; don't kill it.
-- **A rejected submit or a failed Job is not a result.** Manifest errors,
-  unschedulable pods, image-pull failures, OOMKilled — implementation and
-  hardware details, not answers. Fix `.orx/k8s.yaml` on the **same** branch and
-  re-run the same `<expId>`; the hardware shape stays fixed for the round
-  (cardinal rule 2).

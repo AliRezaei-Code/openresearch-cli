@@ -44,8 +44,8 @@ better control than something typed from memory. Reproductions should start from
 the authors' (or a strong community) implementation, not a blank file.
 
 This is cardinal rule 1 working as written: the baseline is **provisional**
-until a run produces reference numbers, so seeding it and making it run are
-part of building the control.
+until a run establishes the control, so seeding it and making it run are part
+of building it.
 
 **Find the code to seed from, in priority order:**
 
@@ -107,17 +107,14 @@ Adds a node to the experiment tree. `--title` is always required. The node shape
 is chosen by flags:
 
 ```sh
-# Child node. Name the measurement so a later reader knows what to compare:
-orx create-experiment <projectId> --title "Larger batch size" --parent <experimentId> \
-  --description "Raise per-device batch 16->32 in config.yaml. Measures: final eval accuracy."
+# Child node, branched off an existing experiment:
+orx create-experiment <projectId> --title "Larger batch size" --parent <experimentId>
 
 # Baseline (root) node on the project's bound repo:
-orx create-experiment <projectId> --title "Baseline" \
-  --description "Unmodified upstream code. Measures: final eval accuracy."
+orx create-experiment <projectId> --title "Baseline"
 
 # Additional baseline (another root) when the project already has one:
-orx create-experiment <projectId> --title "Baseline v2" --baseline \
-  --description "<what this control establishes>. Measures: <metric>."
+orx create-experiment <projectId> --title "Baseline v2" --baseline
 ```
 
 - `--parent` selects the shape: with `--parent` ⇒ child; without it, on an

@@ -95,9 +95,7 @@ intended flow — do **not** edit a frozen node or rewrite the run command:
    different rounds into one batch — that's what produces the flat fan.
 3. **Create the round as a bush, and pick its parent deliberately.** All of this
    round's options are **siblings under one parent** — the title is the idea, the
-   description is the concrete change you'll make on that node's branch **and
-   the measurement it owes** — so a later reader knows what to compare it
-   against. The parent is:
+   description is the concrete change you'll make on that node's branch. The parent is:
    - the **baseline**, only for the very first round (nothing has been won yet); or
    - the **previous round's confirmed winner**, for every round after — so this
      round's changes build *on top of* the last gain instead of resetting to the
@@ -106,13 +104,13 @@ intended flow — do **not** edit a frozen node or rewrite the run command:
    ```sh
    # Round 1 — one decision (the LR), its options fanned off the baseline:
    orx create-experiment <projectId> --parent <baseId> --title "LR 2e-5" \
-     --description "Set the LR in config.yaml to 2e-5; change nothing else. Measures: final eval accuracy."
+     --description "Set the LR in config.yaml to 2e-5; change nothing else."
    orx create-experiment <projectId> --parent <baseId> --title "LR 3e-5" \
-     --description "Set the LR in config.yaml to 3e-5; change nothing else. Measures: final eval accuracy."
+     --description "Set the LR in config.yaml to 3e-5; change nothing else."
 
    # Round 2 — LR 3e-5 won → the next decision (architecture) descends onto it:
    orx create-experiment <projectId> --parent <lr3e5WinnerId> --title "Wider MLP" \
-     --description "On top of the LR-3e-5 winner, widen the MLP hidden dim 1024→2048 in model.py. Measures: final eval accuracy."
+     --description "On top of the LR-3e-5 winner, widen the MLP hidden dim 1024→2048 in model.py."
    ```
    The child inherits its parent's run command automatically — you don't set it,
    and you never give siblings different commands or env vars (cardinal rule 2).
@@ -209,8 +207,5 @@ cat notes.md | orx exp desc <expId> --stdin   # overwrite from stdin (long markd
 - **Write** with exactly one of `--set` (inline) or `--stdin` (whole of stdin).
   Passing both is an error. Writing **replaces** the entire description — to
   append, read first, edit, and write back.
-- **Name the measurement here.** Write "Measures: <metric>" when you create
-  the node, and record the judgement here when the run lands — what it
-  measured, and whether it froze.
 - `<expId>` comes from `orx create-experiment` output or `orx project view
   <projectId>` (the experiment id, not a run or project id).

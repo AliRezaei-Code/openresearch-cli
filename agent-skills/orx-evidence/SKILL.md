@@ -38,13 +38,6 @@ orx search-logs <projectId> "loss=nan" --experiment <id> --max 5000
   remain the right tool for debugging — tracebacks, OOMs, setup failures — and a
   fine metrics fallback when W&B isn't linked or doesn't have the key you need.
 
-## Is the node frozen?
-
-Judging a run is also judging its node: a run that computed a **metric**
-freezes it (whatever ended the run); only an error, or nothing judgeable,
-leaves it provisional and repairable. Full test: `orx-experiment-tree`, "A node
-is an evidence contract".
-
 ## Run artifacts — `orx artifacts` / `orx artifact`
 
 Beyond the terminal log, a run uploads **text artifacts** (eval outputs, reports,

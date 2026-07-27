@@ -24,13 +24,6 @@ orx logs <runId> --range 4096:8192  # exact byte window [start, end)
   status line goes to **stderr**, noting if content was truncated above/below.
 - `<runId>` comes from `orx runs <projectId>` (the run id, not the experiment id).
 
-## Is the node frozen?
-
-Judging a run is also judging its node: a run that computed a **metric**
-freezes it (whatever ended the run); only an error, or nothing judgeable,
-leaves it provisional and repairable. Full test: `orx-experiment-tree`, "A node
-is an evidence contract".
-
 ## Make the run print its own evidence
 
 Run logs are the only evidence channel in local mode. Make the run command
@@ -41,8 +34,7 @@ summary, key config — and read it back with `orx logs <runId>` (use `--head` /
 - Print final metrics and a compact summary block at the end of the run, not just
   scattered mid-training lines — that's what you'll tail to compare siblings.
 - Echo the key config the run actually used (LR, batch size, seed) so a log alone
-  tells you which variant it was — but a config echo is **not** evidence, so it
-  must never be the run's only output (see the freeze test).
+  tells you which variant it was.
 - For a long run, a periodic one-line-per-step metric print keeps the trajectory
   visible via `orx logs --range`; a run that only prints a final number hides
   whether it was converging or diverging.

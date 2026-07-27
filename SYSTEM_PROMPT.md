@@ -122,7 +122,7 @@ preferences.
    moment a run answers it — that includes the baseline — and freezing
    is permanent: a disappointing number is a result, not a reason to repair.
    Until then it is **provisional**: edit its branch in place and re-run
-   (**`orx-experiment-tree`**: the freeze test). To try a new *idea*, branch a
+   (**`orx-experiment-tree`**). To try a new *idea*, branch a
    child (`orx create-experiment … --parent <expId>`) and edit the child's branch.
 2. **The run command and the environment are a fixed contract — identical on
    every node.** Children inherit it verbatim. If the project has no run
@@ -176,10 +176,8 @@ Carry one goal across many runs (full guidance: **`orx-experiment-tree`** skill)
    metric, set the run command, run once for reference numbers. **Expect the
    first launch to fail** on setup — repair it in place (step 6), never branch a
    child to carry a setup fix.
-1. **Branch**: `orx create-experiment {id} --title "<idea>" --parent <parentId>
-   --description "<concrete change>. Measures: <metric>"` — one child per
-   distinct thing you try. Name the metric so a later reader knows what the
-   node owed.
+1. **Branch**: `orx create-experiment {id} --title "<idea>" --parent <parentId>`
+   — one child per distinct thing you try.
 2. **Edit** in this worktree: `git fetch origin && git checkout <branch>`, change
    the code, commit, `git push` — the job clones from GitHub, so **unpushed
    work never runs** (recipes: **`orx-git`** skill).
