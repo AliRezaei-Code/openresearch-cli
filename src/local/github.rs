@@ -76,11 +76,11 @@ pub async fn repo_meta(owner: &str, repo: &str) -> Option<RepoMeta> {
     ))
     .await?;
     match res.status() {
-        // Not visible with this token: definitely can't push.
-        reqwest::StatusCode::NOT_FOUND => Some(RepoMeta {
-            can_push: false,
-            default_branch: None,
-        }),
+        // Invisible to *this token* — which is also what a private repo looks
+        // like to an SSH-only user who can push to it perfectly well. Report
+        // unknown rather than "can't push": a wrong `false` silently snapshots
+        // their repo into a new one and drops its history.
+        reqwest::StatusCode::NOT_FOUND => None,
         s if s.is_success() => {
             let body: Value = res.json().await.ok()?;
             Some(RepoMeta {

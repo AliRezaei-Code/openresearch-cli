@@ -458,10 +458,18 @@ async fn create_project(
             Some(b) => Some(b),
             None => {
                 let (o, r) = (owner.clone(), repo.clone());
-                tokio::task::spawn_blocking(move || local::git::remote_default_branch(&o, &r))
-                    .await
-                    .ok()
-                    .flatten()
+                // Bounded like authed_get: ls-remote tries ssh then https, and
+                // a black-holed host blocks on TCP connect for ~75s each. A
+                // stall degrades to create_project's "main" instead of hanging
+                // the create request.
+                tokio::time::timeout(
+                    Duration::from_secs(15),
+                    tokio::task::spawn_blocking(move || local::git::remote_default_branch(&o, &r)),
+                )
+                .await
+                .ok()
+                .and_then(|joined| joined.ok())
+                .flatten()
             }
         };
         // Unknown access (no token / API hiccup) counts as access: forking

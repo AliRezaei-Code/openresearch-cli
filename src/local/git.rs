@@ -95,9 +95,6 @@ fn assert_branch_exists(dir: &Path, owner: &str, repo: &str, branch: &str) -> Re
     Ok(())
 }
 
-/// Clone `owner/repo` into the cache (ssh first, then https) or, when the
-/// clone already exists, fetch. Validates that `baseline_branch` exists on
-/// the remote. Returns the clone path.
 /// The remote's default branch, over git's own credentials (ssh, then https).
 /// The GitHub API can't answer this without a token, but a project created by
 /// an SSH-only user still needs a baseline that exists — otherwise the clone
@@ -121,6 +118,9 @@ pub fn remote_default_branch(owner: &str, repo: &str) -> Option<String> {
     None
 }
 
+/// Clone `owner/repo` into the cache (ssh first, then https) or, when the
+/// clone already exists, fetch. Validates that `baseline_branch` exists on
+/// the remote. Returns the clone path.
 pub fn ensure_clone(owner: &str, repo: &str, baseline_branch: &str) -> Result<PathBuf> {
     let dir = clone_path(owner, repo);
     if dir.join(".git").is_dir() {

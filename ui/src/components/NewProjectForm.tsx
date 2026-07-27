@@ -103,8 +103,10 @@ export function NewProjectForm({
   const onRepoChange = (value: string) => {
     setRepoInput(value);
     // A forced copy belonged to the old repo — start the new one back at the
-    // default so an unpushable repo can't leave "Private copy" stuck on.
-    setRepoMode("use");
+    // default so an unpushable repo can't leave "Private copy" stuck on. Not
+    // in paper mode: selectPaper deliberately defaults to a copy, and editing
+    // the auto-filled repo shouldn't quietly retarget pushes upstream.
+    if (!paper) setRepoMode("use");
     // Name follows the repo until the user edits it themselves.
     if (!nameTouched) setName(parseRepo(value)?.repo ?? "");
   };

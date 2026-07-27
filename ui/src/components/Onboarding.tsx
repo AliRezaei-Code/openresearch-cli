@@ -90,18 +90,20 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
               autoresearch run on your own logins, no extra API keys.
             </p>
             <div className="onb-cards">
-              {harnesses === null ? (
+              {harnesses !== null ? (
+                harnesses.map((h) => <AgentCard key={h.id} h={h} />)
+              ) : harnessError ? (
+                // Never a spinner next to an error — detection isn't running.
+                <div className="onb-card-meta">{RETRY_COPY}</div>
+              ) : (
                 <div className="onb-loading">
                   <span className="spinner" /> Detecting Claude Code, Codex, OpenCode…
                 </div>
-              ) : (
-                harnesses.map((h) => <AgentCard key={h.id} h={h} />)
               )}
             </div>
-            {(harnessError || harnesses !== null) && !anyAgentReady && (
+            {harnesses !== null && !anyAgentReady && (
               <p className="onb-gate-hint">Sign in to at least one agent to continue.</p>
             )}
-            {harnessError && <p className="onb-aside-text">{RETRY_COPY}</p>}
             <div className="onb-actions">
               <button className="btn ghost" onClick={() => load(true)} disabled={checking}>
                 <RefreshCw size={12} className={checking ? "spin" : ""} /> Re-check
@@ -129,12 +131,15 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
               orx clones your GitHub repos and pushes each experiment as a branch.
             </p>
             <div className="onb-cards">
-              <GitCard git={git} onUpdate={setGit} />
+              {gitError ? (
+                <div className="onb-card-meta">{RETRY_COPY}</div>
+              ) : (
+                <GitCard git={git} onUpdate={setGit} />
+              )}
             </div>
-            {(gitError || git !== null) && !githubConnected && (
+            {git !== null && !githubConnected && (
               <p className="onb-gate-hint">Connect GitHub to continue.</p>
             )}
-            {gitError && <p className="onb-aside-text">{RETRY_COPY}</p>}
             <div className="onb-actions">
               <button className="btn ghost" onClick={() => setStep(0)}>
                 <ArrowLeft size={12} /> Back
