@@ -697,12 +697,7 @@ function renderParts(
     if (part.type === "tool" && (part.tool === "subagent" || (part.children?.length ?? 0) > 0)) {
       flushTools();
       rendered.push(
-        <SubagentBlock
-          key={part.id}
-          part={part}
-          onOpenFile={onOpenFile}
-          onOpenSubagent={onOpenSubagent}
-        />,
+        <SubagentBlock key={part.id} part={part} onOpenSubagent={onOpenSubagent} />,
       );
       continue;
     }
@@ -775,59 +770,31 @@ export function SubagentTranscript({
   );
 }
 
-/** A Codex sub-agent spawn row + its streaming nested transcript. Reads like a
- * spawn header ("Spawned agent — …") with a status dot; expands to reveal the
- * sub-agent's own parts (rendered by the same `renderParts`, so nested
- * sub-agents recurse). Auto-expands while the sub-agent is running. */
+/** A Codex/Claude/OpenCode sub-agent spawn row. A single clickable line — a
+ * status dot + label — that opens the sub-agent's full transcript in the
+ * right-side panel (like the Claude/Codex desktop apps). The transcript is
+ * never expanded inline; the row stays a one-liner whether the sub-agent is
+ * running (pulsing dot) or done. */
 function SubagentBlock({
   part,
-  onOpenFile,
   onOpenSubagent,
 }: {
   part: ChatPart;
-  onOpenFile?: (path: string) => void;
   onOpenSubagent?: (spawnPartId: string) => void;
 }) {
-  const running = part.state?.status === "running";
   const errored = part.state?.status === "error";
-  const children = part.children ?? [];
-  // Default open when the sub-agent is still working (you want to watch it), but
-  // the toggle is authoritative from then on — a sub-agent runs for a long time,
-  // so `open || running` would make the row impossible to collapse.
-  const [expanded, setExpanded] = useState(running);
-  // Reuse the tool-group shell (identical styling) + a `subagent` modifier that
-  // only swaps in the sub-agent icon color.
   return (
-    <div className={`tool-group ${errored ? "has-error" : ""}`}>
-      <button className="tool-group-summary" onClick={() => setExpanded((v) => !v)}>
-        <Users size={12} className="subagent-icon" />
-        <span className={toolStatusClass(part.state?.status)} />
-        <span className="tool-line">{toolLine(part)}</span>
-        {onOpenSubagent && children.length > 0 && (
-          <button
-            className="tool-open"
-            title="Open sub-agent transcript"
-            onClick={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              onOpenSubagent(part.id);
-            }}
-          >
-            view
-          </button>
-        )}
-        <ChevronRight size={12} className={`tool-chevron ${expanded ? "open" : ""}`} />
-      </button>
-      {expanded && (
-        <div className="tool-group-rows">
-          {children.length === 0 ? (
-            <div className="subagent-empty">{running ? "Working…" : "No activity"}</div>
-          ) : (
-            renderParts(children, { onOpenFile, onOpenSubagent })
-          )}
-        </div>
-      )}
-    </div>
+    <button
+      className={`subagent-row ${errored ? "has-error" : ""}`}
+      title="Open sub-agent transcript"
+      onClick={() => onOpenSubagent?.(part.id)}
+      disabled={!onOpenSubagent}
+    >
+      <Users size={12} className="subagent-icon" />
+      <span className={toolStatusClass(part.state?.status)} />
+      <span className="tool-line">{toolLine(part)}</span>
+      <ChevronRight size={12} className="subagent-row-chevron" />
+    </button>
   );
 }
 

@@ -1146,8 +1146,35 @@ textarea::placeholder {
   padding-left: 10px;
   border-left: 1px solid var(--border-variant);
 }
-/* A Codex sub-agent spawn row reuses the .tool-group shell; it only needs the
-   sub-agent icon color and an empty-state line. */
+/* A sub-agent spawn row: one clickable line that opens the transcript in the
+   right panel (never expands inline). Styled like a tool-group summary. */
+.subagent-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin: 2px 0;
+  padding: 3px 2px;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: var(--fs-md);
+  text-align: left;
+  border-radius: var(--radius-sm);
+}
+.subagent-row:hover:not(:disabled) {
+  color: var(--subtext);
+  background: var(--surface);
+}
+.subagent-row:disabled {
+  cursor: default;
+}
+.subagent-row.has-error {
+  color: var(--accent-red);
+}
+.subagent-row-chevron {
+  flex-shrink: 0;
+  color: var(--muted);
+}
 .subagent-icon {
   flex-shrink: 0;
   color: var(--muted);

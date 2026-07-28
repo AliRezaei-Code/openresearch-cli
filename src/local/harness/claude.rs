@@ -856,7 +856,13 @@ fn subagent_parent(event: &Value) -> Option<&str> {
 /// bridge special-casing, which only applies to the main session. `start` is the
 /// index of the first not-yet-seen block (the thinking-model dedup offset), so a
 /// re-sent `assistant` event doesn't duplicate the sub-agent's earlier blocks.
-fn apply_subagent_blocks(ctx: &mut TurnCtx, parent: &str, mid: &str, start: usize, blocks: &[Value]) {
+fn apply_subagent_blocks(
+    ctx: &mut TurnCtx,
+    parent: &str,
+    mid: &str,
+    start: usize,
+    blocks: &[Value],
+) {
     for (i, block) in blocks.iter().enumerate().skip(start) {
         let ns = |id: &str| format!("{parent}:{id}");
         match block.get("type").and_then(Value::as_str) {
