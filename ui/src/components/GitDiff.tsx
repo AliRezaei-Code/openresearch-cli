@@ -48,7 +48,7 @@ function getHighlightPath(file: FileData): string | null {
   return file.newPath;
 }
 
-export function formatDiffFilePath(file: FileData): string {
+function formatDiffFilePath(file: FileData): string {
   switch (file.type) {
     case "delete":
       return file.oldPath;

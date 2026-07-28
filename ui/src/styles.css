@@ -1713,7 +1713,7 @@ textarea::placeholder {
 }
 .exp-hover-card .hc-title {
   margin-top: 3px;
-  color: var(--muted);
+  color: var(--text);
 }
 .exp-hover-card .hc-body {
   margin-top: 10px;
@@ -1726,6 +1726,28 @@ textarea::placeholder {
   -webkit-line-clamp: 10;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+/* Expanded via the Show more toggle: unclamp, but keep the card viewport-
+ * sized — long results scroll inside the body instead of growing the card
+ * past the screen. */
+.exp-hover-card .hc-body.expanded {
+  display: block;
+  -webkit-line-clamp: unset;
+  max-height: 45vh;
+  overflow-y: auto;
+}
+.exp-hover-card .hc-toggle {
+  margin-top: 4px;
+  padding: 0;
+  border: none;
+  background: none;
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--muted);
+  cursor: pointer;
+}
+.exp-hover-card .hc-toggle:hover {
+  color: var(--text);
 }
 .exp-hover-card .hc-failure {
   margin-top: 8px;
@@ -1742,14 +1764,14 @@ textarea::placeholder {
   gap: 12px;
   flex-wrap: wrap;
   font-size: var(--fs-xs);
-  color: var(--muted);
+  color: var(--text);
 }
 .exp-hover-card .hc-git {
   margin-top: 10px;
   padding-top: 8px;
   border-top: 1px solid var(--border-variant);
   font-size: var(--fs-xs);
-  color: var(--muted);
+  color: var(--text);
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -1770,16 +1792,6 @@ textarea::placeholder {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-.exp-hover-card .hc-files {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-/* Kept outside the ellipsised file list so it never gets clipped away. */
-.exp-hover-card .hc-more {
-  flex-shrink: 0;
 }
 .exp-hover-card .hc-foot {
   margin-top: 8px;

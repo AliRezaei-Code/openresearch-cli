@@ -19,13 +19,12 @@ import {
   type Run,
 } from "../api";
 import { BackendBadge } from "./BackendLogos";
-import { countChanges, formatDiffFilePath } from "./GitDiff";
+import { countChanges } from "./GitDiff";
 import { StatusBadge } from "./StatusBadge";
 import { useMeasure, usePopoverPosition } from "./tourGeometry";
 
 const CARD_W = 380;
 const GAP = 12; // node ↔ card
-const MAX_FILES_SHOWN = 3;
 
 // Hover-intent timings: long enough that sweeping the cursor across the tree
 // opens nothing, short enough to feel deliberate. The close grace lets the
@@ -97,7 +96,7 @@ export function useHoverIntent(ref: RefObject<HTMLElement | null>, refreshKey: u
 }
 
 interface DiffStat {
-  files: string[];
+  fileCount: number;
   additions: number;
   deletions: number;
   truncated: boolean;
@@ -188,7 +187,7 @@ export function ExpHoverCard({
         }
         if (!cancelled) {
           setDiffStat({
-            files: files.map(formatDiffFilePath),
+            fileCount: files.length,
             additions,
             deletions,
             truncated: p.truncated,
@@ -219,7 +218,16 @@ export function ExpHoverCard({
   const failureNote =
     latestRun?.status === "failed" && latestRun.resultMarkdown ? latestRun.resultMarkdown : null;
   const body = exp.description || (failureNote ? null : latestRun?.resultMarkdown) || null;
-  const moreFiles = diffStat ? diffStat.files.length - MAX_FILES_SHOWN : 0;
+
+  // Clamped by default; "Show more" appears only when the clamp actually
+  // hides content, and expands in place (the card is already interactive).
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const [expanded, setExpanded] = useState(false);
+  const [clamped, setClamped] = useState(false);
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (el) setClamped(el.scrollHeight > el.clientHeight + 1);
+  }, [body, expanded]);
 
   return createPortal(
     <div
@@ -240,7 +248,16 @@ export function ExpHoverCard({
         <StatusBadge status={latestRun?.status ?? "idle"} />
       </div>
       {exp.title && <div className="hc-title">{exp.title}</div>}
-      {body && <div className="hc-body">{body}</div>}
+      {body && (
+        <div className={`hc-body${expanded ? " expanded" : ""}`} ref={bodyRef}>
+          {body}
+        </div>
+      )}
+      {body && (clamped || expanded) && (
+        <button className="hc-toggle" onClick={() => setExpanded((v) => !v)}>
+          {expanded ? "Show less" : "Show more"}
+        </button>
+      )}
       {failureNote && <div className="hc-failure">{failureNote}</div>}
       <div className="hc-stats">
         <span>
@@ -266,7 +283,7 @@ export function ExpHoverCard({
             </span>
           )}
         </div>
-        {diffStat && diffStat.files.length > 0 && (
+        {diffStat && diffStat.fileCount > 0 && (
           <div
             className="hc-git-row"
             title={`Committed changes vs ${parentSlug ?? "parent"}${diffStat.truncated ? " (diff truncated — counts are lower bounds)" : ""}`}
@@ -276,14 +293,10 @@ export function ExpHoverCard({
               <span className="diff-stat-add">+{diffStat.additions}</span>{" "}
               <span className="diff-stat-del">−{diffStat.deletions}</span>
               {" · "}
-              {diffStat.files.length === 1 && !diffStat.truncated
+              {diffStat.fileCount === 1 && !diffStat.truncated
                 ? "1 file"
-                : `${diffStat.files.length}${diffStat.truncated ? "+" : ""} files`}
+                : `${diffStat.fileCount}${diffStat.truncated ? "+" : ""} files`}
             </span>
-            <span className="hc-files hc-mono">
-              {diffStat.files.slice(0, MAX_FILES_SHOWN).join(" · ")}
-            </span>
-            {moreFiles > 0 && <span className="hc-more">+{moreFiles} more</span>}
           </div>
         )}
       </div>
