@@ -1149,9 +1149,10 @@ textarea::placeholder {
 /* A sub-agent spawn row: one clickable line that opens the transcript in the
    right panel (never expands inline). Sized like the transcript body text. */
 .subagent-row {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 8px;
+  width: 100%;
   margin: 2px 0;
   padding: 3px 4px;
   cursor: pointer;
@@ -1169,8 +1170,10 @@ textarea::placeholder {
 .subagent-row.has-error {
   color: var(--accent-red);
 }
+/* Match the body text size/color; keep flex:1 + min-width:0 (from base
+   .tool-line) so a long label truncates with an ellipsis and the chevron pins
+   right. */
 .subagent-row .tool-line {
-  flex: initial;
   font-size: var(--fs-base);
   color: var(--text);
 }

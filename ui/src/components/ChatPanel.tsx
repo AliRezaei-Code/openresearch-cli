@@ -741,8 +741,9 @@ export function findPartById(parts: ChatPart[], id: string): ChatPart | null {
   return null;
 }
 
-/** The sub-agent's transcript, rendered standalone in the right-pane tab. Reuses
- * `renderParts`, so it streams and nests exactly like the inline block. */
+/** The sub-agent's transcript, rendered standalone in the right-pane tab (the
+ * only place the transcript is shown — the inline row just opens this). Reuses
+ * `renderParts`, so nested sub-agents are themselves click-to-open rows. */
 export function SubagentTranscript({
   spawn,
   onOpenFile,
