@@ -1736,6 +1736,144 @@ textarea::placeholder {
   border: 1.5px solid var(--border);
 }
 
+/* Hover detail card for tree nodes. Portaled to <body> at a fixed viewport
+ * position (outside the canvas transform), so it neither scales with zoom nor
+ * disturbs the tree layout. */
+.exp-hover-card {
+  position: fixed;
+  /* Must clear the maximized right pane (.right-pane.max, z 60) that
+   * hosts the tree; the portal's end-of-body DOM order breaks the tie in the
+   * card's favor. Still below the modal tier (100). */
+  z-index: 60;
+  background: var(--base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+  padding: 14px 16px;
+  font-size: var(--fs-sm);
+  color: var(--text);
+}
+/* Scoped mono: font family only, so the row's own size scale wins (the global
+ * .mono class pins font-size and would break the 10px foot row). */
+.exp-hover-card .hc-mono {
+  font-family: var(--mono);
+}
+.exp-hover-card .hc-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.exp-hover-card .hc-slug {
+  font-family: var(--mono);
+  font-size: var(--fs-md);
+  font-weight: var(--fw-semibold);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.exp-hover-card .hc-title {
+  margin-top: 3px;
+  color: var(--text);
+}
+/* Plain text between hairline rules — no fill, matching the app's quiet
+ * hairline idiom (a recessed box read as a heavy slab on long results). */
+.exp-hover-card .hc-body {
+  margin-top: 10px;
+  border-top: 1px solid var(--border-variant);
+  padding-top: 10px;
+  line-height: 1.6;
+  white-space: pre-line;
+  display: -webkit-box;
+  -webkit-line-clamp: 10;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+/* Expanded via the Show more toggle: unclamp, but keep the card viewport-
+ * sized — long results scroll inside the body instead of growing the card
+ * past the screen. */
+.exp-hover-card .hc-body.expanded {
+  display: block;
+  -webkit-line-clamp: unset;
+  max-height: 45vh;
+  overflow-y: auto;
+  /* Breathing room so mid-scroll text doesn't sit flush on the next rule. */
+  padding-bottom: 4px;
+}
+.exp-hover-card .hc-toggle {
+  margin-top: 4px;
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--muted);
+}
+/* Quiet muted→text affordance (no underline/accent — deliberate: the card
+ * is all hairlines and an accent link would be its loudest element). */
+.exp-hover-card .hc-toggle:hover {
+  color: var(--text);
+}
+.exp-hover-card .hc-failure {
+  margin-top: 8px;
+  color: var(--accent-red);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.exp-hover-card .hc-stats {
+  margin-top: 10px;
+  border-top: 1px solid var(--border-variant);
+  padding-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: var(--fs-xs);
+  color: var(--text);
+}
+.exp-hover-card .hc-git {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-variant);
+  font-size: var(--fs-xs);
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.exp-hover-card .hc-git-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.exp-hover-card .hc-branch {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--mono);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.exp-hover-card .hc-foot {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+}
+.exp-hover-card .hc-foot .hc-mono {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .react-flow__handle {
   opacity: 0;
   pointer-events: none;
