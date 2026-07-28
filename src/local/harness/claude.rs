@@ -914,8 +914,10 @@ fn subagent_parent(event: &Value) -> Option<&str> {
 /// part's `children` (ids namespaced by `parent` so concurrent sub-agents can't
 /// collide). Mirrors the main-loop block handling minus the interactive-prompt /
 /// bridge special-casing, which only applies to the main session. `start` is the
-/// index of the first not-yet-seen block (the thinking-model dedup offset), so a
-/// re-sent `assistant` event doesn't duplicate the sub-agent's earlier blocks.
+/// message-cumulative index of this event's first block: the CLI emits one
+/// `assistant` event per content block (see the main-loop arm), so each event
+/// continues the message where the last left off — the offset shifts the ids,
+/// it does NOT skip elements of this event's (usually single-element) array.
 fn apply_subagent_blocks(
     ctx: &mut TurnCtx,
     parent: &str,
@@ -923,16 +925,23 @@ fn apply_subagent_blocks(
     start: usize,
     blocks: &[Value],
 ) {
-    for (i, block) in blocks.iter().enumerate().skip(start) {
+    for (n, block) in blocks.iter().enumerate() {
+        let i = start + n;
         let ns = |id: &str| format!("{parent}:{id}");
         match block.get("type").and_then(Value::as_str) {
             Some("text") => {
                 let text = block.get("text").and_then(Value::as_str).unwrap_or("");
-                ctx.upsert_child(parent, WirePart::text(ns(&format!("{mid}-{i}")), text));
+                if !text.is_empty() {
+                    ctx.upsert_child(parent, WirePart::text(ns(&format!("{mid}-{i}")), text));
+                }
             }
             Some("thinking") => {
+                // An empty text/thinking block (encrypted reasoning) must not
+                // mint an invisible child part, nor blank one the deltas built.
                 let text = block.get("thinking").and_then(Value::as_str).unwrap_or("");
-                ctx.upsert_child(parent, WirePart::reasoning(ns(&format!("{mid}-{i}")), text));
+                if !text.is_empty() {
+                    ctx.upsert_child(parent, WirePart::reasoning(ns(&format!("{mid}-{i}")), text));
+                }
             }
             Some("tool_use") => {
                 let raw_id = block
@@ -1024,6 +1033,16 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                     let Some(text) = delta.get(field).and_then(Value::as_str) else {
                         return false;
                     };
+                    // An empty delta has nothing to append and must not mint a
+                    // part: an empty part renders nothing but still breaks
+                    // tool-run grouping in the UI. Encrypted-reasoning models
+                    // (e.g. Fable) stream exactly this — every `thinking_delta`
+                    // is empty, the payload rides in `signature_delta`. (The UI
+                    // also skips invisible parts, for transcripts stored before
+                    // this guard existed; both layers are required.)
+                    if text.is_empty() {
+                        return false;
+                    }
                     match parent {
                         Some(p) => {
                             // Namespace the child id by parent so two sub-agents'
@@ -1108,11 +1127,20 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                         if !text.trim().is_empty() {
                             state.last_text = text.to_string();
                         }
-                        ctx.upsert_part(WirePart::text(format!("{mid}-{i}"), text));
+                        // Empty-block guard, same as the thinking arm below.
+                        if !text.is_empty() {
+                            ctx.upsert_part(WirePart::text(format!("{mid}-{i}"), text));
+                        }
                     }
                     Some("thinking") => {
+                        // An empty block (encrypted reasoning sends
+                        // `thinking: ""` — the content is in `signature`) must
+                        // not mint an invisible part that splits tool-run
+                        // grouping, nor wipe text the deltas already built.
                         let text = block.get("thinking").and_then(Value::as_str).unwrap_or("");
-                        ctx.upsert_part(WirePart::reasoning(format!("{mid}-{i}"), text));
+                        if !text.is_empty() {
+                            ctx.upsert_part(WirePart::reasoning(format!("{mid}-{i}"), text));
+                        }
                     }
                     Some("tool_use") => {
                         let id = block
@@ -1828,6 +1856,56 @@ mod tests {
         assert_eq!(parts[1].text.as_deref(), Some("Rivers flow."));
         // The final assistant event still feeds last_text (plan synthesis).
         assert_eq!(state.last_text, "Rivers flow.");
+    }
+
+    #[test]
+    fn encrypted_thinking_mints_no_empty_reasoning_parts() {
+        // Encrypted-reasoning models (Fable) stream `thinking_delta` with an
+        // empty string — the payload rides in `signature_delta` — and the
+        // per-block assistant event carries `thinking: ""` too (captured live
+        // from the claude CLI). Neither may mint a part: an empty reasoning
+        // part renders nothing but still splits tool-run grouping in the UI.
+        let transcript = [
+            r#"{"type":"system","subtype":"init","session_id":"sf1"}"#,
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"mF"}},"parent_tool_use_id":null}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}},"parent_tool_use_id":null}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"CAIS…"}},"parent_tool_use_id":null}"#,
+            r#"{"type":"assistant","message":{"id":"mF","content":[{"type":"thinking","thinking":"","signature":"CAIS…"}]}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Done."}},"parent_tool_use_id":null}"#,
+            r#"{"type":"assistant","message":{"id":"mF","content":[{"type":"text","text":"Done."}]}}"#,
+            r#"{"type":"result","subtype":"success","session_id":"sf1","is_error":false}"#,
+        ];
+        let mut ctx = TurnCtx::test_stub();
+        fold(&mut ctx, false, &transcript);
+        let parts = &ctx.assistant.parts;
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        // The skipped block still occupies index 0 — the text lands at -1.
+        assert_eq!(parts[0].id, "mF-1");
+        assert_eq!(parts[0].kind, "text");
+        assert_eq!(parts[0].text.as_deref(), Some("Done."));
+    }
+
+    #[test]
+    fn subagent_empty_thinking_mints_no_child_parts() {
+        // The same encrypted-thinking skip on the sub-agent routing path: an
+        // empty thinking block from a Task sub-agent must not hang an empty
+        // child under the spawn part, and the block offset still advances so
+        // the following text block keys to the namespaced -1 id.
+        let transcript = [
+            r#"{"type":"system","subtype":"init","session_id":"sf2"}"#,
+            r#"{"type":"assistant","message":{"id":"mG","content":[{"type":"tool_use","id":"toolu_1","name":"Task","input":{"description":"explore"}}]}}"#,
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"id":"sub","content":[{"type":"thinking","thinking":"","signature":"CAIS…"}]}}"#,
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"id":"sub","content":[{"type":"text","text":"found it"}]}}"#,
+            r#"{"type":"result","subtype":"success","session_id":"sf2","is_error":false}"#,
+        ];
+        let mut ctx = TurnCtx::test_stub();
+        fold(&mut ctx, false, &transcript);
+        let task = &ctx.assistant.parts[0];
+        assert_eq!(task.id, "toolu_1");
+        assert_eq!(task.children.len(), 1, "{:?}", task.children);
+        assert_eq!(task.children[0].id, "toolu_1:sub-1");
+        assert_eq!(task.children[0].kind, "text");
+        assert_eq!(task.children[0].text.as_deref(), Some("found it"));
     }
 
     #[test]
