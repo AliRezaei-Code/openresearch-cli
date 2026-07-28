@@ -1147,22 +1147,20 @@ textarea::placeholder {
   border-left: 1px solid var(--border-variant);
 }
 /* A sub-agent spawn row: one clickable line that opens the transcript in the
-   right panel (never expands inline). Styled like a tool-group summary. */
+   right panel (never expands inline). Sized like the transcript body text. */
 .subagent-row {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   gap: 8px;
-  width: 100%;
   margin: 2px 0;
-  padding: 3px 2px;
+  padding: 3px 4px;
   cursor: pointer;
-  color: var(--muted);
-  font-size: var(--fs-md);
+  color: var(--text);
+  font-size: var(--fs-base);
   text-align: left;
   border-radius: var(--radius-sm);
 }
 .subagent-row:hover:not(:disabled) {
-  color: var(--subtext);
   background: var(--surface);
 }
 .subagent-row:disabled {
@@ -1170,6 +1168,11 @@ textarea::placeholder {
 }
 .subagent-row.has-error {
   color: var(--accent-red);
+}
+.subagent-row .tool-line {
+  flex: initial;
+  font-size: var(--fs-base);
+  color: var(--text);
 }
 .subagent-row-chevron {
   flex-shrink: 0;
