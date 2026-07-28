@@ -780,6 +780,24 @@ textarea::placeholder {
 .plan-tab-content .md {
   max-width: var(--readable-col);
 }
+.subagent-tab-content {
+  overflow-y: auto;
+  background: var(--base);
+  padding: 12px 16px;
+}
+.subagent-tab-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 8px;
+  margin-bottom: 8px;
+  border-bottom: 1px solid var(--border-variant);
+}
+.subagent-live {
+  flex-shrink: 0;
+  font-size: var(--fs-xs);
+  color: var(--accent-amber);
+}
 
 /* Segmented control: a clearly-darker track (the theme's creams all blend
    into each other) with a raised white pill on the active segment. */
@@ -1134,6 +1152,50 @@ textarea::placeholder {
   margin: 2px 0 4px 7px;
   padding-left: 10px;
   border-left: 1px solid var(--border-variant);
+}
+/* A sub-agent spawn row: one clickable line that opens the transcript in the
+   right panel (never expands inline). Sized like the transcript body text. */
+.subagent-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin: 2px 0;
+  padding: 3px 4px;
+  cursor: pointer;
+  color: var(--text);
+  font-size: var(--fs-base);
+  text-align: left;
+  border-radius: var(--radius-sm);
+}
+.subagent-row:hover:not(:disabled) {
+  background: var(--surface);
+}
+.subagent-row:disabled {
+  cursor: default;
+}
+.subagent-row.has-error {
+  color: var(--accent-red);
+}
+/* Match the body text size/color; keep flex:1 + min-width:0 (from base
+   .tool-line) so a long label truncates with an ellipsis and the chevron pins
+   right. */
+.subagent-row .tool-line {
+  font-size: var(--fs-base);
+  color: var(--text);
+}
+.subagent-row-chevron {
+  flex-shrink: 0;
+  color: var(--muted);
+}
+.subagent-icon {
+  flex-shrink: 0;
+  color: var(--muted);
+}
+.subagent-empty {
+  padding: 3px 4px;
+  font-size: var(--fs-md);
+  color: var(--muted);
 }
 .tool-row {
   display: flex;
