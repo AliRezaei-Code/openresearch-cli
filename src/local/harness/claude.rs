@@ -862,6 +862,30 @@ fn result_text(content: &Value) -> String {
     }
 }
 
+/// True for the stdout acknowledgment of the exact stdin message we sent.
+fn replays_user_message(event: &Value, text: &str) -> bool {
+    if event.get("type").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    match event.pointer("/message/content") {
+        Some(Value::String(content)) => content == text,
+        Some(Value::Array(blocks)) => {
+            blocks.len() == 1
+                && blocks[0].get("type").and_then(Value::as_str) == Some("text")
+                && blocks[0].get("text").and_then(Value::as_str) == Some(text)
+        }
+        _ => false,
+    }
+}
+
+fn belongs_to_current_turn(saw_user_echo: &mut bool, event: &Value, text: &str) -> bool {
+    if *saw_user_echo {
+        return true;
+    }
+    *saw_user_echo = replays_user_message(event, text);
+    false
+}
+
 /// The per-turn state `apply_event` folds each stream-json line into. Kept
 /// store-free so the caller (not the fold) owns every side effect — the native
 /// session id is applied per event by `run_turn`, and every flush happens there
@@ -1398,6 +1422,7 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
         bridge_active,
         ..Default::default()
     };
+    let mut saw_user_echo = false;
     // Fold events until the turn's `result`. The caller (here) applies the
     // native session id and flushes per event, keeping `apply_event` store-free.
     loop {
@@ -1408,6 +1433,9 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
         };
         match event {
             TurnEvent::Line(value) => {
+                if !belongs_to_current_turn(&mut saw_user_echo, &value, &ctx.text) {
+                    continue;
+                }
                 let done = apply_event(ctx, &mut state, &value);
                 if let Some(sid) = state.native_session_id.take() {
                     ctx.set_native_session_id(&sid);
@@ -1776,6 +1804,33 @@ mod tests {
         assert_eq!(tool.status, "completed");
         assert_eq!(tool.output.as_deref(), Some("fn main() {}"));
         assert_eq!(tool.input.as_ref().unwrap()["filePath"], "/x/y.rs");
+    }
+
+    #[test]
+    fn user_echo_distinguishes_the_turn_from_resume_bootstrap_output() {
+        let transcript = [
+            r#"{"type":"result","subtype":"success","result":"No response requested."}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"repeat"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"real","content":[{"type":"text","text":"I am Claude."}]}}"#,
+            r#"{"type":"result","subtype":"success","session_id":"session","is_error":false}"#,
+        ];
+        let mut saw_user_echo = false;
+        let mut ctx = TurnCtx::test_stub();
+        let mut state = TurnState::default();
+        for line in transcript {
+            let event: Value = serde_json::from_str(line).unwrap();
+            if belongs_to_current_turn(&mut saw_user_echo, &event, "repeat") {
+                apply_event(&mut ctx, &mut state, &event);
+            }
+        }
+        assert!(state.saw_result);
+        assert_eq!(ctx.assistant.parts.len(), 1);
+        assert_eq!(ctx.assistant.parts[0].text.as_deref(), Some("I am Claude."));
+
+        let string_echo: Value =
+            serde_json::from_str(r#"{"type":"user","message":{"role":"user","content":"repeat"}}"#)
+                .unwrap();
+        assert!(replays_user_message(&string_echo, "repeat"));
     }
 
     #[test]

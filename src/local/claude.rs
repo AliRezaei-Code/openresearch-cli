@@ -314,6 +314,9 @@ async fn spawn_client(spec: &SpawnSpec) -> Result<Arc<ClaudeClient>> {
         // Stream text/thinking deltas (stream_event lines) instead of only
         // complete assistant messages — apply_event paints them token by token.
         "--include-partial-messages",
+        // Marks the exact boundary between resume/startup output and the turn
+        // we submitted; the harness ignores events until this echo arrives.
+        "--replay-user-messages",
         "--verbose",
         "--permission-mode",
         claude_permission_mode(spec.config.permission_mode),
