@@ -757,7 +757,8 @@ textarea::placeholder {
 .pane-toolbar {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
   padding: 10px 12px 0;
   flex-shrink: 0;
 }
@@ -813,12 +814,16 @@ textarea::placeholder {
   color: var(--text);
   border-radius: var(--radius-sm);
 }
-.seg button:hover {
+.seg button:not(:disabled):hover {
   color: var(--text);
 }
 .seg button.active {
   background: var(--base);
   box-shadow: 0 1px 3px color-mix(in oklab, var(--text) 25%, transparent);
+}
+.seg button:disabled {
+  color: var(--muted);
+  cursor: default;
 }
 
 /* ---- chat ---- */
@@ -1709,6 +1714,43 @@ textarea::placeholder {
 .exp-node .node-action-ext {
   margin-left: auto;
   padding: 3px 5px;
+}
+
+/* Agent scope: dashed "…" pill standing in for a region of the tree created
+ * by other agents. Clicking it switches the pane back to Project scope. */
+.react-flow__node.react-flow__node-elided.selectable {
+  cursor: pointer;
+}
+.elided-node {
+  /* Keep width/height in sync with ELIDED_W/ELIDED_H in TreeView.tsx (layout
+     math positions the pill with them). */
+  width: 148px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-md);
+  background: color-mix(in oklab, var(--text) 3%, transparent);
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+  font-weight: var(--fw-medium);
+  text-align: left;
+  transition: border-color 120ms ease, color 120ms ease;
+}
+.elided-node:hover {
+  border-color: var(--text);
+  color: var(--text);
+}
+.elided-node .elided-node-label {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.3;
+}
+.elided-node .elided-node-sub {
+  /* Stays muted while the pill's label brightens on hover. */
+  color: var(--muted);
 }
 
 /* run-history squares (RUNS strip on node cards) */

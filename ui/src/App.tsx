@@ -10,7 +10,7 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   cancelRun,
   getFiles,
@@ -226,6 +226,25 @@ export default function App() {
   const [runs, setRuns] = useState<Run[]>([]);
   const [files, setFiles] = useState<ProjectFiles | null>(null);
   const [view, setView] = useState<"tree" | "table">("tree");
+  // Experiments pane scope: "agent" narrows to the open chat session's work.
+  // Falls back to "project" whenever there's no session to scope to. The
+  // toggle only renders when every experiment carries attribution — any
+  // unattributed node (legacy, or created before chatSessionId existed) means
+  // Agent scope would misrepresent the tree, so those projects keep today's UI.
+  const [scope, setScope] = useState<"agent" | "project">("project");
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const allExperimentsAttributed =
+    experiments.length > 0 && experiments.every((e) => e.chatSessionId);
+  const effectiveScope = activeSessionId && allExperimentsAttributed ? scope : "project";
+  // Agent scope means "this session's experiments" in both panes: runs are
+  // scoped by their experiment's owner, not by which session launched them.
+  const scopedRuns = useMemo(() => {
+    if (effectiveScope !== "agent") return runs;
+    const mine = new Set(
+      experiments.filter((e) => e.chatSessionId === activeSessionId).map((e) => e.id),
+    );
+    return runs.filter((r) => mine.has(r.experimentId));
+  }, [runs, experiments, effectiveScope, activeSessionId]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   // Right-panel tab strip: the pinned Experiments tab plus a closable tab per
   // opened experiment view / project file. Views are single-purpose, so the
@@ -340,6 +359,11 @@ export default function App() {
     setCodeTab(null);
     setWorktreeTab(null);
     setRightTab("experiments");
+    // Scoping is an explicit per-project choice — don't let Agent scope
+    // re-bind to whichever session ChatPanel auto-selects in the next project.
+    // (activeSessionId needs no reset here: ChatPanel owns it and re-reports
+    // null on its own project-switch effect.)
+    setScope("project");
     listExperiments(projectId).then(setExperiments).catch(() => {});
     listRuns(projectId).then(setRuns).catch(() => {});
     getFiles(projectId).then(setFiles).catch(() => {});
@@ -367,6 +391,10 @@ export default function App() {
       if (pid === projectIdRef.current) refreshFiles();
     },
   });
+
+  // Stable identity: in TreeView's layout-memo deps, so an inline arrow would
+  // recompute the graph on every render.
+  const showProjectScope = useCallback(() => setScope("project"), []);
 
   // Open an experiment view as a right-panel tab (creating it if needed) and
   // focus it.
@@ -706,6 +734,7 @@ export default function App() {
             onOpenSubagent={openSubagentTab}
             onOpenWorktree={openWorktreeTab}
             onStartTour={startTour}
+            onActiveSessionChange={setActiveSessionId}
           >
             {mainView === "files" ? (
               (() => {
@@ -837,6 +866,29 @@ export default function App() {
           {rightTab === "experiments" ? (
             <div className="tab-body">
               <div className="pane-toolbar">
+                {allExperimentsAttributed && (
+                  <div className="seg">
+                    <button
+                      className={effectiveScope === "agent" ? "active" : ""}
+                      disabled={!activeSessionId}
+                      title={
+                        activeSessionId
+                          ? undefined
+                          : "Open a chat session to filter to its experiments"
+                      }
+                      onClick={() => setScope("agent")}
+                    >
+                      Agent
+                    </button>
+                    <button
+                      className={effectiveScope === "project" ? "active" : ""}
+                      onClick={() => setScope("project")}
+                    >
+                      Project
+                    </button>
+                  </div>
+                )}
+                <span style={{ flex: 1 }} />
                 <div className="seg">
                   <button
                     className={view === "tree" ? "active" : ""}
@@ -857,15 +909,24 @@ export default function App() {
                   activeProject && (
                     <TreeView
                       experiments={experiments}
-                      runs={runs}
+                      runs={scopedRuns}
                       project={activeProject}
                       onOpenView={openExperimentTab}
                       onOpenCodeBranch={openCodeTabForBranch}
+                      agentSessionId={effectiveScope === "agent" ? activeSessionId : null}
+                      onShowProjectScope={showProjectScope}
                     />
                   )
                 ) : (
                   <RunsTable
-                    runs={runs}
+                    runs={scopedRuns}
+                    emptyHint={
+                      // Unlike the tree's empty state, suppressed when Project
+                      // scope would be just as empty.
+                      effectiveScope === "agent" && runs.length > 0
+                        ? "No runs from this agent's experiments yet. Switch to Project to see all runs."
+                        : undefined
+                    }
                     experiments={experiments}
                     onOpen={(run) => {
                       setSelectedRunId(run.id);

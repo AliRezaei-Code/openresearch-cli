@@ -31,6 +31,8 @@ export interface Experiment {
   agentStatus: string;
   createdAt: number;
   updatedAt: number;
+  /** Chat session that created this experiment; null for dashboard/legacy rows. */
+  chatSessionId?: string | null;
 }
 
 export type RunStatus = "starting" | "running" | "done" | "failed" | "cancelled";
