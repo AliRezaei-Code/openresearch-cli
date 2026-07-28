@@ -704,6 +704,10 @@ const Transcript = memo(function Transcript({
 
 type SessionFilter = "active" | "archived" | "all";
 
+/** Whether the rail's current filter shows a session in this archived state. */
+const matchesFilter = (filter: SessionFilter, archived: boolean) =>
+  filter === "all" ? true : filter === "archived" ? archived : !archived;
+
 /** Menu label + rail section heading per filter — "Recents" for the default view. */
 const SESSION_FILTERS: { id: SessionFilter; label: string; railLabel: string }[] = [
   { id: "active", label: "Active", railLabel: "Recents" },
@@ -924,6 +928,7 @@ export function ChatPanel({
   onOpenPlan,
   onOpenWorktree,
   onStartTour,
+  onActiveSessionChange,
   children,
 }: {
   projectId: string;
@@ -951,6 +956,8 @@ export function ChatPanel({
   onOpenWorktree?: (sessionId: string) => void;
   /** Replay the onboarding tour (chat header help button). */
   onStartTour?: () => void;
+  /** The open chat session, surfaced so the shell can scope panes to it. */
+  onActiveSessionChange?: (sessionId: string | null) => void;
   /** Middle-pane content when a settings section is active (the SettingsView). */
   children?: React.ReactNode;
 }) {
@@ -1313,6 +1320,11 @@ export function ChatPanel({
   // from one session's pickers onto another's.
   useEffect(() => setSessionOverride({}), [activeId]);
 
+  // Surface the open session to the shell (Agent-scoped panes key off it).
+  useEffect(() => {
+    onActiveSessionChange?.(activeId);
+  }, [activeId, onActiveSessionChange]);
+
   // Opening a session — or remounting the thread (leaving a settings view,
   // history seeding in) — always starts pinned at the latest messages.
   const threadMounted = mainView === "chat" && (messages.length > 0 || busy);
@@ -1465,6 +1477,11 @@ export function ChatPanel({
     // which could undo a concurrent authoritative update).
     const prev = session.archived;
     setSessions((cur) => cur.map((s) => (s.id === session.id ? { ...s, archived } : s)));
+    // Deselect only when the row leaves the rail's current filter — keeping it
+    // selected would leave the thread (and Agent-scoped panes) keyed to an
+    // invisible session. Kept even if the request fails; it's a no-op then.
+    if (!matchesFilter(sessionFilter, archived))
+      setActiveId((cur) => (cur === session.id ? null : cur));
     void setChatSessionArchived(session.id, archived).catch(() => {
       setSessions((cur) =>
         cur.map((s) => (s.id === session.id ? { ...s, archived: prev } : s)),
@@ -1538,9 +1555,7 @@ export function ChatPanel({
     [activeId, projectId],
   );
 
-  const visibleSessions = sessions.filter((s) =>
-    sessionFilter === "all" ? true : sessionFilter === "archived" ? s.archived : !s.archived,
-  );
+  const visibleSessions = sessions.filter((s) => matchesFilter(sessionFilter, s.archived));
 
   const rail = (
     <aside className="session-rail floating-panel">
