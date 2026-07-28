@@ -228,12 +228,14 @@ export default function App() {
   const [view, setView] = useState<"tree" | "table">("tree");
   // Experiments pane scope: "agent" narrows to the open chat session's work.
   // Falls back to "project" whenever there's no session to scope to. The
-  // toggle only renders once some experiment carries attribution — legacy
-  // projects (all created before chatSessionId existed) keep today's UI.
+  // toggle only renders when every experiment carries attribution — any
+  // unattributed node (legacy, or created before chatSessionId existed) means
+  // Agent scope would misrepresent the tree, so those projects keep today's UI.
   const [scope, setScope] = useState<"agent" | "project">("project");
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const hasAttributedExperiments = experiments.some((e) => e.chatSessionId);
-  const effectiveScope = activeSessionId && hasAttributedExperiments ? scope : "project";
+  const allExperimentsAttributed =
+    experiments.length > 0 && experiments.every((e) => e.chatSessionId);
+  const effectiveScope = activeSessionId && allExperimentsAttributed ? scope : "project";
   // Agent scope means "this session's experiments" in both panes: runs are
   // scoped by their experiment's owner, not by which session launched them.
   const scopedRuns = useMemo(() => {
@@ -864,7 +866,7 @@ export default function App() {
           {rightTab === "experiments" ? (
             <div className="tab-body">
               <div className="pane-toolbar">
-                {hasAttributedExperiments && (
+                {allExperimentsAttributed && (
                   <div className="seg">
                     <button
                       className={effectiveScope === "agent" ? "active" : ""}
