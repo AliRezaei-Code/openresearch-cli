@@ -219,11 +219,15 @@ export function ExpHoverCard({
     latestRun?.status === "failed" && latestRun.resultMarkdown ? latestRun.resultMarkdown : null;
   const body = exp.description || (failureNote ? null : latestRun?.resultMarkdown) || null;
 
-  // Clamped by default; "Show more" appears only when the clamp actually
-  // hides content, and expands in place (the card is already interactive).
+  // Clamped by default; "Show more" appears when the clamp actually hides
+  // content and stays while expanded so "Show less" remains reachable.
   const bodyRef = useRef<HTMLDivElement>(null);
   const [expanded, setExpanded] = useState(false);
   const [clamped, setClamped] = useState(false);
+  useEffect(() => {
+    // Re-collapse when SSE swaps the text out from under an expanded card.
+    setExpanded(false);
+  }, [body]);
   useEffect(() => {
     const el = bodyRef.current;
     if (el) setClamped(el.scrollHeight > el.clientHeight + 1);
@@ -254,7 +258,7 @@ export function ExpHoverCard({
         </div>
       )}
       {body && (clamped || expanded) && (
-        <button className="hc-toggle" onClick={() => setExpanded((v) => !v)}>
+        <button type="button" className="hc-toggle" onClick={() => setExpanded((v) => !v)}>
           {expanded ? "Show less" : "Show more"}
         </button>
       )}

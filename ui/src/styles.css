@@ -1736,17 +1736,17 @@ textarea::placeholder {
   -webkit-line-clamp: unset;
   max-height: 45vh;
   overflow-y: auto;
+  /* Breathing room so mid-scroll text doesn't sit flush on the next rule. */
+  padding-bottom: 4px;
 }
 .exp-hover-card .hc-toggle {
   margin-top: 4px;
-  padding: 0;
-  border: none;
-  background: none;
   font-size: var(--fs-xs);
   font-weight: var(--fw-medium);
   color: var(--muted);
-  cursor: pointer;
 }
+/* Quiet muted→text affordance (no underline/accent — deliberate: the card
+ * is all hairlines and an accent link would be its loudest element). */
 .exp-hover-card .hc-toggle:hover {
   color: var(--text);
 }
