@@ -759,8 +759,6 @@ textarea::placeholder {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-  /* Assumes two control groups: scope on the left, view on the right. */
-  justify-content: space-between;
   padding: 10px 12px 0;
   flex-shrink: 0;
 }
