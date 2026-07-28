@@ -1715,12 +1715,13 @@ textarea::placeholder {
   margin-top: 3px;
   color: var(--text);
 }
+/* Plain text between hairline rules — no fill, matching the app's quiet
+ * hairline idiom (a recessed box read as a heavy slab on long results). */
 .exp-hover-card .hc-body {
   margin-top: 10px;
-  background: var(--surface);
-  border-radius: var(--radius-sm);
-  padding: 8px 10px;
-  line-height: 1.55;
+  border-top: 1px solid var(--border-variant);
+  padding-top: 10px;
+  line-height: 1.6;
   white-space: pre-line;
   display: -webkit-box;
   -webkit-line-clamp: 10;
@@ -1759,6 +1760,8 @@ textarea::placeholder {
 }
 .exp-hover-card .hc-stats {
   margin-top: 10px;
+  border-top: 1px solid var(--border-variant);
+  padding-top: 10px;
   display: flex;
   align-items: center;
   gap: 12px;
