@@ -10,9 +10,10 @@ import {
 } from "@xyflow/react";
 import { Ellipsis, FolderTree, GitBranch, Terminal } from "lucide-react";
 import { GitHubMark } from "./BackendLogos";
-import { memo, useMemo } from "react";
+import { memo, useMemo, useRef } from "react";
 import { githubBranchUrl, timeAgo, type Experiment, type Project, type Run } from "../api";
 import type { ExperimentView } from "./DetailDrawer";
+import { ExpHoverCard, dismissTreeHoverCards, useHoverIntent } from "./ExpHoverCard";
 import { StatusBadge } from "./StatusBadge";
 
 const NODE_W = 264;
@@ -29,6 +30,7 @@ type ExpNodeData = {
   latestRun: Run | null;
   runs: Run[]; // oldest → newest
   isBaseline: boolean;
+  parentSlug: string | null;
   githubOwner: string;
   githubRepo: string;
   onOpenView: (id: string, view: ExperimentView) => void;
@@ -153,13 +155,26 @@ function runSquareClass(status: string): string {
 }
 
 const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
-  const { exp, latestRun, runs, isBaseline, githubOwner, githubRepo, onOpenView, onOpenCodeBranch } = data;
+  const { exp, latestRun, runs, isBaseline, parentSlug, githubOwner, githubRepo, onOpenView, onOpenCodeBranch } = data;
   const status = latestRun?.status;
   const live = status === "running" || status === "starting";
   const kind = isBaseline ? "Baseline" : live ? "Running" : "Experiment";
   const squares = runs.slice(-MAX_SQUARES);
+
+  // `data` is rebuilt on every experiments/runs change (a superset of the
+  // re-layouts that matter), so it doubles as the hover card's re-measure
+  // key. Canvas pan/zoom dismissal arrives via dismissTreeHoverCards, wired
+  // to the ReactFlow onMoveStart prop below.
+  const rootRef = useRef<HTMLDivElement>(null);
+  const hover = useHoverIntent(rootRef, data);
+
   return (
-    <div className={`exp-node ${live ? "live" : ""}`}>
+    <div
+      ref={rootRef}
+      className={`exp-node ${live ? "live" : ""}`}
+      onMouseEnter={hover.onMouseEnter}
+      onMouseLeave={hover.onMouseLeave}
+    >
       <Handle type="target" position={Position.Top} />
       <div className="node-eyebrow">
         <span>{kind}</span>
@@ -227,6 +242,19 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
         </a>
       </div>
       <Handle type="source" position={Position.Bottom} />
+      {/* Node and card share one leave handler — React's enter/leave pairing
+        * across the portal (fiber-tree walk) relies on it; don't split them. */}
+      {hover.rect && (
+        <ExpHoverCard
+          exp={exp}
+          runs={runs}
+          latestRun={latestRun}
+          parentSlug={parentSlug}
+          anchor={hover.rect}
+          onMouseEnter={hover.keepOpen}
+          onMouseLeave={hover.onMouseLeave}
+        />
+      )}
     </div>
   );
 });
@@ -311,6 +339,7 @@ export function TreeView({
     const isMine = (n: TreeNode) =>
       !agentSessionId || n.exp.chatSessionId === agentSessionId;
     const roots = elideForeignRegions(buildForest(experiments), isMine);
+    const slugById = new Map(experiments.map((e) => [e.id, e.slug]));
 
     function layout(node: DisplayNode, cx: number, y: number) {
       const x = cx - nodeWidth(node) / 2;
@@ -325,6 +354,9 @@ export function TreeView({
             latestRun: expRuns[expRuns.length - 1] ?? null,
             runs: expRuns,
             isBaseline: !node.exp.parentExperimentId,
+            parentSlug: node.exp.parentExperimentId
+              ? (slugById.get(node.exp.parentExperimentId) ?? null)
+              : null,
             githubOwner: project.githubOwner,
             githubRepo: project.githubRepo,
             onOpenView,
@@ -409,6 +441,7 @@ export function TreeView({
       nodesDraggable={false}
       nodesConnectable={false}
       nodesFocusable={false}
+      onMoveStart={dismissTreeHoverCards}
       minZoom={0.15}
       fitView
       fitViewOptions={{ padding: 0.25, maxZoom: 1 }}
