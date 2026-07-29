@@ -54,7 +54,8 @@ const sameExpTab = (a: ExpViewDef, b: ExpViewDef) => a.id === b.id && a.view ===
 interface FileViewDef {
   path: string;
   /** Which backend serves this file. Absent/"repo" → the repo `/file`
-   * endpoint (worktree/clone/branch); "files" → the project's files dir
+   * endpoint (worktree/clone/branch), falling back to the files dir when a
+   * non-ref path misses the checkout; "files" → the project's files dir
    * (`/files/report` + `/files/file`). */
   source?: "repo" | "files";
   /** Chat session whose worktree holds the file (absent → hub clone).
