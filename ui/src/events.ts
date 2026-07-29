@@ -93,11 +93,19 @@ export function useOrxEvents(handlers: OrxEventHandlers) {
   useEffect(() => {
     const es = new EventSource("/api/events");
     // The browser auto-reconnects a dropped EventSource and fires `open` again
-    // on each re-open — emit only then, not on the first connect.
-    let connected = false;
+    // on each re-open. Emit on any open that follows a drop — including a
+    // FAILED first connect (page loaded while the backend was briefly down):
+    // the initial session-list/transcript fetches likely failed too, so the
+    // first successful open needs the same repair. A clean first open emits
+    // nothing.
+    let needsRepair = false;
+    es.onerror = () => {
+      needsRepair = true;
+    };
     es.onopen = () => {
-      if (connected) emitChat({ type: "reconnected" });
-      connected = true;
+      if (needsRepair) emitChat({ type: "reconnected" });
+      // Every open after this one follows a drop by definition.
+      needsRepair = true;
     };
     const parse = <T>(e: MessageEvent): T | null => {
       try {

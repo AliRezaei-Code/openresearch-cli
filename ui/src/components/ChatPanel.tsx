@@ -1228,6 +1228,9 @@ export function ChatPanel({
   // Bumped on every chat.message dispatch — the reconnect repair uses it to
   // detect a live flush racing its transcript refetch.
   const msgGen = useRef(0);
+  // Render-fresh mirror of `sessions` for callbacks memoized on projectId
+  // alone (syncSessionList snapshots it before fetching).
+  const sessionsRef = useRef<ChatSession[]>([]);
   const threadRef = useRef<HTMLDivElement>(null);
   const threadInnerRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
@@ -1373,18 +1376,33 @@ export function ChatPanel({
   const setPermissionMode = (id: string) => selectModel({ permissionMode: id });
   const setReasoningLevel = (id: string) => selectModel({ reasoningLevel: id });
 
+  sessionsRef.current = sessions;
+
   /** Fetch the authoritative session list and adopt it wholesale: the rows
    * (honoring delete tombstones and keeping locally-newer contextUsage — same
    * merge as the chat.session handler), the seenTitles baseline (so the next
    * live event compares against what's on screen rather than animating a title
-   * the user already had), and the busy set. Shared by the project-change load
-   * and the SSE-reconnect repair. Resolves to the adopted list, null on fetch
-   * failure. */
+   * the user already had), and the busy set. A session we showed that the
+   * authoritative list no longer has was deleted while SSE was down (its
+   * chat.session.deleted frame is lost for good) — run the full forget
+   * cleanup, or its cached transcript, busy flag, and active selection linger
+   * as a ghost. Shared by the project-change load and the SSE-reconnect
+   * repair. Resolves to the adopted list, null on fetch failure. */
   const syncSessionList = useCallback(async (): Promise<ChatSession[] | null> => {
+    // Snapshot BEFORE the fetch: a session created while the request is in
+    // flight is absent from the response but also absent here, so it can
+    // never be mistaken for deleted (forgetSession tombstones — a false
+    // positive would kill a live session for good).
+    const before = sessionsRef.current.map((s) => s.id);
     try {
       const list = (await listChatSessions(projectId)).filter(
         (s) => !deletedIds.current.has(s.id),
       );
+      const ids = new Set(list.map((s) => s.id));
+      // Forget BEFORE seeding busy: forget drops the ghost's busy flag, so
+      // the known-scoped seed below can't carry it forward as if the session
+      // belonged to another project.
+      for (const id of before) if (!ids.has(id)) forgetSession(id);
       // Same contextUsage-preservation rule as the chat.session handler (the
       // scope differs: this replaces the whole array, that merges one row).
       setSessions((cur) => {
@@ -1409,6 +1427,10 @@ export function ChatPanel({
   // Reset everything when the project changes.
   useEffect(() => {
     setSessions([]);
+    // Clear the mirror NOW, not at the next render: syncSessionList below
+    // snapshots it, and the old project's rows would all read as "deleted"
+    // against the new project's list — tombstoning the entire old project.
+    sessionsRef.current = [];
     setActiveId(null);
     setDraft("");
     setPickedSkill(null);
