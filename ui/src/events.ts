@@ -37,7 +37,11 @@ export type ChatEvent =
   | { type: "sessionDeleted"; sessionId: string }
   | { type: "message"; sessionId: string; message: ChatMessage }
   | { type: "busy"; sessionId: string; busy: boolean }
-  | { type: "usage"; sessionId: string; usage: ContextUsage };
+  | { type: "usage"; sessionId: string; usage: ContextUsage }
+  /** The EventSource re-connected after a drop. Chat events are edge-only (no
+   * snapshot on connect), so frames emitted during the gap are lost for good —
+   * subscribers must refetch whatever they render from chat events. */
+  | { type: "reconnected" };
 
 type ChatListener = (ev: ChatEvent) => void;
 const chatListeners = new Set<ChatListener>();
@@ -88,6 +92,21 @@ export function useOrxEvents(handlers: OrxEventHandlers) {
   ref.current = handlers;
   useEffect(() => {
     const es = new EventSource("/api/events");
+    // The browser auto-reconnects a dropped EventSource and fires `open` again
+    // on each re-open. Emit on any open that follows a drop — including a
+    // FAILED first connect (page loaded while the backend was briefly down):
+    // the initial session-list/transcript fetches likely failed too, so the
+    // first successful open needs the same repair. A clean first open emits
+    // nothing.
+    let needsRepair = false;
+    es.onerror = () => {
+      needsRepair = true;
+    };
+    es.onopen = () => {
+      if (needsRepair) emitChat({ type: "reconnected" });
+      // Every open after this one follows a drop by definition.
+      needsRepair = true;
+    };
     const parse = <T>(e: MessageEvent): T | null => {
       try {
         return JSON.parse(e.data as string) as T;

@@ -41,7 +41,7 @@ use super::detect::{
     resolve_symlinks, title_case, HarnessInfo, ModelInfo,
 };
 use super::options::{resolve_reasoning, HarnessOptions, PermissionMode, REASONING_DEFAULT_ID};
-use super::{should_synthesize_plan, synthesize_resume, Harness, ResumeAction};
+use super::{should_synthesize_plan, synthesize_resume, Harness, ResumeAction, TURN_WATCHDOG};
 use crate::error::{anyhow, Result};
 use crate::local::chat::{
     find_part_mut, prepare_env, set_chat_session_env, upsert_preserving_children, ContextUsage,
@@ -722,13 +722,6 @@ impl Harness for Codex {
 /// First protocol version the harness was validated against (schema dump +
 /// live spike). Older CLIs take the exec fallback below.
 const MIN_APP_SERVER_VERSION: (u64, u64, u64) = (0, 144, 0);
-
-/// A turn with NO events for this long is treated as wedged and interrupted
-/// rather than held busy forever. Known false positive: a command that is
-/// legitimately silent this long (a quiet build, a training step with
-/// buffered output) is indistinguishable from a hang — hence the generous
-/// bound; the interruption is a clear, recoverable error either way.
-const TURN_WATCHDOG: Duration = Duration::from_secs(30 * 60);
 
 /// Whether the installed codex speaks the validated app-server protocol.
 /// Probed once per process (a codex upgrade mid-run takes an `orx up` restart

@@ -7,12 +7,21 @@
 //! `run_turn`), whose ~3–6s of per-turn spawn/config/MCP-handshake overhead the
 //! latency probe measured.
 //!
-//! Wire shapes were pinned live against claude CLI 2.1.197. In persistent mode
-//! `--print --input-format stream-json --output-format stream-json` accepts one
-//! user message per stdin line and ends each turn with a `result` event; the
+//! Wire shapes were pinned live against claude CLI 2.1.197 (the echo contract
+//! below re-verified on 2.1.200/2.1.212). In persistent mode `--print
+//! --input-format stream-json --output-format stream-json` accepts one user
+//! message per stdin line and ends each turn with a `result` event; the
 //! `session_id` is stable across turns in one process, and `--resume <id>`
 //! composes with stream-json input, so a crash/restart or config-change respawn
-//! recovers cheaply. Control requests ride the same stdin stream
+//! recovers cheaply. A `--resume` respawn can replay prior-session output
+//! *before* touching the new message — including a stale `result` — so
+//! `--replay-user-messages` re-emits each submitted stdin message on stdout and
+//! the echo, not the send, is a turn's start boundary
+//! (`harness/claude.rs`'s `belongs_to_current_turn`). The flag long predates
+//! the pinned CLI version (the Claude Agent SDK's stream-json transport has
+//! always passed it); a CLI without it fails loudly at spawn, never silently.
+//!
+//! Control requests ride the same stdin stream
 //! (`{"type":"control_request","request_id":…,"request":{"subtype":…}}`) and are
 //! answered by a `control_response`; `set_model` is the only one we use — native
 //! `interrupt` gave no response and is treated as unreliable, so v1 interrupts
@@ -314,6 +323,11 @@ async fn spawn_client(spec: &SpawnSpec) -> Result<Arc<ClaudeClient>> {
         // Stream text/thinking deltas (stream_event lines) instead of only
         // complete assistant messages — apply_event paints them token by token.
         "--include-partial-messages",
+        // Echo each submitted user message back on stdout — the exact boundary
+        // between `--resume`/startup replay output (which can carry a stale
+        // `result` that would end the turn instantly) and the turn we sent;
+        // the harness ignores events until the echo arrives.
+        "--replay-user-messages",
         "--verbose",
         "--permission-mode",
         claude_permission_mode(spec.config.permission_mode),

@@ -86,7 +86,9 @@ type Action =
   | { type: "upsertMessage"; sessionId: string; message: ChatMessage }
   | { type: "optimisticUser"; sessionId: string; text: string; imageUrls: string[] }
   | { type: "busy"; sessionId: string; busy: boolean }
-  | { type: "seedBusy"; sessions: string[] }
+  // `known` scopes the reseed: flags for sessions outside it (other projects —
+  // busy events aren't project-filtered) are carried forward, not wiped.
+  | { type: "seedBusy"; sessions: string[]; known: string[] }
   | { type: "forget"; sessionId: string };
 
 const LOCAL_PREFIX = "local-";
@@ -152,8 +154,12 @@ function reducer(state: ChatState, action: Action): ChatState {
       else busySessions.delete(action.sessionId);
       return { ...state, busySessions };
     }
-    case "seedBusy":
-      return { ...state, busySessions: new Set(action.sessions) };
+    case "seedBusy": {
+      const busySessions = new Set(action.sessions);
+      const known = new Set(action.known);
+      for (const id of state.busySessions) if (!known.has(id)) busySessions.add(id);
+      return { ...state, busySessions };
+    }
     case "forget": {
       // Deleted session: drop its transcript and busy flag so a same-id event
       // arriving late can't render stale state.
@@ -264,6 +270,8 @@ function toolLine(part: ChatPart): string {
       return subagentLine(input);
     case "error":
       return "Error";
+    case "interrupted":
+      return "Interrupted";
     default: {
       const detail = desc ?? fp ?? cmd ?? part.state?.title ?? "";
       return detail ? `${tool}: ${detail}` : tool;
@@ -1217,6 +1225,12 @@ export function ChatPanel({
   // final chat.session upsert *after* chat.session.deleted; ignoring upserts
   // for known-deleted ids keeps the ghost row from coming back.
   const deletedIds = useRef(new Set<string>());
+  // Bumped on every chat.message dispatch — the reconnect repair uses it to
+  // detect a live flush racing its transcript refetch.
+  const msgGen = useRef(0);
+  // Render-fresh mirror of `sessions` for callbacks memoized on projectId
+  // alone (syncSessionList snapshots it before fetching).
+  const sessionsRef = useRef<ChatSession[]>([]);
   const threadRef = useRef<HTMLDivElement>(null);
   const threadInnerRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
@@ -1362,9 +1376,61 @@ export function ChatPanel({
   const setPermissionMode = (id: string) => selectModel({ permissionMode: id });
   const setReasoningLevel = (id: string) => selectModel({ reasoningLevel: id });
 
+  sessionsRef.current = sessions;
+
+  /** Fetch the authoritative session list and adopt it wholesale: the rows
+   * (honoring delete tombstones and keeping locally-newer contextUsage — same
+   * merge as the chat.session handler), the seenTitles baseline (so the next
+   * live event compares against what's on screen rather than animating a title
+   * the user already had), and the busy set. A session we showed that the
+   * authoritative list no longer has was deleted while SSE was down (its
+   * chat.session.deleted frame is lost for good) — run the full forget
+   * cleanup, or its cached transcript, busy flag, and active selection linger
+   * as a ghost. Shared by the project-change load and the SSE-reconnect
+   * repair. Resolves to the adopted list, null on fetch failure. */
+  const syncSessionList = useCallback(async (): Promise<ChatSession[] | null> => {
+    // Snapshot BEFORE the fetch: a session created while the request is in
+    // flight is absent from the response but also absent here, so it can
+    // never be mistaken for deleted (forgetSession tombstones — a false
+    // positive would kill a live session for good).
+    const before = sessionsRef.current.map((s) => s.id);
+    try {
+      const list = (await listChatSessions(projectId)).filter(
+        (s) => !deletedIds.current.has(s.id),
+      );
+      const ids = new Set(list.map((s) => s.id));
+      // Forget BEFORE seeding busy: forget drops the ghost's busy flag, so
+      // the known-scoped seed below can't carry it forward as if the session
+      // belonged to another project.
+      for (const id of before) if (!ids.has(id)) forgetSession(id);
+      // Same contextUsage-preservation rule as the chat.session handler (the
+      // scope differs: this replaces the whole array, that merges one row).
+      setSessions((cur) => {
+        const prevUsage = new Map(cur.map((c) => [c.id, c.contextUsage]));
+        return list.map((s) => ({
+          ...s,
+          contextUsage: s.contextUsage ?? prevUsage.get(s.id),
+        }));
+      });
+      seenTitles.current = new Map(list.map((s) => [s.id, s.title]));
+      dispatch({
+        type: "seedBusy",
+        sessions: list.filter((s) => s.busy).map((s) => s.id),
+        known: list.map((s) => s.id),
+      });
+      return list;
+    } catch {
+      return null;
+    }
+  }, [projectId]);
+
   // Reset everything when the project changes.
   useEffect(() => {
     setSessions([]);
+    // Clear the mirror NOW, not at the next render: syncSessionList below
+    // snapshots it, and the old project's rows would all read as "deleted"
+    // against the new project's list — tombstoning the entire old project.
+    sessionsRef.current = [];
     setActiveId(null);
     setDraft("");
     setPickedSkill(null);
@@ -1373,22 +1439,11 @@ export function ChatPanel({
     loadedSessions.current = new Set();
     setTitleReveals(new Map());
     seenTitles.current = new Map();
-    listChatSessions(projectId)
-      .then((list) => {
-        setSessions(list);
-        // Seed the titles baseline from the load itself, so the first live
-        // event compares against what's on screen rather than reading as a
-        // change and animating a title the user already had.
-        seenTitles.current = new Map(list.map((s) => [s.id, s.title]));
-        // Prefer the newest non-archived session; archived ones stay hidden.
-        setActiveId((cur) => cur ?? list.find((s) => !s.archived)?.id ?? null);
-        dispatch({
-          type: "seedBusy",
-          sessions: list.filter((s) => s.busy).map((s) => s.id),
-        });
-      })
-      .catch(() => {});
-  }, [projectId]);
+    void syncSessionList().then((list) => {
+      // Prefer the newest non-archived session; archived ones stay hidden.
+      if (list) setActiveId((cur) => cur ?? list.find((s) => !s.archived)?.id ?? null);
+    });
+  }, [projectId, syncSessionList]);
 
   // Load message history when a session becomes active.
   useEffect(() => {
@@ -1455,6 +1510,7 @@ export function ChatPanel({
           forgetSession(ev.sessionId);
           break;
         case "message":
+          msgGen.current++;
           dispatch({ type: "upsertMessage", sessionId: ev.sessionId, message: ev.message });
           break;
         case "busy":
@@ -1468,6 +1524,36 @@ export function ChatPanel({
       }
     });
   }, [projectId]);
+
+  // Repair after an SSE gap. Chat frames are edge-only — a dropped EventSource
+  // mid-turn loses chat.message / chat.busy events for good, which strands the
+  // UI (a spinner that never clears, or a reply that never appears until a
+  // reload). On reconnect, refetch the authoritative state: the session list
+  // (busy flags ride it) and the active transcript. The seed replaces the
+  // transcript wholesale, so a live flush racing the fetch would be clobbered
+  // — and if it was the turn's FINAL flush, never repaired; the msgGen check
+  // refetches once when that race is detected. Separate subscription so it can
+  // depend on activeId without re-running the main handler's effect.
+  useEffect(() => {
+    return onChatEvent((ev) => {
+      if (ev.type !== "reconnected") return;
+      void syncSessionList();
+      if (!activeId || !loadedSessions.current.has(activeId)) return;
+      // One retry is sufficient: flush persists to the store BEFORE it emits,
+      // so a refetch issued after observing a raced event already reads that
+      // event's content.
+      const reseed = (allowRetry: boolean) => {
+        const gen = msgGen.current;
+        getChatMessages(activeId)
+          .then((messages) => {
+            dispatch({ type: "seed", sessionId: activeId, messages });
+            if (allowRetry && msgGen.current !== gen) reseed(false);
+          })
+          .catch(() => {});
+      };
+      reseed(true);
+    });
+  }, [activeId, syncSessionList]);
 
   const messages = activeId ? (state.messagesBySession[activeId] ?? []) : [];
   const busy = activeId ? state.busySessions.has(activeId) : false;
@@ -1699,8 +1785,56 @@ export function ChatPanel({
         dataBase64: a.dataUrl.slice(a.dataUrl.indexOf(",") + 1),
       }));
       await sendChatMessage(sid, text, turnOpts, images.length ? images : undefined);
-    } catch {
-      if (sid) dispatch({ type: "busy", sessionId: sid, busy: false });
+    } catch (err) {
+      // The message never reached a turn — put it back in the composer so a
+      // retry is one keypress, whichever branch below applies.
+      setDraft((cur) => cur || text);
+      setAttachments((cur) => (cur.length ? cur : pending));
+      if (!sid) return; // session creation failed; no transcript to annotate
+      const msg = err instanceof Error ? err.message : String(err);
+      // A *network* failure does not prove no turn started — the backend
+      // claims the turn (and emits busy) before its response, so a lost
+      // response can reject on a live, streaming turn; ask the server before
+      // declaring failure. An explicit busy rejection is different: the slot
+      // belongs to someone else's turn (run watcher, second tab) and ours was
+      // never accepted — always surface that.
+      if (!/session is busy/i.test(msg)) {
+        const busyNow = await listChatSessions(projectId)
+          .then((list) => !!list.find((s) => s.id === sid)?.busy)
+          .catch(() => false);
+        if (busyNow) {
+          // The turn is real and streaming — undo the restore, nothing failed.
+          setDraft((cur) => (cur === text ? "" : cur));
+          setAttachments((cur) => (cur === pending ? [] : cur));
+          return;
+        }
+      }
+      dispatch({ type: "busy", sessionId: sid, busy: false });
+      // Surface the failure instead of swallowing it: a silently dropped send
+      // leaves the optimistic bubble unanswered and reads as "orx did nothing".
+      // Local-only — swept by upsertMessage's LOCAL_PREFIX filter when the next
+      // server user message lands (or by the reconnect reseed), and gone on
+      // reload.
+      dispatch({
+        type: "upsertMessage",
+        sessionId: sid,
+        message: {
+          id: `${LOCAL_PREFIX}senderr-${Date.now()}`,
+          role: "assistant",
+          parts: [
+            {
+              id: "p0",
+              type: "tool",
+              tool: "error",
+              state: {
+                status: "error",
+                error: `Message not sent: ${msg}`,
+              },
+            },
+          ],
+          createdAt: Date.now(),
+        },
+      });
     }
   }
 

@@ -2,9 +2,11 @@
 //!
 //! Chat: one *resident* `claude --print --input-format stream-json` child per
 //! chat session (`local::claude::ClaudeHost`), reused across turns — each turn
-//! sends one user message and folds the child's stream-json output until a
-//! `result` event. The child persists (stable `session_id`, stdin held open),
-//! collapsing the old spawn-per-turn overhead; a config change (permission mode
+//! sends one user message and folds the child's stream-json output, from the
+//! `--replay-user-messages` echo of that message (the turn's start boundary —
+//! see `belongs_to_current_turn`) until a `result` event. The child persists
+//! (stable `session_id`, stdin held open), collapsing the old spawn-per-turn
+//! overhead; a config change (permission mode
 //! / effort / bridge), interrupt, or crash respawns it with `--resume`. The
 //! playbook rides `--append-system-prompt-file`; the permission mode is
 //! `--permission-mode` from the session's setting (`auto`/`bypass` — see
@@ -862,6 +864,42 @@ fn result_text(content: &Value) -> String {
     }
 }
 
+/// True for the stdout acknowledgment of the exact stdin message we sent
+/// (`--replay-user-messages` re-emits it, string or single-text-block form,
+/// byte-exact — verified live on claude 2.1.212). The echo also carries an
+/// undocumented `isReplay: true`; content equality is deliberately the sole
+/// discriminator, so a future CLI dropping that field changes nothing. A
+/// mid-turn synthetic `user` event (a tool_result) can't collide: those carry
+/// `tool_result` blocks, never a single text block equal to the prompt.
+fn replays_user_message(event: &Value, text: &str) -> bool {
+    if event.get("type").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    match event.pointer("/message/content") {
+        Some(Value::String(content)) => content == text,
+        Some(Value::Array(blocks)) => {
+            blocks.len() == 1
+                && blocks[0].get("type").and_then(Value::as_str) == Some("text")
+                && blocks[0].get("text").and_then(Value::as_str) == Some(text)
+        }
+        _ => false,
+    }
+}
+
+/// Whether an event is part of the turn we submitted, tracked through
+/// `saw_user_echo`: everything before the child echoes our user message is
+/// `--resume`/startup replay of prior-session output, if any — fatally
+/// including a stale `result` that would end the turn instantly. The echo
+/// itself is consumed (returns `false`); everything after it belongs to the
+/// turn.
+fn belongs_to_current_turn(event: &Value, text: &str, saw_user_echo: &mut bool) -> bool {
+    if *saw_user_echo {
+        return true;
+    }
+    *saw_user_echo = replays_user_message(event, text);
+    false
+}
+
 /// The per-turn state `apply_event` folds each stream-json line into. Kept
 /// store-free so the caller (not the fold) owns every side effect — the native
 /// session id is applied per event by `run_turn`, and every flush happens there
@@ -1368,6 +1406,15 @@ fn spawn_config(ctx: &TurnCtx) -> SpawnConfig {
     }
 }
 
+/// Deadline for a turn's first sign of life — any stdout line at all, echo or
+/// pre-echo. A healthy child (resident or freshly spawned, `--resume`
+/// rehydration included) emits its per-turn `system`/`init` within seconds of
+/// a message; TOTAL silence this long means a wedged child (seen live: a
+/// resident child stuck in an expired-OAuth refresh). From the first line on,
+/// waits get the shared [`super::TURN_WATCHDOG`] instead (a long-running tool
+/// or an API backoff burst emits nothing for minutes, legitimately).
+const FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(120);
+
 async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     let project = ctx.project.clone();
     let session_id = ctx.session_id.clone();
@@ -1428,14 +1475,95 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     };
     // Fold events until the turn's `result`. The caller (here) applies the
     // native session id and flushes per event, keeping `apply_event` store-free.
+    //
+    // Both waits are watchdogged (the codex adapter's TURN_WATCHDOG precedent):
+    // a wedged child — seen in the wild blocking forever on an expired-OAuth
+    // refresh — otherwise hangs the turn silently, and the user watches an
+    // eternal spinner with nothing to go on. The first event gets a short
+    // deadline (a healthy child answers a message within seconds; only a wedge
+    // is silent for two minutes), later gaps the long one (a tool can
+    // legitimately run for many minutes without emitting anything).
+    let mut saw_event = false;
+    let mut saw_user_echo = false;
     loop {
-        let Some(event) = rx.recv().await else {
+        let deadline = if saw_event {
+            super::TURN_WATCHDOG
+        } else {
+            FIRST_EVENT_TIMEOUT
+        };
+        let event = match tokio::time::timeout(deadline, rx.recv()).await {
+            Ok(event) => event,
+            // A child held on the mcp-gate bridge long-poll is silently
+            // blocked BY DESIGN — user think-time on an approval card is
+            // unbounded. Re-arm the same deadline (checked on timeout, not up
+            // front, so a card raised mid-wait is honored too).
+            Err(_) if ctx.host.has_pending_permission(&ctx.session_id) => continue,
+            Err(_) => {
+                ctx.host.claude.kill_session(&ctx.session_id).await;
+                let _ = ctx.flush();
+                // The expired-login hint only fits the never-spoke case; a
+                // gap this long after output arrived is more likely a hung
+                // tool or a stalled API stream ("went quiet", not "no
+                // output").
+                let (what, hint) = if saw_event {
+                    (
+                        format!(
+                            "went quiet for {} minutes",
+                            super::TURN_WATCHDOG.as_secs() / 60
+                        ),
+                        "",
+                    )
+                } else {
+                    (
+                        format!("produced no output for {}s", FIRST_EVENT_TIMEOUT.as_secs()),
+                        " (an expired login can cause this; run `claude` in a \
+                         terminal to check)",
+                    )
+                };
+                return Err(anyhow!(
+                    "claude {what} — killed the wedged child{hint}. Sending \
+                     another message resumes the session; see {}",
+                    crate::store::data_dir().join("agent-claude.log").display()
+                ));
+            }
+        };
+        let Some(event) = event else {
             // The route channel closed without a Closed marker — treat as a
             // dropped turn; the next turn respawns via `--resume`.
             break;
         };
         match event {
             TurnEvent::Line(value) => {
+                // A `--resume` respawn can re-emit prior-session/startup output
+                // before touching our message — fatally, a stale `result`,
+                // which would end this turn instantly with nothing (the real
+                // reply then streams into a dropped channel: a silently
+                // swallowed turn). `--replay-user-messages` makes the child
+                // echo the message we submitted, marking the exact boundary;
+                // ignore everything before the echo, if anything precedes it
+                // (on a healthy child it's just the per-turn `system`/`init`).
+                if !belongs_to_current_turn(&value, &ctx.text, &mut saw_user_echo) {
+                    // A pre-echo line is proof of life — the main loop is
+                    // reading our stdin — so hand the wait over to the long
+                    // watchdog: only TOTAL silence keeps the 120s wedge budget
+                    // (and its expired-login hint) in force. An API
+                    // retry-with-backoff burst after boot must not be killed
+                    // at 120s.
+                    saw_event = true;
+                    // Still harvest the session id from the pre-echo
+                    // `system`/`init` (matching `apply_event`'s init-only
+                    // rule): a first turn interrupted before its `result` has
+                    // no other id to `--resume` with.
+                    if value.get("type").and_then(Value::as_str) == Some("system")
+                        && value.get("subtype").and_then(Value::as_str) == Some("init")
+                    {
+                        if let Some(sid) = value.get("session_id").and_then(Value::as_str) {
+                            ctx.set_native_session_id(sid);
+                        }
+                    }
+                    continue;
+                }
+                saw_event = true;
                 let done = apply_event(ctx, &mut state, &value);
                 if let Some(sid) = state.native_session_id.take() {
                     ctx.set_native_session_id(&sid);
@@ -1856,6 +1984,60 @@ mod tests {
         assert_eq!(parts[1].text.as_deref(), Some("Rivers flow."));
         // The final assistant event still feeds last_text (plan synthesis).
         assert_eq!(state.last_text, "Rivers flow.");
+    }
+
+    #[test]
+    fn user_echo_distinguishes_the_turn_from_resume_bootstrap_output() {
+        // The per-turn `system`/`init` always precedes the echo; the stale
+        // pre-echo `result` is the defensive worst case (captured by the
+        // original fix-swallowed-messages investigation of a `--resume`
+        // respawn) and must NOT end this turn. The `--replay-user-messages`
+        // echo of our submitted message is the boundary; everything before it
+        // is skipped.
+        let transcript = [
+            r#"{"type":"system","subtype":"init","session_id":"pre"}"#,
+            r#"{"type":"result","subtype":"success","result":"No response requested."}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"repeat"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"real","content":[{"type":"text","text":"I am Claude."}]}}"#,
+            r#"{"type":"result","subtype":"success","session_id":"session","is_error":false}"#,
+        ];
+        let mut saw_user_echo = false;
+        let mut ctx = TurnCtx::test_stub();
+        let mut state = TurnState::default();
+        for line in transcript {
+            let event: Value = serde_json::from_str(line).unwrap();
+            if belongs_to_current_turn(&event, "repeat", &mut saw_user_echo) {
+                apply_event(&mut ctx, &mut state, &event);
+            }
+        }
+        assert!(state.saw_result);
+        assert_eq!(ctx.assistant.parts.len(), 1);
+        assert_eq!(ctx.assistant.parts[0].text.as_deref(), Some("I am Claude."));
+
+        // The echo also comes in plain-string content form.
+        let string_echo: Value =
+            serde_json::from_str(r#"{"type":"user","message":{"role":"user","content":"repeat"}}"#)
+                .unwrap();
+        let mut echo = false;
+        assert!(!belongs_to_current_turn(&string_echo, "repeat", &mut echo));
+        assert!(echo, "string-form echo flips the boundary");
+        // A user event with different text is NOT the echo.
+        let mut other = false;
+        assert!(!belongs_to_current_turn(
+            &string_echo,
+            "different",
+            &mut other
+        ));
+        assert!(!other);
+        // A tool_result-shaped `user` event (the realistic mid-turn shape) is
+        // NOT the echo, even when its content text matches.
+        let tool_result: Value = serde_json::from_str(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"repeat"}]}}"#,
+        )
+        .unwrap();
+        let mut tr = false;
+        assert!(!belongs_to_current_turn(&tool_result, "repeat", &mut tr));
+        assert!(!tr);
     }
 
     #[test]
