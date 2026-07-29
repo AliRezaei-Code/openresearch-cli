@@ -14,7 +14,7 @@
 //! entirely: no credentials, no mirror, no upload — cancel intent comes from
 //! the local run row's `cancel_requested` flag instead.
 
-use std::io::Write as _;
+use std::io::{Seek as _, Write as _};
 use std::time::Duration;
 
 use serde_json::json;
@@ -1507,7 +1507,6 @@ async fn tail_logs_ray(
                     // Shrunk or shifted snapshot (e.g. driver restart): the
                     // remembered offset is meaningless — rewrite from scratch.
                     None => {
-                        use std::io::Seek;
                         if log_file.rewind().is_ok() && log_file.set_len(0).is_ok() {
                             let _ = write!(log_file, "{full}");
                             let _ = log_file.flush();

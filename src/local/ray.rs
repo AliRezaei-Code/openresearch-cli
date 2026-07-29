@@ -5,7 +5,8 @@ use std::collections::HashMap;
 
 use crate::commands::exp::{hf_clone_script, spawn_detached_supervise};
 use crate::error::{anyhow, Result};
-use crate::jobs::{ray, BackendDescriptor};
+use crate::jobs::ssh::sh_quote;
+use crate::jobs::{huggingface, ray, BackendDescriptor};
 use crate::local::git;
 use crate::store::{now_ms, Store, StoredRun};
 
@@ -32,8 +33,8 @@ pub async fn launch_local_ray(args: &crate::ExpRunArgs) -> Result<()> {
 pub async fn submit_local_ray(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     if args.sandbox.is_some() || args.gpu.is_some() || args.cpu.is_some() {
         return Err(anyhow!(
-            "Local experiments run on Ray Jobs; drop --gpu/--cpu/--sandbox \
-             and pass --backend ray [--flavor cpu:2|gpu:1|…]."
+            "--backend ray submits to your Ray cluster; drop --gpu/--cpu/--sandbox and \
+             ask for resources with --flavor (e.g. --flavor gpu:1)."
         ));
     }
     if args.image.is_some() {
@@ -136,8 +137,16 @@ pub async fn submit_local_ray(args: &crate::ExpRunArgs) -> Result<StoredRun> {
         &project.github_repo,
         &run_command,
     );
-    let mut env = HashMap::new();
+    // The job env: everything the user synced (API keys), plus the tokens the
+    // clone step expects. Ray renders runtime_env in its dashboard, but anyone
+    // with dashboard access can submit jobs anyway — same trust boundary.
+    let mut env: HashMap<String, String> = crate::config::list_synced_env().into_iter().collect();
+    if let Ok(hf_token) = huggingface::resolve_token() {
+        env.entry("HF_TOKEN".to_string()).or_insert(hf_token);
+    }
     if let Some(gh) = git::resolve_github_token() {
+        // Overrides any synced GITHUB_TOKEN: the clone URL embeds exactly this
+        // variable, and it must be the token the branch was pushed with.
         env.insert("GITHUB_TOKEN".to_string(), gh);
     }
     let mut metadata = HashMap::new();
@@ -148,7 +157,7 @@ pub async fn submit_local_ray(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     let job = ray::run_job(
         &address,
         &ray::JobSubmission {
-            entrypoint: format!("bash -c {}", shell_single_quote(&script)),
+            entrypoint: format!("bash -c {}", sh_quote(&script)),
             submission_id: submission_id.clone(),
             resources,
             env,
@@ -157,7 +166,7 @@ pub async fn submit_local_ray(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     )
     .await?;
 
-    let job_id = job.submission_id.or(job.job_id).unwrap_or(submission_id);
+    let job_id = job.submission_id.unwrap_or(submission_id);
     let watch = ray::job_url(&address, &job_id);
 
     let descriptor = BackendDescriptor {
@@ -195,9 +204,4 @@ pub async fn submit_local_ray(args: &crate::ExpRunArgs) -> Result<StoredRun> {
 
     spawn_detached_supervise(&run_id)?;
     Ok(run)
-}
-
-/// Wrap `s` in single quotes for `bash -c '…'`, escaping embedded `'`.
-fn shell_single_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
 }

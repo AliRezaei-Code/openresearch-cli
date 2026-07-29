@@ -2295,7 +2295,7 @@ fn ray_settings_json() -> Value {
     let settings = ray::load_settings().ok().flatten().unwrap_or_default();
     let (resolved, source) = ray::resolve_address_with_source(None);
     let source_label = match source {
-        ray::AddressSource::Settings => "settings",
+        ray::AddressSource::Explicit | ray::AddressSource::Settings => "settings",
         ray::AddressSource::AstroaiEnv => "ASTROAI_RAY_JOBS_ADDRESS",
         ray::AddressSource::RayEnv => "RAY_DASHBOARD_URL",
         ray::AddressSource::Default => "default",
@@ -2324,7 +2324,18 @@ async fn set_ray_settings(Json(req): Json<SetRaySettingsReq>) -> ApiResult {
     tokio::task::spawn_blocking(move || {
         let mut settings = ray::load_settings()?.unwrap_or_default();
         if let Some(a) = req.address {
-            settings.address = Some(a.trim().to_string()).filter(|s| !s.is_empty());
+            let a = Some(a.trim().to_string()).filter(|s| !s.is_empty());
+            if let Some(a) = &a {
+                // Reject a default that would fail every later launch.
+                let url = reqwest::Url::parse(a)
+                    .map_err(|e| bad_request(anyhow!("Invalid Jobs URL {a:?}: {e}")))?;
+                if !matches!(url.scheme(), "http" | "https") {
+                    return Err(bad_request(anyhow!(
+                        "The Jobs URL must be http(s), e.g. http://127.0.0.1:8265 (got {a:?})."
+                    )));
+                }
+            }
+            settings.address = a;
         }
         ray::save_settings(&settings)?;
         Ok(Json(ray_settings_json()))
@@ -2342,10 +2353,10 @@ struct RayPreflightReq {
 async fn ray_preflight(Json(req): Json<RayPreflightReq>) -> ApiResult {
     let address = ray::resolve_address(req.address.as_deref());
     match ray::preflight(&address).await {
-        Ok(p) => Ok(Json(json!({
-            "reachable": p.reachable,
-            "address": p.address,
-            "rayVersion": p.ray_version,
+        Ok(ray_version) => Ok(Json(json!({
+            "reachable": true,
+            "address": address,
+            "rayVersion": ray_version,
             "error": null,
         }))),
         Err(e) => Ok(Json(json!({
@@ -2438,7 +2449,9 @@ fn compute_settings_json(ssh: SshReadiness) -> Value {
     let (ray_resolved, ray_source) = crate::jobs::ray::resolve_address_with_source(None);
     let ray_configured = !matches!(ray_source, crate::jobs::ray::AddressSource::Default);
     let ray_source_label = match ray_source {
-        crate::jobs::ray::AddressSource::Settings => "Saved address",
+        crate::jobs::ray::AddressSource::Explicit | crate::jobs::ray::AddressSource::Settings => {
+            "Saved address"
+        }
         crate::jobs::ray::AddressSource::AstroaiEnv => "ASTROAI_RAY_JOBS_ADDRESS",
         crate::jobs::ray::AddressSource::RayEnv => "RAY_DASHBOARD_URL",
         crate::jobs::ray::AddressSource::Default => "Default localhost:8265",
@@ -2510,9 +2523,7 @@ fn compute_settings_json(ssh: SshReadiness) -> Value {
         },
         {
             "id": "ray",
-            // Always "worth trying" — default localhost is a valid cluster
-            // address when a local head is running; the expanded row probes.
-            "configured": true,
+            "configured": ray_configured,
             "summary": if ray_configured {
                 format!("{ray_source_label} ({ray_resolved})")
             } else {

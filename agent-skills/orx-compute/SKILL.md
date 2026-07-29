@@ -227,8 +227,9 @@ Rules and notes:
   `ASTROAI_RAY_JOBS_ADDRESS` / `RAY_DASHBOARD_URL`, else
   `http://127.0.0.1:8265` (a local Ray head).
 - **`--flavor` is optional** entrypoint resource hints: `cpu[:N]`, `gpu[:N]`,
-  `mem:<size>` (comma-separated, e.g. `gpu:1,cpu:4,mem:8GiB`). Omit it to
-  reserve nothing — that avoids Pending on small heads.
+  `mem:<size>` (comma-separated, e.g. `gpu:1,cpu:4,mem:8GiB`; `mem` is a
+  scheduling reservation, not an enforced cap). Omit it to reserve nothing —
+  that avoids Pending on small heads.
 - No `--image`, `--host`, or `--timeout` — the job runs in the cluster's
   runtime env until it finishes; size and bound work in the run command itself.
 - Same clone contract and downstream commands as every backend; a detached

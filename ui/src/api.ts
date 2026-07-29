@@ -195,7 +195,7 @@ export const startRun = (
   body: {
     /** Omit to launch on the default compute target (Settings → Compute);
      * with no default set the server falls back to `hf`. */
-    backend?: "local" | "hf" | "modal" | "k8s" | "ssh" | "slurm" | "openresearch";
+    backend?: "local" | "hf" | "modal" | "k8s" | "ssh" | "slurm" | "ray" | "openresearch";
     flavor?: string;
     manifest?: string;
     timeout?: string;
@@ -1136,6 +1136,8 @@ export function backendDetail(backend: Run["backend"]): string {
   if (!backend) return "";
   if (typeof backend.flavor === "string" && backend.flavor) return backend.flavor;
   if (typeof backend.manifest === "string" && backend.manifest) return backend.manifest;
+  // Ray's namespace is the whole Jobs URL — too long for a badge.
+  if (backendKind(backend) === "ray_job") return "";
   if (typeof backend.namespace === "string" && backend.namespace) return backend.namespace;
   return "";
 }

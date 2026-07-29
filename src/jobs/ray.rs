@@ -1,17 +1,7 @@
 //! Ray Jobs client — REST surface for `orx exp run --backend ray`.
 //!
-//! Talks to a Ray cluster's Jobs / Dashboard API (default
-//! `http://127.0.0.1:8265`). Address resolution:
-//!   1. Settings file (`$XDG_CONFIG_HOME/openresearch/ray.json`)
-//!   2. `ASTROAI_RAY_JOBS_ADDRESS`
-//!   3. `RAY_DASHBOARD_URL`
-//!   4. `http://127.0.0.1:8265`
-//!
-//! Paths (Ray 2.x):
-//!   POST   {address}/api/jobs/                 submit
-//!   GET    {address}/api/jobs/{submission_id}  inspect
-//!   GET    {address}/api/jobs/{submission_id}/logs
-//!   POST   {address}/api/jobs/{submission_id}/stop
+//! Talks to the Ray 2.x Jobs API, which the cluster's Dashboard serves (hence
+//! the dashboard port in the default address).
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -67,32 +57,13 @@ pub fn save_settings(settings: &RaySettings) -> Result<()> {
 
 /// Resolve the Jobs API base URL (no trailing slash).
 pub fn resolve_address(explicit: Option<&str>) -> String {
-    if let Some(a) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
-        return a.trim_end_matches('/').to_string();
-    }
-    if let Ok(Some(s)) = load_settings() {
-        if let Some(a) = s
-            .address
-            .map(|x| x.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            return a.trim_end_matches('/').to_string();
-        }
-    }
-    for key in ["ASTROAI_RAY_JOBS_ADDRESS", "RAY_DASHBOARD_URL"] {
-        if let Ok(a) = std::env::var(key) {
-            let a = a.trim().to_string();
-            if !a.is_empty() {
-                return a.trim_end_matches('/').to_string();
-            }
-        }
-    }
-    DEFAULT_ADDRESS.to_string()
+    resolve_address_with_source(explicit).0
 }
 
 /// Where the address came from (settings UI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressSource {
+    Explicit,
     Settings,
     AstroaiEnv,
     RayEnv,
@@ -100,33 +71,19 @@ pub enum AddressSource {
 }
 
 pub fn resolve_address_with_source(explicit: Option<&str>) -> (String, AddressSource) {
-    if let Some(a) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
-        return (a.trim_end_matches('/').to_string(), AddressSource::Settings);
+    let clean = |a: &str| a.trim().trim_end_matches('/').to_string();
+    let nonempty = |a: Option<String>| a.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    if let Some(a) = nonempty(explicit.map(str::to_string)) {
+        return (clean(&a), AddressSource::Explicit);
     }
-    if let Ok(Some(s)) = load_settings() {
-        if let Some(a) = s
-            .address
-            .as_ref()
-            .map(|x| x.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            return (a.trim_end_matches('/').to_string(), AddressSource::Settings);
-        }
+    if let Some(a) = nonempty(load_settings().ok().flatten().and_then(|s| s.address)) {
+        return (clean(&a), AddressSource::Settings);
     }
-    if let Ok(a) = std::env::var("ASTROAI_RAY_JOBS_ADDRESS") {
-        let a = a.trim().to_string();
-        if !a.is_empty() {
-            return (
-                a.trim_end_matches('/').to_string(),
-                AddressSource::AstroaiEnv,
-            );
-        }
+    if let Some(a) = nonempty(std::env::var("ASTROAI_RAY_JOBS_ADDRESS").ok()) {
+        return (clean(&a), AddressSource::AstroaiEnv);
     }
-    if let Ok(a) = std::env::var("RAY_DASHBOARD_URL") {
-        let a = a.trim().to_string();
-        if !a.is_empty() {
-            return (a.trim_end_matches('/').to_string(), AddressSource::RayEnv);
-        }
+    if let Some(a) = nonempty(std::env::var("RAY_DASHBOARD_URL").ok()) {
+        return (clean(&a), AddressSource::RayEnv);
     }
     (DEFAULT_ADDRESS.to_string(), AddressSource::Default)
 }
@@ -199,8 +156,8 @@ pub fn parse_flavor(flavor: Option<&str>) -> Result<RayResources> {
             }
         }
     }
-    if out.cpus < 0.0 || out.gpus < 0.0 {
-        return Err(anyhow!("Ray flavor cpus/gpus must be non-negative"));
+    if !(out.cpus.is_finite() && out.cpus >= 0.0 && out.gpus.is_finite() && out.gpus >= 0.0) {
+        return Err(anyhow!("Ray flavor cpus/gpus must be non-negative numbers"));
     }
     Ok(out)
 }
@@ -265,40 +222,21 @@ async fn check(res: reqwest::Response, what: &str) -> Result<reqwest::Response> 
     ))
 }
 
-/// Probe the Jobs API (used by Settings preflight).
-pub async fn preflight(address: &str) -> Result<Preflight> {
+/// Probe the Jobs API; `Ok` means reachable, carrying the cluster's Ray
+/// version when it reports one.
+pub async fn preflight(address: &str) -> Result<Option<String>> {
     let address = address.trim_end_matches('/');
-    let version_url = format!("{address}/api/version");
     let res = http()
-        .get(&version_url)
+        .get(format!("{address}/api/version"))
         .send()
         .await
         .map_err(|e| anyhow!("Could not reach Ray Jobs at {address}: {e}"))?;
-    let status = res.status();
-    if !status.is_success() {
-        let body = res.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "Ray Jobs at {address} returned HTTP {}: {body}",
-            status.as_u16()
-        ));
-    }
+    let res = check(res, "preflight").await?;
     let body: serde_json::Value = res.json().await.unwrap_or(json!({}));
-    let ray_version = body
+    Ok(body
         .get("ray_version")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    Ok(Preflight {
-        reachable: true,
-        address: address.to_string(),
-        ray_version,
-    })
-}
-
-#[derive(Debug, Clone)]
-pub struct Preflight {
-    pub reachable: bool,
-    pub address: String,
-    pub ray_version: Option<String>,
+        .map(|s| s.to_string()))
 }
 
 pub struct JobSubmission {
@@ -309,18 +247,15 @@ pub struct JobSubmission {
     pub metadata: HashMap<String, String>,
 }
 
+/// Ray echoes the client-chosen submission id back on submit.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubmitResponse {
     #[serde(default)]
     pub submission_id: Option<String>,
-    #[serde(default)]
-    pub job_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct JobInfo {
-    #[allow(dead_code)]
-    pub submission_id: String,
     /// Shared stage vocabulary (`SCHEDULING` / `RUNNING` / `COMPLETED` / …).
     pub stage: String,
     pub message: Option<String>,
@@ -332,8 +267,6 @@ struct RawJobStatus {
     status: Option<String>,
     #[serde(default)]
     message: Option<String>,
-    #[serde(default)]
-    submission_id: Option<String>,
 }
 
 fn map_ray_status(raw: &str) -> String {
@@ -381,9 +314,6 @@ pub async fn inspect_job(address: &str, submission_id: &str) -> Result<JobInfo> 
     let raw: RawJobStatus = check(res, "job inspect").await?.json().await?;
     let status = raw.status.unwrap_or_else(|| "PENDING".into());
     Ok(JobInfo {
-        submission_id: raw
-            .submission_id
-            .unwrap_or_else(|| submission_id.to_string()),
         stage: map_ray_status(&status),
         message: raw.message,
     })
@@ -451,6 +381,13 @@ mod tests {
     fn address_prefers_explicit() {
         let (a, src) = resolve_address_with_source(Some("http://example:8265/"));
         assert_eq!(a, "http://example:8265");
-        assert_eq!(src, AddressSource::Settings);
+        assert_eq!(src, AddressSource::Explicit);
+    }
+
+    #[test]
+    fn flavor_rejects_nan_and_negative() {
+        assert!(parse_flavor(Some("gpu:NaN")).is_err());
+        assert!(parse_flavor(Some("cpu:-1")).is_err());
+        assert!(parse_flavor(Some("gpu:inf")).is_err());
     }
 }
