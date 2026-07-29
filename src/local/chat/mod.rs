@@ -253,6 +253,32 @@ impl WirePart {
         }
     }
 
+    /// A synthetic tool part — a status row (`error`, `interrupted`, …) that
+    /// isn't a real tool call. The UI renders it through the same tool-row path
+    /// as harness tools.
+    pub fn tool(
+        id: impl Into<String>,
+        tool: impl Into<String>,
+        status: impl Into<String>,
+        error: Option<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            kind: "tool".into(),
+            text: None,
+            tool: Some(tool.into()),
+            state: Some(WireToolState {
+                status: status.into(),
+                input: None,
+                output: None,
+                error,
+                title: None,
+            }),
+            prompt: None,
+            children: Vec::new(),
+        }
+    }
+
     /// An interactive prompt part (plan / permission / question).
     pub fn prompt(id: impl Into<String>, prompt: WirePrompt) -> Self {
         Self {
@@ -1206,37 +1232,34 @@ impl ChatHost {
     /// markerless on purpose: their stories are told elsewhere (the resolved
     /// card, the row disappearing).
     pub async fn interrupt_by_user(&self, session_id: &str) -> Result<()> {
+        // Stamped before the abort: a fast resend can claim the freed slot and
+        // persist its user message before this runs, and a later timestamp
+        // would sort the marker after that new bubble. (The live broadcast can
+        // still paint them in arrival order for a few ms; a reload converges
+        // on the stored order.)
+        let created_at = now_ms();
         if !self.interrupt(session_id).await? {
             return Ok(());
         }
         let msg = WireMessage {
             id: format!("msg_{}", uuid::Uuid::new_v4()),
             role: "assistant".into(),
-            parts: vec![WirePart {
-                id: "interrupted".into(),
-                kind: "tool".into(),
-                text: None,
-                tool: Some("interrupted".into()),
-                state: Some(WireToolState {
-                    status: "completed".into(),
-                    input: None,
-                    output: None,
-                    error: None,
-                    title: None,
-                }),
-                prompt: None,
-                children: Vec::new(),
-            }],
-            created_at: now_ms(),
+            parts: vec![WirePart::tool(
+                "interrupted",
+                "interrupted",
+                "completed",
+                None,
+            )],
+            created_at,
         };
         // Marker persistence is best-effort: the abort already happened, and an
         // Err here would surface as a failed Stop on a turn that IS stopped.
-        if let Ok(store) = Store::open() {
+        if let (Ok(store), Ok(json)) = (Store::open(), serde_json::to_string(&msg.parts)) {
             let _ = store.upsert_chat_message(&StoredChatMessage {
                 id: msg.id.clone(),
                 session_id: session_id.to_string(),
                 role: "assistant".into(),
-                parts_json: serde_json::to_string(&msg.parts)?,
+                parts_json: json,
                 created_at: msg.created_at,
             });
         }
@@ -1919,21 +1942,9 @@ impl TurnCtx {
 
     pub fn push_error(&mut self, message: String) {
         let id = format!("err-{}", self.assistant.parts.len());
-        self.assistant.parts.push(WirePart {
-            id,
-            kind: "tool".into(),
-            text: None,
-            tool: Some("error".into()),
-            state: Some(WireToolState {
-                status: "error".into(),
-                input: None,
-                output: None,
-                error: Some(message),
-                title: None,
-            }),
-            prompt: None,
-            children: Vec::new(),
-        });
+        self.assistant
+            .parts
+            .push(WirePart::tool(id, "error", "error", Some(message)));
     }
 
     /// Persist + broadcast the assistant message, rate-limited mid-turn.

@@ -27,6 +27,7 @@ mod plan_gate;
 pub(crate) mod title;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
@@ -38,6 +39,14 @@ pub use detect::{HarnessInfo, ModelInfo};
 pub use options::{HarnessOptions, PermissionMode};
 pub use plan_gate::command_is_readonly;
 pub use plan_gate::decide as plan_gate_decide;
+
+/// A turn with NO events for this long is treated as wedged and interrupted
+/// rather than held busy forever. Known false positive: a command that is
+/// legitimately silent this long (a quiet build, a training step with
+/// buffered output) is indistinguishable from a hang — hence the generous
+/// bound; the interruption is a clear, recoverable error either way. Shared
+/// by the codex and claude adapters (each applies it to its own event wait).
+pub(crate) const TURN_WATCHDOG: Duration = Duration::from_secs(30 * 60);
 
 /// How an answered interactive prompt flows back into the harness. The two axes
 /// a harness can live on:

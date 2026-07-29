@@ -92,18 +92,12 @@ export function useOrxEvents(handlers: OrxEventHandlers) {
   ref.current = handlers;
   useEffect(() => {
     const es = new EventSource("/api/events");
-    // Surface reconnects (not the first connect) so chat state can re-sync:
-    // the browser auto-reconnects a dropped EventSource, but any chat frames
-    // emitted during the gap were broadcast-only and are gone.
-    let hadError = false;
-    es.onerror = () => {
-      hadError = true;
-    };
+    // The browser auto-reconnects a dropped EventSource and fires `open` again
+    // on each re-open — emit only then, not on the first connect.
+    let connected = false;
     es.onopen = () => {
-      if (hadError) {
-        hadError = false;
-        emitChat({ type: "reconnected" });
-      }
+      if (connected) emitChat({ type: "reconnected" });
+      connected = true;
     };
     const parse = <T>(e: MessageEvent): T | null => {
       try {

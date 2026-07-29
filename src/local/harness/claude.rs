@@ -1371,13 +1371,9 @@ fn spawn_config(ctx: &TurnCtx) -> SpawnConfig {
 /// Deadline for a turn's FIRST stream event. A healthy child (resident or
 /// freshly spawned) answers a user message with output within seconds; total
 /// silence this long means a wedged child. Generous enough to sit out an API
-/// retry-with-backoff burst.
+/// retry-with-backoff burst. Later gaps get the shared [`super::TURN_WATCHDOG`]
+/// instead (a long-running tool emits nothing until it finishes).
 const FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Deadline between events once the turn is streaming — matches the codex
-/// adapter's TURN_WATCHDOG trade-off (a long-running tool emits nothing until
-/// it finishes, so this must be generous).
-const TURN_WATCHDOG: Duration = Duration::from_secs(30 * 60);
 
 async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     let project = ctx.project.clone();
@@ -1450,28 +1446,38 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     let mut saw_event = false;
     loop {
         let deadline = if saw_event {
-            TURN_WATCHDOG
+            super::TURN_WATCHDOG
         } else {
             FIRST_EVENT_TIMEOUT
         };
         let event = match tokio::time::timeout(deadline, rx.recv()).await {
             Ok(event) => event,
+            // A child held on the mcp-gate bridge long-poll is silently
+            // blocked BY DESIGN — user think-time on an approval card is
+            // unbounded. Re-arm the same deadline (checked on timeout, not up
+            // front, so a card raised mid-wait is honored too).
+            Err(_) if ctx.host.has_pending_permission(&ctx.session_id) => continue,
             Err(_) => {
-                // A child held on the mcp-gate bridge long-poll is silently
-                // blocked BY DESIGN — user think-time on an approval card is
-                // unbounded. Re-arm rather than kill. (Checked on timeout, not
-                // up front, so a card raised mid-wait is honored too.)
-                if ctx.host.has_pending_permission(&ctx.session_id) {
-                    saw_event = true;
-                    continue;
-                }
                 ctx.host.claude.kill_session(&ctx.session_id).await;
                 let _ = ctx.flush();
+                // The expired-login hint only fits the never-answered case; a
+                // mid-turn gap this long is more likely a genuinely hung tool.
+                let (span, hint) = if saw_event {
+                    (
+                        format!("{} minutes", super::TURN_WATCHDOG.as_secs() / 60),
+                        "",
+                    )
+                } else {
+                    (
+                        format!("{}s", deadline.as_secs()),
+                        " (an expired login can cause this; run `claude` in a \
+                         terminal to check)",
+                    )
+                };
                 return Err(anyhow!(
-                    "claude produced no output for {}s — killed the wedged child \
-                     (an expired login can cause this; run `claude` in a terminal \
-                     to check). Sending another message resumes the session; see {}",
-                    deadline.as_secs(),
+                    "claude produced no output for {span} — killed the wedged \
+                     child{hint}. Sending another message resumes the session; \
+                     see {}",
                     crate::store::data_dir().join("agent-claude.log").display()
                 ));
             }
