@@ -37,7 +37,11 @@ export type ChatEvent =
   | { type: "sessionDeleted"; sessionId: string }
   | { type: "message"; sessionId: string; message: ChatMessage }
   | { type: "busy"; sessionId: string; busy: boolean }
-  | { type: "usage"; sessionId: string; usage: ContextUsage };
+  | { type: "usage"; sessionId: string; usage: ContextUsage }
+  /** The EventSource re-connected after a drop. Chat events are edge-only (no
+   * snapshot on connect), so frames emitted during the gap are lost for good —
+   * subscribers must refetch whatever they render from chat events. */
+  | { type: "reconnected" };
 
 type ChatListener = (ev: ChatEvent) => void;
 const chatListeners = new Set<ChatListener>();
@@ -88,6 +92,19 @@ export function useOrxEvents(handlers: OrxEventHandlers) {
   ref.current = handlers;
   useEffect(() => {
     const es = new EventSource("/api/events");
+    // Surface reconnects (not the first connect) so chat state can re-sync:
+    // the browser auto-reconnects a dropped EventSource, but any chat frames
+    // emitted during the gap were broadcast-only and are gone.
+    let hadError = false;
+    es.onerror = () => {
+      hadError = true;
+    };
+    es.onopen = () => {
+      if (hadError) {
+        hadError = false;
+        emitChat({ type: "reconnected" });
+      }
+    };
     const parse = <T>(e: MessageEvent): T | null => {
       try {
         return JSON.parse(e.data as string) as T;

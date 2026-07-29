@@ -264,6 +264,8 @@ function toolLine(part: ChatPart): string {
       return subagentLine(input);
     case "error":
       return "Error";
+    case "interrupted":
+      return "Interrupted";
     default: {
       const detail = desc ?? fp ?? cmd ?? part.state?.title ?? "";
       return detail ? `${tool}: ${detail}` : tool;
@@ -1469,6 +1471,32 @@ export function ChatPanel({
     });
   }, [projectId]);
 
+  // Repair after an SSE gap. Chat frames are edge-only — a dropped EventSource
+  // mid-turn loses chat.message / chat.busy events for good, which strands the
+  // UI (a spinner that never clears, or a reply that never appears until a
+  // reload). On reconnect, refetch the authoritative state: the session list
+  // (busy flags ride it) and the active transcript. Separate subscription so
+  // it can depend on activeId without re-running the main handler's effect.
+  useEffect(() => {
+    return onChatEvent((ev) => {
+      if (ev.type !== "reconnected") return;
+      listChatSessions(projectId)
+        .then((list) => {
+          setSessions(list);
+          dispatch({
+            type: "seedBusy",
+            sessions: list.filter((s) => s.busy).map((s) => s.id),
+          });
+        })
+        .catch(() => {});
+      if (activeId && loadedSessions.current.has(activeId)) {
+        getChatMessages(activeId)
+          .then((messages) => dispatch({ type: "seed", sessionId: activeId, messages }))
+          .catch(() => {});
+      }
+    });
+  }, [projectId, activeId]);
+
   const messages = activeId ? (state.messagesBySession[activeId] ?? []) : [];
   const busy = activeId ? state.busySessions.has(activeId) : false;
   // A session whose transcript hasn't been seeded yet: its key is absent from
@@ -1699,8 +1727,33 @@ export function ChatPanel({
         dataBase64: a.dataUrl.slice(a.dataUrl.indexOf(",") + 1),
       }));
       await sendChatMessage(sid, text, turnOpts, images.length ? images : undefined);
-    } catch {
-      if (sid) dispatch({ type: "busy", sessionId: sid, busy: false });
+    } catch (err) {
+      if (!sid) return;
+      dispatch({ type: "busy", sessionId: sid, busy: false });
+      // Surface the failure instead of swallowing it: a silently dropped send
+      // leaves the optimistic bubble unanswered and reads as "orx did nothing".
+      // Local-only (LOCAL_PREFIX) — it vanishes on reload, and a later
+      // successful send sweeps it with the optimistic bubble.
+      dispatch({
+        type: "upsertMessage",
+        sessionId: sid,
+        message: {
+          id: `${LOCAL_PREFIX}senderr-${Date.now()}`,
+          role: "assistant",
+          parts: [
+            {
+              id: "p0",
+              type: "tool",
+              tool: "error",
+              state: {
+                status: "error",
+                error: `Message not sent: ${err instanceof Error ? err.message : String(err)}`,
+              },
+            },
+          ],
+          createdAt: Date.now(),
+        },
+      });
     }
   }
 

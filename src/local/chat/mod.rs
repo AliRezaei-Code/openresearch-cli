@@ -809,6 +809,18 @@ impl ChatHost {
         Ok(())
     }
 
+    /// Whether a bridge approval card of this session is still awaiting the
+    /// user. The claude turn watchdog consults this: a child held on the
+    /// mcp-gate long-poll is silently blocked *by design* (user think-time is
+    /// unbounded), so the no-output timeout must not kill it.
+    pub fn has_pending_permission(&self, session_id: &str) -> bool {
+        self.pending_permissions
+            .lock()
+            .unwrap()
+            .values()
+            .any(|p| p.session_id == session_id)
+    }
+
     /// Deny-and-unblock every pending bridge request of a session. Called when
     /// its turn ends or is interrupted: the bridge child dies with the turn,
     /// and a card left pending would strand its long-poll forever.
@@ -1143,12 +1155,13 @@ impl ChatHost {
 
     /// Abort an in-flight turn. Child processes die via kill_on_drop; the
     /// opencode adapter additionally gets a native abort so the serve process
-    /// stops generating.
-    pub async fn interrupt(&self, session_id: &str) -> Result<()> {
+    /// stops generating. Returns whether a turn (or a reservation) was
+    /// actually aborted — `false` means the session was already idle.
+    pub async fn interrupt(&self, session_id: &str) -> Result<bool> {
         // Outer None: not busy. Inner None: reserved but not yet spawned — the
         // reservation is now cleared, so send_message's guard will abort setup.
         let Some(handle) = self.turns.lock().await.remove(session_id) else {
-            return Ok(());
+            return Ok(false);
         };
         if let Ok(store) = Store::open() {
             if let Ok(Some(session)) = store.get_chat_session(session_id) {
@@ -1181,6 +1194,53 @@ impl ChatHost {
             handle.abort();
         }
         self.finish_turn(session_id).await;
+        Ok(true)
+    }
+
+    /// User-facing interrupt (the Stop button / Escape): abort like
+    /// [`Self::interrupt`], and when a turn was actually in flight persist a
+    /// visible "Interrupted" marker in the transcript. An aborted turn that had
+    /// streamed nothing would otherwise vanish without a trace — the user's
+    /// message sits unanswered and the stop reads as "orx did nothing".
+    /// Internal interrupts (plan-approval resume, session/project delete) stay
+    /// markerless on purpose: their stories are told elsewhere (the resolved
+    /// card, the row disappearing).
+    pub async fn interrupt_by_user(&self, session_id: &str) -> Result<()> {
+        if !self.interrupt(session_id).await? {
+            return Ok(());
+        }
+        let msg = WireMessage {
+            id: format!("msg_{}", uuid::Uuid::new_v4()),
+            role: "assistant".into(),
+            parts: vec![WirePart {
+                id: "interrupted".into(),
+                kind: "tool".into(),
+                text: None,
+                tool: Some("interrupted".into()),
+                state: Some(WireToolState {
+                    status: "completed".into(),
+                    input: None,
+                    output: None,
+                    error: None,
+                    title: None,
+                }),
+                prompt: None,
+                children: Vec::new(),
+            }],
+            created_at: now_ms(),
+        };
+        // Marker persistence is best-effort: the abort already happened, and an
+        // Err here would surface as a failed Stop on a turn that IS stopped.
+        if let Ok(store) = Store::open() {
+            let _ = store.upsert_chat_message(&StoredChatMessage {
+                id: msg.id.clone(),
+                session_id: session_id.to_string(),
+                role: "assistant".into(),
+                parts_json: serde_json::to_string(&msg.parts)?,
+                created_at: msg.created_at,
+            });
+        }
+        self.emit("chat.message", message_json(&msg, session_id));
         Ok(())
     }
 

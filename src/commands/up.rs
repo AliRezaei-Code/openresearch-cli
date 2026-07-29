@@ -2763,7 +2763,7 @@ async fn chat_attachment(Path(name): Path<String>) -> std::result::Result<Respon
 }
 
 async fn interrupt_chat(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
-    state.chat.interrupt(&id).await?;
+    state.chat.interrupt_by_user(&id).await?;
     Ok(Json(json!({ "ok": true })))
 }
 
