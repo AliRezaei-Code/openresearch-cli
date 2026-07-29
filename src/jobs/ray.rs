@@ -1,7 +1,8 @@
 //! Ray Jobs client — REST surface for `orx exp run --backend ray`.
 //!
 //! Talks to the Ray 2.x Jobs API, which the cluster's Dashboard serves (hence
-//! the dashboard port in the default address).
+//! the dashboard port in the default address). Every function here expects a
+//! `resolve_address`-normalized base URL (trimmed, no trailing slash).
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -55,35 +56,35 @@ pub fn save_settings(settings: &RaySettings) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the Jobs API base URL (no trailing slash).
+/// Resolve the Jobs API base URL (trimmed, no trailing slash), preferring an
+/// explicit caller-supplied address over the saved/env/default chain.
 pub fn resolve_address(explicit: Option<&str>) -> String {
-    resolve_address_with_source(explicit).0
+    match explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(a) => a.trim_end_matches('/').to_string(),
+        None => resolve_address_with_source().0,
+    }
 }
 
 /// Where the address came from (settings UI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressSource {
-    Explicit,
     Settings,
     AstroaiEnv,
     RayEnv,
     Default,
 }
 
-pub fn resolve_address_with_source(explicit: Option<&str>) -> (String, AddressSource) {
-    let clean = |a: &str| a.trim().trim_end_matches('/').to_string();
-    let nonempty = |a: Option<String>| a.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    if let Some(a) = nonempty(explicit.map(str::to_string)) {
-        return (clean(&a), AddressSource::Explicit);
-    }
+pub fn resolve_address_with_source() -> (String, AddressSource) {
+    let clean = |a: String| a.trim().trim_end_matches('/').to_string();
+    let nonempty = |a: Option<String>| a.filter(|s| !s.trim().is_empty());
     if let Some(a) = nonempty(load_settings().ok().flatten().and_then(|s| s.address)) {
-        return (clean(&a), AddressSource::Settings);
+        return (clean(a), AddressSource::Settings);
     }
     if let Some(a) = nonempty(std::env::var("ASTROAI_RAY_JOBS_ADDRESS").ok()) {
-        return (clean(&a), AddressSource::AstroaiEnv);
+        return (clean(a), AddressSource::AstroaiEnv);
     }
     if let Some(a) = nonempty(std::env::var("RAY_DASHBOARD_URL").ok()) {
-        return (clean(&a), AddressSource::RayEnv);
+        return (clean(a), AddressSource::RayEnv);
     }
     (DEFAULT_ADDRESS.to_string(), AddressSource::Default)
 }
@@ -225,7 +226,6 @@ async fn check(res: reqwest::Response, what: &str) -> Result<reqwest::Response> 
 /// Probe the Jobs API; `Ok` means reachable, carrying the cluster's Ray
 /// version when it reports one.
 pub async fn preflight(address: &str) -> Result<Option<String>> {
-    let address = address.trim_end_matches('/');
     let res = http()
         .get(format!("{address}/api/version"))
         .send()
@@ -245,13 +245,6 @@ pub struct JobSubmission {
     pub resources: RayResources,
     pub env: HashMap<String, String>,
     pub metadata: HashMap<String, String>,
-}
-
-/// Ray echoes the client-chosen submission id back on submit.
-#[derive(Debug, Clone, Deserialize)]
-pub struct SubmitResponse {
-    #[serde(default)]
-    pub submission_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -280,8 +273,9 @@ fn map_ray_status(raw: &str) -> String {
     }
 }
 
-pub async fn run_job(address: &str, spec: &JobSubmission) -> Result<SubmitResponse> {
-    let address = address.trim_end_matches('/');
+/// Submit the job. The submission id is client-chosen (`spec.submission_id`),
+/// so a success needs nothing from the response body.
+pub async fn run_job(address: &str, spec: &JobSubmission) -> Result<()> {
     let env = super::default_unbuffered(&spec.env);
     let mut body = json!({
         "entrypoint": spec.entrypoint,
@@ -300,17 +294,25 @@ pub async fn run_job(address: &str, spec: &JobSubmission) -> Result<SubmitRespon
         .send()
         .await
         .map_err(|e| anyhow!("Could not reach Ray Jobs at {address}: {e}"))?;
-    let job: SubmitResponse = check(res, "job submit").await?.json().await?;
-    Ok(job)
+    check(res, "job submit").await?;
+    Ok(())
 }
 
 pub async fn inspect_job(address: &str, submission_id: &str) -> Result<JobInfo> {
-    let address = address.trim_end_matches('/');
     let res = http()
         .get(format!("{address}/api/jobs/{submission_id}"))
         .send()
         .await
         .map_err(|e| anyhow!("Could not reach Ray Jobs at {address}: {e}"))?;
+    // A 404 means the cluster no longer knows the job (record purged, head
+    // restarted) — a distinct GONE stage for the supervisor to debounce, not
+    // a transport error to retry forever.
+    if res.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(JobInfo {
+            stage: "GONE".to_string(),
+            message: None,
+        });
+    }
     let raw: RawJobStatus = check(res, "job inspect").await?.json().await?;
     let status = raw.status.unwrap_or_else(|| "PENDING".into());
     Ok(JobInfo {
@@ -320,7 +322,6 @@ pub async fn inspect_job(address: &str, submission_id: &str) -> Result<JobInfo> 
 }
 
 pub async fn stop_job(address: &str, submission_id: &str) -> Result<()> {
-    let address = address.trim_end_matches('/');
     let res = http()
         .post(format!("{address}/api/jobs/{submission_id}/stop"))
         .send()
@@ -332,7 +333,6 @@ pub async fn stop_job(address: &str, submission_id: &str) -> Result<()> {
 
 /// Fetch the full driver log text (Ray returns JSON `{"logs":"..."}` or plain text).
 pub async fn fetch_logs(address: &str, submission_id: &str) -> Result<String> {
-    let address = address.trim_end_matches('/');
     let res = http()
         .get(format!("{address}/api/jobs/{submission_id}/logs"))
         .send()
@@ -358,7 +358,6 @@ pub async fn fetch_logs(address: &str, submission_id: &str) -> Result<String> {
 }
 
 pub fn job_url(address: &str, submission_id: &str) -> String {
-    let address = address.trim_end_matches('/');
     format!("{address}/#/jobs/{submission_id}")
 }
 
@@ -379,9 +378,10 @@ mod tests {
 
     #[test]
     fn address_prefers_explicit() {
-        let (a, src) = resolve_address_with_source(Some("http://example:8265/"));
-        assert_eq!(a, "http://example:8265");
-        assert_eq!(src, AddressSource::Explicit);
+        assert_eq!(
+            resolve_address(Some(" http://example:8265/ ")),
+            "http://example:8265"
+        );
     }
 
     #[test]

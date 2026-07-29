@@ -154,7 +154,7 @@ pub async fn submit_local_ray(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     metadata.insert("or_experiment".to_string(), exp.id.clone());
     metadata.insert("or_project".to_string(), project.id.clone());
 
-    let job = ray::run_job(
+    ray::run_job(
         &address,
         &ray::JobSubmission {
             entrypoint: format!("bash -c {}", sh_quote(&script)),
@@ -166,13 +166,12 @@ pub async fn submit_local_ray(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     )
     .await?;
 
-    let job_id = job.submission_id.unwrap_or(submission_id);
-    let watch = ray::job_url(&address, &job_id);
+    let watch = ray::job_url(&address, &submission_id);
 
     let descriptor = BackendDescriptor {
         kind: "ray_job".to_string(),
         namespace: Some(address.clone()),
-        job_id: Some(job_id),
+        job_id: Some(submission_id),
         flavor: args.flavor.clone(),
         image: None,
         url: Some(watch),

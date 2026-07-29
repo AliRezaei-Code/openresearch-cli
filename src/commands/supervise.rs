@@ -1377,9 +1377,14 @@ async fn run_ray(
 
     let mut last_status = stored.status.clone();
     let mut cancel_sent = false;
+    // "GONE" (a 404 — the cluster no longer knows the job) must persist for a
+    // full minute before it's believed: it also fires while a Ray head
+    // restarts. Any other observation resets the count.
+    const GONE_POLLS_TO_FAIL: u32 = (60 / POLL_INTERVAL.as_secs()) as u32;
+    let mut gone_polls = 0u32;
 
     loop {
-        let job = match ray::inspect_job(&address, &submission_id).await {
+        let mut job = match ray::inspect_job(&address, &submission_id).await {
             Ok(j) => j,
             Err(err) => {
                 eprintln!("supervise {run_id}: inspect failed (will retry): {err}");
@@ -1387,6 +1392,22 @@ async fn run_ray(
                 continue;
             }
         };
+        if job.stage == "GONE" {
+            gone_polls += 1;
+            if gone_polls < GONE_POLLS_TO_FAIL {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
+            job = ray::JobInfo {
+                stage: "ERROR".to_string(),
+                message: Some(
+                    "job no longer known to the cluster (record purged or head restarted?)"
+                        .to_string(),
+                ),
+            };
+        } else {
+            gone_polls = 0;
+        }
         let stage = job.stage.as_str();
         let status = if cancel_sent && is_terminal_stage(stage) {
             "cancelled".to_string()
@@ -1449,17 +1470,20 @@ async fn run_ray(
             };
             eprintln!("supervise {run_id}: {last_status} -> {status} (stage {stage})");
             last_status = status.clone();
-            if cancel_requested && !cancel_sent {
+            if cancel_requested || cancel_sent {
                 cancel_ray(&address, &submission_id, &run_id, &mut cancel_sent).await;
             }
-        } else if !cancel_sent {
-            let cancel_requested = match &creds {
-                Some(creds) => crate::client::get_external_run_state(creds, &run_id)
-                    .await
-                    .map(|s| s.cancel_requested)
-                    .unwrap_or(false),
-                None => local_cancel_requested(&store, &run_id),
-            };
+        } else {
+            // Ray's stop is a request, not a guarantee — once cancel was sent,
+            // keep re-issuing until the job actually reaches a terminal stage.
+            let cancel_requested = cancel_sent
+                || match &creds {
+                    Some(creds) => crate::client::get_external_run_state(creds, &run_id)
+                        .await
+                        .map(|s| s.cancel_requested)
+                        .unwrap_or(false),
+                    None => local_cancel_requested(&store, &run_id),
+                };
             if cancel_requested {
                 cancel_ray(&address, &submission_id, &run_id, &mut cancel_sent).await;
             }
@@ -1491,28 +1515,28 @@ async fn tail_logs_ray(
             return;
         }
     };
-    let mut written = 0usize;
+    let mut last = String::new();
     loop {
         match ray::fetch_logs(&address, &submission_id).await {
             Ok(full) => {
-                match full.get(written..) {
-                    // Snapshots are append-only in practice; write just the tail.
-                    Some(chunk) => {
-                        if !chunk.is_empty() {
-                            let _ = write!(log_file, "{chunk}");
-                            let _ = log_file.flush();
-                            written = full.len();
-                        }
+                // Snapshots normally only grow; append the delta. Anything
+                // else (truncation, rotation, a shifted window) invalidates
+                // what's on disk, so rewrite the file wholesale.
+                if let Some(delta) = full.strip_prefix(last.as_str()) {
+                    if !delta.is_empty() {
+                        let _ = log_file.write_all(delta.as_bytes());
+                        let _ = log_file.flush();
+                        last = full;
                     }
-                    // Shrunk or shifted snapshot (e.g. driver restart): the
-                    // remembered offset is meaningless — rewrite from scratch.
-                    None => {
-                        if log_file.rewind().is_ok() && log_file.set_len(0).is_ok() {
-                            let _ = write!(log_file, "{full}");
-                            let _ = log_file.flush();
-                            written = full.len();
-                        }
-                    }
+                } else if log_file.rewind().is_ok() && log_file.set_len(0).is_ok() {
+                    let _ = log_file.write_all(full.as_bytes());
+                    let _ = log_file.flush();
+                    last = full;
+                } else {
+                    eprintln!(
+                        "supervise {run_id}: could not rewrite {} (will retry)",
+                        path.display()
+                    );
                 }
             }
             Err(err) => {
