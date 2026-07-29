@@ -10,6 +10,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { resolveSyntaxLanguage } from "../syntaxLanguage";
 import { highlight } from "../syntaxHighlight";
+// Must match rehype-katex's bundled katex — a version skew breaks \boxed.
 import "katex/dist/katex.min.css";
 
 // Chat blocks are short; cap tokenizing well below the file viewer's limit.
