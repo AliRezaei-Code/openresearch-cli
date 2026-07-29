@@ -18,8 +18,8 @@ importers:
         specifier: ^12.6.0
         version: 12.11.1(@types/react-dom@19.2.3(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
       katex:
-        specifier: ^0.18.1
-        version: 0.18.1
+        specifier: ^0.16.22
+        version: 0.16.47
       lucide-react:
         specifier: ^1.23.0
         version: 1.23.0(react@19.2.7)
@@ -774,10 +774,6 @@ packages:
 
   katex@0.16.47:
     resolution: {integrity: sha512-Eeo8Ys1doU1z+x8AZsPpQu+p/QcZBI5PeOo7QGQdy2x2m0MU/hYagBbGOmXwr5KVbEfVuWv9LpnQWeehogurjg==}
-    hasBin: true
-
-  katex@0.18.1:
-    resolution: {integrity: sha512-Td8GCYSxDAoMhHOlKmCFMJ/hz5qlAAb71n66Dryw9nfCVfumLo7nhuotbvKom/XPADmrYC3O5QR71EPq4DarJQ==}
     hasBin: true
 
   lodash@4.18.1:
@@ -1825,10 +1821,6 @@ snapshots:
   json5@2.2.3: {}
 
   katex@0.16.47:
-    dependencies:
-      commander: 8.3.0
-
-  katex@0.18.1:
     dependencies:
       commander: 8.3.0
 

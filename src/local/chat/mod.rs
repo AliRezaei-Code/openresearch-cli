@@ -2143,11 +2143,17 @@ pub fn prepare_env(cmd: &mut tokio::process::Command) {
 /// notification back to exactly the session that started it.
 pub const CHAT_SESSION_ENV: &str = "ORX_CHAT_SESSION_ID";
 
+/// Marks a process as a child of a local `orx up` harness. Separate from
+/// [`CHAT_SESSION_ENV`], which the cloud box's opencode plugin also exports for
+/// attribution — presence of a session id alone no longer implies local.
+pub const LOCAL_SESSION_ENV: &str = "ORX_LOCAL_SESSION";
+
 /// Stamp the launching session id onto a harness child's env. Call *after*
 /// `prepare_env` so a dashboard-synced value can't shadow it. Harness children
 /// are one-per-session, so this is unambiguous.
 pub fn set_chat_session_env(cmd: &mut tokio::process::Command, session_id: &str) {
     cmd.env(CHAT_SESSION_ENV, session_id);
+    cmd.env(LOCAL_SESSION_ENV, "1");
 }
 
 /// The chat session that launched this run, read from the env the harness child
@@ -2160,13 +2166,13 @@ pub fn launching_chat_session() -> Option<String> {
 }
 
 /// Whether this process is running inside a local `orx up` session.
-/// [`CHAT_SESSION_ENV`] is exported only by [`set_chat_session_env`] onto
+/// [`LOCAL_SESSION_ENV`] is exported only by [`set_chat_session_env`] onto
 /// `orx up` harness children, so its presence means this process is one (or a
 /// subprocess of one). Commands that take a project or run id should prefer
 /// `…is_local()` on the resolved entity; this is for the ones that take
 /// neither (e.g. `orx skill <name>`).
 pub fn in_local_session() -> bool {
-    launching_chat_session().is_some()
+    std::env::var(LOCAL_SESSION_ENV).is_ok_and(|v| !v.is_empty())
 }
 
 /// Append-only stderr sink for a harness child (startup/debug diagnostics).
@@ -2181,6 +2187,65 @@ pub fn harness_log(name: &str) -> Result<std::fs::File> {
         .append(true)
         .open(&path)
         .map_err(|e| anyhow!("Could not open {}: {}", path.display(), e))
+}
+
+#[cfg(test)]
+mod session_env_tests {
+    use super::{in_local_session, CHAT_SESSION_ENV, LOCAL_SESSION_ENV};
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn new(vars: &[&'static str]) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let saved = vars
+                .iter()
+                .map(|k| (*k, std::env::var(k).ok()))
+                .collect::<Vec<_>>();
+            for k in vars {
+                std::env::remove_var(k);
+            }
+            EnvGuard { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// The cloud box's opencode plugin exports CHAT_SESSION_ENV for experiment
+    /// attribution. That must not read as a local `orx up` session, or
+    /// `orx skill` serves the Local skill bodies on every cloud box.
+    #[test]
+    fn chat_session_alone_is_not_a_local_session() {
+        let _guard = EnvGuard::new(&[CHAT_SESSION_ENV, LOCAL_SESSION_ENV]);
+
+        std::env::set_var(CHAT_SESSION_ENV, "ses_cloud_box");
+        assert!(!in_local_session());
+
+        std::env::set_var(LOCAL_SESSION_ENV, "1");
+        assert!(in_local_session());
+    }
+
+    #[test]
+    fn empty_local_marker_is_not_a_local_session() {
+        let _guard = EnvGuard::new(&[CHAT_SESSION_ENV, LOCAL_SESSION_ENV]);
+        std::env::set_var(LOCAL_SESSION_ENV, "");
+        assert!(!in_local_session());
+    }
 }
 
 #[cfg(test)]

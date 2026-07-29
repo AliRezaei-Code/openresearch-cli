@@ -621,6 +621,7 @@ impl ControlPlane for ServerPlane {
                     title,
                     description,
                     parent_experiment_id: parent,
+                    chat_session_id: crate::local::chat::launching_chat_session(),
                 },
             )
             .await?;
@@ -637,6 +638,7 @@ impl ControlPlane for ServerPlane {
                     title: Some(title),
                     description,
                     run_command,
+                    chat_session_id: crate::local::chat::launching_chat_session(),
                 },
             )
             .await?;
