@@ -2436,14 +2436,7 @@ fn compute_settings_json(ssh: SshReadiness) -> Value {
     let slurm_settings = crate::jobs::slurm::load_settings().ok().flatten();
     let slurm_host = slurm_settings.as_ref().and_then(|s| s.host.clone());
     let (ray_resolved, ray_source) = crate::jobs::ray::resolve_address_with_source(None);
-    let ray_configured = !matches!(
-        ray_source,
-        crate::jobs::ray::AddressSource::Default
-    ) || crate::jobs::ray::load_settings()
-        .ok()
-        .flatten()
-        .and_then(|s| s.address)
-        .is_some();
+    let ray_configured = !matches!(ray_source, crate::jobs::ray::AddressSource::Default);
     let ray_source_label = match ray_source {
         crate::jobs::ray::AddressSource::Settings => "Saved address",
         crate::jobs::ray::AddressSource::AstroaiEnv => "ASTROAI_RAY_JOBS_ADDRESS",
@@ -2523,7 +2516,7 @@ fn compute_settings_json(ssh: SshReadiness) -> Value {
             "summary": if ray_configured {
                 format!("{ray_source_label} ({ray_resolved})")
             } else {
-                format!("{ray_source_label}")
+                ray_source_label.to_string()
             },
         },
         {

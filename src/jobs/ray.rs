@@ -71,7 +71,11 @@ pub fn resolve_address(explicit: Option<&str>) -> String {
         return a.trim_end_matches('/').to_string();
     }
     if let Ok(Some(s)) = load_settings() {
-        if let Some(a) = s.address.map(|x| x.trim().to_string()).filter(|s| !s.is_empty()) {
+        if let Some(a) = s
+            .address
+            .map(|x| x.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
             return a.trim_end_matches('/').to_string();
         }
     }

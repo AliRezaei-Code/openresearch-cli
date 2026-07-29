@@ -36,6 +36,27 @@ pub async fn submit_local_ray(args: &crate::ExpRunArgs) -> Result<StoredRun> {
              and pass --backend ray [--flavor cpu:2|gpu:1|…]."
         ));
     }
+    if args.image.is_some() {
+        return Err(anyhow!(
+            "--image doesn't apply to --backend ray — the job runs in the cluster's \
+             runtime environment, not a per-job container."
+        ));
+    }
+    if args.host.is_some() {
+        return Err(anyhow!(
+            "--host only applies with --backend ssh/slurm. Set the Ray Jobs URL in \
+             Settings → Compute → Ray (or ASTROAI_RAY_JOBS_ADDRESS / RAY_DASHBOARD_URL)."
+        ));
+    }
+    if args.manifest.is_some() {
+        return Err(anyhow!("--manifest only applies with --backend k8s."));
+    }
+    if args.timeout.is_some() {
+        return Err(anyhow!(
+            "--timeout isn't supported on --backend ray — Ray Jobs have no time limit; \
+             the job runs until the command exits. Bound the run in the command itself."
+        ));
+    }
 
     let resources = ray::parse_flavor(args.flavor.as_deref())?;
     let address = ray::resolve_address(None);
@@ -115,11 +136,6 @@ pub async fn submit_local_ray(args: &crate::ExpRunArgs) -> Result<StoredRun> {
         &project.github_repo,
         &run_command,
     );
-    // Prefer an explicit image only as documentation on the descriptor —
-    // Ray Jobs run in the cluster's runtime env, not a per-job Docker image
-    // unless the cluster is configured for it. We still record --image if set.
-    let image = args.image.clone();
-
     let mut env = HashMap::new();
     if let Some(gh) = git::resolve_github_token() {
         env.insert("GITHUB_TOKEN".to_string(), gh);
@@ -141,10 +157,7 @@ pub async fn submit_local_ray(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     )
     .await?;
 
-    let job_id = job
-        .submission_id
-        .or(job.job_id)
-        .unwrap_or(submission_id);
+    let job_id = job.submission_id.or(job.job_id).unwrap_or(submission_id);
     let watch = ray::job_url(&address, &job_id);
 
     let descriptor = BackendDescriptor {
@@ -152,7 +165,7 @@ pub async fn submit_local_ray(args: &crate::ExpRunArgs) -> Result<StoredRun> {
         namespace: Some(address.clone()),
         job_id: Some(job_id),
         flavor: args.flavor.clone(),
-        image,
+        image: None,
         url: Some(watch),
         context: None,
         manifest: None,

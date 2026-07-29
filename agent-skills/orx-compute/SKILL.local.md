@@ -143,8 +143,8 @@ orx exp run <expId> --backend ray --flavor cpu:2,mem:8GiB
   `http://127.0.0.1:8265`.
 - **`--flavor` is optional** resource hints for the job entrypoint:
   `cpu[:N]`, `gpu[:N]`, `mem:<size>` (comma-separated). Omit it to reserve
-  nothing (avoids Pending on small heads). There is no per-job `--image`
-  unless the cluster's runtime env already provides one.
+  nothing (avoids Pending on small heads). No `--image`, `--host`, or
+  `--timeout` — the job runs in the cluster's runtime env until it finishes.
 
 ## An OpenResearch box — `--backend openresearch`
 

@@ -1,6 +1,6 @@
 ---
 name: orx-compute
-description: "Launch experiment runs with `orx exp run`: backends (hf, modal, k8s, ssh, slurm, openresearch, local), flavors, timeouts, images, sizing, and `orx exp wait`. Use before launching or re-launching any run, when choosing or switching a backend or GPU flavor, when a job OOMs, stalls, or times out, or when deciding GPU vs CPU."
+description: "Launch experiment runs with `orx exp run`: backends (hf, modal, k8s, ssh, slurm, ray, openresearch, local), flavors, timeouts, images, sizing, and `orx exp wait`. Use before launching or re-launching any run, when choosing or switching a backend or GPU flavor, when a job OOMs, stalls, or times out, or when deciding GPU vs CPU."
 ---
 
 Each experiment node has a **run command** (the shell command that trains/evaluates
@@ -207,6 +207,32 @@ Rules and notes:
   GitHub tip and runs the fixed command — commit and push first. Everything
   downstream (`orx exp wait` / `orx runs` / `orx logs` / `orx exp cancel`) is
   identical; a detached `orx supervise` mirrors status and logs — don't kill it.
+
+## Running on a Ray Jobs cluster — `--backend ray`
+
+**Same rule: use `--backend ray` ONLY when the user explicitly asks for their
+Ray cluster** ("submit it to ray", "run it on the ray cluster") or it is the
+configured default target. Local projects (`orx up`) only. It submits via the
+Ray Jobs / Dashboard API — the job runs in the cluster's own runtime
+environment, no per-job container.
+
+```sh
+orx exp run <expId> --backend ray
+orx exp run <expId> --backend ray --flavor gpu:1
+orx exp run <expId> --backend ray --flavor cpu:2,mem:8GiB
+```
+
+Rules and notes:
+- **Address** comes from Settings → Compute → Ray, else
+  `ASTROAI_RAY_JOBS_ADDRESS` / `RAY_DASHBOARD_URL`, else
+  `http://127.0.0.1:8265` (a local Ray head).
+- **`--flavor` is optional** entrypoint resource hints: `cpu[:N]`, `gpu[:N]`,
+  `mem:<size>` (comma-separated, e.g. `gpu:1,cpu:4,mem:8GiB`). Omit it to
+  reserve nothing — that avoids Pending on small heads.
+- No `--image`, `--host`, or `--timeout` — the job runs in the cluster's
+  runtime env until it finishes; size and bound work in the run command itself.
+- Same clone contract and downstream commands as every backend; a detached
+  `orx supervise` mirrors status and logs — don't kill it.
 
 ## Running on an OpenResearch box — `--backend openresearch`
 

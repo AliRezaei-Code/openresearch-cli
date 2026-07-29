@@ -150,10 +150,12 @@ fn playbook_md_with_memory(project: &LocalProject, memory: &str) -> String {
                  Use another backend only when the user names one (see \"Compute backends\")"
             )
         }
-        None => "- Compute: backends — `hf`, `modal`, `k8s`, `ssh`, `slurm`, `ray`, or `local` —\n  \
+        None => {
+            "- Compute: backends — `hf`, `modal`, `k8s`, `ssh`, `slurm`, `ray`, or `local` —\n  \
                  chosen by the user per run; **there is no default backend** (see \"Compute\n  \
                  backends\")"
-            .to_string(),
+                .to_string()
+        }
     };
     let backends_intro = match &compute_default {
         Some((b, f)) => {

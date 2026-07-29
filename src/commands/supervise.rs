@@ -1495,11 +1495,25 @@ async fn tail_logs_ray(
     loop {
         match ray::fetch_logs(&address, &submission_id).await {
             Ok(full) => {
-                if full.len() > written {
-                    let chunk = &full[written..];
-                    let _ = write!(log_file, "{chunk}");
-                    let _ = log_file.flush();
-                    written = full.len();
+                match full.get(written..) {
+                    // Snapshots are append-only in practice; write just the tail.
+                    Some(chunk) => {
+                        if !chunk.is_empty() {
+                            let _ = write!(log_file, "{chunk}");
+                            let _ = log_file.flush();
+                            written = full.len();
+                        }
+                    }
+                    // Shrunk or shifted snapshot (e.g. driver restart): the
+                    // remembered offset is meaningless — rewrite from scratch.
+                    None => {
+                        use std::io::Seek;
+                        if log_file.rewind().is_ok() && log_file.set_len(0).is_ok() {
+                            let _ = write!(log_file, "{full}");
+                            let _ = log_file.flush();
+                            written = full.len();
+                        }
+                    }
                 }
             }
             Err(err) => {
