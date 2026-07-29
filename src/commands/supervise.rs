@@ -1470,7 +1470,7 @@ async fn run_ray(
             };
             eprintln!("supervise {run_id}: {last_status} -> {status} (stage {stage})");
             last_status = status.clone();
-            if cancel_requested || cancel_sent {
+            if cancel_requested && !cancel_sent {
                 cancel_ray(&address, &submission_id, &run_id, &mut cancel_sent).await;
             }
         } else {
@@ -1516,25 +1516,39 @@ async fn tail_logs_ray(
         }
     };
     let mut last = String::new();
+    // Set when a write failed, so the file may not match `last`: forces a
+    // wholesale rewrite until one fully succeeds.
+    let mut dirty = false;
     loop {
         match ray::fetch_logs(&address, &submission_id).await {
             Ok(full) => {
                 // Snapshots normally only grow; append the delta. Anything
                 // else (truncation, rotation, a shifted window) invalidates
                 // what's on disk, so rewrite the file wholesale.
-                if let Some(delta) = full.strip_prefix(last.as_str()) {
-                    if !delta.is_empty() {
-                        let _ = log_file.write_all(delta.as_bytes());
-                        let _ = log_file.flush();
-                        last = full;
+                let delta = if dirty {
+                    None
+                } else {
+                    full.strip_prefix(last.as_str())
+                };
+                let ok = match delta {
+                    Some(d) => {
+                        d.is_empty()
+                            || (log_file.write_all(d.as_bytes()).is_ok()
+                                && log_file.flush().is_ok())
                     }
-                } else if log_file.rewind().is_ok() && log_file.set_len(0).is_ok() {
-                    let _ = log_file.write_all(full.as_bytes());
-                    let _ = log_file.flush();
+                    None => {
+                        log_file.rewind().is_ok()
+                            && log_file.set_len(0).is_ok()
+                            && log_file.write_all(full.as_bytes()).is_ok()
+                            && log_file.flush().is_ok()
+                    }
+                };
+                dirty = !ok;
+                if ok {
                     last = full;
                 } else {
                     eprintln!(
-                        "supervise {run_id}: could not rewrite {} (will retry)",
+                        "supervise {run_id}: could not write {} (will retry)",
                         path.display()
                     );
                 }

@@ -22,7 +22,8 @@ const DEFAULT_ADDRESS: &str = "http://127.0.0.1:8265";
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RaySettings {
-    /// Jobs / Dashboard base URL (no trailing slash).
+    /// Jobs / Dashboard base URL as the user typed it; normalized on read by
+    /// `resolve_address`.
     #[serde(default)]
     pub address: Option<String>,
 }
