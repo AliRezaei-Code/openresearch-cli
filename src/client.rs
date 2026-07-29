@@ -478,6 +478,9 @@ pub struct CreateChildBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub parent_experiment_id: String,
+    /// Populated from `launching_chat_session()`; None outside a chat session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -491,6 +494,9 @@ pub struct CreateBaselineExperimentBody {
     /// Omit to set it later (`orx exp cmd`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_command: Option<String>,
+    /// Populated from `launching_chat_session()`; None outside a chat session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1544,8 +1550,8 @@ pub async fn fetch_paper_markdown(kind: &str, paper_id: &str) -> Result<Option<S
 #[cfg(test)]
 mod tests {
     use super::{
-        CreateSandboxBody, ListCatalog, ListCpuCatalog, RunBody, RunTarget, SandboxEnvelope,
-        SandboxTarget,
+        CreateBaselineExperimentBody, CreateChildBody, CreateSandboxBody, ListCatalog,
+        ListCpuCatalog, RunBody, RunTarget, SandboxEnvelope, SandboxTarget,
     };
     use serde_json::json;
 
@@ -1819,5 +1825,47 @@ mod tests {
         assert_eq!(sb.ssh_hostname.as_deref(), Some("203.0.113.7"));
         assert_eq!(sb.ssh_port, Some(22022));
         assert_eq!(sb.ssh_username.as_deref(), Some("root"));
+    }
+
+    /// The api declares `chatSessionId` optional: a lost `rename_all` would send
+    /// `chat_session_id` and a lost `skip_serializing_if` would send `null`,
+    /// either of which silently drops the row's attribution.
+    #[test]
+    fn serializes_experiment_chat_session_id() {
+        let child = serde_json::to_value(CreateChildBody {
+            title: "Child".into(),
+            description: None,
+            parent_experiment_id: "exp_parent".into(),
+            chat_session_id: Some("ses_abc123".into()),
+        })
+        .unwrap();
+        assert_eq!(child.get("chatSessionId"), Some(&json!("ses_abc123")));
+
+        let child_without = serde_json::to_value(CreateChildBody {
+            title: "Child".into(),
+            description: None,
+            parent_experiment_id: "exp_parent".into(),
+            chat_session_id: None,
+        })
+        .unwrap();
+        assert!(child_without.get("chatSessionId").is_none());
+
+        let baseline = serde_json::to_value(CreateBaselineExperimentBody {
+            title: Some("Baseline".into()),
+            description: None,
+            run_command: None,
+            chat_session_id: Some("ses_abc123".into()),
+        })
+        .unwrap();
+        assert_eq!(baseline.get("chatSessionId"), Some(&json!("ses_abc123")));
+
+        let baseline_without = serde_json::to_value(CreateBaselineExperimentBody {
+            title: Some("Baseline".into()),
+            description: None,
+            run_command: None,
+            chat_session_id: None,
+        })
+        .unwrap();
+        assert!(baseline_without.get("chatSessionId").is_none());
     }
 }
