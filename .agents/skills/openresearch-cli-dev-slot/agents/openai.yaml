@@ -1,4 +1,0 @@
-interface:
-  display_name: "OpenResearch CLI Dev Slot"
-  short_description: "Run an isolated CLI development slot"
-  default_prompt: "Use $openresearch-cli-dev-slot to start or manage an isolated worktree test environment."

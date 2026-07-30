@@ -1,4 +1,0 @@
-interface:
-  display_name: "Ship openresearch-cli"
-  short_description: "Run openresearch-cli shipping checks"
-  default_prompt: "Use $ship-openresearch-cli to run the repository shipping gate."
