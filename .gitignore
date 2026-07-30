@@ -3,10 +3,23 @@
 .DS_Store
 Claude.local.md
 
-# Local git worktrees (created under .claude/worktrees/ for per-task work) must
-# never be committed — they get recorded as orphan gitlinks with no .gitmodules
-# entry, which breaks `git checkout --recurse-submodules` in CI.
-.claude/worktrees/
+# Keep local Claude state private; commit only the public skill wrappers.
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/ship-openresearch-cli/
+!.claude/skills/ship-openresearch-cli/**
+!.claude/skills/openresearch-cli-dev-slot/
+!.claude/skills/openresearch-cli-dev-slot/**
+
+# Keep local agent state private; commit only the canonical public skills.
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/ship-openresearch-cli/
+!.agents/skills/ship-openresearch-cli/**
+!.agents/skills/openresearch-cli-dev-slot/
+!.agents/skills/openresearch-cli-dev-slot/**
 
 # Stray SQLite store if the binary is ever run from the repo root
 /orx.db
