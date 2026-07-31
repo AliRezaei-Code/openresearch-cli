@@ -57,6 +57,25 @@ function emitChat(ev: ChatEvent) {
   chatListeners.forEach((fn) => fn(ev));
 }
 
+export interface HarnessAuthEvent {
+  harness: string;
+  authState: string;
+}
+
+type HarnessAuthListener = (ev: HarnessAuthEvent) => void;
+const harnessAuthListeners = new Set<HarnessAuthListener>();
+
+export function onHarnessAuth(fn: HarnessAuthListener): () => void {
+  harnessAuthListeners.add(fn);
+  return () => {
+    harnessAuthListeners.delete(fn);
+  };
+}
+
+function emitHarnessAuth(ev: HarnessAuthEvent) {
+  harnessAuthListeners.forEach((fn) => fn(ev));
+}
+
 // Data-dir move progress fans out the same way so the Storage settings card can
 // subscribe without touching the shared useOrxEvents handler set.
 export type DataDirMoveEvent =
@@ -103,7 +122,10 @@ export function useOrxEvents(handlers: OrxEventHandlers) {
       needsRepair = true;
     };
     es.onopen = () => {
-      if (needsRepair) emitChat({ type: "reconnected" });
+      if (needsRepair) {
+        emitChat({ type: "reconnected" });
+        emitHarnessAuth({ harness: "*", authState: "unknown" });
+      }
       // Every open after this one follows a drop by definition.
       needsRepair = true;
     };
@@ -153,6 +175,10 @@ export function useOrxEvents(handlers: OrxEventHandlers) {
     es.addEventListener("chat.usage", (e) => {
       const d = parse<{ sessionId: string; usage: ContextUsage }>(e as MessageEvent);
       if (d?.sessionId && d.usage) emitChat({ type: "usage", sessionId: d.sessionId, usage: d.usage });
+    });
+    es.addEventListener("harness.auth", (e) => {
+      const d = parse<HarnessAuthEvent>(e as MessageEvent);
+      if (d?.harness && d.authState) emitHarnessAuth(d);
     });
     es.addEventListener("datadir.move.progress", (e) => {
       const d = parse<{ phase: string; copiedBytes: number; totalBytes: number }>(

@@ -11,7 +11,7 @@
 //! browser can't call api.alphaxiv.org cross-origin). No auth — the bind is
 //! loopback-only.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,7 +52,9 @@ pub async fn run(args: UpArgs) -> Result<()> {
     let state = AppState {
         agent: agent.clone(),
         chat: Arc::new(ChatHost::new(agent.clone(), codex.clone(), claude.clone())),
+        claude: claude.clone(),
         harnesses: Arc::new(tokio::sync::Mutex::new(None)),
+        project_lifecycle: Arc::new(ProjectLifecycle::default()),
         data_dir_move_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     // Plan-mode turns hand this port to the `orx mcp-gate` permission bridge.
@@ -64,6 +66,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
     // Wake an idle chat session when a run completes (the agent's wait loop
     // covers the busy case; this covers turns that ended early).
     tokio::spawn(local::chat::watch_runs(state.chat.clone()));
+    spawn_claude_auth_monitor(state.chat.clone(), claude.clone(), state.harnesses.clone());
 
     let app = router(state);
     let url = format!("http://127.0.0.1:{port}");
@@ -131,13 +134,87 @@ async fn shutdown_signal() {
 struct AppState {
     agent: Arc<AgentHost>,
     chat: Arc<ChatHost>,
+    claude: Arc<local::claude::ClaudeHost>,
     /// Harness detection cache — detection shells out to CLIs, so it's rate-
     /// limited to once per TTL unless the UI asks for a refresh.
     harnesses: Arc<tokio::sync::Mutex<Option<(std::time::Instant, Value)>>>,
+    project_lifecycle: Arc<ProjectLifecycle>,
     /// Set while a data-dir move is running. New chat turns and run launches
     /// check it and refuse (409) so nothing starts writing the store mid-move —
     /// closing the window between the move's in-flight check and its completion.
     data_dir_move_in_progress: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Default)]
+struct ProjectLifecycle {
+    inner: Arc<std::sync::Mutex<ProjectLifecycleState>>,
+}
+
+#[derive(Default)]
+struct ProjectLifecycleState {
+    deleting: HashSet<String>,
+    admissions: HashMap<String, usize>,
+}
+
+struct ProjectAdmissionLease {
+    inner: Arc<std::sync::Mutex<ProjectLifecycleState>>,
+    project_id: String,
+}
+
+impl Drop for ProjectAdmissionLease {
+    fn drop(&mut self) {
+        let mut state = self.inner.lock().unwrap();
+        if let Some(count) = state.admissions.get_mut(&self.project_id) {
+            *count -= 1;
+            if *count == 0 {
+                state.admissions.remove(&self.project_id);
+            }
+        }
+    }
+}
+
+struct ProjectDeletionLease {
+    inner: Arc<std::sync::Mutex<ProjectLifecycleState>>,
+    project_id: String,
+}
+
+impl Drop for ProjectDeletionLease {
+    fn drop(&mut self) {
+        self.inner.lock().unwrap().deleting.remove(&self.project_id);
+    }
+}
+
+impl ProjectLifecycle {
+    fn admit(&self, project_id: &str) -> Option<ProjectAdmissionLease> {
+        let mut state = self.inner.lock().unwrap();
+        if state.deleting.contains(project_id) {
+            return None;
+        }
+        *state.admissions.entry(project_id.to_string()).or_default() += 1;
+        Some(ProjectAdmissionLease {
+            inner: self.inner.clone(),
+            project_id: project_id.to_string(),
+        })
+    }
+
+    fn begin_delete(&self, project_id: &str) -> Option<ProjectDeletionLease> {
+        let mut state = self.inner.lock().unwrap();
+        if state.deleting.contains(project_id)
+            || state
+                .admissions
+                .get(project_id)
+                .copied()
+                .unwrap_or_default()
+                > 0
+        {
+            return None;
+        }
+        state.deleting.insert(project_id.to_string());
+        Some(ProjectDeletionLease {
+            inner: self.inner.clone(),
+            project_id: project_id.to_string(),
+        })
+    }
 }
 
 fn router(state: AppState) -> Router {
@@ -601,6 +678,10 @@ async fn update_project(
 /// GitHub repo and the cache clone are left untouched.
 async fn delete_project(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
     reject_if_moving(&state)?;
+    let _deleting_project = state
+        .project_lifecycle
+        .begin_delete(&id)
+        .ok_or_else(|| bad_request("project has an operation or deletion in progress"))?;
     let store = Store::open()?;
     let project = store
         .get_local_project(&id)?
@@ -621,14 +702,26 @@ async fn delete_project(State(state): State<AppState>, Path(id): Path<String>) -
     }
     // Abort any in-flight chat turns before their rows disappear, and clean up
     // each session's serve child + worktree (the rows cascade with the project).
-    for session in store.list_chat_sessions_by_project(&id)? {
+    let sessions = store.list_chat_sessions_by_project(&id)?;
+    let mut _session_deletions = Vec::with_capacity(sessions.len());
+    for session in &sessions {
+        _session_deletions.push(
+            state
+                .chat
+                .begin_session_delete(&session.id)
+                .ok_or_else(|| bad_request("a chat session deletion is already in progress"))?,
+        );
+    }
+    for session in &sessions {
         let _ = state.chat.interrupt(&session.id).await;
         state.chat.opencode.kill_session(&session.id).await;
         state.chat.codex.kill_session(&session.id).await;
-        state.chat.claude.kill_session(&session.id).await;
-        local::chat::cleanup_session_worktree(&project, &session.id);
+        state.chat.claude.forget_session(&session.id).await;
     }
     store.delete_local_project(&id)?;
+    for session in &sessions {
+        local::chat::cleanup_session_worktree(&project, &session.id);
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -702,8 +795,13 @@ async fn create_experiment(
     Json(req): Json<CreateExperimentReq>,
 ) -> ApiResult {
     reject_if_moving(&state)?;
+    let admission = state
+        .project_lifecycle
+        .admit(&id)
+        .ok_or_else(|| bad_request("project deletion is in progress"))?;
     // Branch create + push shells out to git (network); off the async workers.
     let experiment = tokio::task::spawn_blocking(move || {
+        let _admission = admission;
         let store = Store::open()?;
         let project = store
             .get_local_project(&id)?
@@ -756,6 +854,21 @@ async fn run_experiment(
     body: Bytes,
 ) -> ApiResult {
     reject_if_moving(&state)?;
+    let store = Store::open()?;
+    let project_id = store
+        .get_local_experiment(&id)?
+        .ok_or_else(|| not_found("experiment"))?
+        .project_id;
+    let _admission = state
+        .project_lifecycle
+        .admit(&project_id)
+        .ok_or_else(|| bad_request("project deletion is in progress"))?;
+    store
+        .get_local_experiment(&id)?
+        .ok_or_else(|| not_found("experiment"))?;
+    store
+        .get_local_project(&project_id)?
+        .ok_or_else(|| not_found("project"))?;
     // Tolerate an empty body — every field is optional in the schema.
     let req: RunReq = if body.is_empty() {
         RunReq::default()
@@ -789,19 +902,24 @@ async fn run_experiment(
         force: false,
     };
     // Same code paths as CLI `orx exp run --backend <b>` on a local experiment.
-    let run = match backend.as_str() {
-        "hf" => local::hf::submit_local_hf(&args).await,
-        "modal" => local::modal::submit_local_modal(&args).await,
-        "k8s" => local::k8s::submit_local_k8s(&args).await,
-        "ssh" => local::ssh::submit_local_ssh(&args).await,
-        "slurm" => local::slurm::submit_local_slurm(&args).await,
-        "ray" => local::ray::submit_local_ray(&args).await,
-        "openresearch" => local::openresearch::submit_local_openresearch(&args).await,
-        "local" => local::localrun::submit_local_run(&args).await,
-        other => Err(anyhow!(
-            "Unknown backend '{other}'. Supported: local, hf, modal, k8s, ssh, slurm, ray, openresearch."
-        )),
-    }
+    let run = tokio::spawn(async move {
+        let _admission = _admission;
+        match backend.as_str() {
+            "hf" => local::hf::submit_local_hf(&args).await,
+            "modal" => local::modal::submit_local_modal(&args).await,
+            "k8s" => local::k8s::submit_local_k8s(&args).await,
+            "ssh" => local::ssh::submit_local_ssh(&args).await,
+            "slurm" => local::slurm::submit_local_slurm(&args).await,
+            "ray" => local::ray::submit_local_ray(&args).await,
+            "openresearch" => local::openresearch::submit_local_openresearch(&args).await,
+            "local" => local::localrun::submit_local_run(&args).await,
+            other => Err(anyhow!(
+                "Unknown backend '{other}'. Supported: local, hf, modal, k8s, ssh, slurm, ray, openresearch."
+            )),
+        }
+    })
+    .await
+    .map_err(|error| bad_request(format!("run launch task failed: {error}")))?
     .map_err(bad_request)?;
     Ok(Json(json!({ "run": ApiRun::from(&run) })))
 }
@@ -1449,6 +1567,62 @@ fn spawn_agent_git_preflight() {
             }
         })
         .await;
+    });
+}
+
+/// A signed-out harness is the only state that needs polling. Normal turns and
+/// healthy idle sessions do no auth work; this loop merely notices a login the
+/// user completed separately and wakes the UI immediately.
+fn spawn_claude_auth_monitor(
+    chat: Arc<ChatHost>,
+    claude: Arc<local::claude::ClaudeHost>,
+    harnesses: Arc<tokio::sync::Mutex<Option<(std::time::Instant, Value)>>>,
+) {
+    tokio::spawn(async move {
+        let mut delay = Duration::from_secs(5);
+        let mut observed_generation = claude.auth_snapshot().generation;
+        loop {
+            tokio::time::sleep(delay).await;
+            let before = claude.auth_snapshot();
+            if before.generation != observed_generation {
+                observed_generation = before.generation;
+                *harnesses.lock().await = None;
+                if claude.claim_auth_announcement(before.generation) {
+                    chat.emit_event(
+                        "harness.auth",
+                        json!({ "harness": "claude-code", "authState": before.state }),
+                    );
+                }
+            }
+            if before.runtime_rejected
+                || matches!(
+                    before.state,
+                    local::harness::HarnessAuthState::Ready
+                        | local::harness::HarnessAuthState::Unsupported
+                )
+            {
+                delay = Duration::from_secs(5);
+                continue;
+            }
+            let state = local::harness::claude::current_auth_state().await;
+            claude.observe_auth_state(state, before.generation);
+            let after = claude.auth_snapshot();
+            if after.generation != observed_generation {
+                observed_generation = after.generation;
+                *harnesses.lock().await = None;
+                if claude.claim_auth_announcement(after.generation) {
+                    chat.emit_event(
+                        "harness.auth",
+                        json!({ "harness": "claude-code", "authState": after.state }),
+                    );
+                }
+            }
+            delay = if state == local::harness::HarnessAuthState::Unknown {
+                (delay * 2).min(Duration::from_secs(60))
+            } else {
+                Duration::from_secs(5)
+            };
+        }
     });
 }
 
@@ -2666,6 +2840,86 @@ const HARNESS_CACHE_TTL: Duration = Duration::from_secs(60);
 #[derive(Deserialize)]
 struct HarnessQuery {
     refresh: Option<u8>,
+    retry: Option<u8>,
+}
+
+fn overlay_claude_auth(payload: &mut Value, snapshot: local::claude::AuthSnapshot) {
+    let Some(harnesses) = payload.get_mut("harnesses").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let Some(claude) = harnesses
+        .iter_mut()
+        .find(|h| h.get("id").and_then(Value::as_str) == Some("claude-code"))
+    else {
+        return;
+    };
+    claude["authState"] = json!(snapshot.state);
+    if snapshot.state == local::harness::HarnessAuthState::Ready {
+        return;
+    }
+    claude["authenticated"] = json!(false);
+    claude["agentReady"] = json!(false);
+    claude["models"] = json!([]);
+    if let Some(object) = claude.as_object_mut() {
+        object.remove("authMethod");
+        object.remove("account");
+        object.remove("org");
+        object.remove("plan");
+    }
+    claude["agentNote"] = json!(if snapshot.runtime_rejected {
+        local::harness::claude::auth_recovery_note()
+    } else {
+        match snapshot.state {
+            local::harness::HarnessAuthState::NeedsLogin => {
+                "Sign in with `claude auth login`, then re-check this harness."
+            }
+            local::harness::HarnessAuthState::Unknown => {
+                "Open a terminal and run `claude auth status`, then re-check this harness."
+            }
+            local::harness::HarnessAuthState::Unsupported => {
+                "Update Claude Code to 2.1.211 or newer, then re-check this harness."
+            }
+            local::harness::HarnessAuthState::Ready => unreachable!(),
+        }
+    });
+}
+
+fn payload_has_ready_claude(payload: &Value) -> bool {
+    payload
+        .get("harnesses")
+        .and_then(Value::as_array)
+        .and_then(|harnesses| {
+            harnesses
+                .iter()
+                .find(|h| h.get("id").and_then(Value::as_str) == Some("claude-code"))
+        })
+        .and_then(|claude| claude.get("agentReady"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+fn ready_claude_entry(payload: &Value) -> Option<Value> {
+    payload
+        .get("harnesses")?
+        .as_array()?
+        .iter()
+        .find(|h| {
+            h.get("id").and_then(Value::as_str) == Some("claude-code")
+                && h.get("agentReady").and_then(Value::as_bool) == Some(true)
+        })
+        .cloned()
+}
+
+fn replace_claude_entry(payload: &mut Value, replacement: Value) {
+    let Some(harnesses) = payload.get_mut("harnesses").and_then(Value::as_array_mut) else {
+        return;
+    };
+    if let Some(claude) = harnesses
+        .iter_mut()
+        .find(|h| h.get("id").and_then(Value::as_str) == Some("claude-code"))
+    {
+        *claude = replacement;
+    }
 }
 
 async fn list_harnesses(
@@ -2673,14 +2927,64 @@ async fn list_harnesses(
     Query(q): Query<HarnessQuery>,
 ) -> Json<Value> {
     let mut cache = state.harnesses.lock().await;
+    if q.retry == Some(1) && state.claude.clear_runtime_rejection() {
+        *cache = None;
+    }
+    let prior_ready_claude = cache
+        .as_ref()
+        .map(|(_, payload)| payload)
+        .and_then(ready_claude_entry);
     if q.refresh != Some(1) {
         if let Some((at, payload)) = cache.as_ref() {
             if at.elapsed() < HARNESS_CACHE_TTL {
-                return Json(payload.clone());
+                let snapshot = state.claude.auth_snapshot();
+                if snapshot.state != local::harness::HarnessAuthState::Ready
+                    || payload_has_ready_claude(payload)
+                {
+                    let mut payload = payload.clone();
+                    overlay_claude_auth(&mut payload, snapshot);
+                    return Json(payload);
+                }
             }
         }
     }
-    let payload = json!({ "harnesses": local::harness::detect_harnesses().await });
+    let probe_generation = state.claude.auth_snapshot().generation;
+    let harnesses = local::harness::detect_harnesses().await;
+    if let Some(claude) = harnesses.iter().find(|h| h.id == "claude-code") {
+        state
+            .claude
+            .observe_auth_state(claude.auth_state, probe_generation);
+    }
+    let mut payload = json!({ "harnesses": harnesses });
+    let mut snapshot = state.claude.auth_snapshot();
+    if snapshot.state == local::harness::HarnessAuthState::Ready
+        && !payload_has_ready_claude(&payload)
+    {
+        if let Some(prior) = prior_ready_claude {
+            replace_claude_entry(&mut payload, prior);
+        } else if let Some(retry) = local::harness::detect_harness("claude-code").await {
+            state
+                .claude
+                .observe_auth_state(retry.auth_state, snapshot.generation);
+            if retry.agent_ready {
+                replace_claude_entry(&mut payload, json!(retry));
+            }
+            snapshot = state.claude.auth_snapshot();
+        }
+        if snapshot.state == local::harness::HarnessAuthState::Ready
+            && !payload_has_ready_claude(&payload)
+        {
+            state.claude.defer_auth_verification(snapshot.generation);
+            snapshot = state.claude.auth_snapshot();
+        }
+    }
+    if state.claude.claim_auth_announcement(snapshot.generation) {
+        state.chat.emit_event(
+            "harness.auth",
+            json!({ "harness": "claude-code", "authState": snapshot.state }),
+        );
+    }
+    overlay_claude_auth(&mut payload, snapshot);
     *cache = Some((std::time::Instant::now(), payload.clone()));
     Json(payload)
 }
@@ -2724,6 +3028,10 @@ async fn create_chat_session(
     if !local::harness::is_chat_harness(&req.harness) {
         return Err(bad_request(format!("unknown harness: {}", req.harness)));
     }
+    let _admission = state
+        .project_lifecycle
+        .admit(&req.project_id)
+        .ok_or_else(|| bad_request("project deletion is in progress"))?;
     let store = Store::open()?;
     store
         .get_local_project(&req.project_id)?

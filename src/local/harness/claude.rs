@@ -15,9 +15,9 @@
 //! mode, where the mcp-gate bridge holds both open mid-turn and the answer
 //! continues the same turn.
 //!
-//! Detection: `~/.claude.json` carries the signed-in OAuth account (no secrets
-//! read); `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` are credential
-//! fallbacks, and are what a custom `ANTHROPIC_BASE_URL` gateway uses.
+//! Detection: `claude auth status --json` is the readiness source of truth.
+//! `~/.claude.json` contributes display metadata only after that live check;
+//! `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` remain credential fallbacks.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,7 +29,10 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-use super::detect::{bin_version, find_on_path, nonempty_str, read_json, HarnessInfo, ModelInfo};
+use super::detect::{
+    bin_version, find_on_path, nonempty_str, parse_version, read_json, HarnessAuthState,
+    HarnessInfo, ModelInfo,
+};
 use super::options::{HarnessOptions, PermissionMode, REASONING_DEFAULT_ID};
 use super::{Harness, ResumeAction};
 use crate::error::{anyhow, Result};
@@ -63,6 +66,105 @@ const CLAUDE_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"
 /// versions whose `--effort` accepts it — which is why support is detected by
 /// [`claude_accepts_ultracode`] rather than read from the catalog.
 const CLAUDE_ULTRACODE: &str = "ultracode";
+
+/// Includes Anthropic's multi-process refresh-token and sleep/wake fixes.
+const MIN_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 211);
+
+const AUTH_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AuthProbe {
+    state: HarnessAuthState,
+    method: Option<&'static str>,
+}
+
+fn parse_auth_status(success: bool, stdout: &[u8]) -> AuthProbe {
+    let value = serde_json::from_slice::<Value>(stdout).ok();
+    let logged_in = value
+        .as_ref()
+        .and_then(|value| value.get("loggedIn"))
+        .and_then(Value::as_bool);
+    let reported_method = value
+        .as_ref()
+        .and_then(|value| value.get("authMethod"))
+        .and_then(Value::as_str)
+        .map(|method| method.to_ascii_lowercase());
+    let method = reported_method.as_deref().and_then(|method| {
+        if method.contains("api") || method.contains("token") {
+            Some("apiKey")
+        } else if method.contains("oauth") || method.contains("claude") {
+            Some("oauth")
+        } else {
+            None
+        }
+    });
+    let state = match (success, logged_in) {
+        (true, Some(true)) => HarnessAuthState::Ready,
+        (_, Some(false)) => HarnessAuthState::NeedsLogin,
+        _ => HarnessAuthState::Unknown,
+    };
+    AuthProbe { state, method }
+}
+
+async fn probe_auth(bin: &Path) -> AuthProbe {
+    let mut cmd = Command::new(bin);
+    cmd.args(["auth", "status", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    prepare_env(&mut cmd);
+    match tokio::time::timeout(AUTH_STATUS_TIMEOUT, cmd.output()).await {
+        Ok(Ok(out)) => parse_auth_status(out.status.success(), &out.stdout),
+        _ => AuthProbe {
+            state: HarnessAuthState::Unknown,
+            method: None,
+        },
+    }
+}
+
+async fn effective_auth_probe(bin: &Path) -> AuthProbe {
+    let mut probe = probe_auth(bin).await;
+    // Headless Claude gives ANTHROPIC_* credentials precedence over a saved
+    // subscription login. If status still reports OAuth in that environment,
+    // it has only verified leftover OAuth metadata, not the credential the
+    // worker will actually send.
+    if has_api_credential() && probe.method != Some("apiKey") {
+        probe.state = HarnessAuthState::Unknown;
+        probe.method = None;
+    } else if probe.state == HarnessAuthState::Ready && probe.method.is_none() {
+        probe.method = Some("oauth");
+    }
+    probe
+}
+
+fn gate_oauth_version(mut probe: AuthProbe, version: Option<&str>) -> AuthProbe {
+    if probe.state == HarnessAuthState::Ready && probe.method == Some("oauth") {
+        probe.state = match version.and_then(parse_version) {
+            Some(version) if version >= MIN_CLAUDE_VERSION => HarnessAuthState::Ready,
+            Some(_) => HarnessAuthState::Unsupported,
+            None => HarnessAuthState::Unknown,
+        };
+    }
+    probe
+}
+
+pub(crate) async fn current_auth_state() -> HarnessAuthState {
+    match find_claude() {
+        Some(bin) => {
+            let version = bin_version(&bin).await;
+            gate_oauth_version(effective_auth_probe(&bin).await, version.as_deref()).state
+        }
+        None => HarnessAuthState::Unknown,
+    }
+}
+
+pub(crate) fn auth_recovery_note() -> &'static str {
+    if has_api_credential() {
+        "Claude Code rejected the configured `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`. Replace or unset it, then re-check this harness."
+    } else {
+        "Sign in with `claude auth login`, then re-check this harness."
+    }
+}
 
 /// Ask the installed CLI's own argument parser whether it accepts
 /// `--effort ultracode`. `--version` still runs the parser, which prints
@@ -247,11 +349,6 @@ fn has_api_credential() -> bool {
         .any(|key| super::detect::api_key(key).is_some())
 }
 
-/// Whether Claude Code is pointed at a non-first-party endpoint.
-fn custom_base_url() -> bool {
-    super::detect::api_key("ANTHROPIC_BASE_URL").is_some()
-}
-
 /// One-shot session title from the first user message: a throwaway
 /// `claude -p` child pinned to Haiku, mirroring how Claude Code titles its own
 /// conversations with a cheap background model. Deliberately *not* the session's
@@ -340,32 +437,38 @@ impl Harness for ClaudeCode {
             info.version = bin_version(&bin).await;
             info.bin_path = Some(bin.to_string_lossy().into_owned());
         }
-        // A custom `ANTHROPIC_BASE_URL` gateway authenticates with an env
-        // credential and never writes OAuth metadata, so a leftover
-        // `~/.claude.json` from an earlier first-party login would otherwise
-        // mislabel the account. Only a custom base url takes that precedence —
-        // an api key alongside a live OAuth login still shows the account.
-        if custom_base_url() && has_api_credential() {
-            info.authenticated = true;
-            info.auth_method = Some("apiKey");
-        }
-        // ~/.claude.json carries the signed-in OAuth account (no secrets read).
-        else if let Some(cfg) = dirs::home_dir().and_then(|h| read_json(h.join(".claude.json"))) {
-            if let Some(acct) = cfg.get("oauthAccount") {
+        // The CLI owns OAuth and Keychain refresh. Its live status, including
+        // the effective auth method, decides whether this harness can run.
+        if info.installed {
+            let bin = info.bin_path.as_deref().map(Path::new);
+            let probe = match bin {
+                Some(bin) => {
+                    gate_oauth_version(effective_auth_probe(bin).await, info.version.as_deref())
+                }
+                None => AuthProbe {
+                    state: HarnessAuthState::Unknown,
+                    method: None,
+                },
+            };
+            info.auth_state = probe.state;
+            info.auth_method = probe.method;
+            if info.auth_state == HarnessAuthState::Ready {
                 info.authenticated = true;
-                info.auth_method = Some("oauth");
-                info.account = nonempty_str(acct, "emailAddress");
-                info.org = nonempty_str(acct, "organizationName");
-                info.plan = match nonempty_str(acct, "billingType").as_deref() {
-                    Some("stripe_subscription") => Some("Subscription".to_string()),
-                    Some(other) => Some(other.to_string()),
-                    None => None,
-                };
+                if probe.method == Some("oauth") {
+                    if let Some(acct) = dirs::home_dir()
+                        .and_then(|h| read_json(h.join(".claude.json")))
+                        .and_then(|cfg| cfg.get("oauthAccount").cloned())
+                    {
+                        info.account = nonempty_str(&acct, "emailAddress");
+                        info.org = nonempty_str(&acct, "organizationName");
+                        info.plan = match nonempty_str(&acct, "billingType").as_deref() {
+                            Some("stripe_subscription") => Some("Subscription".to_string()),
+                            Some(other) => Some(other.to_string()),
+                            None => None,
+                        };
+                    }
+                }
             }
-        }
-        if !info.authenticated && has_api_credential() {
-            info.authenticated = true;
-            info.auth_method = Some("apiKey");
         }
 
         info.agent_ready = info.installed && info.authenticated;
@@ -390,9 +493,18 @@ impl Harness for ClaudeCode {
                     .map(|id| ModelInfo::new(*id).with_reasoning(&ids))
                     .collect()
             }));
+        } else if info.auth_state == HarnessAuthState::Unsupported {
+            info.agent_note = Some(
+                "Update Claude Code to 2.1.211 or newer, then re-check this harness.".to_string(),
+            );
         } else if info.installed {
-            info.agent_note =
-                Some("Sign in with `claude auth login` to chat with it here.".to_string());
+            info.agent_note = Some(match info.auth_state {
+                HarnessAuthState::Unknown if has_api_credential() =>
+                    "Claude Code could not verify the effective `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`. Fix or unset it, then re-check this harness.".to_string(),
+                HarnessAuthState::Unknown =>
+                    "Open a terminal and run `claude auth status`, then re-check this harness.".to_string(),
+                _ => auth_recovery_note().to_string(),
+            });
         } else {
             info.agent_note = Some(
                 "Install Claude Code (claude.com/download), then sign in with `claude auth login`."
@@ -902,7 +1014,7 @@ fn belongs_to_current_turn(event: &Value, text: &str, saw_user_echo: &mut bool) 
 
 /// The per-turn state `apply_event` folds each stream-json line into. Kept
 /// store-free so the caller (not the fold) owns every side effect — the native
-/// session id is applied per event by `run_turn`, and every flush happens there
+/// session id is committed only after an accepted attempt, and every flush happens there
 /// too, which is what lets the fold run against a bare `TurnCtx::test_stub()` in
 /// the fixture tests.
 #[derive(Default)]
@@ -918,11 +1030,16 @@ struct TurnState {
     saw_prompt: bool,
     /// The turn ended with a genuine failure (drives the error path).
     turn_errored: bool,
+    /// Claude's typed headless auth failure. Its synthetic assistant text is
+    /// suppressed and the resident child is quarantined by the caller.
+    auth_failed: bool,
+    /// Any real output or tool activity makes transparent resubmission unsafe.
+    had_activity: bool,
     /// The last non-empty assistant text block — the plan, if the model wrote
     /// one as plain text.
     last_text: String,
-    /// The native session id from the latest `system/init` or `result` (the
-    /// caller applies it to the store per event).
+    /// The provisional native session id from the latest `system/init` or
+    /// `result`. An auth-failed attempt never commits it to the store.
     native_session_id: Option<String>,
     /// The in-flight assistant message id from the stream's `message_start` —
     /// deltas carry only a block `index`, so this is what keys them to the
@@ -1081,6 +1198,7 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                     if text.is_empty() {
                         return false;
                     }
+                    state.had_activity = true;
                     match parent {
                         Some(p) => {
                             // Namespace the child id by parent so two sub-agents'
@@ -1118,6 +1236,16 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
             }
         }
         Some("assistant") => {
+            if event
+                .get("error")
+                .or_else(|| event.pointer("/message/error"))
+                .and_then(Value::as_str)
+                == Some("authentication_failed")
+            {
+                state.auth_failed = true;
+                state.turn_errored = true;
+                return false;
+            }
             let mid = event
                 .pointer("/message/id")
                 .and_then(Value::as_str)
@@ -1167,6 +1295,7 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                         }
                         // Empty-block guard, same as the thinking arm below.
                         if !text.is_empty() {
+                            state.had_activity = true;
                             ctx.upsert_part(WirePart::text(format!("{mid}-{i}"), text));
                         }
                     }
@@ -1177,10 +1306,12 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                         // grouping, nor wipe text the deltas already built.
                         let text = block.get("thinking").and_then(Value::as_str).unwrap_or("");
                         if !text.is_empty() {
+                            state.had_activity = true;
                             ctx.upsert_part(WirePart::reasoning(format!("{mid}-{i}"), text));
                         }
                     }
                     Some("tool_use") => {
+                        state.had_activity = true;
                         let id = block
                             .get("id")
                             .and_then(Value::as_str)
@@ -1240,6 +1371,7 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
             // (Sub-agent messages returned early above, so their smaller counts
             // never reach — and never clobber — the main session's meter.)
             if let Some(used) = claude_used_tokens(event.pointer("/message/usage")) {
+                state.had_activity |= used > 0;
                 ctx.report_usage(ContextUsage {
                     used_tokens: used,
                     context_window: None,
@@ -1260,6 +1392,7 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                 if block.get("type").and_then(Value::as_str) != Some("tool_result") {
                     continue;
                 }
+                state.had_activity = true;
                 let Some(tool_id) = block.get("tool_use_id").and_then(Value::as_str) else {
                     continue;
                 };
@@ -1310,14 +1443,16 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                 .unwrap_or(subtype != "success");
             if is_error {
                 state.turn_errored = true;
-                let detail = event
-                    .get("result")
-                    .and_then(Value::as_str)
-                    .unwrap_or(subtype)
-                    .to_string();
-                ctx.push_error(format!("claude: {detail}"));
+                if !state.auth_failed {
+                    let detail = event
+                        .get("result")
+                        .and_then(Value::as_str)
+                        .unwrap_or(subtype)
+                        .to_string();
+                    ctx.push_error(format!("claude: {detail}"));
+                }
             }
-            report_result_usage(ctx, event);
+            state.had_activity |= report_result_usage(ctx, event).is_some_and(|used| used > 0);
             return true;
         }
         _ => {}
@@ -1348,7 +1483,7 @@ fn claude_used_tokens(usage: Option<&Value>) -> Option<u64> {
 /// largest entry, so subagent models don't win); occupancy comes from the
 /// `assistant` usage already captured this turn, else the last
 /// `usage.iterations[]` entry, else the top-level `usage` aggregate.
-fn report_result_usage(ctx: &mut TurnCtx, event: &Value) {
+fn report_result_usage(ctx: &mut TurnCtx, event: &Value) -> Option<u64> {
     let model_usage = event.get("modelUsage").and_then(Value::as_object);
     let entry = model_usage.and_then(|map| {
         map.get(ctx.model.as_deref().unwrap_or_default())
@@ -1375,17 +1510,26 @@ fn report_result_usage(ctx: &mut TurnCtx, event: &Value) {
         .and_then(Value::as_array)
         .and_then(|it| it.last())
         .and_then(|last| claude_used_tokens(Some(last)));
+    let event_used = iteration_used.or_else(|| claude_used_tokens(event.get("usage")));
     let used = ctx
         .context_usage
         .as_ref()
         .map(|u| u.used_tokens)
-        .or(iteration_used)
-        .or_else(|| claude_used_tokens(event.get("usage")));
+        .or(event_used);
     if let Some(used) = used {
         ctx.report_usage(ContextUsage {
             used_tokens: used,
             context_window,
         });
+    }
+    event_used
+}
+
+fn commit_attempt_session(ctx: &mut TurnCtx, state: &TurnState) {
+    if !state.auth_failed || state.had_activity {
+        if let Some(sid) = state.native_session_id.as_deref() {
+            ctx.set_native_session_id(sid);
+        }
     }
 }
 
@@ -1415,6 +1559,112 @@ fn spawn_config(ctx: &TurnCtx) -> SpawnConfig {
 /// or an API backoff burst emits nothing for minutes, legitimately).
 const FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(120);
 
+async fn run_attempt(ctx: &mut TurnCtx, spec: SpawnSpec) -> Result<(TurnState, u64)> {
+    let client = ctx.host.claude.ensure(spec).await?;
+    let auth_generation = client.auth_generation();
+    let bridge_active = client.config().bridge_active;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let _route = client.register_turn(tx);
+    if let Err(e) = client.send_user_message(&ctx.text).await {
+        ctx.host.claude.kill_session(&ctx.session_id).await;
+        return Err(anyhow!(
+            "claude stdin write failed: {e}; see {}",
+            crate::store::data_dir().join("agent-claude.log").display()
+        ));
+    }
+
+    let mut state = TurnState {
+        bridge_active,
+        ..Default::default()
+    };
+    let mut saw_event = false;
+    let mut saw_user_echo = false;
+    loop {
+        let deadline = if saw_event {
+            super::TURN_WATCHDOG
+        } else {
+            FIRST_EVENT_TIMEOUT
+        };
+        let event = match tokio::time::timeout(deadline, rx.recv()).await {
+            Ok(event) => event,
+            Err(_) if ctx.host.has_pending_permission(&ctx.session_id) => continue,
+            Err(_) => {
+                commit_attempt_session(ctx, &state);
+                ctx.host.claude.kill_session(&ctx.session_id).await;
+                let _ = ctx.flush();
+                let (what, hint) = if saw_event {
+                    (
+                        format!(
+                            "went quiet for {} minutes",
+                            super::TURN_WATCHDOG.as_secs() / 60
+                        ),
+                        "",
+                    )
+                } else {
+                    (
+                        format!("produced no output for {}s", FIRST_EVENT_TIMEOUT.as_secs()),
+                        " (check Claude Code authentication in Harnesses)",
+                    )
+                };
+                return Err(anyhow!(
+                    "claude {what} — killed the wedged child{hint}. Sending another message \
+                     resumes the session; see {}",
+                    crate::store::data_dir().join("agent-claude.log").display()
+                ));
+            }
+        };
+        let Some(event) = event else {
+            break;
+        };
+        match event {
+            TurnEvent::Line(value) => {
+                if !belongs_to_current_turn(&value, &ctx.text, &mut saw_user_echo) {
+                    saw_event = true;
+                    if value.get("type").and_then(Value::as_str) == Some("system")
+                        && value.get("subtype").and_then(Value::as_str) == Some("init")
+                    {
+                        if let Some(sid) = value.get("session_id").and_then(Value::as_str) {
+                            state.native_session_id = Some(sid.to_string());
+                        }
+                    }
+                    continue;
+                }
+                saw_event = true;
+                let done = apply_event(ctx, &mut state, &value);
+                if state.had_activity {
+                    commit_attempt_session(ctx, &state);
+                }
+                ctx.maybe_flush();
+                if done {
+                    break;
+                }
+            }
+            TurnEvent::Closed => {
+                commit_attempt_session(ctx, &state);
+                ctx.host.claude.kill_session(&ctx.session_id).await;
+                let _ = ctx.flush();
+                return Err(anyhow!(
+                    "claude exited mid-turn; see {}",
+                    crate::store::data_dir().join("agent-claude.log").display()
+                ));
+            }
+        }
+    }
+
+    if !state.saw_result {
+        commit_attempt_session(ctx, &state);
+        ctx.host.claude.kill_session(&ctx.session_id).await;
+        let _ = ctx.flush();
+        return Err(anyhow!(
+            "claude ended the turn without a result; see {}",
+            crate::store::data_dir().join("agent-claude.log").display()
+        ));
+    }
+    commit_attempt_session(ctx, &state);
+    Ok((state, auth_generation))
+}
+
 async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     let project = ctx.project.clone();
     let session_id = ctx.session_id.clone();
@@ -1439,165 +1689,63 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     // cards are deliberately left alone — they resume via --resume.
     let _ = ctx.host.resolve_stale_prompts(&ctx.session_id, true).await;
 
-    // Ensure the session's resident child, reconciled to this turn's config: a
-    // reused child costs nothing, a model-only change retunes live, a launch-flag
-    // change (or a crash) respawns with `--resume`.
-    let spec = SpawnSpec {
+    let resume = ctx.native_session_id.clone();
+    let base_spec = SpawnSpec {
         chat: ctx.host.clone(),
         session_id: ctx.session_id.clone(),
         repo,
         playbook,
-        resume: ctx.native_session_id.clone(),
+        resume: resume.clone(),
         config: spawn_config(ctx),
     };
-    let client = ctx.host.claude.ensure(spec).await?;
-    // The child records what bridge state it ACHIEVED — a failed mcp-config write
-    // leaves it false even in plan mode. Drive card suppression off that, not the
-    // wanted value.
-    let bridge_active = client.config().bridge_active;
-
-    // Route events to this turn before sending the message — nothing is missed.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let _route = client.register_turn(tx);
-    if let Err(e) = client.send_user_message(&ctx.text).await {
-        // The child is unusable (stdin gone). Kill it so the next turn respawns
-        // with `--resume` and recovers this session's context.
-        ctx.host.claude.kill_session(&ctx.session_id).await;
-        return Err(anyhow!(
-            "claude stdin write failed: {e}; see {}",
-            crate::store::data_dir().join("agent-claude.log").display()
-        ));
-    }
-
-    let mut state = TurnState {
-        bridge_active,
-        ..Default::default()
-    };
-    // Fold events until the turn's `result`. The caller (here) applies the
-    // native session id and flushes per event, keeping `apply_event` store-free.
-    //
-    // Both waits are watchdogged (the codex adapter's TURN_WATCHDOG precedent):
-    // a wedged child — seen in the wild blocking forever on an expired-OAuth
-    // refresh — otherwise hangs the turn silently, and the user watches an
-    // eternal spinner with nothing to go on. The first event gets a short
-    // deadline (a healthy child answers a message within seconds; only a wedge
-    // is silent for two minutes), later gaps the long one (a tool can
-    // legitimately run for many minutes without emitting anything).
-    let mut saw_event = false;
-    let mut saw_user_echo = false;
+    let mut retry_count = 0;
+    let mut state;
     loop {
-        let deadline = if saw_event {
-            super::TURN_WATCHDOG
-        } else {
-            FIRST_EVENT_TIMEOUT
-        };
-        let event = match tokio::time::timeout(deadline, rx.recv()).await {
-            Ok(event) => event,
-            // A child held on the mcp-gate bridge long-poll is silently
-            // blocked BY DESIGN — user think-time on an approval card is
-            // unbounded. Re-arm the same deadline (checked on timeout, not up
-            // front, so a card raised mid-wait is honored too).
-            Err(_) if ctx.host.has_pending_permission(&ctx.session_id) => continue,
-            Err(_) => {
-                ctx.host.claude.kill_session(&ctx.session_id).await;
-                let _ = ctx.flush();
-                // The expired-login hint only fits the never-spoke case; a
-                // gap this long after output arrived is more likely a hung
-                // tool or a stalled API stream ("went quiet", not "no
-                // output").
-                let (what, hint) = if saw_event {
-                    (
-                        format!(
-                            "went quiet for {} minutes",
-                            super::TURN_WATCHDOG.as_secs() / 60
-                        ),
-                        "",
-                    )
-                } else {
-                    (
-                        format!("produced no output for {}s", FIRST_EVENT_TIMEOUT.as_secs()),
-                        " (an expired login can cause this; run `claude` in a \
-                         terminal to check)",
-                    )
-                };
-                return Err(anyhow!(
-                    "claude {what} — killed the wedged child{hint}. Sending \
-                     another message resumes the session; see {}",
-                    crate::store::data_dir().join("agent-claude.log").display()
-                ));
-            }
-        };
-        let Some(event) = event else {
-            // The route channel closed without a Closed marker — treat as a
-            // dropped turn; the next turn respawns via `--resume`.
+        // Always resume from the last known-good session id. An auth-failed
+        // process can emit a synthetic init id that has no persisted history.
+        let mut spec = base_spec.clone();
+        spec.resume = resume.clone();
+        let (attempt, failed_generation) = run_attempt(ctx, spec).await?;
+        if !attempt.auth_failed {
+            state = attempt;
             break;
-        };
-        match event {
-            TurnEvent::Line(value) => {
-                // A `--resume` respawn can re-emit prior-session/startup output
-                // before touching our message — fatally, a stale `result`,
-                // which would end this turn instantly with nothing (the real
-                // reply then streams into a dropped channel: a silently
-                // swallowed turn). `--replay-user-messages` makes the child
-                // echo the message we submitted, marking the exact boundary;
-                // ignore everything before the echo, if anything precedes it
-                // (on a healthy child it's just the per-turn `system`/`init`).
-                if !belongs_to_current_turn(&value, &ctx.text, &mut saw_user_echo) {
-                    // A pre-echo line is proof of life — the main loop is
-                    // reading our stdin — so hand the wait over to the long
-                    // watchdog: only TOTAL silence keeps the 120s wedge budget
-                    // (and its expired-login hint) in force. An API
-                    // retry-with-backoff burst after boot must not be killed
-                    // at 120s.
-                    saw_event = true;
-                    // Still harvest the session id from the pre-echo
-                    // `system`/`init` (matching `apply_event`'s init-only
-                    // rule): a first turn interrupted before its `result` has
-                    // no other id to `--resume` with.
-                    if value.get("type").and_then(Value::as_str) == Some("system")
-                        && value.get("subtype").and_then(Value::as_str) == Some("init")
-                    {
-                        if let Some(sid) = value.get("session_id").and_then(Value::as_str) {
-                            ctx.set_native_session_id(sid);
-                        }
-                    }
-                    continue;
-                }
-                saw_event = true;
-                let done = apply_event(ctx, &mut state, &value);
-                if let Some(sid) = state.native_session_id.take() {
-                    ctx.set_native_session_id(&sid);
-                }
-                ctx.maybe_flush();
-                if done {
-                    break;
-                }
-            }
-            TurnEvent::Closed => {
-                // Child died mid-turn (EOF on stdout). The next turn respawns via
-                // `--resume`; surface the failure like the old exit path did.
-                if let Some(sid) = state.native_session_id.take() {
-                    ctx.set_native_session_id(&sid);
-                }
-                ctx.host.claude.kill_session(&ctx.session_id).await;
-                let _ = ctx.flush();
-                return Err(anyhow!(
-                    "claude exited mid-turn; see {}",
-                    crate::store::data_dir().join("agent-claude.log").display()
-                ));
-            }
         }
-    }
 
-    // A channel-end without a `result` means the child closed between turns or
-    // the turn was dropped — respawn next turn and report the miss.
-    if !state.saw_result {
-        ctx.host.claude.kill_session(&ctx.session_id).await;
-        let _ = ctx.flush();
-        return Err(anyhow!(
-            "claude ended the turn without a result; see {}",
-            crate::store::data_dir().join("agent-claude.log").display()
-        ));
+        let auth = if retry_count == 0 {
+            ctx.host
+                .claude
+                .recover_auth_failure(&ctx.session_id, failed_generation)
+                .await
+        } else {
+            ctx.host
+                .claude
+                .reject_auth_generation(&ctx.session_id, failed_generation)
+                .await
+        };
+        let snapshot = ctx.host.claude.auth_snapshot();
+        if ctx.host.claude.claim_auth_announcement(snapshot.generation) {
+            ctx.host.emit_event(
+                "harness.auth",
+                serde_json::json!({ "harness": "claude-code", "authState": snapshot.state }),
+            );
+        }
+        if auth == HarnessAuthState::Ready && !attempt.had_activity && retry_count == 0 {
+            retry_count += 1;
+            continue;
+        }
+
+        let detail = match auth {
+            HarnessAuthState::NeedsLogin => {
+                "Claude Code sign-in required. Run `claude auth login`, then retry this message."
+            }
+            HarnessAuthState::Unknown => {
+                "Claude Code authentication could not be verified. Run `claude auth status`, then re-check the harness."
+            }
+            _ => "Claude Code authentication failed. Re-check the harness, then retry this message.",
+        };
+        ctx.push_error(detail.to_string());
+        state = attempt;
+        break;
     }
 
     // The model sometimes ends a plan-mode turn with its plan as plain text and
@@ -2422,5 +2570,110 @@ mod tests {
         // Last iteration (40+2+5+3), not the aggregate.
         assert_eq!(usage.used_tokens, 40 + 2 + 5 + 3);
         assert_eq!(usage.context_window, Some(200000));
+    }
+
+    #[test]
+    fn retry_activity_ignores_usage_persisted_from_a_previous_turn() {
+        let mut ctx = TurnCtx::test_stub();
+        ctx.context_usage = Some(ContextUsage {
+            used_tokens: 123,
+            context_window: Some(200000),
+        });
+        let result = serde_json::json!({
+            "type": "result",
+            "subtype": "error",
+            "is_error": true,
+            "result": "Not logged in"
+        });
+        assert_eq!(report_result_usage(&mut ctx, &result), None);
+        assert_eq!(
+            ctx.context_usage.expect("prior usage retained").used_tokens,
+            123
+        );
+    }
+
+    #[test]
+    fn auth_status_requires_live_logged_in_result() {
+        assert_eq!(
+            parse_auth_status(true, br#"{"loggedIn":true,"authMethod":"claude.ai"}"#),
+            AuthProbe {
+                state: HarnessAuthState::Ready,
+                method: Some("oauth"),
+            }
+        );
+        assert_eq!(
+            parse_auth_status(true, br#"{"loggedIn":true,"authMethod":"api-key"}"#),
+            AuthProbe {
+                state: HarnessAuthState::Ready,
+                method: Some("apiKey"),
+            }
+        );
+        // Claude intentionally exits 1 for this valid signed-out response.
+        assert_eq!(
+            parse_auth_status(false, br#"{"loggedIn":false,"authMethod":"none"}"#),
+            AuthProbe {
+                state: HarnessAuthState::NeedsLogin,
+                method: None,
+            }
+        );
+        assert_eq!(
+            parse_auth_status(true, b"not json"),
+            AuthProbe {
+                state: HarnessAuthState::Unknown,
+                method: None,
+            }
+        );
+        assert_eq!(
+            gate_oauth_version(
+                AuthProbe {
+                    state: HarnessAuthState::Ready,
+                    method: Some("oauth"),
+                },
+                None,
+            )
+            .state,
+            HarnessAuthState::Unknown
+        );
+        assert_eq!(
+            gate_oauth_version(
+                AuthProbe {
+                    state: HarnessAuthState::Ready,
+                    method: Some("apiKey"),
+                },
+                Some("2.0.0"),
+            )
+            .state,
+            HarnessAuthState::Ready
+        );
+    }
+
+    #[test]
+    fn typed_auth_failure_is_not_rendered_as_assistant_output() {
+        let mut ctx = TurnCtx::test_stub();
+        let mut state = TurnState::default();
+        let assistant = serde_json::json!({
+            "type": "assistant",
+            "error": "authentication_failed",
+            "message": {
+                "id": "msg_auth",
+                "content": [{"type": "text", "text": "Not logged in · Please run /login"}],
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            }
+        });
+        assert!(!apply_event(&mut ctx, &mut state, &assistant));
+        assert!(state.auth_failed);
+        assert!(state.turn_errored);
+        assert!(!state.had_activity);
+        assert!(ctx.assistant.parts.is_empty());
+
+        let result = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": true,
+            "terminal_reason": "api_error",
+            "result": "Not logged in · Please run /login"
+        });
+        assert!(apply_event(&mut ctx, &mut state, &result));
+        assert!(ctx.assistant.parts.is_empty());
     }
 }

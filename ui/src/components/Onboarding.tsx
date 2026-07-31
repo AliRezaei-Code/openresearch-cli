@@ -14,6 +14,7 @@ import {
 } from "../api";
 import { GitTokenForm } from "./GitTokenForm";
 import { renderNote } from "./agentNote";
+import { onHarnessAuth } from "../events";
 
 const RETRY_COPY = "Couldn't reach orx. Check it's still running, then re-check.";
 
@@ -36,11 +37,10 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   const [harnessError, setHarnessError] = useState(false);
   const [gitError, setGitError] = useState(false);
 
-  // Step 1 gates on a signed-in agent. Null (still detecting) counts as
-  // not-ready; a *failed* probe counts as ready, because detection fans out to
-  // per-binary subprocesses that can stall and onboarding is the whole app on
-  // first boot — a stalled check must not be an unrecoverable dead end.
-  const anyAgentReady = harnessError || (harnesses?.some((h) => h.agentReady) ?? false);
+  // Step 1 requires one genuinely usable harness. A failed or inconclusive
+  // detection never bypasses the gate; the user can re-check without being
+  // tricked into a chat configuration that cannot run.
+  const anyAgentReady = harnesses?.some((h) => h.agentReady) ?? false;
 
   // Drives the nudge on step 2 only — that step doesn't gate, so an unknown
   // answer costs nothing.
@@ -50,14 +50,14 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   // already superseded, so a Save landing mid-refresh isn't overwritten by the
   // pre-save snapshot.
   const loadSeq = useRef(0);
-  const load = (refresh: boolean) => {
+  const load = (refresh: boolean, retryRejected = false) => {
     const seq = ++loadSeq.current;
     setChecking(true);
     setHarnessError(false);
     setGitError(false);
     const fresh = () => seq === loadSeq.current;
     void Promise.allSettled([
-      getHarnesses(refresh).then((h) => fresh() && setHarnesses(h)),
+      getHarnesses(refresh, retryRejected).then((h) => fresh() && setHarnesses(h)),
       getGitSettings().then((g) => fresh() && setGit(g)),
       getTelemetry().then((t) => fresh() && setTelemetryState(t)),
     ])
@@ -82,6 +82,18 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
       .finally(() => setChecking(false));
   };
   useEffect(() => load(false), []);
+  useEffect(
+    () =>
+      onHarnessAuth(() => {
+        void getHarnesses(true)
+          .then((next) => {
+            setHarnesses(next);
+            setHarnessError(false);
+          })
+          .catch(() => setHarnessError(true));
+      }),
+    [],
+  );
 
   // Leaving step 3 → record the final consent decision once (agree or reject),
   // so every user who reaches the analytics step is counted, including those who
@@ -121,7 +133,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
               <p className="onb-gate-hint">Sign in to at least one agent to continue.</p>
             )}
             <div className="onb-actions">
-              <button className="btn ghost" onClick={() => load(true)} disabled={checking}>
+              <button className="btn ghost" onClick={() => load(true, true)} disabled={checking}>
                 <RefreshCw size={12} className={checking ? "spin" : ""} /> Re-check
               </button>
               <div style={{ flex: 1 }} />
@@ -248,7 +260,10 @@ function CmdChip({ cmd }: { cmd: string }) {
 /** Agent notes carry the command to run in backticks (`claude auth login`) —
  * render those spans as code so they read as something to type, not prose. */
 function agentBadge(h: Harness): { cls: string; label: string } {
-  if (h.agentReady) return { cls: "st-done", label: "Connected" };
+  if (h.agentReady) return { cls: "st-done", label: "Signed in" };
+  if (!h.installed) return { cls: "st-idle", label: "Not detected" };
+  if (h.authState === "unknown") return { cls: "st-starting", label: "Unable to verify" };
+  if (h.authState === "unsupported") return { cls: "st-starting", label: "Update required" };
   if (h.installed) return { cls: "st-starting", label: "Not signed in" };
   return { cls: "st-idle", label: "Not detected" };
 }

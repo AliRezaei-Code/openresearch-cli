@@ -61,6 +61,7 @@ import {
   type ModelSelection,
 } from "./ModelPicker";
 import { ContextMeter } from "./ContextMeter";
+import { renderNote } from "./agentNote";
 
 const SELECTION_STORAGE_KEY = "orx:agent-selection";
 
@@ -1737,6 +1738,7 @@ export function ChatPanel({
       return;
     }
     if (busy) return;
+    if (!activeHarness?.agentReady) return;
     // `composerSelection` already resolves to the open session's settings (+ any
     // unsent tweak) or, for a new session, the global preference.
     const effective = composerSelection;
@@ -2225,6 +2227,12 @@ export function ChatPanel({
           />
         )}
         <div className="composer-box" data-onboarding="composer">
+          {activeHarness && !activeHarness.agentReady && (
+            <div className="composer-harness-warning">
+              <strong>{activeHarness.name} is unavailable.</strong>{" "}
+              {activeHarness.agentNote ? renderNote(activeHarness.agentNote) : "Re-check its setup."}
+            </div>
+          )}
           {skillMenuOpen && (
             <SkillMenu
               skills={skillMatches}
@@ -2278,7 +2286,9 @@ export function ChatPanel({
                       ? `[paper — optional, defaults to ${paperId}] on [compute]`
                       : pickedSkill.argHint
                     : composerSelection
-                      ? `Message ${HARNESS_LABELS[composerSelection.harness]}… ( / for skills)`
+                      ? activeHarness?.agentReady
+                        ? `Message ${HARNESS_LABELS[composerSelection.harness]}… ( / for skills)`
+                        : `${HARNESS_LABELS[composerSelection.harness]} is unavailable — open the model picker`
                       : "Ask the research agent… ( / for skills)"
               }
               rows={2}
@@ -2361,7 +2371,7 @@ export function ChatPanel({
           <div className="composer-actions">
             {/* Bottom-left: permission mode. */}
             <OptionPicker
-              choices={opts?.permissionModes ?? []}
+              choices={activeHarness?.agentReady ? (opts?.permissionModes ?? []) : []}
               value={composerSelection?.permissionMode ?? null}
               defaultId={opts?.defaultPermissionMode ?? null}
               header="Mode"
@@ -2382,7 +2392,7 @@ export function ChatPanel({
               lockHarness={!!openSession}
             />
             <OptionPicker
-              choices={reasoning.choices}
+              choices={activeHarness?.agentReady ? reasoning.choices : []}
               value={composerSelection?.reasoningLevel ?? null}
               defaultId={reasoning.defaultId}
               header="Reasoning"
@@ -2407,7 +2417,10 @@ export function ChatPanel({
                 title="Send"
                 aria-label="Send"
                 onClick={() => void send()}
-                disabled={!pickedSkill && !draft.trim() && attachments.length === 0}
+                disabled={
+                  !activeHarness?.agentReady ||
+                  (!pickedSkill && !draft.trim() && attachments.length === 0)
+                }
               >
                 <CornerDownLeft size={16} />
               </button>
