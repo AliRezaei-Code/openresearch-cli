@@ -44,10 +44,10 @@
   /* Type scale. Sizes are px steps; anything smaller than --fs-2xs is banned. */
   --fs-2xs: 10px;
   --fs-xs: 11px;
-  --fs-sm: 12px;
-  --fs-md: 13px;
-  --fs-base: 14px;
-  --fs-lg: 15px;
+  --fs-sm: 13px;
+  --fs-md: 14px;
+  --fs-base: 15px;
+  --fs-lg: 16px;
   --fs-xl: 16px;
   --fs-2xl: 18px;
   --fs-3xl: 22px;
@@ -352,7 +352,7 @@ textarea::placeholder {
   flex: 1;
   min-width: 0;
   font-weight: var(--fw-semibold);
-  font-size: var(--fs-md);
+  font-size: var(--fs-base);
   color: var(--text);
   padding: 4px 6px 4px 0;
   border-radius: var(--radius-sm);
@@ -569,7 +569,7 @@ textarea::placeholder {
   align-items: center;
   gap: 10px;
   padding: 7px 10px;
-  font-size: var(--fs-md);
+  font-size: var(--fs-base);
   color: var(--text);
   border-radius: var(--radius-md);
   text-align: left;
@@ -584,7 +584,7 @@ textarea::placeholder {
 
 .rail-section-label {
   padding: 10px 10px 6px;
-  font-size: var(--fs-sm);
+  font-size: var(--fs-md);
   font-weight: var(--fw-medium);
   color: var(--subtext);
 }
@@ -607,7 +607,7 @@ textarea::placeholder {
 }
 .rail-empty {
   padding: 6px 10px;
-  font-size: var(--fs-sm);
+  font-size: var(--fs-md);
   color: var(--muted);
 }
 .session-rail .rail-body {
@@ -735,7 +735,7 @@ textarea::placeholder {
   align-items: center;
   gap: 6px;
   padding: 5px 12px;
-  font-size: var(--fs-sm);
+  font-size: var(--fs-md);
   font-weight: var(--fw-semibold);
   color: var(--text);
   border-radius: var(--radius-sm);
@@ -809,7 +809,7 @@ textarea::placeholder {
 }
 .seg button {
   padding: 3px 12px;
-  font-size: var(--fs-sm);
+  font-size: var(--fs-md);
   font-weight: var(--fw-semibold);
   color: var(--text);
   border-radius: var(--radius-sm);
@@ -868,7 +868,7 @@ textarea::placeholder {
 
 
 .chat-header .title {
-  font-size: var(--fs-md);
+  font-size: var(--fs-base);
   font-weight: var(--fw-semibold);
   color: var(--text);
   flex: 1;
@@ -1042,20 +1042,20 @@ textarea::placeholder {
   color: var(--text);
 }
 .chat-empty .chat-empty-hint {
-  font-size: var(--fs-sm);
+  font-size: var(--fs-md);
   color: var(--muted);
   max-width: 340px;
   text-align: center;
 }
 .chat-empty p {
   margin: 0;
-  font-size: var(--fs-md);
+  font-size: var(--fs-base);
   max-width: 320px;
 }
 /* one-click /reproduce-paper prefill for paper-born projects */
 .chat-empty .chat-suggest {
   font-family: var(--mono);
-  font-size: var(--fs-sm);
+  font-size: var(--fs-md);
   color: var(--text);
   background: var(--surface);
   border: 1px solid var(--border);
@@ -1094,7 +1094,7 @@ textarea::placeholder {
   background: var(--surface);
   border-radius: 16px; /* chat bubble — deliberate outsized radius */
   padding: 10px 15px;
-  font-size: var(--fs-md);
+  font-size: var(--fs-base);
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -1113,7 +1113,7 @@ textarea::placeholder {
 }
 
 .msg-assistant {
-  font-size: var(--fs-base);
+  font-size: var(--fs-lg);
   line-height: 1.62;
   color: var(--text);
   min-width: 0;
@@ -1121,7 +1121,7 @@ textarea::placeholder {
 
 .reasoning {
   color: var(--muted);
-  font-size: var(--fs-sm);
+  font-size: var(--fs-md);
   margin: 2px 0;
 }
 .reasoning summary {
@@ -1363,7 +1363,7 @@ textarea::placeholder {
   background: none;
   resize: none;
   padding: 10px 12px 4px;
-  font-size: var(--fs-md);
+  font-size: var(--fs-base);
   /* Auto-grow with the draft (Firefox doesn't ship field-sizing yet and
      falls back to the fixed two-row box). min-height keeps the two-row
      resting look — field-sizing ignores rows — and max-height caps the
@@ -3722,7 +3722,7 @@ a.files-pill:hover {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  font-size: var(--fs-sm);
+  font-size: var(--fs-md);
   color: var(--text);
   padding: 5px 8px;
   border-radius: var(--radius-sm);
@@ -3736,7 +3736,7 @@ a.files-pill:hover {
   display: inline-flex;
   align-items: center;
   gap: 3px;
-  font-size: var(--fs-sm);
+  font-size: var(--fs-md);
   color: var(--text);
   padding: 5px 4px;
   border-radius: var(--radius-sm);
@@ -3924,13 +3924,13 @@ a.files-pill:hover {
   background: var(--surface);
 }
 .skill-item .skill-name {
-  font-size: var(--fs-sm);
+  font-size: var(--fs-md);
 }
 .skill-item .skill-hint {
   color: var(--muted);
 }
 .skill-item .skill-desc {
-  font-size: var(--fs-xs);
+  font-size: var(--fs-sm);
   color: var(--subtext);
 }
 
@@ -3941,7 +3941,7 @@ a.files-pill:hover {
   align-items: center;
   padding: 1px 7px;
   font-family: var(--mono);
-  font-size: var(--fs-sm);
+  font-size: var(--fs-md);
   font-weight: var(--fw-medium);
   color: var(--primary);
   background: var(--primary-subtle);
@@ -3962,8 +3962,8 @@ a.files-pill:hover {
 }
 .composer-chip {
   position: absolute;
-  /* Sit on the textarea's first text line (10px top padding, --fs-md text)
-     despite the chip's smaller --fs-sm body. */
+  /* Sit on the textarea's first text line (10px top padding, --fs-base text)
+     despite the chip's smaller --fs-md body. */
   top: 9px;
   left: 12px;
   z-index: 1;
