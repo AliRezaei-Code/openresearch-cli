@@ -14,7 +14,7 @@
 //! entirely: no credentials, no mirror, no upload — cancel intent comes from
 //! the local run row's `cancel_requested` flag instead.
 
-use std::io::Write as _;
+use std::io::{Seek as _, Write as _};
 use std::time::Duration;
 
 use serde_json::json;
@@ -27,6 +27,7 @@ use crate::jobs::kubernetes as k8s;
 use crate::jobs::localbox;
 use crate::jobs::modal;
 use crate::jobs::openresearch;
+use crate::jobs::ray;
 use crate::jobs::slurm;
 use crate::jobs::ssh;
 use crate::jobs::{is_terminal_stage, stage_to_run_status, BackendDescriptor};
@@ -62,6 +63,9 @@ pub async fn run(args: crate::SuperviseArgs) -> Result<()> {
     }
     if descriptor.kind == "slurm_job" {
         return run_slurm(store, stored, descriptor, creds, run_id).await;
+    }
+    if descriptor.kind == "ray_job" {
+        return run_ray(store, stored, descriptor, creds, run_id).await;
     }
     if descriptor.kind == "openresearch_job" {
         return run_openresearch(store, stored, descriptor, creds, run_id).await;
@@ -1341,5 +1345,229 @@ async fn cancel_slurm(host: &str, job_id: &str, run_id: &str, cancel_sent: &mut 
     match slurm::cancel_job(host, job_id).await {
         Ok(()) => *cancel_sent = true,
         Err(err) => eprintln!("supervise {run_id}: scancel failed (will retry): {err}"),
+    }
+}
+
+// --- ray ----------------------------------------------------------------------
+//
+// Poll Ray Jobs status + full-log snapshot (no SSE). Cancel = POST …/stop.
+
+async fn run_ray(
+    store: Store,
+    stored: crate::store::StoredRun,
+    descriptor: BackendDescriptor,
+    creds: Option<Credentials>,
+    run_id: String,
+) -> Result<()> {
+    let (address, submission_id) = descriptor.ray_ref()?;
+    let address = address.to_string();
+    let submission_id = submission_id.to_string();
+
+    eprintln!("supervise {run_id}: watching ray job {submission_id} at {address}");
+
+    let path = log_path(&run_id);
+    let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+    let mut log_task = tokio::spawn(tail_logs_ray(
+        address.clone(),
+        submission_id.clone(),
+        path.clone(),
+        run_id.clone(),
+        done_rx,
+    ));
+
+    let mut last_status = stored.status.clone();
+    let mut cancel_sent = false;
+    // "GONE" (a 404 — the cluster no longer knows the job) must persist for a
+    // full minute before it's believed: it also fires while a Ray head
+    // restarts. Any other observation resets the count.
+    const GONE_POLLS_TO_FAIL: u32 = (60 / POLL_INTERVAL.as_secs()) as u32;
+    let mut gone_polls = 0u32;
+
+    loop {
+        let mut job = match ray::inspect_job(&address, &submission_id).await {
+            Ok(j) => j,
+            Err(err) => {
+                eprintln!("supervise {run_id}: inspect failed (will retry): {err}");
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
+        };
+        if job.stage == "GONE" {
+            gone_polls += 1;
+            if gone_polls < GONE_POLLS_TO_FAIL {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
+            job = ray::JobInfo {
+                stage: "ERROR".to_string(),
+                message: Some(
+                    "job no longer known to the cluster (record purged or head restarted?)"
+                        .to_string(),
+                ),
+            };
+        } else {
+            gone_polls = 0;
+        }
+        let stage = job.stage.as_str();
+        let status = if cancel_sent && is_terminal_stage(stage) {
+            "cancelled".to_string()
+        } else {
+            stage_to_run_status(stage).to_string()
+        };
+
+        if is_terminal_stage(stage) {
+            store.update_status(&run_id, &status, Some(now_ms()), None)?;
+            if creds.is_none() && status == "failed" {
+                if let Some(msg) = &job.message {
+                    if let Err(err) =
+                        store.set_result_markdown(&run_id, &format!("Job failed: {msg}"))
+                    {
+                        eprintln!("supervise {run_id}: could not record failure reason: {err}");
+                    }
+                }
+            }
+            let _ = done_tx.send(true);
+            if tokio::time::timeout(Duration::from_secs(20), &mut log_task)
+                .await
+                .is_err()
+            {
+                log_task.abort();
+            }
+            if let Some(creds) = &creds {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    if !bytes.is_empty() {
+                        match presign_external_run_log(creds, &run_id).await {
+                            Ok(presigned) => {
+                                if let Err(err) = upload_to_presigned(
+                                    &presigned.url,
+                                    "application/octet-stream",
+                                    bytes,
+                                )
+                                .await
+                                {
+                                    eprintln!("supervise {run_id}: log upload failed: {err}");
+                                }
+                            }
+                            Err(err) => eprintln!("supervise {run_id}: log presign failed: {err}"),
+                        }
+                    }
+                }
+                if let Err(err) = mirror_status(creds, &run_id, &status, &job.message).await {
+                    eprintln!("supervise {run_id}: final status mirror failed: {err}");
+                }
+            }
+            eprintln!("supervise {run_id}: finished ({status})");
+            return Ok(());
+        }
+
+        if status != last_status {
+            store.update_status(&run_id, &status, None, None)?;
+            let cancel_requested = match &creds {
+                Some(creds) => mirror_status(creds, &run_id, &status, &job.message)
+                    .await
+                    .unwrap_or(false),
+                None => local_cancel_requested(&store, &run_id),
+            };
+            eprintln!("supervise {run_id}: {last_status} -> {status} (stage {stage})");
+            last_status = status.clone();
+            if cancel_requested && !cancel_sent {
+                cancel_ray(&address, &submission_id, &run_id, &mut cancel_sent).await;
+            }
+        } else {
+            // Ray's stop is a request, not a guarantee — once cancel was sent,
+            // keep re-issuing until the job actually reaches a terminal stage.
+            let cancel_requested = cancel_sent
+                || match &creds {
+                    Some(creds) => crate::client::get_external_run_state(creds, &run_id)
+                        .await
+                        .map(|s| s.cancel_requested)
+                        .unwrap_or(false),
+                    None => local_cancel_requested(&store, &run_id),
+                };
+            if cancel_requested {
+                cancel_ray(&address, &submission_id, &run_id, &mut cancel_sent).await;
+            }
+        }
+
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+async fn tail_logs_ray(
+    address: String,
+    submission_id: String,
+    path: std::path::PathBuf,
+    run_id: String,
+    done: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut log_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(err) => {
+            eprintln!(
+                "supervise {run_id}: could not open {}: {err}",
+                path.display()
+            );
+            return;
+        }
+    };
+    let mut last = String::new();
+    // Set when a write failed, so the file may not match `last`: forces a
+    // wholesale rewrite until one fully succeeds.
+    let mut dirty = false;
+    loop {
+        match ray::fetch_logs(&address, &submission_id).await {
+            Ok(full) => {
+                // Snapshots normally only grow; append the delta. Anything
+                // else (truncation, rotation, a shifted window) invalidates
+                // what's on disk, so rewrite the file wholesale.
+                let delta = if dirty {
+                    None
+                } else {
+                    full.strip_prefix(last.as_str())
+                };
+                let ok = match delta {
+                    Some(d) => {
+                        d.is_empty()
+                            || (log_file.write_all(d.as_bytes()).is_ok()
+                                && log_file.flush().is_ok())
+                    }
+                    None => {
+                        log_file.rewind().is_ok()
+                            && log_file.set_len(0).is_ok()
+                            && log_file.write_all(full.as_bytes()).is_ok()
+                            && log_file.flush().is_ok()
+                    }
+                };
+                dirty = !ok;
+                if ok {
+                    last = full;
+                } else {
+                    eprintln!(
+                        "supervise {run_id}: could not write {} (will retry)",
+                        path.display()
+                    );
+                }
+            }
+            Err(err) => {
+                eprintln!("supervise {run_id}: ray log fetch error (will retry): {err}");
+            }
+        }
+        if *done.borrow() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn cancel_ray(address: &str, submission_id: &str, run_id: &str, cancel_sent: &mut bool) {
+    eprintln!("supervise {run_id}: cancel requested — stopping ray job {submission_id}");
+    match ray::stop_job(address, submission_id).await {
+        Ok(()) => *cancel_sent = true,
+        Err(err) => eprintln!("supervise {run_id}: ray stop failed (will retry): {err}"),
     }
 }

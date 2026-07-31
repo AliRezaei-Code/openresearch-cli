@@ -601,9 +601,10 @@ pub struct ExpRunArgs {
     /// account, billed per second), `k8s` (a Job on your own Kubernetes
     /// cluster), `ssh` (a detached process on one of your own boxes), `slurm`
     /// (a batch job on your Slurm cluster, submitted via its login node),
-    /// `openresearch` (an ephemeral OpenResearch GPU/CPU box billed to your
-    /// org; needs `orx login`), or `local` (a detached process on this
-    /// machine). k8s, ssh, slurm, openresearch, and local are local
+    /// `ray` (a job on your Ray cluster, via the Ray Jobs API), `openresearch`
+    /// (an ephemeral OpenResearch GPU/CPU box billed to your org; needs
+    /// `orx login`), or `local` (a detached process on this machine). k8s,
+    /// ssh, slurm, ray, openresearch, and local are local
     /// experiments only. orx submits the job and a detached supervisor
     /// mirrors status/logs back. Omitted on a local experiment: launches on
     /// the default compute target from `orx up` Settings → Compute, if set.
@@ -613,10 +614,12 @@ pub struct ExpRunArgs {
     /// h200, … With `--backend modal`: a Modal GPU (t4, l4, a10g, a100,
     /// a100-80gb, l40s, h100, h200, or e.g. h100:2) or cpu/cpu-large. With
     /// `--backend slurm`: a GPU request as a GRES spec (h100:2 → --gres=gpu:h100:2;
-    /// plain `gpu` → one GPU; omit for CPU-only). With `--backend openresearch`:
-    /// a GPU id from `orx compute` (h100_sxm, or h100_sxm:2 for two) or a CPU
-    /// flavor (cpu5c/cpu5g/cpu5m, or cpu5c:32 for the vCPU tier). Not used by
-    /// k8s (see --manifest) or ssh (see --host).
+    /// plain `gpu` → one GPU; omit for CPU-only). With `--backend ray`: optional
+    /// entrypoint resources (`cpu:2`, `gpu:1`, `gpu:1,mem:8GiB`; omit to reserve
+    /// nothing). With `--backend openresearch`: a GPU id from `orx compute`
+    /// (h100_sxm, or h100_sxm:2 for two) or a CPU flavor (cpu5c/cpu5g/cpu5m, or
+    /// cpu5c:32 for the vCPU tier). Not used by k8s (see --manifest) or ssh
+    /// (see --host).
     #[arg(long)]
     pub flavor: Option<String>,
     /// The org to bill the box to (with `--backend openresearch`). Omit when
@@ -646,6 +649,7 @@ pub struct ExpRunArgs {
     /// has no 4h default — unset falls back to the slurm settings, then the
     /// cluster's own limit. With `--backend openresearch` it bounds the run's
     /// wall clock on the box (the box itself is deleted when the run ends).
+    /// Not supported with `--backend ray` (Ray Jobs have no time limit).
     #[arg(long)]
     pub timeout: Option<String>,
     /// Launch even if the experiment's branch has no changes over its parent

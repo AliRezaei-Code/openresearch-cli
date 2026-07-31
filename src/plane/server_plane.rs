@@ -720,6 +720,11 @@ impl ServerPlane {
                     "--backend slurm is supported for local experiments (`orx up`) only for now."
                 ));
             }
+            Some("ray") => {
+                return Err(anyhow!(
+                    "--backend ray is supported for local experiments (`orx up`) only for now."
+                ));
+            }
             Some("openresearch") => {
                 return Err(anyhow!(
                     "--backend openresearch is for local experiments (`orx up`) only. Server \
@@ -734,7 +739,7 @@ impl ServerPlane {
             Some(other) => {
                 return Err(anyhow!(
                     "Unknown --backend '{}'. Supported: hf (Hugging Face Jobs), \
-                     modal (Modal serverless GPUs), k8s/ssh/slurm/openresearch/local \
+                     modal (Modal serverless GPUs), k8s/ssh/slurm/ray/openresearch/local \
                      (local experiments only).",
                     other
                 ));
