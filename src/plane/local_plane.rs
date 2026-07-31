@@ -7,7 +7,7 @@
 //!
 //! Verbs that are server-only today return the SAME error the command returned:
 //! `set_experiment_command` → `local::unsupported("exp cmd")`; `report` → the
-//! files-dir guidance. Byte-identical.
+//! local artifacts guidance.
 
 use std::collections::HashMap;
 use std::io::{Read as _, Seek as _};
@@ -542,15 +542,16 @@ impl ControlPlane for LocalPlane {
     // --- reports (local has no report registry) ---------------------------
 
     async fn report(&self, _cmd: ReportCommand) -> Result<()> {
-        // Local projects have no report registry or upload step — the files dir
+        // Local projects have no report registry or upload step — the artifacts dir
         // on disk is the whole feature. Point there instead of pretending to
-        // upload. Byte-identical to the former `report::local_guidance`.
+        // upload.
         let project = self.project()?;
         let dir = crate::local::files::ensure_dir(project)?;
         Err(anyhow!(
-            "`orx report` is cloud-only. Local projects have no upload step: write the report \
-             folder (report.md + images/) straight into the project's files directory,\n  {}\n\
-             Everything in that directory shows up in the dashboard's Files tab.",
+            "`orx report` is cloud-only. Local projects have no upload step: write \
+             descriptively named outputs straight into the project's artifacts directory,\n  {}\n\
+             Everything in that directory shows up in the dashboard's Artifacts tab; \
+             folders are optional.",
             dir.display()
         ))
     }

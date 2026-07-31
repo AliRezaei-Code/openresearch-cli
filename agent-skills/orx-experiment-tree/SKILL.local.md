@@ -186,8 +186,8 @@ intended flow — do **not** edit a frozen node or rewrite the run command:
    down the tree, it never rewrites a node that already measured something.
 
 Stop when the goal is met, or after ~3 consecutive failed or regressed runs.
-When you stop, write up the tree as a report in the project's files dir — see
-the `orx-reports` skill for the folder layout and section structure.
+When you stop, write up the tree as a descriptively named project artifact — see
+the `orx-reports` skill for naming and optional folder guidance.
 
 ## Experiment description / notes — `orx exp desc`
 

@@ -1,4 +1,4 @@
-//! Relocating the orx data dir (`orx.db` + `run-logs/` + `files/` +
+//! Relocating the orx data dir (`orx.db` + `run-logs/` + `files/` + legacy
 //! `memory/` + `chat-attachments/` + `agent-*.log`) to a user-chosen path.
 //!
 //! The whole dir is a self-contained, relocatable unit (the api already tars it

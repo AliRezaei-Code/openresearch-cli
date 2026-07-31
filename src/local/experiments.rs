@@ -12,16 +12,12 @@ use super::model::{LocalExperiment, LocalProject};
 use super::slugify;
 
 /// First free slug within the project: `base`, `base-2`, `base-3`, …
-/// `project` is never issued — it's the files dir's reserved top-level
-/// namespace for project-wide reports, and experiment folders there are
-/// keyed by slug.
 fn unique_slug(store: &Store, project_id: &str, base: &str) -> Result<String> {
-    let mut taken: HashSet<String> = store
+    let taken: HashSet<String> = store
         .list_experiments_by_project(project_id)?
         .into_iter()
         .map(|e| e.slug)
         .collect();
-    taken.insert(super::files::PROJECT_NAMESPACE.to_string());
     if !taken.contains(base) {
         return Ok(base.to_string());
     }
@@ -180,5 +176,15 @@ mod tests {
         assert!(legacy_root_warning(&p, &experiment(None, "orx/baseline")).is_none());
         // Child, even on the base branch name (not a root): silent.
         assert!(legacy_root_warning(&p, &experiment(Some("root"), "main")).is_none());
+    }
+
+    #[test]
+    fn project_is_available_as_an_experiment_slug() {
+        let root =
+            std::env::temp_dir().join(format!("orx-experiment-slug-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(root.clone()).unwrap();
+        assert_eq!(unique_slug(&store, "p1", "project").unwrap(), "project");
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

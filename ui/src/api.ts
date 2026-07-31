@@ -8,10 +8,11 @@ export interface Project {
   githubRepo: string;
   baselineBranch: string;
   repoPath: string;
-  /** Absolute path of the project's files dir (`<data dir>/files/<slug>`),
-   *  non-canonical to match the paths agents inline into chat. Lets the UI
-   *  recognize a files-dir link and route it to the files endpoints. */
-  filesDir: string;
+  /** Absolute path of the project's artifacts directory, non-canonical to
+   *  match paths agents inline into chat. */
+  artifactsDir: string;
+  /** Compatibility alias returned by older/newer mixed local clients. */
+  filesDir?: string;
   runCommand?: string | null;
   /** arXiv id the project starts from (versionless). */
   paperId?: string | null;
@@ -622,63 +623,44 @@ export interface OpenResearchSettings {
 export const getOpenResearchSettings = () =>
   get<OpenResearchSettings>("/api/settings/openresearch");
 
-/** The experiment a top-level files folder is named for (folder == slug). */
-export interface FileExperiment {
-  id: string;
-  slug: string;
-  title?: string;
-  branchName: string;
-  /** The experiment's most recent run status, if it has ever run. */
-  latestRunStatus?: string;
-}
-
-/** One node of the files tree: a file, or a directory with children. */
-export interface FileEntry {
+/** One node of the artifacts tree: a file, or a directory with children. */
+export interface ArtifactEntry {
   name: string;
-  /** Dir-relative `/`-joined path — the id for file/report/delete endpoints. */
+  /** Directory-relative `/`-joined path — the id for read/delete endpoints. */
   path: string;
   isDir: boolean;
   /** 0 for directories. */
   size: number;
   modifiedAt: number;
-  /** Set when the dir holds a top-level report.md — renders as a report. */
-  reportTitle?: string;
-  /** Top-level dirs only: the experiment this folder corresponds to. */
-  experiment?: FileExperiment;
-  children?: FileEntry[];
+  children?: ArtifactEntry[];
 }
 
-/** Listing of the project's on-disk files directory. */
-export interface ProjectFiles {
+/** Listing of the project's on-disk artifacts directory. */
+export interface ProjectArtifacts {
   dir: string;
-  entries: FileEntry[];
+  entries: ArtifactEntry[];
   truncated: boolean;
 }
 
-export const getFiles = (projectId: string) =>
-  get<ProjectFiles>(`/api/projects/${projectId}/files`);
+export const getArtifacts = (projectId: string) =>
+  get<ProjectArtifacts>(`/api/projects/${projectId}/files`);
 
-export const getFileReport = (projectId: string, name: string) =>
-  get<{ markdown: string }>(
-    `/api/projects/${projectId}/files/report?path=${encodeURIComponent(name)}`,
-  );
-
-/** Delete a file or report folder in the files dir. */
-export const deleteFile = (projectId: string, path: string) =>
+/** Delete a file or folder in the artifacts directory. */
+export const deleteArtifact = (projectId: string, path: string) =>
   fetch(`/api/projects/${projectId}/files?path=${encodeURIComponent(path)}`, {
     method: "DELETE",
   }).then((r) => json<{ ok: boolean }>(r));
 
-/** Raw file (images, CSVs, report figures) served by the API. */
-export const fileUrl = (projectId: string, path: string) =>
+/** Raw artifact bytes served by the compatibility `/files` API. */
+export const artifactUrl = (projectId: string, path: string) =>
   `/api/projects/${projectId}/files/file?path=${encodeURIComponent(path)}`;
 
-/** Text body of a files-dir file (raw bytes decoded as UTF-8), or `null` when
+/** Text body of an artifact (raw bytes decoded as UTF-8), or `null` when
  *  the file is missing (404). The endpoint returns bytes, not JSON, so this
  *  bypasses the `get`/`json` helpers; a 404 is a normal "not found", not an
  *  error to surface. */
-export const getFilesDirFileText = (projectId: string, path: string): Promise<string | null> =>
-  fetch(fileUrl(projectId, path)).then((r) => {
+export const getArtifactFileText = (projectId: string, path: string): Promise<string | null> =>
+  fetch(artifactUrl(projectId, path)).then((r) => {
     if (r.status === 404) return null;
     // Bare message — the viewer prefixes "Failed to load file:" itself.
     if (!r.ok) throw new Error(`HTTP ${r.status}`);

@@ -172,7 +172,7 @@ function isFileHref(href: string): boolean {
 /** Shared `code`/`pre` renderers: fenced blocks (language-*) become
  * highlighted CodeBlocks with a copy button; inline code stays a plain
  * <code> chip. The <pre> wrapper is handled inside CodeBlock, so
- * react-markdown's is unwrapped. Reused by the Files tab's report renderer. */
+ * react-markdown's is unwrapped. Reused by the Artifacts markdown renderer. */
 export const mdCodeComponents: Record<string, (props: any) => ReactNode> = {
   code: ({ node: _node, className, children, ...rest }: any) => {
     const cls: string = className ?? "";

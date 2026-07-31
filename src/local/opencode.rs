@@ -105,22 +105,16 @@ fn opencode_config_json(model: Option<&str>, instructions: &str) -> String {
 /// artifacts/query/chart).
 /// The playbook template — a literal, GitHub-readable markdown file. Rendered
 /// by [`playbook_md`]: the leading HTML comment is stripped and `{token}`
-/// placeholders are substituted (project facts, the compute default, the
-/// skills index, persisted memory).
+/// placeholders are substituted (project facts, the compute default, and the
+/// skills index).
 const SYSTEM_PROMPT: &str = include_str!("../../SYSTEM_PROMPT.md");
 
 fn playbook_md(project: &LocalProject) -> String {
-    playbook_md_with_memory(project, &super::memory::memory_section(project))
-}
-
-/// The render body, with the `{memory}` block passed in so tests can render
-/// the playbook without touching the developer's real memory files.
-fn playbook_md_with_memory(project: &LocalProject, memory: &str) -> String {
     let id = &project.id;
     let name = &project.name;
     let repo = format!("{}/{}", project.github_owner, project.github_repo);
     let baseline = &project.baseline_branch;
-    let files = super::files::files_dir(project)
+    let artifacts = super::files::files_dir(project)
         .to_string_lossy()
         .into_owned();
     let paper_line = project.paper_id.as_deref().map_or(String::new(), |p| {
@@ -222,14 +216,10 @@ fn playbook_md_with_memory(project: &LocalProject, memory: &str) -> String {
         .replace("{baseline}", baseline)
         .replace("{paper_line}", &paper_line)
         .replace("{compute_bullet}", &compute_bullet)
-        .replace("{files}", &files)
+        .replace("{artifacts}", &artifacts)
         .replace("{skills_list}", &skills_list)
         .replace("{launch_step}", launch_step)
         .replace("{backends_intro}", &backends_intro)
-        // Must stay LAST: later .replace calls rescan already-substituted
-        // text, so memory content containing a literal `{files}`/`{id}` etc.
-        // would get rewritten if this ran earlier.
-        .replace("{memory}", memory)
 }
 
 /// Keep the files we drop into the checkout out of `git status` / accidental
@@ -308,11 +298,8 @@ pub fn ensure_playbook(
         &project.github_owner,
         &project.github_repo,
     ));
-    // The playbook points the agent at the files dir — make sure it exists.
+    // The playbook points the agent at the artifacts dir — make sure it exists.
     let _ = super::files::ensure_dir(project);
-    // Same for the memory paths it advertises: parents must exist so any
-    // harness's file tools can create the .md files on first write.
-    super::memory::ensure_memory_dirs(project);
     Ok((workdir, playbook))
 }
 
@@ -627,16 +614,8 @@ mod tests {
         }
     }
 
-    /// Render with a fixed memory stub — tests must never read the
-    /// developer's real memory files through `data_dir()`.
     fn sample_playbook() -> String {
-        let memory = crate::local::memory::render_memory_section(
-            "/tmp/x/user.md",
-            "/tmp/x/memory.md",
-            None,
-            None,
-        );
-        playbook_md_with_memory(&sample_project(), &memory)
+        playbook_md(&sample_project())
     }
 
     /// The playbook's "## Skills" index must list exactly the Local-set skills,
@@ -674,8 +653,8 @@ mod tests {
     #[test]
     fn playbook_has_no_unresolved_placeholders() {
         let md = sample_playbook();
-        // Every token the template may carry must be substituted — a typo'd or
-        // newly added token that playbook_md doesn't know about fails here.
+        // Every current token must be substituted — a typo'd or newly added
+        // token that playbook_md doesn't know about fails here.
         for token in [
             "{name}",
             "{id}",
@@ -683,13 +662,15 @@ mod tests {
             "{baseline}",
             "{paper_line}",
             "{compute_bullet}",
-            "{files}",
+            "{artifacts}",
             "{skills_list}",
             "{launch_step}",
             "{backends_intro}",
-            "{memory}",
         ] {
             assert!(!md.contains(token), "unresolved placeholder {token}");
+        }
+        for retired in ["{files}", "{memory}"] {
+            assert!(!md.contains(retired), "retired placeholder {retired}");
         }
         // The template's leading HTML comment (repo-reader documentation) must
         // be stripped — the prompt starts at the title.
@@ -702,9 +683,8 @@ mod tests {
         assert!(md.contains("orx-compute"));
         assert!(md.contains("orx-reports"));
         assert!(md.contains("orx-evidence"));
-        // The memory section rendered with both scopes present.
-        assert!(md.contains("## Memory"));
-        assert!(md.contains("### User memory"));
-        assert!(md.contains("### Project memory"));
+        assert!(!md.contains("## Memory"));
+        assert!(!md.contains("User memory"));
+        assert!(!md.contains("Project memory"));
     }
 }
