@@ -5,6 +5,11 @@
 > we'd love to chat with you. Please email
 > [contact@alphaxiv.org](mailto:contact@alphaxiv.org) if interested.
 
+### Stay updated or use OpenResearch compute
+
+To receive email updates about the OpenResearch CLI or spin up compute from
+OpenResearch, create an account at [openresearch.sh](https://openresearch.sh).
+
 ### Run autoresearch on your machine
 
 - **Run research agents in parallel**. Spins up agents in different worktrees
