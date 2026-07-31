@@ -173,10 +173,9 @@ fn router(state: AppState) -> Router {
         .route("/api/projects/{id}/file", get(project_file))
         .route(
             "/api/projects/{id}/files",
-            get(list_files).delete(delete_file),
+            get(list_artifacts).delete(delete_artifact),
         )
-        .route("/api/projects/{id}/files/report", get(file_report))
-        .route("/api/projects/{id}/files/file", get(serve_file))
+        .route("/api/projects/{id}/files/file", get(serve_artifact))
         .route("/api/events", get(events))
         .route("/api/settings/hf", get(hf_settings).post(set_hf_token))
         .route(
@@ -349,21 +348,24 @@ async fn list_skills() -> Json<Value> {
     Json(json!({ "skills": skills }))
 }
 
-/// Serialize a project for the UI, injecting the absolute `filesDir` so the
-/// dashboard can recognize files-dir paths in chat links. Every project the UI
+/// Serialize a project for the UI, injecting the absolute artifacts directory
+/// so the dashboard can recognize artifact paths in chat links. `filesDir` is
+/// retained as a compatibility alias for older clients. Every project the UI
 /// receives must go through this — the SSE `project.updated` diff (fired on
 /// every visit, since `open_project` bumps `updated_at`) and `create_project`
-/// upsert into the same `projects` state as `list_projects`, so enriching one
-/// site alone would let a bare project overwrite `filesDir` mid-session.
+/// upsert into the same `projects` state as `list_projects`.
 fn project_json(p: &local::model::LocalProject) -> Value {
+    project_json_with_artifacts_dir(p, local::files::files_dir_display(p))
+}
+
+fn project_json_with_artifacts_dir(p: &local::model::LocalProject, artifacts_dir: String) -> Value {
     // LocalProject is all String/Option/i64, so this can't realistically fail;
     // fail loud rather than emit a malformed `null` project if it ever does.
     let mut v = serde_json::to_value(p).expect("LocalProject serializes");
     if let Value::Object(map) = &mut v {
-        map.insert(
-            "filesDir".into(),
-            Value::String(local::files::files_dir_display(p)),
-        );
+        let dir = Value::String(artifacts_dir);
+        map.insert("artifactsDir".into(), dir.clone());
+        map.insert("filesDir".into(), dir);
     }
     v
 }
@@ -1222,54 +1224,32 @@ async fn project_file(Path(id): Path<String>, Query(q): Query<ProjectFileQuery>)
     .await
 }
 
-// --- files ----------------------------------------------------------------
+// --- project artifacts ----------------------------------------------------
 
-/// Listing of the project's files dir — the filesystem is the source of
+/// Listing of the project's artifacts dir — the filesystem is the source of
 /// truth; this scans it fresh on every call (and creates it if missing).
-/// Top-level folders named for an experiment slug carry that experiment
-/// (title, branch, latest run status) so the tab can group by experiment.
-async fn list_files(Path(id): Path<String>) -> ApiResult {
+async fn list_artifacts(Path(id): Path<String>) -> ApiResult {
     blocking_api(move || {
         let store = Store::open()?;
         let project = store
             .get_local_project(&id)?
             .ok_or_else(|| not_found("project"))?;
-        let experiments = store.list_experiments_by_project(&id)?;
-        // Newest-first run list → first status seen per experiment is latest.
-        let mut latest: HashMap<String, String> = HashMap::new();
-        for run in store.list_runs_by_project(&id)? {
-            latest.entry(run.experiment_id).or_insert(run.status);
-        }
-        let listing = local::files::list(&project, &experiments, &latest)?;
+        let listing = local::files::list(&project)?;
         Ok(Json(json!(listing)))
     })
     .await
 }
 
 #[derive(Deserialize)]
-struct FilePathQuery {
+struct ArtifactPathQuery {
     path: String,
 }
 
-/// A report folder's markdown body (`<name>/report.md`).
-async fn file_report(Path(id): Path<String>, Query(q): Query<FilePathQuery>) -> ApiResult {
-    blocking_api(move || {
-        let store = Store::open()?;
-        let project = store
-            .get_local_project(&id)?
-            .ok_or_else(|| not_found("project"))?;
-        let markdown = local::files::read_report_markdown(&project, &q.path)
-            .map_err(|_| not_found("report"))?;
-        Ok(Json(json!({ "markdown": markdown })))
-    })
-    .await
-}
-
-/// Delete a file or report folder in the files dir, by relative path.
-async fn delete_file(
+/// Delete a file or folder in the artifacts dir, by relative path.
+async fn delete_artifact(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(q): Query<FilePathQuery>,
+    Query(q): Query<ArtifactPathQuery>,
 ) -> ApiResult {
     reject_if_moving(&state)?;
     blocking_api(move || {
@@ -1283,11 +1263,11 @@ async fn delete_file(
     .await
 }
 
-/// Raw file bytes, by files-dir-relative path. `no-cache`: the same path can
+/// Raw artifact bytes, by directory-relative path. `no-cache`: the same path can
 /// be rewritten in place on disk.
-async fn serve_file(
+async fn serve_artifact(
     Path(id): Path<String>,
-    Query(q): Query<FilePathQuery>,
+    Query(q): Query<ArtifactPathQuery>,
 ) -> std::result::Result<Response, ApiError> {
     tokio::task::spawn_blocking(move || {
         let store = Store::open()?;
@@ -3039,7 +3019,7 @@ fn collect_events(cursor: &mut EventCursor, first: bool) -> Result<Vec<Event>> {
             ));
         }
         push_experiment_events(&store, &project.id, cursor, &mut out)?;
-        // Files appear live — anything written into the files dir (by the
+        // Artifacts appear live — anything written into the directory (by the
         // agent or the user) pings the UI to refetch the listing.
         let fp = local::files::fingerprint(&project);
         if cursor.files.get(&project.id) != Some(&fp) {
@@ -3215,6 +3195,32 @@ async fn spa(uri: Uri) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_json_exposes_artifacts_dir_with_legacy_alias() {
+        let project = local::model::LocalProject {
+            id: "p1".into(),
+            name: "Demo".into(),
+            slug: "demo".into(),
+            github_owner: "o".into(),
+            github_repo: "r".into(),
+            baseline_branch: "main".into(),
+            repo_path: "/tmp/r".into(),
+            run_command: None,
+            paper_id: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let json = project_json_with_artifacts_dir(
+            &project,
+            "/tmp/openresearch-test/files/demo".to_string(),
+        );
+        assert_eq!(json["artifactsDir"], json["filesDir"]);
+        assert!(json["artifactsDir"]
+            .as_str()
+            .unwrap()
+            .ends_with("files/demo"));
+    }
 
     fn no_key(path: Option<&str>) -> SshReadiness {
         SshReadiness::NoUsableKey {

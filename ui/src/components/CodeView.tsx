@@ -1,5 +1,5 @@
 // Shared source-code block: line-number gutter + refractor-highlighted
-// content, used by the repo file viewer and the Files tab preview. Style
+// content, used by the repo file viewer and the Artifacts tab preview. Style
 // scoping note: syntax token colors apply under a `.file-view` ancestor.
 import { useMemo } from "react";
 import { detectSyntaxLanguageFromFilePath } from "../syntaxLanguage";

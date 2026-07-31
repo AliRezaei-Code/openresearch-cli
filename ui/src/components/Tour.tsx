@@ -53,12 +53,12 @@ const STEPS: TourStep[] = [
       "New sessions start with whatever you pick here, and each session keeps its harness.",
   },
   {
-    focus: ["nav-files"],
+    focus: ["nav-artifacts"],
     anchor: "right",
-    title: "Reports and outputs",
+    title: "Project artifacts",
     description:
       "The agent writes its reports, figures, and other outputs here, and anything you drop " +
-      "in is visible to it too. Check Files after a run to see what came back.",
+      "in is visible to it too. Check Artifacts after a run to see what came back.",
   },
   {
     focus: ["nav-compute"],

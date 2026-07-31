@@ -13,13 +13,13 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   cancelRun,
-  getFiles,
+  getArtifacts,
   listExperiments,
   listProjects,
   listRuns,
   openProject,
   type Experiment,
-  type ProjectFiles,
+  type ProjectArtifacts,
   type Project,
   type Run,
 } from "./api";
@@ -27,7 +27,7 @@ import { ChatPanel } from "./components/ChatPanel";
 import { SubagentTab } from "./components/SubagentTab";
 import { CodeTab } from "./components/CodeTab";
 import { WorktreeTab, type WorktreeView } from "./components/WorktreeTab";
-import { FilesTab } from "./components/FilesTab";
+import { ArtifactsTab } from "./components/ArtifactsTab";
 import { ClosableTab } from "./components/ClosableTab";
 import { DetailDrawer, type ExperimentView } from "./components/DetailDrawer";
 import { FileViewer } from "./components/FileViewer";
@@ -54,12 +54,12 @@ const sameExpTab = (a: ExpViewDef, b: ExpViewDef) => a.id === b.id && a.view ===
 interface FileViewDef {
   path: string;
   /** Which backend serves this file. Absent/"repo" → the repo `/file`
-   * endpoint (worktree/clone/branch), falling back to the files dir when a
-   * non-ref path misses the checkout; "files" → the project's files dir
-   * (`/files/report` + `/files/file`). */
-  source?: "repo" | "files";
+   * endpoint (worktree/clone/branch), falling back to artifacts when a
+   * non-ref path misses the checkout; "artifacts" → the project's durable
+   * output directory through the compatibility `/files/file` endpoint. */
+  source?: "repo" | "artifacts";
   /** Chat session whose worktree holds the file (absent → hub clone).
-   * Files-dir tabs never carry this. */
+   * Artifact tabs never carry this. */
   sessionId?: string;
   /** Branch whose committed copy to show (code browser in branch mode);
    * overrides the live checkout. */
@@ -130,10 +130,9 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-// Map a path an agent reported to a right-pane file tab. A files-dir path
-// (a report/figure the agent wrote under <data dir>/files/<slug>/…) is stripped
-// to a files-dir-relative path and tagged source:"files" so FileViewer reads it
-// from the /files endpoints. Otherwise it's a repo/worktree path stripped to
+// Map a path an agent reported to a right-pane file tab. An artifact path under
+// the compatibility <data dir>/files/<slug>/ layout is stripped to a relative
+// path and tagged source:"artifacts". Otherwise it's a repo/worktree path stripped to
 // repo-relative, keeping the session id when it points into a per-session
 // worktree. Relative paths name files in the click context's checkout and
 // inherit `contextSessionId`; the regex fallbacks encode the
@@ -143,24 +142,24 @@ function parseFilePath(
   rawPath: string,
   repoPath?: string,
   contextSessionId?: string,
-  filesDir?: string,
+  artifactsDir?: string,
   slug?: string,
 ): FileViewDef | null {
   let path = rawPath;
   let sessionId: string | undefined;
   const clone = repoPath?.replace(/\/+$/, "");
-  const files = filesDir?.replace(/\/+$/, "");
+  const artifacts = artifactsDir?.replace(/\/+$/, "");
   if (!path.startsWith("/")) {
     sessionId = contextSessionId;
-  } else if (files && (path === files || path.startsWith(`${files}/`))) {
-    // Files-dir file — exact prefix match against the (non-canonical) dir the
+  } else if (artifacts && (path === artifacts || path.startsWith(`${artifacts}/`))) {
+    // Artifact — exact prefix match against the non-canonical dir the
     // backend surfaced, which mirrors what the agent inlines.
-    const rel = path.slice(files.length).replace(/^\/+/, "");
-    return rel ? { path: rel, source: "files" } : null;
+    const rel = path.slice(artifacts.length).replace(/^\/+/, "");
+    return rel ? { path: rel, source: "artifacts" } : null;
   } else if (clone && (path === clone || path.startsWith(`${clone}/`))) {
     path = path.slice(clone.length).replace(/^\/+/, "");
   } else {
-    // Files-dir fallback for a symlink-divergent path (e.g. /tmp vs
+    // Artifact fallback for a symlink-divergent path (e.g. /tmp vs
     // /private/tmp) where the exact prefix missed: match the …/files/<slug>/<rel>
     // layout, requiring the slug segment when we know it. (Legacy artifacts/ is
     // migrated to files/ in place, so it never appears in a live path.)
@@ -169,7 +168,7 @@ function parseFilePath(
     const wt = fd ? null : path.match(/\/openresearch\/worktrees\/[^/]+\/[^/]+\/([^/]+)\/(.+)$/);
     const hub = fd || wt ? null : path.match(/\/openresearch\/repos\/[^/]+\/[^/]+\/(.+)$/);
     if (fd) {
-      return { path: fd[1], source: "files" };
+      return { path: fd[1], source: "artifacts" };
     } else if (wt) {
       sessionId = wt[1];
       path = wt[2];
@@ -225,7 +224,7 @@ export default function App() {
   const [projectId, setProjectId] = useState<string | null>(null);
   const [experiments, setExperiments] = useState<Experiment[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
-  const [files, setFiles] = useState<ProjectFiles | null>(null);
+  const [artifacts, setArtifacts] = useState<ProjectArtifacts | null>(null);
   const [view, setView] = useState<"tree" | "table">("tree");
   // Experiments pane scope: "agent" narrows to the open chat session's work.
   // Falls back to "project" whenever there's no session to scope to. The
@@ -276,9 +275,9 @@ export default function App() {
   // The agents rail is a floating panel too: fixed-width, collapsible.
   const [railOpen, setRailOpen] = useState(true);
   const [homeOpen, setHomeOpen] = useState(false);
-  // What the middle pane shows: the agent chat, the project's files, or
+  // What the middle pane shows: the agent chat, project artifacts, or
   // one settings section (picked from the rail nav — no separate pages).
-  const [mainView, setMainView] = useState<"chat" | "files" | SettingsTab>("chat");
+  const [mainView, setMainView] = useState<"chat" | "artifacts" | SettingsTab>("chat");
   const [onboarded, setOnboarded] = useState(() => {
     try {
       return localStorage.getItem(ONBOARDED_KEY) === "1";
@@ -351,7 +350,7 @@ export default function App() {
     openProject(projectId).catch(() => {});
     setExperiments([]);
     setRuns([]);
-    setFiles(null);
+    setArtifacts(null);
     setSelectedRunId(null);
     setExpTabs([]);
     setFileTabs([]);
@@ -367,13 +366,13 @@ export default function App() {
     setScope("project");
     listExperiments(projectId).then(setExperiments).catch(() => {});
     listRuns(projectId).then(setRuns).catch(() => {});
-    getFiles(projectId).then(setFiles).catch(() => {});
+    getArtifacts(projectId).then(setArtifacts).catch(() => {});
   }, [projectId]);
 
-  // Refetch the files listing (on open and whenever the dir changes).
-  const refreshFiles = useCallback(() => {
+  // Refetch artifacts on open and whenever the directory changes.
+  const refreshArtifacts = useCallback(() => {
     const id = projectIdRef.current;
-    if (id) getFiles(id).then(setFiles).catch(() => {});
+    if (id) getArtifacts(id).then(setArtifacts).catch(() => {});
   }, []);
 
   // Live store updates.
@@ -388,8 +387,8 @@ export default function App() {
     onProject: (project) => {
       setProjects((cur) => (cur ? upsert(cur, project) : [project]));
     },
-    onFiles: (pid) => {
-      if (pid === projectIdRef.current) refreshFiles();
+    onArtifacts: (pid) => {
+      if (pid === projectIdRef.current) refreshArtifacts();
     },
   });
 
@@ -429,13 +428,12 @@ export default function App() {
         rawPath,
         project?.repoPath,
         contextSessionId,
-        project?.filesDir,
+        project?.artifactsDir ?? project?.filesDir,
         project?.slug,
       );
       if (!tab) return;
-      // A branch ref only applies to repo files; never stamp it onto a
-      // files-dir tab (it has no branch, and would fragment the tab identity).
-      if (ref && tab.source !== "files") tab.ref = ref;
+      // A branch ref only applies to repo files; artifacts have no branch.
+      if (ref && tab.source !== "artifacts") tab.ref = ref;
       setFileTabs((prev) => (prev.some((t) => sameFileTab(t, tab)) ? prev : [...prev, tab]));
       setRightTab(tab);
       setPanelOpen(true);
@@ -737,17 +735,17 @@ export default function App() {
             onStartTour={startTour}
             onActiveSessionChange={setActiveSessionId}
           >
-            {mainView === "files" ? (
+            {mainView === "artifacts" ? (
               (() => {
                 const project = projects.find((p) => p.id === projectId);
                 return project ? (
-                  <FilesTab
-                    // Remount per project: selection, collapsed-folder state,
-                    // and the auto-select latch must not leak across projects.
+                  <ArtifactsTab
+                    // Remount per project so selection cannot leak and saved
+                    // folder preferences reload for the newly active project.
                     key={project.id}
                     project={project}
-                    files={files}
-                    onChanged={refreshFiles}
+                    artifacts={artifacts}
+                    onChanged={refreshArtifacts}
                     onOpenStorage={() => setMainView("storage")}
                   />
                 ) : null;
