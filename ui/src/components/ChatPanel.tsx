@@ -1171,9 +1171,9 @@ export function ChatPanel({
   railOpen: boolean;
   /** Reopen the rail (from the chat header's sidebar icon). */
   onShowRail: () => void;
-  /** What the middle pane shows: chat, files, or a settings section. */
-  mainView: "chat" | "files" | SettingsTab;
-  onSelectMainView: (view: "chat" | "files" | SettingsTab) => void;
+  /** What the middle pane shows: chat, artifacts, or a settings section. */
+  mainView: "chat" | "artifacts" | SettingsTab;
+  onSelectMainView: (view: "chat" | "artifacts" | SettingsTab) => void;
   /** Whether the right panel is showing (toggled from the chat header). */
   panelOpen: boolean;
   onTogglePanel: () => void;
@@ -1848,7 +1848,7 @@ export function ChatPanel({
   // mirroring the Claude Code desktop app. Harness-agnostic — `stop()` →
   // `interruptChat` interrupts whichever harness (Claude, Codex, OpenCode, …)
   // is running the active session. Only armed on the chat view while busy, so
-  // it never fires from the settings/files panels that also render inside
+  // it never fires from the settings/artifacts panels that also render inside
   // ChatPanel.
   //
   // An overlay that should swallow Escape (rather than let it stop the turn)
@@ -1985,12 +1985,12 @@ export function ChatPanel({
           New session
         </button>
         <button
-          className={`rail-nav-item ${mainView === "files" ? "active" : ""}`}
-          data-onboarding="nav-files"
-          onClick={() => onSelectMainView("files")}
+          className={`rail-nav-item ${mainView === "artifacts" ? "active" : ""}`}
+          data-onboarding="nav-artifacts"
+          onClick={() => onSelectMainView("artifacts")}
         >
           <FolderOpen size={15} />
-          Files
+          Artifacts
         </button>
         {SETTINGS_NAV.map((item) => (
           <button

@@ -7,7 +7,7 @@
 //! presigned URLs the API returns (bytes never transit the API).
 //!
 //! Reports are a cloud-only feature: a local project has no report registry, so
-//! its plane returns files-dir guidance instead of a registry op. The dispatch,
+//! its plane returns artifacts-directory guidance instead of a registry op. The dispatch,
 //! upload/list/show/download logic, and the guidance all live in the plane impls
 //! (`ServerPlane` / `LocalPlane`); this command just resolves and forwards.
 

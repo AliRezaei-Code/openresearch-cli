@@ -16,24 +16,51 @@ import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import {
-  deleteFile,
-  fileUrl,
+  artifactUrl,
+  deleteArtifact,
   fmtBytes,
-  getFileReport,
-  type FileEntry,
+  type ArtifactEntry,
   type Project,
-  type ProjectFiles,
+  type ProjectArtifacts,
 } from "../api";
 import { CodeView } from "./CodeView";
 import { mdCodeComponents, normalizeMathDelimiters, remarkMathOptions } from "./Md";
 
-/** Top-level folder reserved for project-wide reports (mirrors the backend). */
-const PROJECT_NAMESPACE = "project";
-
 /** Any href with a URI scheme (https:, mailto:, data:, …) or a
- * protocol-relative // — i.e. not a report-relative path to resolve. */
+ * protocol-relative // — i.e. not an artifact-relative path to resolve. */
 function isExternalSrc(src: string): boolean {
   return /^[a-z][a-z0-9+.-]*:/i.test(src) || src.startsWith("//");
+}
+
+/** Resolve a Markdown target within the artifacts root. URL suffixes stay
+ * outside the encoded filesystem path, and upward escapes are rejected. */
+function artifactTargetUrl(projectId: string, folder: string, src: string): string | null {
+  const hashAt = src.indexOf("#");
+  const beforeHash = hashAt === -1 ? src : src.slice(0, hashAt);
+  const hash = hashAt === -1 ? "" : src.slice(hashAt);
+  const queryAt = beforeHash.indexOf("?");
+  const pathname = queryAt === -1 ? beforeHash : beforeHash.slice(0, queryAt);
+  const query = queryAt === -1 ? "" : beforeHash.slice(queryAt + 1);
+  const parts = pathname.startsWith("/")
+    ? []
+    : folder.split("/").filter((part) => part.length > 0);
+
+  for (const part of pathname.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (parts.length === 0) return null;
+      parts.pop();
+    } else {
+      parts.push(part);
+    }
+  }
+
+  const path = parts.join("/");
+  if (!path) return null;
+  const queryParams = new URLSearchParams(query);
+  queryParams.delete("path");
+  const querySuffix = queryParams.toString();
+  return `${artifactUrl(projectId, path)}${querySuffix ? `&${querySuffix}` : ""}${hash}`;
 }
 
 /** Drop a leading YAML frontmatter block so it doesn't render as markdown. */
@@ -50,6 +77,7 @@ const MAX_TEXT_PREVIEW = 512 * 1024;
 
 /** Tree pane width: draggable divider, persisted across reloads. */
 const TREE_WIDTH_KEY = "orx:files-tree-width";
+const COLLAPSED_DIRS_KEY_PREFIX = "orx:artifacts-collapsed:";
 const TREE_MIN_WIDTH = 180;
 const TREE_MAX_WIDTH = 560;
 const TREE_DEFAULT_WIDTH = 280;
@@ -64,8 +92,20 @@ function initialTreeWidth(): number {
   return TREE_DEFAULT_WIDTH;
 }
 
-/** Depth-first lookup of a tree entry by its dir-relative path. */
-function findEntry(entries: FileEntry[], path: string): FileEntry | null {
+function initialCollapsed(projectId: string): Set<string> {
+  try {
+    const raw = localStorage.getItem(`${COLLAPSED_DIRS_KEY_PREFIX}${projectId}`);
+    if (!raw) return new Set();
+    const value: unknown = JSON.parse(raw);
+    if (!Array.isArray(value)) return new Set();
+    return new Set(value.filter((path): path is string => typeof path === "string"));
+  } catch {
+    return new Set();
+  }
+}
+
+/** Depth-first lookup of a tree entry by its directory-relative path. */
+function findEntry(entries: ArtifactEntry[], path: string): ArtifactEntry | null {
   for (const e of entries) {
     if (e.path === path) return e;
     if (e.isDir && path.startsWith(e.path + "/")) {
@@ -76,22 +116,9 @@ function findEntry(entries: FileEntry[], path: string): FileEntry | null {
   return null;
 }
 
-/** Every report folder in the tree, for the initial auto-selection. */
-function collectReports(entries: FileEntry[]): FileEntry[] {
-  const out: FileEntry[] = [];
-  for (const e of entries) {
-    if (!e.isDir) continue;
-    if (e.reportTitle !== undefined) out.push(e);
-    out.push(...collectReports(e.children ?? []));
-  }
-  return out;
-}
-
-/** Report markdown with report-relative image/link paths (`images/...`)
- * rewritten to the file endpoint, scoped to the report's folder. Exported so
- * the chat file viewer can render files-dir reports with the same image
- * resolution (a bare <Md> would 404 the figures). */
-export function ReportMd({
+/** Artifact markdown with relative image/link paths rewritten to the raw
+ * artifact endpoint, scoped to the markdown file's parent directory. */
+export function ArtifactMarkdown({
   projectId,
   folder,
   markdown,
@@ -102,11 +129,10 @@ export function ReportMd({
 }) {
   const resolve = (src: string) => {
     if (isExternalSrc(src)) return src;
-    const rel = src.replace(/^\.?\//, "");
-    return fileUrl(projectId, folder ? `${folder}/${rel}` : rel);
+    return artifactTargetUrl(projectId, folder, src);
   };
   return (
-    <div className="md report-md">
+    <div className="md artifact-md">
       <ReactMarkdown
         remarkPlugins={[remarkGfm, [remarkMath, remarkMathOptions]]}
         rehypePlugins={[rehypeKatex]}
@@ -115,10 +141,12 @@ export function ReportMd({
           // and stay in the page; everything else resolves + opens a tab.
           a: ({ href, children, ...rest }) => {
             const isHash = !href || href.startsWith("#");
+            const resolved = isHash ? href : resolve(href);
+            if (!resolved) return <span>{children}</span>;
             return (
               <a
                 {...rest}
-                href={isHash ? href : resolve(href)}
+                href={resolved}
                 {...(isHash ? {} : { target: "_blank", rel: "noopener noreferrer" })}
               >
                 {children}
@@ -128,10 +156,11 @@ export function ReportMd({
           img: ({ src, alt }) => {
             if (!src || typeof src !== "string") return null;
             const url = resolve(src);
+            if (!url) return null;
             return (
-              <a href={url} target="_blank" rel="noopener noreferrer" className="report-img">
+              <a href={url} target="_blank" rel="noopener noreferrer" className="artifact-img">
                 <img src={url} alt={alt ?? ""} loading="lazy" />
-                {alt && <span className="report-img-caption">{alt}</span>}
+                {alt && <span className="artifact-img-caption">{alt}</span>}
               </a>
             );
           },
@@ -144,27 +173,23 @@ export function ReportMd({
   );
 }
 
-type PreviewKind = "report" | "markdown" | "image" | "pdf" | "text";
+type PreviewKind = "markdown" | "image" | "pdf" | "text";
 
-function previewKind(entry: FileEntry): PreviewKind {
-  // Only report folders are selectable (plain dirs merely toggle open), so
-  // a dir here always has a report.md to render.
-  if (entry.isDir) return "report";
+function previewKind(entry: ArtifactEntry): PreviewKind {
   if (MD_RE.test(entry.name)) return "markdown";
   if (IMAGE_RE.test(entry.name)) return "image";
   if (/\.pdf$/i.test(entry.name)) return "pdf";
   return "text";
 }
 
-/** Fetched body for kinds that need text: report md, file md, or raw text.
+/** Fetched body for kinds that need text: markdown or raw text.
  * `binary` flags NUL bytes so we don't dump garbage into a <pre>. */
-function useTextBody(projectId: string, entry: FileEntry, kind: PreviewKind) {
+function useTextBody(projectId: string, entry: ArtifactEntry, kind: PreviewKind) {
   const [text, setText] = useState<string | null>(null);
   const [binary, setBinary] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const wantsText =
-    kind === "report" || kind === "markdown" || (kind === "text" && entry.size <= MAX_TEXT_PREVIEW);
+  const wantsText = kind === "markdown" || (kind === "text" && entry.size <= MAX_TEXT_PREVIEW);
 
   useEffect(() => {
     // Reset before the wantsText guard: a refire on the same mounted entry
@@ -175,13 +200,10 @@ function useTextBody(projectId: string, entry: FileEntry, kind: PreviewKind) {
     setError(null);
     if (!wantsText) return;
     let cancelled = false;
-    const load =
-      kind === "report"
-        ? getFileReport(projectId, entry.path).then((r) => r.markdown)
-        : fetch(fileUrl(projectId, entry.path)).then((r) => {
-            if (!r.ok) throw new Error(`Failed to load file (${r.status})`);
-            return r.text();
-          });
+    const load = fetch(artifactUrl(projectId, entry.path)).then((r) => {
+      if (!r.ok) throw new Error(`Failed to load artifact (${r.status})`);
+      return r.text();
+    });
     load
       .then((body) => {
         if (cancelled) return;
@@ -199,25 +221,23 @@ function useTextBody(projectId: string, entry: FileEntry, kind: PreviewKind) {
   return { text, binary, error, wantsText };
 }
 
-/** Right pane: the selected entry rendered inline — report folders and
- * markdown as documents, images/PDFs directly, everything else as code. */
+/** Right pane: the selected artifact rendered inline — markdown as a document,
+ * images/PDFs directly, and everything else as code. */
 function PreviewPane({
   projectId,
   entry,
   onDelete,
 }: {
   projectId: string;
-  entry: FileEntry;
+  entry: ArtifactEntry;
   onDelete: (path: string) => void;
 }) {
   const kind = previewKind(entry);
   const { text, binary, error, wantsText } = useTextBody(projectId, entry, kind);
   const [showSource, setShowSource] = useState(false);
-  const isDoc = kind === "report" || kind === "markdown";
-  // Reports resolve images relative to their folder; a bare .md file
-  // resolves relative to its parent directory.
-  const mdFolder = entry.isDir ? entry.path : entry.path.split("/").slice(0, -1).join("/");
-  const rawUrl = fileUrl(projectId, entry.isDir ? `${entry.path}/report.md` : entry.path);
+  const isDoc = kind === "markdown";
+  const mdFolder = entry.path.split("/").slice(0, -1).join("/");
+  const rawUrl = artifactUrl(projectId, entry.path);
 
   let body: ReactNode;
   if (kind === "image") {
@@ -246,9 +266,9 @@ function PreviewPane({
       </div>
     );
   } else if (isDoc && !showSource) {
-    body = <ReportMd projectId={projectId} folder={mdFolder} markdown={text} />;
+    body = <ArtifactMarkdown projectId={projectId} folder={mdFolder} markdown={text} />;
   } else {
-    body = <CodeView text={text} path={entry.isDir ? "report.md" : entry.path} />;
+    body = <CodeView text={text} path={entry.path} />;
   }
 
   return (
@@ -257,7 +277,7 @@ function PreviewPane({
       <div className="fpreview-head">
         <FileText size={13} style={{ flexShrink: 0 }} />
         <code className="fpreview-path" title={entry.path}>
-          {entry.isDir ? `${entry.path}/report.md` : entry.path}
+          {entry.path}
         </code>
         <span className="fpreview-date">
           Modified{" "}
@@ -266,7 +286,7 @@ function PreviewPane({
             timeStyle: "short",
           })}
         </span>
-        {!entry.isDir && kind === "text" && (
+        {kind === "text" && (
           <span className="fpreview-size">{fmtBytes(entry.size)}</span>
         )}
         {isDoc && (
@@ -291,10 +311,10 @@ function PreviewPane({
         </a>
         <button
           className="icon-btn"
-          data-tip={entry.isDir ? "Delete report folder" : "Delete file"}
-          aria-label={entry.isDir ? "Delete report folder" : "Delete file"}
+          data-tip="Delete artifact"
+          aria-label="Delete artifact"
           onClick={() => {
-            if (window.confirm(`Delete "${entry.path}" from the files dir?`))
+            if (window.confirm(`Delete "${entry.path}" from the artifacts directory?`))
               onDelete(entry.path);
           }}
         >
@@ -314,36 +334,26 @@ function TreeRows({
   selected,
   onToggle,
   onSelect,
+  onDelete,
 }: {
   projectId: string;
-  entries: FileEntry[];
+  entries: ArtifactEntry[];
   depth: number;
   collapsed: Set<string>;
   selected: string | null;
   onToggle: (path: string) => void;
   onSelect: (path: string) => void;
+  onDelete: (path: string) => void;
 }) {
   return (
     <>
       {entries.map((e) => {
         const indent = { paddingLeft: 8 + depth * 14 };
         if (e.isDir) {
-          const isReport = e.reportTitle !== undefined;
           const open = !collapsed.has(e.path);
-          // Report folders read as documents: the report's own title, with
-          // the on-disk slug (and experiment status) in the tooltip.
-          const label = isReport ? e.reportTitle : `${e.name}/`;
-          const tooltip = isReport
-            ? [e.name, e.experiment?.latestRunStatus].filter(Boolean).join(" — ")
-            : undefined;
           return (
             <div key={e.path}>
-              <div
-                className={`ft-row ${selected === e.path ? "selected" : ""}`}
-                style={indent}
-                title={tooltip}
-                onClick={() => (isReport ? onSelect(e.path) : onToggle(e.path))}
-              >
+              <div className="ft-row" style={indent} onClick={() => onToggle(e.path)}>
                 <button
                   className={`ft-chevron ${open ? "open" : ""}`}
                   aria-label={open ? `Collapse ${e.name}` : `Expand ${e.name}`}
@@ -354,7 +364,19 @@ function TreeRows({
                 >
                   <ChevronRight size={12} />
                 </button>
-                <span className={isReport ? "ft-title" : "ft-dirname"}>{label}</span>
+                <span className="ft-dirname">{e.name}/</span>
+                <button
+                  className="icon-btn ft-row-delete"
+                  data-tip="Delete folder"
+                  aria-label={`Delete folder ${e.name}`}
+                  onClick={(ev) => {
+                    ev.stopPropagation();
+                    if (window.confirm(`Delete "${e.path}" from the artifacts directory?`))
+                      onDelete(e.path);
+                  }}
+                >
+                  <Trash2 size={12} />
+                </button>
               </div>
               {open && (e.children?.length ?? 0) > 0 && (
                 <TreeRows
@@ -365,6 +387,7 @@ function TreeRows({
                   selected={selected}
                   onToggle={onToggle}
                   onSelect={onSelect}
+                  onDelete={onDelete}
                 />
               )}
             </div>
@@ -381,7 +404,7 @@ function TreeRows({
           >
             <span className="ft-chevron spacer" />
             {IMAGE_RE.test(e.name) && (
-              <img className="ft-thumb" src={fileUrl(projectId, e.path)} alt="" loading="lazy" />
+              <img className="ft-thumb" src={artifactUrl(projectId, e.path)} alt="" loading="lazy" />
             )}
             <span className="ft-name">{e.name}</span>
           </div>
@@ -391,26 +414,7 @@ function TreeRows({
   );
 }
 
-/** Top-level ordering that mirrors the layout convention: the reserved
- * `project/` namespace first, then experiment folders, then everything else
- * (which keeps its dirs-then-files explorer order). */
-function groupTopLevel(entries: FileEntry[]): {
-  project: FileEntry[];
-  experiments: FileEntry[];
-  other: FileEntry[];
-} {
-  const project: FileEntry[] = [];
-  const experiments: FileEntry[] = [];
-  const other: FileEntry[] = [];
-  for (const e of entries) {
-    if (e.isDir && e.name === PROJECT_NAMESPACE) project.push(e);
-    else if (e.isDir && e.experiment) experiments.push(e);
-    else other.push(e);
-  }
-  return { project, experiments, other };
-}
-
-/** The files dir path, copyable — demoted to a footer under the tree. */
+/** The artifacts directory path, copyable in the tree footer. */
 function DirFooter({ dir, onOpenStorage }: { dir: string; onOpenStorage: () => void }) {
   const [copied, setCopied] = useState(false);
   return (
@@ -419,7 +423,7 @@ function DirFooter({ dir, onOpenStorage }: { dir: string; onOpenStorage: () => v
       <button
         className="icon-btn tip-up"
         data-tip={copied ? "Copied!" : "Copy path"}
-        aria-label="Copy files directory path"
+        aria-label="Copy artifacts directory path"
         onClick={() => {
           void navigator.clipboard?.writeText(dir);
           setCopied(true);
@@ -440,30 +444,38 @@ function DirFooter({ dir, onOpenStorage }: { dir: string; onOpenStorage: () => v
   );
 }
 
-/** Middle-pane Files tab — a split explorer over the project's files folder
+/** Middle-pane Artifacts tab — a split explorer over the project's durable outputs
  * on disk. Tree on the left; the selected entry renders inline on the right
- * (reports and markdown as documents, images and PDFs directly, code as
- * highlighted source). Top-level folders correspond to experiments, with the
- * reserved `project/` namespace for project-wide reports pinned first. */
-export function FilesTab({
+ * (markdown as documents, images and PDFs directly, code as highlighted source). */
+export function ArtifactsTab({
   project,
-  files,
+  artifacts,
   onChanged,
   onOpenStorage,
 }: {
   project: Project;
-  files: ProjectFiles | null;
+  artifacts: ProjectArtifacts | null;
   onChanged: () => void;
   /** Navigate to Settings → Storage (where the data dir can be changed). */
   onOpenStorage: () => void;
 }) {
   const [selected, setSelected] = useState<string | null>(null);
-  // Folders are open by default — including ones that appear later, when the
-  // agent writes a new report — so this tracks what the user closed instead.
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
-  const [autoSelected, setAutoSelected] = useState(false);
+  // Folders are open by default — including ones that appear later — so this
+  // tracks what the user closed instead.
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => initialCollapsed(project.id));
   const [treeWidth, setTreeWidth] = useState(initialTreeWidth);
   const treeRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        `${COLLAPSED_DIRS_KEY_PREFIX}${project.id}`,
+        JSON.stringify([...collapsed]),
+      );
+    } catch {
+      // best-effort persistence
+    }
+  }, [project.id, collapsed]);
 
   // Drag the divider to resize the tree pane; width persists across reloads.
   // Mirrors App's right-panel resizer: capture the pointer so views under the
@@ -495,21 +507,12 @@ export function FilesTab({
     window.addEventListener("pointercancel", stop);
   };
 
-  // First load: open the most recent report so the pane isn't dead space.
+  // Clear a selection that vanished or became a directory on disk.
   useEffect(() => {
-    if (!files || autoSelected) return;
-    setAutoSelected(true);
-    if (selected) return;
-    const reports = collectReports(files.entries);
-    if (reports.length === 0) return;
-    const latest = reports.reduce((a, b) => (b.modifiedAt > a.modifiedAt ? b : a));
-    setSelected(latest.path);
-  }, [files, autoSelected, selected]);
-
-  // The selection vanished from disk (deleted externally) — clear it.
-  useEffect(() => {
-    if (selected && files && !findEntry(files.entries, selected)) setSelected(null);
-  }, [selected, files]);
+    if (!selected || !artifacts) return;
+    const entry = findEntry(artifacts.entries, selected);
+    if (!entry || entry.isDir) setSelected(null);
+  }, [selected, artifacts]);
 
   const toggle = (path: string) =>
     setCollapsed((prev) => {
@@ -521,23 +524,22 @@ export function FilesTab({
 
   const remove = (path: string) => {
     if (selected === path || selected?.startsWith(path + "/")) setSelected(null);
-    void deleteFile(project.id, path)
+    void deleteArtifact(project.id, path)
       .catch(() => {})
       .finally(onChanged);
   };
 
-  if (!files) {
+  if (!artifacts) {
     return (
       <div className="files-tab">
         <div className="settings-loading" style={{ padding: 20 }}>
-          <span className="spinner" /> Loading files…
+          <span className="spinner" /> Loading artifacts…
         </div>
       </div>
     );
   }
 
-  const { project: projectNs, experiments, other } = groupTopLevel(files.entries);
-  const tree = (entries: FileEntry[]) => (
+  const tree = (entries: ArtifactEntry[]) => (
     <TreeRows
       projectId={project.id}
       entries={entries}
@@ -546,22 +548,22 @@ export function FilesTab({
       selected={selected}
       onToggle={toggle}
       onSelect={setSelected}
+      onDelete={remove}
     />
   );
-  const selectedEntry = selected ? findEntry(files.entries, selected) : null;
+  const selectedEntry = selected ? findEntry(artifacts.entries, selected) : null;
 
-  if (files.entries.length === 0) {
+  if (artifacts.entries.length === 0) {
     return (
       <div className="files-tab">
         <div className="files-empty-state">
           <FolderOpen size={28} strokeWidth={1.5} />
-          <h3>No files yet</h3>
+          <h3>No artifacts yet</h3>
           <p>
-            This is where the agent saves the project's files — experiment reports, figures, and
-            other artifacts. Ask it for a write-up of its findings and the report will land
-            here. You can also drop your own files into the folder:
+            This is the project's durable output space for reports, figures, images, CSVs, PDFs,
+            and other research artifacts. Ask the agent for a write-up or add your own files:
           </p>
-          <DirFooter dir={files.dir} onOpenStorage={onOpenStorage} />
+          <DirFooter dir={artifacts.dir} onOpenStorage={onOpenStorage} />
         </div>
       </div>
     );
@@ -572,21 +574,16 @@ export function FilesTab({
       <div className="ftree-pane" ref={treeRef} style={{ width: treeWidth }}>
         <div className="ftree-resizer" onPointerDown={resizeTree} />
         <div className="ftree-scroll">
-          {tree(projectNs)}
-          {tree(experiments)}
-          {other.length > 0 && (experiments.length > 0 || projectNs.length > 0) && (
-            <div className="ft-divider">Other files</div>
-          )}
-          {tree(other)}
-          {files.truncated && (
-            <p className="files-truncated">Listing truncated — the folder has more files.</p>
+          {tree(artifacts.entries)}
+          {artifacts.truncated && (
+            <p className="files-truncated">Listing truncated — the folder has more artifacts.</p>
           )}
         </div>
-        <DirFooter dir={files.dir} onOpenStorage={onOpenStorage} />
+        <DirFooter dir={artifacts.dir} onOpenStorage={onOpenStorage} />
       </div>
       {selectedEntry ? (
         // Keyed by path so per-file view state (source toggle, fetched body)
-        // starts fresh on every selection instead of leaking across files.
+        // starts fresh on every selection instead of leaking across artifacts.
         <PreviewPane
           key={selectedEntry.path}
           projectId={project.id}
@@ -596,7 +593,7 @@ export function FilesTab({
       ) : (
         <div className="fpreview fpreview-none">
           <MousePointerClick size={22} strokeWidth={1.5} />
-          <span>Click a file to view it</span>
+          <span>Click an artifact to view it</span>
         </div>
       )}
     </div>

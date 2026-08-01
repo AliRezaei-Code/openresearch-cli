@@ -20,7 +20,7 @@
 //!
 //! The two sets share the same public skill *names* so docs and references stay
 //! stable; several modules swap their **body** between a local-mode form
-//! (backend-based launches, logs-only evidence, files-dir reports, worktree
+//! (backend-based launches, logs-only evidence, project artifacts, worktree
 //! git flow) and a full/cloud form (managed-SKU compute, artifacts + query +
 //! chart, `orx report` upload). The `orx-` prefix on every dir name makes them
 //! unmistakable in an agent's skill listing.
@@ -43,7 +43,7 @@ pub struct AgentSkill {
 /// names; only a few bodies differ (see the module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkillSet {
-    /// `orx up` local mode: logs-only evidence, files-dir reports, no `create`.
+    /// `orx up` local mode: logs-only evidence, project artifacts, no `create`.
     Local,
     /// Full/cloud surface: artifacts + query + chart evidence, `orx report`
     /// upload, and the project/experiment creation module.
@@ -122,7 +122,7 @@ const S_CREATE: AgentSkill = AgentSkill {
 };
 const S_REPORTS_LOCAL: AgentSkill = AgentSkill {
     name: "orx-reports",
-    description: "Write research reports into the local project's files dir (tree-mirroring folder layout) so they appear in the dashboard's Files tab. Use when a line of work concludes, when the user asks for a write-up, summary, comparison, or figures, or before ending a long task — findings not written down are lost.",
+    description: "Write durable research outputs into the local project's artifacts directory so they appear in the dashboard's Artifacts tab. Use when a line of work concludes, when the user asks for a write-up, summary, comparison, figures, or exported data, or before ending a long task — findings not written down are lost.",
     content: REPORTS_LOCAL,
 };
 const S_REPORTS_CLOUD: AgentSkill = AgentSkill {
