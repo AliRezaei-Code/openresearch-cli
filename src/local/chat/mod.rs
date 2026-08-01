@@ -533,6 +533,7 @@ pub struct ChatHost {
     /// the running task's abort handle, or `None` while a turn is being set up
     /// (reserved but not yet spawned — see `TurnGuard`).
     turns: Mutex<HashMap<String, Option<tokio::task::AbortHandle>>>,
+    deleting_sessions: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Per-session serialization for `respond`. Answering a prompt reads the
     /// card, delivers the answer (a non-idempotent POST for inline harnesses),
     /// and marks it resolved — steps that must not interleave for one session,
@@ -579,11 +580,27 @@ struct TurnGuard {
     armed: bool,
 }
 
+pub struct SessionDeletionLease {
+    deleting: Arc<std::sync::Mutex<HashSet<String>>>,
+    session_id: String,
+}
+
+impl Drop for SessionDeletionLease {
+    fn drop(&mut self) {
+        self.deleting.lock().unwrap().remove(&self.session_id);
+    }
+}
+
 impl TurnGuard {
     /// `Some` if the slot was free and is now reserved; `None` if already busy.
     async fn claim(host: &Arc<ChatHost>, session_id: &str) -> Option<Self> {
+        if host.deleting_sessions.lock().unwrap().contains(session_id) {
+            return None;
+        }
         let mut turns = host.turns.lock().await;
-        if turns.contains_key(session_id) {
+        if host.deleting_sessions.lock().unwrap().contains(session_id)
+            || turns.contains_key(session_id)
+        {
             return None;
         }
         turns.insert(session_id.to_string(), None);
@@ -637,6 +654,7 @@ impl ChatHost {
             http: reqwest::Client::new(),
             events,
             turns: Mutex::new(HashMap::new()),
+            deleting_sessions: Arc::new(std::sync::Mutex::new(HashSet::new())),
             respond_locks: Mutex::new(HashMap::new()),
             msg_write: std::sync::Mutex::new(()),
             pending_permissions: std::sync::Mutex::new(HashMap::new()),
@@ -912,6 +930,17 @@ impl ChatHost {
         self.turns.lock().await.contains_key(session_id)
     }
 
+    pub fn begin_session_delete(&self, session_id: &str) -> Option<SessionDeletionLease> {
+        let mut deleting = self.deleting_sessions.lock().unwrap();
+        if !deleting.insert(session_id.to_string()) {
+            return None;
+        }
+        Some(SessionDeletionLease {
+            deleting: self.deleting_sessions.clone(),
+            session_id: session_id.to_string(),
+        })
+    }
+
     /// Persist the user message and run one harness turn in the background.
     pub async fn send_message(
         self: &Arc<Self>,
@@ -1110,49 +1139,38 @@ impl ChatHost {
                 .and_then(|json| serde_json::from_str(json).ok()),
             last_flush: Instant::now() - FLUSH_INTERVAL,
         };
-        let task = tokio::spawn(async move {
-            let result = match crate::local::harness::chat_harness(&ctx.harness) {
-                Some(harness) => harness.run_turn(&mut ctx).await,
-                None => Err(anyhow!("unknown harness: {}", ctx.harness)),
-            };
-            if let Err(err) = result {
-                ctx.push_error(format!("{err}"));
-            }
-            let _ = ctx.flush();
-            // Persist the turn's final context usage so it survives a backend
-            // restart and rides on the `chat.session` emit below.
-            if let Some(usage) = &ctx.context_usage {
-                if let (Ok(store), Ok(json)) = (Store::open(), serde_json::to_string(usage)) {
-                    let _ = store.set_chat_session_context_usage(&ctx.session_id, &json);
-                }
-            }
-            ctx.host.finish_turn(&ctx.session_id).await;
-        });
         // Upgrade the reservation None→Some(handle), atomically re-checking that
         // it's still ours: an `interrupt` racing the prologue above may have
-        // removed the reservation (and already emitted idle). If so, the freshly
-        // spawned task must be aborted — never re-inserted — or it would run to
-        // completion uninterruptible while the UI shows the session idle.
+        // removed the reservation, while deletion also closes admission before
+        // it interrupts. In either case no harness task may start.
         {
             let mut turns = self.turns.lock().await;
-            if matches!(turns.get(&sid), Some(None)) {
-                turns.insert(sid, Some(task.abort_handle()));
-                // Inside the success arm so an interrupt that killed the turn
-                // mid-prologue doesn't still launch a title child. Runs parallel
-                // with the turn: naming the session must never delay the first
-                // answer.
-                if let Some(seed) = title_seed {
-                    self.spawn_title_generation(session.id.clone(), session.harness.clone(), seed);
-                }
-            } else {
-                // Reservation gone (interrupted) or already replaced — honor the
-                // interrupt: abort the task (its finish_turn won't run) and leave
-                // the slot exactly as interrupt left it.
-                task.abort();
+            if self.deleting_sessions.lock().unwrap().contains(&sid)
+                || !matches!(turns.get(&sid), Some(None))
+            {
+                _guard.defuse();
+                return Ok(());
             }
-            // Defuse in BOTH branches while still holding the lock: the guard's
-            // Drop must never run after this, or a same-session send that claims
-            // a fresh reservation in the gap before Drop could have it clobbered.
+            let task = tokio::spawn(async move {
+                let result = match crate::local::harness::chat_harness(&ctx.harness) {
+                    Some(harness) => harness.run_turn(&mut ctx).await,
+                    None => Err(anyhow!("unknown harness: {}", ctx.harness)),
+                };
+                if let Err(err) = result {
+                    ctx.push_error(format!("{err}"));
+                }
+                let _ = ctx.flush();
+                if let Some(usage) = &ctx.context_usage {
+                    if let (Ok(store), Ok(json)) = (Store::open(), serde_json::to_string(usage)) {
+                        let _ = store.set_chat_session_context_usage(&ctx.session_id, &json);
+                    }
+                }
+                ctx.host.finish_turn(&ctx.session_id).await;
+            });
+            turns.insert(sid, Some(task.abort_handle()));
+            if let Some(seed) = title_seed {
+                self.spawn_title_generation(session.id.clone(), session.harness.clone(), seed);
+            }
             _guard.defuse();
         }
         Ok(())
@@ -1494,24 +1512,20 @@ impl ChatHost {
     }
 
     pub async fn delete_session(&self, session_id: &str) -> Result<()> {
+        let _deleting = self
+            .begin_session_delete(session_id)
+            .ok_or_else(|| anyhow!("session deletion is already in progress"))?;
         let _ = self.interrupt(session_id).await;
         // A live opencode serve child would keep running in (and lock) the
         // session's worktree; the resident claude child's cwd is that worktree
         // too, so reap it before `cleanup_session_worktree` below.
         self.opencode.kill_session(session_id).await;
         self.codex.kill_session(session_id).await;
-        self.claude.kill_session(session_id).await;
-        // Drop the session's respond lock so the map doesn't retain an entry for
-        // a session that no longer exists.
+        self.claude.forget_session(session_id).await;
         self.respond_locks.lock().await.remove(session_id);
         let store = Store::open()?;
-        // Read before the row disappears: worktree cleanup needs the repo.
         let session = store.get_chat_session(session_id)?;
         store.delete_chat_session(session_id)?;
-        // Broadcast after the row is gone. The interrupt above may have emitted
-        // a final chat.session upsert; this event orders after it, so every
-        // dashboard (including the deleting one) converges on removal instead
-        // of resurrecting a ghost row.
         self.emit("chat.session.deleted", json!({ "sessionId": session_id }));
         if let Some(session) = session {
             if let Ok(Some(project)) = store.get_local_project(&session.project_id) {

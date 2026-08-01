@@ -1358,6 +1358,21 @@ textarea::placeholder {
   border-radius: var(--radius-md);
   background: var(--base);
 }
+.composer-harness-warning {
+  padding: 8px 12px;
+  color: var(--subtext);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  border-bottom: 1px solid var(--border-variant);
+}
+.composer-harness-warning strong {
+  color: var(--accent-amber);
+  font-weight: var(--fw-medium);
+}
+.composer-harness-warning code {
+  font-family: var(--mono);
+  color: var(--text);
+}
 .composer textarea {
   border: none;
   background: none;
@@ -3843,10 +3858,21 @@ a.files-pill:hover {
   padding: 6px;
 }
 .model-group {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   font-size: var(--fs-xs);
   font-weight: var(--fw-medium);
   color: var(--muted);
   padding: 8px 8px 4px;
+}
+.model-group-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--accent-amber);
+  font-weight: var(--fw-regular);
 }
 .model-item {
   display: flex;
@@ -3872,6 +3898,10 @@ a.files-pill:hover {
   padding: 4px 8px 8px;
   font-size: var(--fs-xs);
   color: var(--muted);
+}
+.model-unavailable {
+  line-height: 1.5;
+  border-bottom: 1px solid var(--border-variant);
 }
 /* Mid-session footer: the harness is fixed, so only its models are offered. */
 .model-locked-note {

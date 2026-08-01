@@ -33,7 +33,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,7 +46,7 @@ use crate::error::{anyhow, Result};
 use crate::local::harness::claude::{
     claude_permission_mode, find_claude, write_mcp_config, write_plan_settings,
 };
-use crate::local::harness::PermissionMode;
+use crate::local::harness::{HarnessAuthState, PermissionMode};
 
 /// Ceiling on a control request's response wait. Control requests (`set_model`)
 /// are quick; a wedged child must never hold the respawn path for long.
@@ -73,6 +73,7 @@ pub struct SpawnConfig {
 /// `chat` is the spawn-time handle for the plan-mode bridge (`up_port` +
 /// `mint_gate_token`) — the spec is transient (built per turn, consumed by
 /// `ensure`), so the strong ref cannot cycle.
+#[derive(Clone)]
 pub struct SpawnSpec {
     pub chat: Arc<crate::local::chat::ChatHost>,
     pub session_id: String,
@@ -162,12 +163,17 @@ pub struct ClaudeClient {
     /// What this child was spawned with — the reuse/respawn decision reads it,
     /// and a successful `set_model` updates its `model` in place.
     config: std::sync::Mutex<SpawnConfig>,
+    auth_generation: u64,
 }
 
 impl ClaudeClient {
     /// The config this child is currently running under.
     pub fn config(&self) -> SpawnConfig {
         self.config.lock().unwrap().clone()
+    }
+
+    pub fn auth_generation(&self) -> u64 {
+        self.auth_generation
     }
 
     /// Send a user message as one stream-json line. The child answers with a
@@ -309,7 +315,7 @@ async fn read_loop(client: Arc<ClaudeClient>, stdout: tokio::process::ChildStdou
 /// wiring: `--input-format stream-json` and, on recovery/respawn,
 /// `--resume <native_id>`. No handshake — the first turn's `system`/`init` line
 /// is the health signal.
-async fn spawn_client(spec: &SpawnSpec) -> Result<Arc<ClaudeClient>> {
+async fn spawn_client(spec: &SpawnSpec, auth_generation: u64) -> Result<Arc<ClaudeClient>> {
     let bin = find_claude().ok_or_else(|| {
         anyhow!("claude not found on PATH — install Claude Code and run `claude` once to sign in")
     })?;
@@ -424,6 +430,7 @@ async fn spawn_client(spec: &SpawnSpec) -> Result<Arc<ClaudeClient>> {
         pending: std::sync::Mutex::new(HashMap::new()),
         turn: std::sync::Mutex::new(None),
         config: std::sync::Mutex::new(config),
+        auth_generation,
     });
     tokio::spawn(read_loop(client.clone(), stdout));
     Ok(client)
@@ -466,9 +473,23 @@ pub fn child_action(current: &SpawnConfig, wanted: &SpawnConfig) -> ChildAction 
 /// The `orx up` Claude host: one resident `claude` child per chat session, keyed
 /// by the orx session id. Share as `Arc<ClaudeHost>` in axum state.
 pub struct ClaudeHost {
-    /// Serializes ensure() spawns; `inner` is never held across a spawn.
-    spawn_lock: Mutex<()>,
+    /// Reconciliation is serialized per chat session, never across unrelated
+    /// concurrent agents.
+    spawn_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    spawn_epochs: Mutex<HashMap<String, u64>>,
     inner: Mutex<HashMap<String, Arc<ClaudeClient>>>,
+    auth: std::sync::RwLock<AuthSnapshot>,
+    auth_recovery_lock: Mutex<()>,
+    announced_generation: AtomicU64,
+    next_spawn_epoch: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthSnapshot {
+    pub state: HarnessAuthState,
+    pub generation: u64,
+    pub runtime_rejected: bool,
+    last_recovered_generation: Option<u64>,
 }
 
 impl Default for ClaudeHost {
@@ -480,9 +501,154 @@ impl Default for ClaudeHost {
 impl ClaudeHost {
     pub fn new() -> Self {
         Self {
-            spawn_lock: Mutex::new(()),
+            spawn_locks: Mutex::new(HashMap::new()),
+            spawn_epochs: Mutex::new(HashMap::new()),
             inner: Mutex::new(HashMap::new()),
+            auth: std::sync::RwLock::new(AuthSnapshot {
+                state: HarnessAuthState::Unknown,
+                generation: 0,
+                runtime_rejected: false,
+                last_recovered_generation: None,
+            }),
+            auth_recovery_lock: Mutex::new(()),
+            announced_generation: AtomicU64::new(0),
+            next_spawn_epoch: AtomicU64::new(1),
         }
+    }
+
+    pub fn auth_snapshot(&self) -> AuthSnapshot {
+        *self.auth.read().unwrap()
+    }
+
+    pub fn claim_auth_announcement(&self, generation: u64) -> bool {
+        let mut announced = self.announced_generation.load(Ordering::Acquire);
+        while generation > announced {
+            match self.announced_generation.compare_exchange_weak(
+                announced,
+                generation,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => announced = current,
+            }
+        }
+        false
+    }
+
+    /// Adopt a read-only detection result if no runtime transition happened
+    /// since that probe began. Inconclusive probes never rotate credentials or
+    /// replace a previously conclusive state.
+    pub fn observe_auth_state(&self, state: HarnessAuthState, expected_generation: u64) -> bool {
+        let mut auth = self.auth.write().unwrap();
+        if auth.generation != expected_generation
+            || auth.runtime_rejected
+            || auth.state == state
+            || (state == HarnessAuthState::Unknown && auth.state != HarnessAuthState::Unknown)
+        {
+            return false;
+        }
+        auth.state = state;
+        if state != HarnessAuthState::Unknown {
+            auth.generation += 1;
+            auth.last_recovered_generation = None;
+        }
+        true
+    }
+
+    /// Explicit UI re-check after the user changed credentials. This clears a
+    /// runtime rejection without initiating login; the following detector is
+    /// still responsible for proving readiness.
+    pub fn clear_runtime_rejection(&self) -> bool {
+        let mut auth = self.auth.write().unwrap();
+        if !auth.runtime_rejected {
+            return false;
+        }
+        auth.runtime_rejected = false;
+        auth.state = HarnessAuthState::Unknown;
+        auth.generation += 1;
+        auth.last_recovered_generation = None;
+        true
+    }
+
+    pub fn defer_auth_verification(&self, expected_generation: u64) -> bool {
+        let mut auth = self.auth.write().unwrap();
+        if auth.generation != expected_generation
+            || auth.runtime_rejected
+            || auth.state != HarnessAuthState::Ready
+        {
+            return false;
+        }
+        auth.state = HarnessAuthState::Unknown;
+        auth.generation += 1;
+        auth.last_recovered_generation = None;
+        true
+    }
+
+    /// Quarantine a failed worker and coordinate one live credential re-check
+    /// across every Claude session. A Ready result advances the generation even
+    /// when the prior snapshot was Ready: the failed child proved its credential
+    /// snapshot stale, so sibling workers must recycle lazily before reuse.
+    pub async fn recover_auth_failure(
+        &self,
+        session_id: &str,
+        failed_generation: u64,
+    ) -> HarnessAuthState {
+        self.kill_session(session_id).await;
+        let _recovering = self.auth_recovery_lock.lock().await;
+        let current = self.auth_snapshot();
+        if current.generation > failed_generation {
+            return current.state;
+        }
+        if current.last_recovered_generation == Some(failed_generation) {
+            return current.state;
+        }
+        if current.state == HarnessAuthState::NeedsLogin {
+            return current.state;
+        }
+        let state = crate::local::harness::claude::current_auth_state().await;
+        let mut auth = self.auth.write().unwrap();
+        if auth.generation != current.generation || auth.runtime_rejected {
+            return auth.state;
+        }
+        auth.last_recovered_generation = Some(failed_generation);
+        auth.generation += 1;
+        auth.state = state;
+        auth.runtime_rejected = false;
+        auth.state
+    }
+
+    /// A replacement from a freshly checked generation failed too. Runtime
+    /// rejection is stronger evidence than `auth status` metadata, so keep the
+    /// harness non-ready until the user changes credentials and explicitly
+    /// re-checks it.
+    pub async fn reject_auth_generation(
+        &self,
+        session_id: &str,
+        failed_generation: u64,
+    ) -> HarnessAuthState {
+        self.kill_session(session_id).await;
+        let _recovering = self.auth_recovery_lock.lock().await;
+        let mut auth = self.auth.write().unwrap();
+        if auth.generation > failed_generation {
+            return auth.state;
+        }
+        auth.state = HarnessAuthState::NeedsLogin;
+        auth.runtime_rejected = true;
+        auth.generation += 1;
+        auth.last_recovered_generation = Some(failed_generation);
+        auth.state
+    }
+
+    async fn resolve_unknown(&self) -> AuthSnapshot {
+        let _recovering = self.auth_recovery_lock.lock().await;
+        let current = self.auth_snapshot();
+        if current.state != HarnessAuthState::Unknown || current.runtime_rejected {
+            return current;
+        }
+        let state = crate::local::harness::claude::current_auth_state().await;
+        self.observe_auth_state(state, current.generation);
+        self.auth_snapshot()
     }
 
     /// Spawn (or reuse) this session's resident child, reconciled to `spec`'s
@@ -496,8 +662,35 @@ impl ClaudeHost {
     /// unreachable by every kill path and leak the process for the rest of `orx
     /// up`'s life. Detached, the bring-up always runs to completion.
     pub async fn ensure(self: &Arc<Self>, spec: SpawnSpec) -> Result<Arc<ClaudeClient>> {
-        let _spawning = self.spawn_lock.lock().await;
         let session = spec.session_id.clone();
+        let session_lock = {
+            let mut locks = self.spawn_locks.lock().await;
+            locks
+                .entry(session.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _spawning = session_lock.lock().await;
+        let mut auth = self.auth_snapshot();
+        if auth.state == HarnessAuthState::Unknown && !auth.runtime_rejected {
+            auth = self.resolve_unknown().await;
+        }
+        match auth.state {
+            HarnessAuthState::NeedsLogin => {
+                return Err(anyhow!(
+                    "Claude Code sign-in required — run `claude auth login`, then try again"
+                ));
+            }
+            HarnessAuthState::Unsupported => {
+                return Err(anyhow!("Claude Code 2.1.211 or newer is required"));
+            }
+            HarnessAuthState::Unknown => {
+                return Err(anyhow!(
+                    "Claude Code authentication could not be verified — run `claude auth status`, then re-check the harness"
+                ));
+            }
+            HarnessAuthState::Ready => {}
+        }
         // Reconcile against a live child under the lock.
         {
             let mut guard = self.inner.lock().await;
@@ -505,24 +698,50 @@ impl ClaudeHost {
                 if matches!(client.child.lock().await.try_wait(), Ok(None)) {
                     let live = client.clone();
                     let current = live.config();
-                    match child_action(&current, &spec.config) {
-                        ChildAction::Reuse => return Ok(live),
-                        ChildAction::SetModel(model) => {
-                            drop(guard);
-                            match live.set_model(&model).await {
-                                Ok(()) => return Ok(live),
-                                // set_model failed (transport/child error): fall
-                                // through to a respawn with --resume.
-                                Err(e) => {
-                                    eprintln!("orx up: claude set_model failed, respawning: {e}");
-                                    let _ = live.child.lock().await.kill().await;
-                                    self.inner.lock().await.remove(&session);
+                    if live.auth_generation() != auth.generation {
+                        let _ = live.child.lock().await.kill().await;
+                        guard.remove(&session);
+                        // Continue below to spawn with the current generation.
+                    } else {
+                        match child_action(&current, &spec.config) {
+                            ChildAction::Reuse => {
+                                let latest = self.auth_snapshot();
+                                if latest.state == HarnessAuthState::Ready
+                                    && live.auth_generation() == latest.generation
+                                {
+                                    return Ok(live);
+                                }
+                                let _ = live.child.lock().await.kill().await;
+                                guard.remove(&session);
+                            }
+                            ChildAction::SetModel(model) => {
+                                drop(guard);
+                                match live.set_model(&model).await {
+                                    Ok(()) => {
+                                        let latest = self.auth_snapshot();
+                                        if latest.state == HarnessAuthState::Ready
+                                            && live.auth_generation() == latest.generation
+                                        {
+                                            return Ok(live);
+                                        }
+                                        let _ = live.child.lock().await.kill().await;
+                                        self.inner.lock().await.remove(&session);
+                                    }
+                                    // set_model failed (transport/child error): fall
+                                    // through to a respawn with --resume.
+                                    Err(e) => {
+                                        eprintln!(
+                                            "orx up: claude set_model failed, respawning: {e}"
+                                        );
+                                        let _ = live.child.lock().await.kill().await;
+                                        self.inner.lock().await.remove(&session);
+                                    }
                                 }
                             }
-                        }
-                        ChildAction::Respawn => {
-                            let _ = live.child.lock().await.kill().await;
-                            guard.remove(&session);
+                            ChildAction::Respawn => {
+                                let _ = live.child.lock().await.kill().await;
+                                guard.remove(&session);
+                            }
                         }
                     }
                 } else {
@@ -531,20 +750,43 @@ impl ClaudeHost {
                 }
             }
         }
+        auth = self.auth_snapshot();
+        if auth.state != HarnessAuthState::Ready {
+            return Err(anyhow!(
+                "Claude Code authentication changed while preparing this session"
+            ));
+        }
+        let spawn_epoch = self.next_spawn_epoch.fetch_add(1, Ordering::AcqRel);
+        self.spawn_epochs
+            .lock()
+            .await
+            .insert(session.clone(), spawn_epoch);
         let host = self.clone();
         tokio::spawn(async move {
-            let client = spawn_client(&spec).await?;
-            // Never displace a live entry: if an abandoned bring-up's insert
-            // races a successor's (spawn_lock was released by the abort), the
-            // loser kills its own child and defers to the live one.
+            let client = spawn_client(&spec, auth.generation).await?;
             {
                 let mut guard = host.inner.lock().await;
+                let latest = host.auth_snapshot();
+                let latest_epoch = host
+                    .spawn_epochs
+                    .lock()
+                    .await
+                    .get(&session)
+                    .copied()
+                    .unwrap_or_default();
+                if latest_epoch != spawn_epoch
+                    || latest.state != HarnessAuthState::Ready
+                    || latest.generation != client.auth_generation()
+                {
+                    drop(guard);
+                    let _ = client.child.lock().await.kill().await;
+                    return Err(anyhow!("Claude Code authentication changed during startup"));
+                }
                 if let Some(existing) = guard.get(&session) {
                     if matches!(existing.child.lock().await.try_wait(), Ok(None)) {
-                        let existing = existing.clone();
-                        drop(guard);
-                        let _ = client.child.lock().await.kill().await;
-                        return Ok(existing);
+                        let stale = existing.clone();
+                        guard.remove(&session);
+                        let _ = stale.child.lock().await.kill().await;
                     }
                 }
                 guard.insert(session.clone(), client.clone());
@@ -559,9 +801,29 @@ impl ClaudeHost {
     /// path: a resident child survives task-abort/`kill_on_drop`, so it must be
     /// killed explicitly; the next turn respawns with `--resume`.
     pub async fn kill_session(&self, session_id: &str) {
+        let epoch = self.next_spawn_epoch.fetch_add(1, Ordering::AcqRel);
+        self.spawn_epochs
+            .lock()
+            .await
+            .insert(session_id.to_string(), epoch);
         if let Some(client) = self.inner.lock().await.remove(session_id) {
             let _ = client.child.lock().await.kill().await;
         }
+    }
+
+    /// Permanently remove one deleted session's child and reconciliation state.
+    pub async fn forget_session(&self, session_id: &str) {
+        let session_lock = {
+            let mut locks = self.spawn_locks.lock().await;
+            locks
+                .entry(session_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _spawning = session_lock.lock().await;
+        self.kill_session(session_id).await;
+        self.spawn_epochs.lock().await.remove(session_id);
+        self.spawn_locks.lock().await.remove(session_id);
     }
 
     /// Kill and reap every child (also happens via kill_on_drop on exit).
@@ -763,5 +1025,19 @@ mod tests {
         // Junk never panics.
         assert_eq!(classify_line("not json"), ClaudeLine::Junk);
         assert_eq!(classify_line("{}"), ClaudeLine::Junk);
+    }
+
+    #[test]
+    fn auth_generation_changes_only_on_transitions() {
+        let host = ClaudeHost::new();
+        assert_eq!(host.auth_snapshot().generation, 0);
+        assert!(host.observe_auth_state(HarnessAuthState::NeedsLogin, 0));
+        assert_eq!(host.auth_snapshot().generation, 1);
+        assert!(!host.observe_auth_state(HarnessAuthState::NeedsLogin, 1));
+        assert_eq!(host.auth_snapshot().generation, 1);
+        assert!(!host.observe_auth_state(HarnessAuthState::Unknown, 1));
+        assert_eq!(host.auth_snapshot().generation, 1);
+        assert!(host.observe_auth_state(HarnessAuthState::Ready, 1));
+        assert_eq!(host.auth_snapshot().generation, 2);
     }
 }

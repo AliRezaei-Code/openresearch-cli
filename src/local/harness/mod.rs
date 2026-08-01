@@ -35,7 +35,7 @@ use crate::error::{anyhow, Result};
 use crate::local::chat::{PromptAnswer, ResumeCtx, TurnCtx, WirePrompt};
 
 pub(crate) use claude::{question_prompt, should_synthesize_plan, synthesize_resume};
-pub use detect::{HarnessInfo, ModelInfo};
+pub use detect::{HarnessAuthState, HarnessInfo, ModelInfo};
 pub use options::{HarnessOptions, PermissionMode};
 pub use plan_gate::command_is_readonly;
 pub use plan_gate::decide as plan_gate_decide;
@@ -220,6 +220,29 @@ pub fn is_chat_harness(id: &str) -> bool {
     registry().iter().any(|h| h.id() == id && h.supports_chat())
 }
 
+async fn detect_one(harness: &dyn Harness) -> Option<HarnessInfo> {
+    harness.detect().await.map(|mut info| {
+        if info.auth_state == HarnessAuthState::Unknown {
+            info.auth_state = if info.agent_ready {
+                HarnessAuthState::Ready
+            } else if info.installed && info.id != "claude-code" {
+                HarnessAuthState::NeedsLogin
+            } else {
+                HarnessAuthState::Unknown
+            };
+        }
+        info.options = harness.options();
+        info
+    })
+}
+
+pub async fn detect_harness(id: &str) -> Option<HarnessInfo> {
+    let harness = registry()
+        .into_iter()
+        .find(|h| h.id() == id && h.supports_chat())?;
+    detect_one(harness.as_ref()).await
+}
+
 /// Detect every chat-capable harness, in registry order. This is what the
 /// `orx up` dashboard renders in its harness picker.
 pub async fn detect_harnesses() -> Vec<HarnessInfo> {
@@ -227,14 +250,7 @@ pub async fn detect_harnesses() -> Vec<HarnessInfo> {
         .into_iter()
         .filter(|h| h.supports_chat())
         .collect();
-    let futures = harnesses.iter().map(|h| async {
-        // Attach the composer toggle vocabulary alongside detection so the UI
-        // gets both in one payload.
-        h.detect().await.map(|mut info| {
-            info.options = h.options();
-            info
-        })
-    });
+    let futures = harnesses.iter().map(|h| detect_one(h.as_ref()));
     futures::future::join_all(futures)
         .await
         .into_iter()

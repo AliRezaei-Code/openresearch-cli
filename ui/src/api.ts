@@ -823,6 +823,7 @@ export interface Harness {
   binPath?: string;
   version?: string;
   authenticated: boolean;
+  authState: "ready" | "needsLogin" | "unknown" | "unsupported";
   authMethod?: "oauth" | "apiKey";
   account?: string;
   org?: string;
@@ -833,10 +834,13 @@ export interface Harness {
   options: HarnessOptions;
 }
 
-export const getHarnesses = (refresh = false) =>
-  get<{ harnesses: Harness[] }>(`/api/harnesses${refresh ? "?refresh=1" : ""}`).then(
-    (r) => r.harnesses,
-  );
+export const getHarnesses = (refresh = false, retryRejected = false) => {
+  const params = new URLSearchParams();
+  if (refresh) params.set("refresh", "1");
+  if (retryRejected) params.set("retry", "1");
+  const query = params.size > 0 ? `?${params.toString()}` : "";
+  return get<{ harnesses: Harness[] }>(`/api/harnesses${query}`).then((r) => r.harnesses);
+};
 
 /** Slash-skill offered in the composer's `/` dropdown; expanded server-side. */
 export interface SkillInfo {

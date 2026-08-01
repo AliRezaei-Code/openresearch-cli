@@ -13,6 +13,15 @@ use serde_json::Value;
 
 pub(super) const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HarnessAuthState {
+    Ready,
+    NeedsLogin,
+    Unknown,
+    Unsupported,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelInfo {
@@ -105,6 +114,8 @@ pub struct HarnessInfo {
     pub version: Option<String>,
     /// A signed-in setup was found (auth file / OAuth account).
     pub authenticated: bool,
+    /// Live credential readiness. Account metadata never implies this state.
+    pub auth_state: HarnessAuthState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<&'static str>, // "oauth" | "apiKey"
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -131,6 +142,7 @@ impl HarnessInfo {
             bin_path: None,
             version: None,
             authenticated: false,
+            auth_state: HarnessAuthState::Unknown,
             auth_method: None,
             account: None,
             org: None,

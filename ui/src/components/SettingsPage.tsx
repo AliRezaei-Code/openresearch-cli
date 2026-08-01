@@ -73,7 +73,7 @@ import {
   type SshPreflight,
   harnessModelLabel,
 } from "../api";
-import { onDataDirMove } from "../events";
+import { onDataDirMove, onHarnessAuth } from "../events";
 import { GitTokenForm } from "./GitTokenForm";
 import { BackendBadge, BackendLogo } from "./BackendLogos";
 import { ProgressBar } from "./ProgressBar";
@@ -91,12 +91,12 @@ type Tab = SettingsTab;
 // --- harnesses ---------------------------------------------------------------
 
 function harnessStatus(h: Harness): { cls: string; label: string } {
-  // Fully usable only when both the binary is on PATH and it's authenticated.
-  if (h.installed && h.authenticated) return { cls: "ok", label: "Connected" };
+  if (h.agentReady) return { cls: "ok", label: "Signed in" };
   // Not installed — the same blocker whether or not there's saved auth: the
   // CLI has to be installed before anything can run. Amber "action needed".
   if (!h.installed) return { cls: "warn", label: "Not installed" };
-  // Installed but not signed in.
+  if (h.authState === "unknown") return { cls: "warn", label: "Unable to verify" };
+  if (h.authState === "unsupported") return { cls: "warn", label: "Update required" };
   return { cls: "warn", label: "Not signed in" };
 }
 
@@ -110,14 +110,15 @@ function HarnessesTab() {
   const [active, setActive] = useState<HarnessId>("claude-code");
   const [refreshing, setRefreshing] = useState(false);
 
-  const load = (refresh: boolean) => {
+  const load = (refresh: boolean, retryRejected = false) => {
     setRefreshing(true);
-    getHarnesses(refresh)
+    getHarnesses(refresh, retryRejected)
       .then(setHarnesses)
       .catch(() => {})
       .finally(() => setRefreshing(false));
   };
   useEffect(() => load(false), []);
+  useEffect(() => onHarnessAuth(() => load(true)), []);
 
   const h = harnesses?.find((x) => x.id === active);
 
@@ -150,7 +151,7 @@ function HarnessesTab() {
           <div className="settings-card-head">
             <span className={`badge ${harnessStatus(h).cls}`}>{harnessStatus(h).label}</span>
             <div className="spacer" style={{ flex: 1 }} />
-            <button className="btn sm" onClick={() => load(true)} disabled={refreshing}>
+            <button className="btn sm" onClick={() => load(true, true)} disabled={refreshing}>
               <RefreshCw size={12} className={refreshing ? "spin" : ""} /> Refresh
             </button>
           </div>

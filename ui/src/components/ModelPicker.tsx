@@ -12,6 +12,7 @@ import {
   type OptionChoice,
 } from "../api";
 import { renderNote } from "./agentNote";
+import { onHarnessAuth } from "../events";
 
 export interface ModelSelection {
   harness: HarnessId;
@@ -99,12 +100,21 @@ export function ModelPicker({
   const [filter, setFilter] = useState("");
 
   useEffect(() => {
-    getHarnesses()
-      .then((list) => {
-        setHarnesses(list);
-        onHarnesses?.(list);
-      })
-      .catch(() => {});
+    let mounted = true;
+    const load = (refresh = false) =>
+      getHarnesses(refresh)
+        .then((list) => {
+          if (!mounted) return;
+          setHarnesses(list);
+          onHarnesses?.(list);
+        })
+        .catch(() => {});
+    void load();
+    const unsubscribe = onHarnessAuth(() => void load(true));
+    return () => {
+      mounted = false;
+      unsubscribe();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -185,9 +195,16 @@ export function ModelPicker({
           <div className="model-menu-list">
             {groups.map(({ harness, models, hidden }) => (
               <div key={harness.id}>
-                <div className="model-group">{harness.name}</div>
+                <div className="model-group">
+                  <span>{harness.name}</span>
+                  {!harness.agentReady && (
+                    <span className="model-group-status">
+                      <Lock size={10} /> Unavailable
+                    </span>
+                  )}
+                </div>
                 {!harness.agentReady ? (
-                  <div className="model-more">
+                  <div className="model-more model-unavailable">
                     {harness.agentNote ? renderNote(harness.agentNote) : "Not available"}
                   </div>
                 ) : (
