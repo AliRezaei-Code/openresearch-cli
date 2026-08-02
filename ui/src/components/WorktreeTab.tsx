@@ -1,14 +1,12 @@
-// The live view of a chat session's private worktree — what the agent is
-// changing right now, before any run/commit exists (the Code tab is
-// committed-state only). Two segmented views, both bound to the session the tab
-// was opened from:
+// The pinned Files home for the active chat session's private worktree — what
+// the agent is changing right now, before any run/commit exists. The Code tab
+// remains committed-state only.
 //
-//   Changes (default): the unified diff vs the baseline merge-base, untracked
+//   Files (default): the full live worktree tree.
+//   Changes: the unified diff vs the baseline merge-base, untracked
 //     files included as new-file chunks — the same per-file-card rendering as
 //     the experiment Changes view (the header's file count comes from a
 //     separate git pass, so it stays truthful even when the diff truncates).
-//   Files: the full live worktree tree (CodeTab's shared components), clicks
-//     opening the existing FileViewer against this session's worktree.
 //
 // Freshness without idle churn: poll every 5 s only while the session is busy
 // (chat.busy SSE), refresh once on the busy→idle edge, and a manual refresh
@@ -27,10 +25,9 @@ import {
 } from "../api";
 import { onChatEvent } from "../events";
 import { buildTree, TreeLevel } from "./codeTree";
-import { GitDiff, TruncatedDiffNotice } from "./GitDiff";
+import { GitDiffExplorer, TruncatedDiffNotice } from "./GitDiff";
 
-/** Poll cadence while the session's agent is working (matches the working-tree
- * poll in DetailDrawer). */
+/** Poll cadence while the session's agent is working. */
 const POLL_MS = 5000;
 
 export type WorktreeView = "changes" | "files";
@@ -164,30 +161,26 @@ export function WorktreeTab({
     [toggled, onToggledChange],
   );
 
-  const branchChip =
+  const checkedOut =
     wt?.branch ?? (wt?.baselineBranch ? `detached @ ${wt.baselineBranch}` : "detached");
   const fileCount = wt?.files?.length ?? 0;
+  const branchChip = `Current worktree · ${checkedOut}${fileCount > 0 ? "*" : ""}`;
 
   return (
     <div className="code-tab wt-tab">
       <div className="code-tab-header">
         <div className="seg">
-          <button className={view === "changes" ? "active" : ""} onClick={() => onViewChange("changes")}>
-            Changes
-          </button>
           <button className={view === "files" ? "active" : ""} onClick={() => onViewChange("files")}>
             Files
+          </button>
+          <button className={view === "changes" ? "active" : ""} onClick={() => onViewChange("changes")}>
+            Changes
           </button>
         </div>
         {wt?.exists && (
           <span className="wt-branch-chip" title={branchChip}>
             <GitBranch size={12} />
             <span className="wt-branch-name">{branchChip}</span>
-          </span>
-        )}
-        {wt?.exists && view === "changes" && (
-          <span className="code-tab-note wt-count">
-            {fileCount} {fileCount === 1 ? "file" : "files"}
           </span>
         )}
         <span style={{ flex: 1 }} />
@@ -216,17 +209,18 @@ export function WorktreeTab({
               {wt.diff.truncated && (
                 <TruncatedDiffNotice bytesRead={wt.diff.bytesRead} byteLimit={wt.diff.byteLimit} />
               )}
-              <GitDiff diff={wt.diff.diff} />
+              <GitDiffExplorer diff={wt.diff.diff} partial={wt.diff.truncated} />
             </>
           )}
         </div>
       ) : (
         <div className="code-tab-body">
-          {tree?.root === "clone" && (
-            <div className="code-tab-note">Worktree unavailable — showing the project clone.</div>
+          {tree?.root !== "clone" && tree?.truncated && (
+            <div className="code-tab-note">Listing truncated.</div>
           )}
-          {tree?.truncated && <div className="code-tab-note">listing truncated</div>}
-          {!filesTree ? (
+          {tree?.root === "clone" ? (
+            <div className="code-tab-note">Current worktree is unavailable.</div>
+          ) : !filesTree ? (
             <div className="code-tab-note">Loading…</div>
           ) : filesTree.dirs.size === 0 && filesTree.files.length === 0 ? (
             <div className="code-tab-note">No files.</div>

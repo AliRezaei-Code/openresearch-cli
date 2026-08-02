@@ -1,47 +1,18 @@
-import { ChevronDown, CircleStop, RotateCw } from "lucide-react";
+import { ChevronDown, CircleStop } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import {
   cancelRun,
-  getCommitDiff,
-  getWorkingTree,
-  listExperimentCommits,
   timeAgo,
-  type CommitInfo,
-  type DiffPayload,
   type Experiment,
   type Project,
   type Run,
-  type WorkingTree,
 } from "../api";
-import { BranchPill } from "./BranchPill";
-import { GitDiff, TruncatedDiffNotice } from "./GitDiff";
+import { ExperimentOverview } from "./ExperimentOverview";
+import type { CodeView } from "./CodeTab";
 import { LogTerminal } from "./LogTerminal";
 import { StatusBadge } from "./StatusBadge";
 
-const UNCOMMITTED = "__uncommitted__";
-
-interface DiffState {
-  loading: boolean;
-  error?: string;
-  payload?: DiffPayload;
-}
-
-function DiffView({ state }: { state: DiffState | undefined }) {
-  if (!state || state.loading) return <div className="changes-note">Loading diff…</div>;
-  if (state.error) return <div className="error">{state.error}</div>;
-  if (!state.payload) return <div className="diff-empty">No changes.</div>;
-  if (state.payload.truncated) {
-    return (
-      <TruncatedDiffNotice
-        bytesRead={state.payload.bytesRead}
-        byteLimit={state.payload.byteLimit}
-      />
-    );
-  }
-  return <GitDiff diff={state.payload.diff} />;
-}
-
-export type ExperimentView = "terminal" | "changes";
+export type ExperimentView = "overview" | "terminal";
 
 /** An experiment's detail view, rendered as right-pane tab content. Mount it
  *  keyed by `${experiment.id}:${view}` so per-view state resets on switch. */
@@ -52,6 +23,9 @@ export function DetailDrawer({
   runs,
   selectedRunId,
   onSelectRun,
+  parentExperiment,
+  onOpenView,
+  onOpenCode,
 }: {
   experiment: Experiment;
   /** Owning project — supplies owner/repo for the GitHub branch link. */
@@ -60,20 +34,35 @@ export function DetailDrawer({
   runs: Run[];
   selectedRunId: string | null;
   onSelectRun: (id: string | null) => void;
+  parentExperiment: Experiment | null;
+  onOpenView: (view: ExperimentView, runId?: string) => void;
+  onOpenCode: (view: CodeView) => void;
 }) {
   const expRuns = runs
     .filter((r) => r.experimentId === experiment.id)
     .sort((a, b) => b.createdAt - a.createdAt);
 
-  return view === "terminal" ? (
+  if (view === "overview") {
+    return (
+      <ExperimentOverview
+        experiment={experiment}
+        parentExperiment={parentExperiment}
+        project={project}
+        runs={expRuns}
+        onOpenLogs={(runId) => onOpenView("terminal", runId)}
+        onOpenChanges={() => onOpenCode("changes")}
+        onOpenCode={() => onOpenCode("files")}
+      />
+    );
+  }
+
+  return (
     <TerminalView
       experiment={experiment}
       expRuns={expRuns}
       selectedRunId={selectedRunId}
       onSelectRun={onSelectRun}
     />
-  ) : (
-    <ChangesView experiment={experiment} project={project} />
   );
 }
 
@@ -194,155 +183,6 @@ function TerminalView({
         ) : (
           <div className="term-empty">No runs yet — ask the agent to launch one.</div>
         )}
-      </div>
-    </div>
-  );
-}
-
-/** The branch's changes: a commit picker + diff, including uncommitted edits. */
-function ChangesView({ experiment, project }: { experiment: Experiment; project: Project }) {
-  const [commits, setCommits] = useState<CommitInfo[] | null>(null);
-  const [changesError, setChangesError] = useState<string | null>(null);
-  const [workingTree, setWorkingTree] = useState<WorkingTree | null>(null);
-  const [selection, setSelection] = useState<string | null>(null);
-  const [commitDiffs, setCommitDiffs] = useState<Record<string, DiffState>>({});
-
-  const uncommittedAvailable = Boolean(
-    workingTree &&
-      workingTree.diff.trim() !== "" &&
-      workingTree.experimentId === experiment.id,
-  );
-
-  async function loadChanges() {
-    setChangesError(null);
-    try {
-      const [commitList, wt] = await Promise.all([
-        listExperimentCommits(experiment.id),
-        getWorkingTree(experiment.projectId),
-      ]);
-      setCommits(commitList);
-      setWorkingTree(wt);
-      setSelection((prev) => {
-        if (prev !== null) return prev;
-        const wtActive = wt.diff.trim() !== "" && wt.experimentId === experiment.id;
-        if (wtActive) return UNCOMMITTED;
-        return commitList[0]?.sha ?? null;
-      });
-    } catch (err) {
-      setChangesError(err instanceof Error ? err.message : String(err));
-    }
-  }
-
-  // First open loads commits + working tree.
-  useEffect(() => {
-    if (commits === null && !changesError) void loadChanges();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [commits, changesError, experiment.id]);
-
-  // Poll the working tree while the view is visible.
-  useEffect(() => {
-    const timer = setInterval(() => {
-      getWorkingTree(experiment.projectId)
-        .then(setWorkingTree)
-        .catch(() => {
-          // transient; next tick retries
-        });
-    }, 5000);
-    return () => clearInterval(timer);
-  }, [experiment.projectId]);
-
-  // If the uncommitted diff disappears from under the selection, fall back.
-  useEffect(() => {
-    if (selection === UNCOMMITTED && workingTree && !uncommittedAvailable) {
-      setSelection(commits?.[0]?.sha ?? null);
-    }
-  }, [selection, workingTree, uncommittedAvailable, commits]);
-
-  // Lazily fetch the selected commit's diff, cached per sha.
-  useEffect(() => {
-    if (!selection || selection === UNCOMMITTED) return;
-    if (commitDiffs[selection]) return;
-    const sha = selection;
-    setCommitDiffs((m) => ({ ...m, [sha]: { loading: true } }));
-    getCommitDiff(experiment.id, sha)
-      .then((payload) => setCommitDiffs((m) => ({ ...m, [sha]: { loading: false, payload } })))
-      .catch((err) =>
-        setCommitDiffs((m) => ({
-          ...m,
-          [sha]: { loading: false, error: err instanceof Error ? err.message : String(err) },
-        })),
-      );
-  }, [selection, commitDiffs, experiment.id]);
-
-  const noChanges = !uncommittedAvailable && (commits?.length ?? 0) === 0;
-
-  return (
-    <div className="drawer">
-      <div className="drawer-body">
-        <div className="drawer-section">
-          <div className="changes-branch">
-            <span className="ctl-label">Branch</span>
-            <BranchPill
-              owner={project.githubOwner}
-              repo={project.githubRepo}
-              branch={experiment.branchName}
-            />
-          </div>
-          {changesError ? (
-            <div className="error">{changesError}</div>
-          ) : commits === null ? (
-            <div className="changes-note">Loading changes…</div>
-          ) : noChanges ? (
-            <div className="changes-note">
-              No changes yet — the agent hasn't committed on this branch.
-            </div>
-          ) : (
-            <>
-              <div className="commit-picker">
-                <span className="ctl-label">Commit</span>
-                {selection === UNCOMMITTED && <span className="uncommitted-dot" />}
-                <select
-                  className="input sm"
-                  value={selection ?? ""}
-                  onChange={(e) => setSelection(e.target.value)}
-                >
-                  {uncommittedAvailable && (
-                    <option value={UNCOMMITTED}>● Uncommitted changes</option>
-                  )}
-                  {commits.map((c) => (
-                    <option key={c.sha} value={c.sha}>
-                      {c.sha.slice(0, 7)} — {c.subject}
-                    </option>
-                  ))}
-                </select>
-                <button
-                  className="icon-btn"
-                  title="Refresh"
-                  aria-label="Refresh"
-                  onClick={() => void loadChanges()}
-                >
-                  <RotateCw size={14} />
-                </button>
-              </div>
-              <div style={{ marginTop: 10 }}>
-                {selection === UNCOMMITTED && workingTree ? (
-                  workingTree.truncated ? (
-                    <div className="truncated-notice">
-                      <h4>Diff too large to display</h4>
-                      <p>The uncommitted diff is too large to display. View it locally with git.</p>
-                    </div>
-                  ) : (
-                    <GitDiff diff={workingTree.diff} />
-                  )
-                ) : selection ? (
-                  <DiffView state={commitDiffs[selection]} />
-                ) : (
-                  <div className="changes-note">Select a commit to view its diff.</div>
-                )}
-              </div>
-            </>
-          )}
-        </div>
       </div>
     </div>
   );

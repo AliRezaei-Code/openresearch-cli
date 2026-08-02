@@ -8,7 +8,7 @@
 
 import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
 import { createPortal } from "react-dom";
-import { GitBranch } from "lucide-react";
+import { FolderTree, GitBranch, Terminal } from "lucide-react";
 import { parseDiff, type FileData } from "react-diff-view";
 import {
   backendKind,
@@ -117,6 +117,9 @@ export function ExpHoverCard({
   latestRun,
   parentSlug,
   anchor,
+  onOpenLogs,
+  onOpenChanges,
+  onOpenCode,
   onMouseEnter,
   onMouseLeave,
 }: {
@@ -126,6 +129,9 @@ export function ExpHoverCard({
   parentSlug: string | null;
   /** Viewport rect of the hovered node (kept fresh by useHoverIntent). */
   anchor: DOMRect;
+  onOpenLogs?: () => void;
+  onOpenChanges: () => void;
+  onOpenCode: () => void;
   onMouseEnter: () => void;
   onMouseLeave: () => void;
 }) {
@@ -252,6 +258,22 @@ export function ExpHoverCard({
         <StatusBadge status={latestRun?.status ?? "idle"} />
       </div>
       {exp.title && <div className="hc-title">{exp.title}</div>}
+      <div className="hc-actions">
+        <button type="button" onClick={onOpenChanges}>
+          <GitBranch size={13} />
+          Changes
+        </button>
+        {onOpenLogs && (
+          <button type="button" onClick={onOpenLogs}>
+            <Terminal size={13} />
+            Logs
+          </button>
+        )}
+        <button type="button" onClick={onOpenCode}>
+          <FolderTree size={13} />
+          Code
+        </button>
+      </div>
       {body && (
         <div className={`hc-body${expanded ? " expanded" : ""}`} ref={bodyRef}>
           {body}

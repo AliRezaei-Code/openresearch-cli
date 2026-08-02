@@ -13,6 +13,7 @@ import { GitHubMark } from "./BackendLogos";
 import { memo, useMemo, useRef } from "react";
 import { githubBranchUrl, timeAgo, type Experiment, type Project, type Run } from "../api";
 import type { ExperimentView } from "./DetailDrawer";
+import type { CodeView } from "./CodeTab";
 import { ExpHoverCard, dismissTreeHoverCards, useHoverIntent } from "./ExpHoverCard";
 import { StatusBadge } from "./StatusBadge";
 
@@ -34,7 +35,7 @@ type ExpNodeData = {
   githubOwner: string;
   githubRepo: string;
   onOpenView: (id: string, view: ExperimentView) => void;
-  onOpenCodeBranch: (branch: string) => void;
+  onOpenCode: (experimentId: string, branch: string, view: CodeView) => void;
 };
 type ExpFlowNode = Node<ExpNodeData, "exp">;
 
@@ -155,7 +156,7 @@ function runSquareClass(status: string): string {
 }
 
 const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
-  const { exp, latestRun, runs, isBaseline, parentSlug, githubOwner, githubRepo, onOpenView, onOpenCodeBranch } = data;
+  const { exp, latestRun, runs, isBaseline, parentSlug, githubOwner, githubRepo, onOpenView, onOpenCode } = data;
   const status = latestRun?.status;
   const live = status === "running" || status === "starting";
   const kind = isBaseline ? "Baseline" : live ? "Running" : "Experiment";
@@ -176,36 +177,48 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
       onMouseLeave={hover.onMouseLeave}
     >
       <Handle type="target" position={Position.Top} />
-      <div className="node-eyebrow">
-        <span>{kind}</span>
-        <StatusBadge status={status ?? "idle"} />
-      </div>
-      <div className="node-head">
-        <span className="node-slug">{exp.slug}</span>
-      </div>
-      {(exp.title || exp.description) && (
-        <div className="node-title">{exp.title || exp.description}</div>
-      )}
-      <div className="node-meta">
-        <span>Runs</span>
-        {squares.length > 0 ? (
-          <span className="run-squares">
-            {squares.map((run) => (
-              <span key={run.id} className={`run-sq ${runSquareClass(run.status)}`} title={run.status} />
-            ))}
-          </span>
-        ) : (
-          <span>no runs</span>
+      <div
+        role="button"
+        tabIndex={0}
+        className="node-overview-link nodrag"
+        onClick={() => onOpenView(exp.id, "overview")}
+        onKeyDown={(event) => {
+          if (event.key !== "Enter" && event.key !== " ") return;
+          event.preventDefault();
+          onOpenView(exp.id, "overview");
+        }}
+      >
+        <div className="node-eyebrow">
+          <span>{kind}</span>
+          <StatusBadge status={status ?? "idle"} />
+        </div>
+        <div className="node-head">
+          <span className="node-slug">{exp.slug}</span>
+        </div>
+        {(exp.title || exp.description) && (
+          <div className="node-title">{exp.title || exp.description}</div>
         )}
-        <span style={{ flex: 1 }} />
-        {latestRun && <span>{timeAgo(latestRun.createdAt)}</span>}
+        <div className="node-meta">
+          <span>Runs</span>
+          {squares.length > 0 ? (
+            <span className="run-squares">
+              {squares.map((run) => (
+                <span key={run.id} className={`run-sq ${runSquareClass(run.status)}`} title={run.status} />
+              ))}
+            </span>
+          ) : (
+            <span>no runs</span>
+          )}
+          <span style={{ flex: 1 }} />
+          {latestRun && <span>{timeAgo(latestRun.createdAt)}</span>}
+        </div>
       </div>
       {/* Direct view shortcuts — changes and code always, logs once there's a run. */}
       <div className="node-actions" onClick={(e) => e.stopPropagation()}>
         <button
           className="node-action"
           title="Open changes"
-          onClick={() => onOpenView(exp.id, "changes")}
+          onClick={() => onOpenCode(exp.id, exp.branchName, "changes")}
         >
           <GitBranch size={13} />
           Changes
@@ -223,7 +236,7 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
         <button
           className="node-action"
           title={`Browse code on ${exp.branchName}`}
-          onClick={() => onOpenCodeBranch(exp.branchName)}
+          onClick={() => onOpenCode(exp.id, exp.branchName, "files")}
         >
           <FolderTree size={13} />
           Code
@@ -251,6 +264,9 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
           latestRun={latestRun}
           parentSlug={parentSlug}
           anchor={hover.rect}
+          onOpenLogs={runs.length > 0 ? () => onOpenView(exp.id, "terminal") : undefined}
+          onOpenChanges={() => onOpenCode(exp.id, exp.branchName, "changes")}
+          onOpenCode={() => onOpenCode(exp.id, exp.branchName, "files")}
           onMouseEnter={hover.keepOpen}
           onMouseLeave={hover.onMouseLeave}
         />
@@ -305,7 +321,7 @@ export function TreeView({
   runs,
   project,
   onOpenView,
-  onOpenCodeBranch,
+  onOpenCode,
   agentSessionId,
   onShowProjectScope,
 }: {
@@ -316,7 +332,7 @@ export function TreeView({
   /** Open an experiment view as a right-pane tab (card shortcut buttons). */
   onOpenView: (id: string, view: ExperimentView) => void;
   /** Browse an experiment branch's code in the project-level Code tab. */
-  onOpenCodeBranch: (branch: string) => void;
+  onOpenCode: (experimentId: string, branch: string, view: CodeView) => void;
   /** Agent scope: show only this chat session's experiments, eliding the rest.
    * Null = Project scope (the whole forest). */
   agentSessionId: string | null;
@@ -360,7 +376,7 @@ export function TreeView({
             githubOwner: project.githubOwner,
             githubRepo: project.githubRepo,
             onOpenView,
-            onOpenCodeBranch,
+            onOpenCode,
           },
         });
       } else {
@@ -402,7 +418,7 @@ export function TreeView({
     experiments,
     runs,
     onOpenView,
-    onOpenCodeBranch,
+    onOpenCode,
     project.githubOwner,
     project.githubRepo,
     agentSessionId,
