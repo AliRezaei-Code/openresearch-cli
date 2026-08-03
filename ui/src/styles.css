@@ -674,26 +674,36 @@ textarea::placeholder {
   display: inline-flex;
   align-items: center;
   gap: 2px;
+  align-self: center;
+  padding: 0 6px;
   flex-shrink: 0;
 }
 
-/* Panel tab bar: pinned Log/Artifacts + closable experiment/file tabs. */
+/* Panel tab bar: pinned homes + closable working tabs. */
 .tabs {
   display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 0 10px;
-  height: 40px;
+  align-items: flex-end;
+  gap: 0;
+  padding: 5px 6px 0 8px;
+  height: 44px;
   border-bottom: 1px solid var(--border);
-  background: var(--base);
+  background: var(--canvas);
   flex-shrink: 0;
 }
 
-/* Scrollable strip of tabs. */
+/* Home tabs never scroll away when many working tabs are open. */
+.pinned-tabs {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+/* Only working tabs participate in horizontal scrolling. */
 .tab-strip {
   display: flex;
-  align-items: center;
-  gap: 4px;
+  align-items: flex-end;
+  gap: 2px;
   flex: 1;
   min-width: 0;
   overflow-x: auto;
@@ -731,19 +741,48 @@ textarea::placeholder {
 
 /* One tab style for the whole strip — pinned tabs simply have no close "x". */
 .tab {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 5px 12px;
+  height: 36px;
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
   font-size: var(--fs-md);
-  font-weight: var(--fw-semibold);
-  color: var(--text);
-  border-radius: var(--radius-sm);
+  font-weight: var(--fw-medium);
+  color: var(--subtext);
   white-space: nowrap;
   flex-shrink: 0;
 }
-.tab.active {
+.tab:hover {
   background: var(--surface);
+  color: var(--text);
+}
+.tab:not(.active) + .tab:not(.active)::before {
+  content: "";
+  position: absolute;
+  top: 10px;
+  bottom: 10px;
+  left: -1px;
+  width: 1px;
+  background: var(--border);
+}
+.tab.active {
+  border-color: var(--border);
+  background: var(--base);
+  color: var(--text);
+  font-weight: var(--fw-semibold);
+}
+.tab.active::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: -1px;
+  left: 0;
+  height: 1px;
+  background: var(--base);
 }
 .tab-body {
   flex: 1;
@@ -761,6 +800,10 @@ textarea::placeholder {
   flex-wrap: wrap;
   padding: 10px 12px 0;
   flex-shrink: 0;
+}
+.pane-toolbar.table-view {
+  background: var(--base);
+  padding-bottom: 12px;
 }
 .pane-content {
   flex: 1;
@@ -1679,6 +1722,26 @@ textarea::placeholder {
   border-color: var(--accent-teal);
   box-shadow: 0 2px 12px rgba(32, 154, 132, 0.2);
 }
+.exp-node .node-overview-link {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.exp-node .node-overview-link:hover .node-slug {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.exp-node .node-overview-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+  border-radius: var(--radius-xs);
+}
 .exp-node .node-eyebrow {
   display: flex;
   align-items: center;
@@ -1864,6 +1927,30 @@ textarea::placeholder {
   margin-top: 3px;
   color: var(--text);
 }
+.exp-hover-card .hc-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+}
+.exp-hover-card .hc-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-width: 84px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--base);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+}
+.exp-hover-card .hc-actions button:hover {
+  border-color: color-mix(in oklab, var(--border) 55%, var(--text));
+  background: var(--canvas);
+}
 /* Plain text between hairline rules — no fill, matching the app's quiet
  * hairline idiom (a recessed box read as a heavy slab on long results). */
 .exp-hover-card .hc-body {
@@ -1971,22 +2058,18 @@ textarea::placeholder {
 
 /* ---- runs table ---- */
 
-/* Runs table: a white card on the panel canvas, quiet separators. */
+/* Runs table fills the panel directly, with quiet row separators. */
 .runs-table-wrap {
   position: absolute;
   inset: 0;
   overflow: auto;
-  padding: 12px;
+  background: var(--base);
 }
 .runs-table {
   width: 100%;
-  border-collapse: separate;
-  border-spacing: 0;
+  border-collapse: collapse;
   font-size: var(--fs-md);
   background: var(--base);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  overflow: hidden;
 }
 .runs-table th {
   text-align: left;
@@ -2124,6 +2207,163 @@ textarea::placeholder {
   font-size: var(--fs-sm);
   font-weight: var(--fw-semibold);
   color: var(--text);
+}
+
+.experiment-overview {
+  position: absolute;
+  inset: 0;
+  overflow-y: auto;
+  background: var(--base);
+}
+.experiment-overview-inner {
+  width: 100%;
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 26px 28px 40px;
+}
+.experiment-overview-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+}
+.experiment-overview-heading {
+  min-width: 0;
+}
+.experiment-overview h1 {
+  margin: 0;
+  color: var(--text);
+  font-size: 22px;
+  line-height: 1.25;
+}
+.experiment-overview-slug {
+  margin-top: 5px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+}
+.experiment-overview-actions {
+  display: flex;
+  gap: 7px;
+  margin-top: 18px;
+}
+.experiment-overview-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 36px;
+  padding: 7px 12px;
+  border: 1px solid var(--border-variant);
+  border-radius: var(--radius-sm);
+  background: var(--base);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.experiment-overview-action:hover {
+  border-color: color-mix(in oklab, var(--text) 34%, var(--border));
+  background: var(--surface);
+}
+.experiment-overview-section {
+  margin-top: 22px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border-variant);
+}
+.experiment-overview-section h2 {
+  margin: 0 0 14px;
+  color: var(--text);
+  font-size: var(--fs-md);
+  font-weight: var(--fw-semibold);
+}
+.overview-description .md {
+  color: var(--text);
+  line-height: 1.65;
+}
+.experiment-overview-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  color: var(--text);
+  font-size: var(--fs-sm);
+}
+.experiment-overview-meta svg {
+  color: var(--muted);
+}
+.experiment-overview-meta .backend-badge,
+.experiment-overview-meta .status-badge {
+  color: var(--text);
+}
+.experiment-overview-meta > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.experiment-overview-meta code {
+  color: var(--text);
+  font-size: var(--fs-xs);
+}
+.experiment-overview-git-meta {
+  gap: 9px 14px;
+}
+.experiment-overview-git-meta .files-pill {
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+}
+.experiment-overview-git-meta .files-pill code {
+  font-size: var(--fs-xs);
+}
+.experiment-overview-command {
+  display: block;
+  margin-top: 13px;
+  color: var(--text);
+  font-size: var(--fs-sm);
+  overflow-wrap: anywhere;
+}
+.experiment-overview-result {
+  margin-top: 16px;
+}
+.experiment-overview-result.failed {
+  color: var(--accent-red);
+}
+.experiment-run-history {
+  border-top: 1px solid var(--border-variant);
+}
+.experiment-run-history button {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(72px, 0.7fr) minmax(100px, 1fr) minmax(70px, 0.7fr) 60px 16px;
+  align-items: center;
+  gap: 14px;
+  padding: 11px 2px;
+  border-bottom: 1px solid var(--border-variant);
+  color: var(--text);
+  text-align: left;
+  font-size: var(--fs-sm);
+}
+.experiment-run-history button:hover {
+  background: var(--surface);
+}
+.experiment-run-number {
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+}
+@media (max-width: 720px) {
+  .experiment-overview-inner {
+    padding: 20px 18px 32px;
+  }
+  .experiment-overview-actions {
+    flex-wrap: wrap;
+  }
+  .experiment-run-history button {
+    grid-template-columns: 65px 1fr 60px 16px;
+  }
+  .experiment-run-history button > :nth-child(3) {
+    display: none;
+  }
 }
 
 .kv {
@@ -3107,17 +3347,109 @@ a.files-pill:hover {
   gap: 16px;
 }
 
-.diff-file-card {
+.diff-explorer {
+  container-type: inline-size;
+}
+.diff-explorer-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+  font-size: var(--fs-sm);
+}
+.diff-explorer-toolbar button {
+  padding: 2px 0;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+}
+.diff-explorer-toolbar button:hover {
+  color: var(--text);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.diff-explorer-layout {
+  display: grid;
+  grid-template-columns: minmax(180px, 260px) minmax(0, 1fr);
+  align-items: start;
+  gap: 14px;
+}
+.diff-explorer-files {
+  position: sticky;
+  top: 0;
+  max-height: min(70vh, 720px);
+  overflow: auto;
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--base);
 }
-/* The header owns the card's rounded top outline (overlaid on the card
-   border via -1px margins) so it still looks like a rounded card top while
-   stuck — the card's own border scrolls away with the card. Painted via two
-   layered pseudo-elements because negative-z children cover the element's own
-   background/border: a square white mask below (hides code scrolling past the
-   corner notches), the rounded bordered surface above it, text on top. */
+.diff-explorer-files button {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 8px 9px;
+  border-bottom: 1px solid var(--border-variant);
+  color: var(--text);
+  text-align: left;
+}
+.diff-explorer-files button:last-child {
+  border-bottom: none;
+}
+.diff-explorer-files button:hover,
+.diff-explorer-files button.active {
+  background: var(--surface);
+}
+.diff-explorer-files button.active {
+  box-shadow: inset 2px 0 0 var(--text);
+}
+.diff-explorer-files code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-xs);
+}
+.diff-file-status {
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  color: var(--muted);
+}
+.diff-file-status.status-add {
+  color: var(--accent-green);
+}
+.diff-file-status.status-delete {
+  color: var(--accent-red);
+}
+.diff-file-status.status-rename,
+.diff-file-status.status-copy {
+  color: var(--accent-blue);
+}
+.diff-explorer-stat {
+  font-family: var(--mono);
+  font-size: var(--fs-2xs);
+}
+.diff-explorer-preview {
+  min-width: 0;
+}
+@container (max-width: 960px) {
+  .diff-explorer-layout {
+    grid-template-columns: 1fr;
+  }
+  .diff-explorer-files {
+    position: static;
+    max-height: 220px;
+  }
+}
+
+.diff-file-card {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--base);
+}
 .diff-file-header {
   position: sticky;
   top: 0;
@@ -3126,27 +3458,14 @@ a.files-pill:hover {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin: -1px -1px 0;
-  width: calc(100% + 2px);
+  width: 100%;
   text-align: left;
   padding: 8px 12px;
+  background: var(--canvas);
   cursor: pointer;
 }
-.diff-file-header::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: -2;
-  background: var(--base);
-}
-.diff-file-header::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  background: var(--canvas);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md) var(--radius-md) 0 0;
+.diff-file-card.expanded .diff-file-header {
+  border-bottom: 1px solid var(--border);
 }
 .diff-file-header .chev {
   color: var(--muted);
@@ -3192,6 +3511,11 @@ a.files-pill:hover {
   padding: 8px 12px;
   color: var(--muted);
   font-size: var(--fs-md);
+}
+
+.diff-file-body {
+  overflow-x: auto;
+  background: var(--base);
 }
 
 .truncated-notice {
@@ -3284,18 +3608,28 @@ a.files-pill:hover {
 
   width: 100%;
   font-size: var(--fs-sm);
-  line-height: 1.5;
+  line-height: 1.55;
 }
 
 .openresearch-diff .openresearch-diff-file.diff-unified {
   table-layout: auto;
 }
+.openresearch-diff .openresearch-diff-file.diff-unified col.diff-gutter-col:first-child {
+  visibility: collapse;
+  width: 0;
+}
+.openresearch-diff .openresearch-diff-file.diff-unified col.diff-gutter-col:nth-child(2) {
+  width: 1%;
+}
 .openresearch-diff .openresearch-diff-file.diff-unified .diff-line > td:first-child {
   display: none;
 }
 .openresearch-diff .openresearch-diff-file.diff-unified .diff-line > td:nth-child(2) {
-  width: 0%;
-  padding: 0 0.5rem 0 0.625rem;
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  width: 1%;
+  padding: 0 10px 0 14px;
   white-space: nowrap;
   text-align: right;
   color: var(--openresearch-diff-unified-gutter-text-color);
@@ -3304,7 +3638,19 @@ a.files-pill:hover {
   cursor: default;
 }
 .openresearch-diff .openresearch-diff-file .diff-line {
-  line-height: 1.5;
+  line-height: 1.55;
+}
+.openresearch-diff .openresearch-diff-file .diff-line:has(.diff-code-insert) {
+  background: var(--openresearch-diff-insert-code-background-color);
+}
+.openresearch-diff .openresearch-diff-file .diff-line:has(.diff-code-delete) {
+  background: var(--openresearch-diff-delete-code-background-color);
+}
+.openresearch-diff .openresearch-diff-file .diff-code {
+  padding: 0 16px;
+  white-space: pre;
+  word-break: normal;
+  overflow-wrap: normal;
 }
 .openresearch-diff .openresearch-diff-file .diff-hunk + .diff-hunk .diff-line:first-child > td {
   border-top: 1px solid var(--openresearch-diff-divider-color);
@@ -4552,6 +4898,14 @@ a.files-pill:hover {
   min-height: 0;
   overflow: auto;
   background: var(--base);
+}
+.branch-changes > .changes-note {
+  margin: 14px 16px;
+}
+.branch-changes > .openresearch-diff,
+.branch-changes > .truncated-notice,
+.branch-changes > .diff-explorer {
+  margin: 14px 16px 0;
 }
 .code-tree {
   padding: 6px 0;

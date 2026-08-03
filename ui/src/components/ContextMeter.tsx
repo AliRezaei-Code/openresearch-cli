@@ -17,9 +17,12 @@ const RING_C = 2 * Math.PI * RING_R;
  * unknown). Hidden until the harness first reports usage; the popover holds
  * the breakdown. */
 export function ContextMeter({ usage }: { usage?: ContextUsage }) {
-  const { open, setOpen, ref } = usePopover();
-  if (!usage) return null;
+  if (!usage || usage.usedTokens <= 0) return null;
+  return <VisibleContextMeter usage={usage} />;
+}
 
+function VisibleContextMeter({ usage }: { usage: ContextUsage }) {
+  const { open, setOpen, ref } = usePopover();
   const { usedTokens, contextWindow } = usage;
   const pct =
     contextWindow && contextWindow > 0

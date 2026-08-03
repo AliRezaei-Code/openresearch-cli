@@ -225,31 +225,10 @@ export interface DiffPayload {
   byteLimit: number;
 }
 
-export interface CommitInfo {
-  sha: string;
-  subject: string;
-  committedAt: number; // unix seconds
-}
-
-export interface WorkingTree {
-  branch: string | null;
-  experimentId: string | null;
-  diff: string;
-  truncated: boolean;
-}
-
 export const getRunDiff = (runId: string) => get<DiffPayload>(`/api/runs/${runId}/diff`);
 
-export const listExperimentCommits = (experimentId: string) =>
-  get<{ commits: CommitInfo[] }>(`/api/experiments/${experimentId}/commits`).then(
-    (r) => r.commits,
-  );
-
-export const getCommitDiff = (experimentId: string, sha: string) =>
-  get<DiffPayload>(`/api/experiments/${experimentId}/commits/${sha}/diff`);
-
-export const getWorkingTree = (projectId: string) =>
-  get<WorkingTree>(`/api/projects/${projectId}/working-tree`);
+export const getExperimentDiff = (experimentId: string) =>
+  get<DiffPayload>(`/api/experiments/${experimentId}/diff`);
 
 /** Which source answered a checkout read: a session's live worktree, the hub
  * clone (also the worktree-pruned fallback), or a branch's committed tree. */

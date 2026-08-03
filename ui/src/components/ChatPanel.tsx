@@ -1186,8 +1186,8 @@ export function ChatPanel({
   /** Open a sub-agent's transcript as a right-pane tab (spawn-row "view").
    * `sessionId` is the chat session; `spawnPartId` locates the spawn part. */
   onOpenSubagent?: (sessionId: string, spawnPartId: string) => void;
-  /** Open the live worktree tab for a session (chat header worktree button). */
-  onOpenWorktree?: (sessionId: string) => void;
+  /** Open the pinned Files home for the active session. */
+  onOpenWorktree?: () => void;
   /** Replay the onboarding tour (chat header help button). */
   onStartTour?: () => void;
   /** The open chat session, surfaced so the shell can scope panes to it. */
@@ -2108,9 +2108,9 @@ export function ChatPanel({
         {onOpenWorktree && activeId && (
           <button
             className="icon-btn"
-            data-tip="View session worktree"
-            aria-label="View session worktree"
-            onClick={() => onOpenWorktree(activeId)}
+            data-tip="View current worktree"
+            aria-label="View current worktree"
+            onClick={onOpenWorktree}
           >
             <FolderGit2 size={15} />
           </button>

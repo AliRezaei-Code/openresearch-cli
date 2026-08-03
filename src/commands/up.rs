@@ -240,6 +240,7 @@ fn router(state: AppState) -> Router {
         .route("/api/runs/{id}/cancel", post(cancel_run))
         .route("/api/runs/{id}/log", get(run_log))
         .route("/api/runs/{id}/diff", get(run_diff))
+        .route("/api/experiments/{id}/diff", get(experiment_diff))
         .route("/api/experiments/{id}/commits", get(experiment_commits))
         .route(
             "/api/experiments/{id}/commits/{sha}/diff",
@@ -1006,6 +1007,36 @@ async fn run_diff(Path(id): Path<String>) -> ApiResult {
         let repo = std::path::Path::new(&project.repo_path);
         let payload = local::git::diff_range(repo, &parent.branch_name, &sha)?;
         Ok(Json(diff_json(payload)))
+    })
+    .await
+}
+
+/// Cumulative committed diff of an experiment branch vs its parent branch.
+async fn experiment_diff(Path(id): Path<String>) -> ApiResult {
+    blocking_api(move || {
+        let store = Store::open()?;
+        let exp = store
+            .get_local_experiment(&id)?
+            .ok_or_else(|| not_found("experiment"))?;
+        let Some(parent_id) = &exp.parent_experiment_id else {
+            return Ok(Json(diff_json(local::git::DiffPayload {
+                diff: String::new(),
+                truncated: false,
+                bytes_read: 0,
+            })));
+        };
+        let parent = store
+            .get_local_experiment(parent_id)?
+            .ok_or_else(|| not_found("parent experiment"))?;
+        let project = store
+            .get_local_project(&exp.project_id)?
+            .ok_or_else(|| not_found("project"))?;
+        let repo = std::path::Path::new(&project.repo_path);
+        Ok(Json(diff_json(local::git::diff_range(
+            repo,
+            &parent.branch_name,
+            &exp.branch_name,
+        )?)))
     })
     .await
 }

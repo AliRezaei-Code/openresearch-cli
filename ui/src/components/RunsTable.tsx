@@ -1,19 +1,10 @@
 import { GitBranch } from "lucide-react";
-import { backendDetail, backendKind, shortId, timeAgo, type Experiment, type Run } from "../api";
+import { shortId, timeAgo, type Experiment, type Run } from "../api";
 import { StatusBadge } from "./StatusBadge";
 
 // Legacy alias kept for external imports; StatusBadge owns the styling.
 export function StatusChip({ status }: { status: string }) {
   return <StatusBadge status={status} />;
-}
-
-// "modal_job · a100" — the kind plus its flavor/host/manifest, for the runs
-// table's text-only Backend column. (The Instances tab uses BackendBadge, which
-// renders the same pieces with a logo.)
-function backendLabel(run: Run): string {
-  const kind = backendKind(run.backend);
-  if (!kind) return "—";
-  return [kind, backendDetail(run.backend)].filter(Boolean).join(" · ");
 }
 
 export function RunsTable({
@@ -28,7 +19,7 @@ export function RunsTable({
   experiments: Experiment[];
   /** Overrides the empty-state text when the caller pre-filtered `runs`. */
   emptyHint?: string;
-  /** Row click — opens the run's experiment terminal tab. */
+  /** Row click — opens the run's experiment overview tab. */
   onOpen: (run: Run) => void;
   /** GitBranch shortcut — opens the experiment's changes tab. */
   onOpenChanges: (experimentId: string) => void;
@@ -50,13 +41,9 @@ export function RunsTable({
       <table className="runs-table">
         <thead>
           <tr>
-            <th>Run</th>
             <th>Experiment</th>
             <th>Status</th>
-            <th>Backend</th>
-            <th>Commit</th>
             <th>Started</th>
-            <th>Exit</th>
             <th />
           </tr>
         </thead>
@@ -65,15 +52,11 @@ export function RunsTable({
             const live = run.status === "running" || run.status === "starting";
             return (
               <tr key={run.id} className="clickable" onClick={() => onOpen(run)}>
-                <td className="mono">{shortId(run.id)}</td>
                 <td className="mono">{slugByExp.get(run.experimentId) ?? shortId(run.experimentId)}</td>
                 <td>
                   <StatusBadge status={run.status} />
                 </td>
-                <td className="mono">{backendLabel(run)}</td>
-                <td className="mono">{run.commitSha ? run.commitSha.slice(0, 7) : "—"}</td>
                 <td>{timeAgo(run.createdAt)}</td>
-                <td className="mono">{run.exitCode ?? "—"}</td>
                 <td>
                   <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
                     <button
