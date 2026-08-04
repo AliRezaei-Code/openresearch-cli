@@ -4,13 +4,9 @@ import { useEffect, useRef, useState } from "react";
 import {
   getGitSettings,
   getHarnesses,
-  getTelemetry,
   harnessModelLabel,
-  recordTelemetryConsent,
-  setTelemetry,
   type GitSettings,
   type Harness,
-  type TelemetrySettings,
 } from "../api";
 import { GitTokenForm } from "./GitTokenForm";
 import { renderNote } from "./agentNote";
@@ -19,22 +15,20 @@ import { onHarnessAuth } from "../events";
 const RETRY_COPY = "Couldn't reach orx. Check it's still running, then re-check.";
 
 /** First-run walkthrough: the detected coding agents, then GitHub access, then
- * the usage-analytics choice, then hand off to the (empty) projects page.
- * Step 1 gates — orx can't chat without a signed-in agent. Step 2 doesn't:
- * cloning and pushing work over SSH keys, so a missing token is a hint, not a
- * wall. The data-dir choice deliberately lives in Settings → Storage instead:
- * the default suits almost everyone, and Settings can also *move* existing
- * data, which this flow never could. */
+ * hand off to the (empty) projects page. Step 1 gates — orx can't chat without
+ * a signed-in agent. Step 2 doesn't: cloning and pushing work over SSH keys, so
+ * a missing token is a hint, not a wall. The data-dir choice deliberately lives
+ * in Settings → Storage (which can also *move* existing data, unlike this flow);
+ * usage analytics is opt-out and toggled from the CLI (`orx telemetry off`), so
+ * neither needs a first-run prompt. */
 export function Onboarding({ onDone }: { onDone: () => void }) {
-  const [step, setStep] = useState<0 | 1 | 2>(0);
+  const [step, setStep] = useState<0 | 1>(0);
   const [harnesses, setHarnesses] = useState<Harness[] | null>(null);
   const [git, setGit] = useState<GitSettings | null>(null);
-  const [telemetry, setTelemetryState] = useState<TelemetrySettings | null>(null);
-  const [telemetrySaving, setTelemetrySaving] = useState(false);
   const [checking, setChecking] = useState(false);
-  // Per-probe, not one shared flag: a telemetry failure must not put a
-  // connectivity error on a gate it has nothing to do with — or worse, hide
-  // the actionable "sign in" hint behind it.
+  // Per-probe, not one shared flag: a git failure must not put a connectivity
+  // error on the harness gate it has nothing to do with — or worse, hide the
+  // actionable "sign in" hint behind it.
   const [harnessError, setHarnessError] = useState(false);
   const [gitError, setGitError] = useState(false);
 
@@ -60,7 +54,6 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
     void Promise.allSettled([
       getHarnesses(refresh, retryRejected).then((h) => fresh() && setHarnesses(h)),
       getGitSettings().then((g) => fresh() && setGit(g)),
-      getTelemetry().then((t) => fresh() && setTelemetryState(t)),
     ])
       .then(([harness, git]) => {
         if (!fresh()) return;
@@ -96,22 +89,13 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
     [],
   );
 
-  // Leaving step 3 → record the final consent decision once (agree or reject),
-  // so every user who reaches the analytics step is counted, including those who
-  // accept the default. Default to enabled if the setting hasn't loaded yet
-  // (that's the default state shown). Best-effort — never block finishing.
-  const finishOnboarding = () => {
-    void recordTelemetryConsent(telemetry?.enabled ?? true).catch(() => {});
-    onDone();
-  };
-
   return (
     <div className="home onboarding">
       <div className="home-inner">
         {step === 0 ? (
           <>
             <div className="onb-eyebrow">
-              <Wordmark /> · Step 1 of 3
+              <Wordmark /> · Step 1 of 2
             </div>
             <h2 className="onb-title">Your coding agents</h2>
             <p className="onb-sub">
@@ -150,10 +134,10 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
               </button>
             </div>
           </>
-        ) : step === 1 ? (
+        ) : (
           <>
             <div className="onb-eyebrow">
-              <Wordmark /> · Step 2 of 3
+              <Wordmark /> · Step 2 of 2
             </div>
             <h2 className="onb-title">Connect GitHub</h2>
             <p className="onb-sub">
@@ -184,6 +168,12 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 still work if you have SSH keys.
               </p>
             )}
+            {/* The data dir moved to Settings → Storage; still disclose where
+                things land so the location isn't a surprise. */}
+            <p className="onb-aside-text" style={{ marginTop: 12 }}>
+              Your database, run logs, and artifacts stay on this machine — change where they live
+              any time in Settings → Storage.
+            </p>
             <div className="onb-actions">
               <button className="btn ghost" onClick={() => setStep(0)}>
                 <ArrowLeft size={12} /> Back
@@ -192,48 +182,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 <RefreshCw size={12} className={checking ? "spin" : ""} /> Re-check
               </button>
               <div style={{ flex: 1 }} />
-              <button className="btn primary" onClick={() => setStep(2)}>
-                Continue <ArrowRight size={13} />
-              </button>
-            </div>
-          </>
-        ) : (
-          <>
-            <div className="onb-eyebrow">
-              <Wordmark /> · Step 3 of 3
-            </div>
-            <h2 className="onb-title">Usage analytics</h2>
-            <p className="onb-sub">
-              orx can send anonymous usage analytics to help improve the tool. No code, prompts,
-              file contents, repo names, or project/session identifiers are ever sent — just a
-              random per-install id, CLI version, OS and architecture, CI flag, coarse install
-              type, and coarse events such as commands, onboarding completion, project creation,
-              and chat-session starts.
-            </p>
-            <div className="onb-cards">
-              <TelemetryCard
-                telemetry={telemetry}
-                saving={telemetrySaving}
-                onSavingChange={setTelemetrySaving}
-                onUpdate={setTelemetryState}
-              />
-            </div>
-            {/* The data dir moved to Settings → Storage; still disclose where
-                things land so the location isn't a surprise. */}
-            <p className="onb-aside-text" style={{ marginTop: 12 }}>
-              Your database, run logs, and artifacts stay on this machine — change where they live
-              any time in Settings → Storage.
-            </p>
-            <div className="onb-actions">
-              <button className="btn ghost" onClick={() => setStep(1)}>
-                <ArrowLeft size={12} /> Back
-              </button>
-              <div style={{ flex: 1 }} />
-              <button
-                className="btn primary"
-                onClick={finishOnboarding}
-                disabled={telemetrySaving}
-              >
+              <button className="btn primary" onClick={onDone}>
                 Create your first project <ArrowRight size={13} />
               </button>
             </div>
@@ -392,83 +341,6 @@ function GitCard({
             Optional — so the agent&apos;s commits are attributed to you:
           </div>
           <CmdChip cmd={`git config --global user.name "Your Name" && git config --global user.email "you@example.com"`} />
-        </div>
-      )}
-    </div>
-  );
-}
-
-function TelemetryCard({
-  telemetry,
-  saving,
-  onSavingChange,
-  onUpdate,
-}: {
-  telemetry: TelemetrySettings | null;
-  saving: boolean;
-  onSavingChange: (saving: boolean) => void;
-  onUpdate: (t: TelemetrySettings) => void;
-}) {
-  if (telemetry === null) {
-    return (
-      <div className="onb-loading">
-        <span className="spinner" /> Checking analytics…
-      </div>
-    );
-  }
-  const on = telemetry.enabled;
-  // A per-run override (e.g. `--no-telemetry`) that isn't the persisted setting:
-  // the toggle writes the persisted flag, but this run stays off regardless.
-  const overridden = !on && telemetry.reason !== null && telemetry.reason !== "disabled via `orx telemetry off`";
-  const choose = (enabled: boolean) => {
-    if (saving || enabled === on) return;
-    onSavingChange(true);
-    void setTelemetry(enabled)
-      .then(onUpdate)
-      .catch(() => {})
-      .finally(() => onSavingChange(false));
-  };
-  return (
-    <div className="onb-card">
-      <div className="onb-card-head">
-        <div>
-          <div className="onb-card-name">Share anonymous usage analytics</div>
-          <div className="onb-card-meta" style={{ marginTop: 2 }}>
-            {on
-              ? "On — helps prioritize what to build next."
-              : overridden
-                ? `Off — ${telemetry.reason}.`
-                : "Off — you can turn it back on anytime."}
-          </div>
-        </div>
-        <div style={{ display: "flex", gap: 6, flex: "none" }}>
-          <button
-            className={`btn ${on ? "primary" : "ghost"}`}
-            onClick={() => choose(true)}
-            disabled={saving}
-            aria-pressed={on}
-          >
-            {on ? <Check size={12} strokeWidth={3} /> : null} On
-          </button>
-          <button
-            className={`btn ${!on ? "primary" : "ghost"}`}
-            onClick={() => choose(false)}
-            disabled={saving}
-            aria-pressed={!on}
-          >
-            {!on ? <Check size={12} strokeWidth={3} /> : null} Off
-          </button>
-        </div>
-      </div>
-      <div className="onb-card-meta" style={{ marginTop: 12 }}>
-        Sent: a random per-install id, CLI version, OS/architecture, CI flag, coarse install type,
-        and coarse usage events. Never sent: code, prompts, file contents, paths, repo names, or
-        project/session identifiers. Change anytime in Settings or with{" "}
-        <code>orx telemetry off</code>.
-      </div>
-      {overridden && (
-        <div className="onb-card-meta" style={{ marginTop: 8 }}>
-          Note: this run is off because of {telemetry.reason}, which overrides the saved choice.
         </div>
       )}
     </div>
