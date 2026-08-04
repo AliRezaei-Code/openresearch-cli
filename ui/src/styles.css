@@ -3813,6 +3813,14 @@ a.files-pill:hover {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
 }
+
+.compute-row.disabled {
+  opacity: 0.52;
+}
+
+.compute-row.disabled .compute-row-head {
+  cursor: default;
+}
 .compute-row-head {
   display: flex;
   align-items: center;

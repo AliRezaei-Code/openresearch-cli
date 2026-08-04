@@ -1117,7 +1117,8 @@ impl ChatHost {
 
         // Slash-skills: the transcript keeps the `/name` the user typed; the
         // harness gets the expanded prompt.
-        let mut turn_text = crate::local::skills::expand(&text).unwrap_or(text);
+        let mut turn_text =
+            crate::local::skills::expand(&text, project.github_enabled()).unwrap_or(text);
         // Harnesses take plain text; pasted images ride as on-disk paths every
         // CLI can open with its own image-viewing tool.
         if !saved_images.is_empty() {
@@ -1562,10 +1563,10 @@ impl ChatHost {
 /// Remove a deleted session's worktree in the background — git + rm are
 /// blocking and best-effort, and must never hold up the delete response.
 pub fn cleanup_session_worktree(project: &LocalProject, session_id: &str) {
-    let (owner, repo) = (project.github_owner.clone(), project.github_repo.clone());
+    let project = project.clone();
     let session_id = session_id.to_string();
     tokio::task::spawn_blocking(move || {
-        crate::local::git::remove_session_worktree(&owner, &repo, &session_id);
+        crate::local::git::remove_session_worktree(&project, &session_id);
     });
 }
 

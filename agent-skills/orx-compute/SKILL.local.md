@@ -3,6 +3,12 @@ name: orx-compute
 description: "Launch experiment runs with `orx exp run`: backends (hf, modal, k8s, ssh, slurm, ray, openresearch, local), flavors, timeouts, images, sizing, and `orx exp wait`. Use before launching or re-launching any run, when choosing or switching a backend or GPU flavor, when a job OOMs, stalls, or times out, or when deciding GPU vs CPU."
 ---
 
+Projects are local-only by default. In that state, commit the experiment and
+use the `local` backend; never push. Remote backends stay unavailable until the
+user explicitly enables GitHub for the project in the Git tab. Once enabled,
+`orx exp run` pushes the selected branch before provisioning and aborts the
+launch if that push fails.
+
 In local mode (`orx up`) every run launches with `orx exp run <expId>` onto a
 **backend**: `hf`, `modal`, `k8s`, `ssh`, `slurm`, `ray`, `openresearch`, or `local`.
 There is no managed-SKU compute here (`--gpu`/`--cpu`/`--sandbox` are

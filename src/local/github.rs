@@ -22,6 +22,12 @@ pub async fn create_repo(
     create_repo_api(repo, true, organization).await
 }
 
+/// Create an empty private repository for a local project. The local history
+/// remains authoritative and becomes the remote's first history on push.
+pub async fn create_project_repo(repo: &str) -> Result<(String, String, String)> {
+    create_repo_api(repo, false, None).await
+}
+
 /// GET an api.github.com URL with the resolved token. `None` when there's no
 /// token or the request fails — callers decide what that means.
 async fn authed_get(url: &str) -> Option<reqwest::Response> {

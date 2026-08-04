@@ -1,34 +1,27 @@
-import { ArrowLeft, ArrowRight, Check, Copy, RefreshCw } from "lucide-react";
+import { ArrowLeft, ArrowRight, Check, RefreshCw } from "lucide-react";
 import { Wordmark } from "./Wordmark";
 import { useEffect, useRef, useState } from "react";
 import {
-  getGitSettings,
   getHarnesses,
   getTelemetry,
   harnessModelLabel,
   recordTelemetryConsent,
   setTelemetry,
-  type GitSettings,
   type Harness,
   type TelemetrySettings,
 } from "../api";
-import { GitTokenForm } from "./GitTokenForm";
 import { renderNote } from "./agentNote";
 import { onHarnessAuth } from "../events";
 
 const RETRY_COPY = "Couldn't reach orx. Check it's still running, then re-check.";
 
-/** First-run walkthrough: the detected coding agents, then GitHub access, then
- * the usage-analytics choice, then hand off to the (empty) projects page.
- * Step 1 gates — orx can't chat without a signed-in agent. Step 2 doesn't:
- * cloning and pushing work over SSH keys, so a missing token is a hint, not a
- * wall. The data-dir choice deliberately lives in Settings → Storage instead:
+/** First-run walkthrough: detected coding agents, then analytics consent.
+ * The data-dir choice deliberately lives in Settings → Storage instead:
  * the default suits almost everyone, and Settings can also *move* existing
  * data, which this flow never could. */
 export function Onboarding({ onDone }: { onDone: () => void }) {
-  const [step, setStep] = useState<0 | 1 | 2>(0);
+  const [step, setStep] = useState<0 | 1>(0);
   const [harnesses, setHarnesses] = useState<Harness[] | null>(null);
-  const [git, setGit] = useState<GitSettings | null>(null);
   const [telemetry, setTelemetryState] = useState<TelemetrySettings | null>(null);
   const [telemetrySaving, setTelemetrySaving] = useState(false);
   const [checking, setChecking] = useState(false);
@@ -36,16 +29,11 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   // connectivity error on a gate it has nothing to do with — or worse, hide
   // the actionable "sign in" hint behind it.
   const [harnessError, setHarnessError] = useState(false);
-  const [gitError, setGitError] = useState(false);
 
   // Step 1 requires one genuinely usable harness. A failed or inconclusive
   // detection never bypasses the gate; the user can re-check without being
   // tricked into a chat configuration that cannot run.
   const anyAgentReady = harnesses?.some((h) => h.agentReady) ?? false;
-
-  // Drives the nudge on step 2 only — that step doesn't gate, so an unknown
-  // answer costs nothing.
-  const githubConnected = git?.githubTokenSource != null;
 
   // Drops a slow probe whose answer a newer load — or a token save — has
   // already superseded, so a Save landing mid-refresh isn't overwritten by the
@@ -55,14 +43,12 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
     const seq = ++loadSeq.current;
     setChecking(true);
     setHarnessError(false);
-    setGitError(false);
     const fresh = () => seq === loadSeq.current;
     void Promise.allSettled([
       getHarnesses(refresh, retryRejected).then((h) => fresh() && setHarnesses(h)),
-      getGitSettings().then((g) => fresh() && setGit(g)),
       getTelemetry().then((t) => fresh() && setTelemetryState(t)),
     ])
-      .then(([harness, git]) => {
+      .then(([harness]) => {
         if (!fresh()) return;
         // Clear the stale answer too, so "errored", "loading" and "loaded"
         // stay mutually exclusive — otherwise a failed re-check leaves old
@@ -70,10 +56,6 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
         if (harness.status === "rejected") {
           setHarnessError(true);
           setHarnesses(null);
-        }
-        if (git.status === "rejected") {
-          setGitError(true);
-          setGit(null);
         }
       })
       // Not sequence-guarded: this is "a load is running", not data a stale
@@ -111,7 +93,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
         {step === 0 ? (
           <>
             <div className="onb-eyebrow">
-              <Wordmark /> · Step 1 of 3
+              <Wordmark /> · Step 1 of 2
             </div>
             <h2 className="onb-title">Your coding agents</h2>
             <p className="onb-sub">
@@ -150,57 +132,10 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
               </button>
             </div>
           </>
-        ) : step === 1 ? (
-          <>
-            <div className="onb-eyebrow">
-              <Wordmark /> · Step 2 of 3
-            </div>
-            <h2 className="onb-title">Connect GitHub</h2>
-            <p className="onb-sub">
-              orx clones your GitHub repos and pushes each experiment as a branch.
-            </p>
-            <div className="onb-cards">
-              {gitError ? (
-                <div className="onb-card-meta">{RETRY_COPY}</div>
-              ) : (
-                <GitCard
-                  git={git}
-                  onUpdate={(g) => {
-                    // A save is newer than any probe still in flight.
-                    loadSeq.current++;
-                    setGit(g);
-                    setGitError(false);
-                  }}
-                />
-              )}
-            </div>
-            {/* Soft, and honestly so: cloning and pushing work over SSH keys
-                (ensure_clone tries ssh first), so a token is a convenience,
-                not a requirement. State what's missing; never block on it. A
-                disabled Continue beside an enabled Skip just reads as a bug. */}
-            {git !== null && !githubConnected && (
-              <p className="onb-gate-hint">
-                Without GitHub access, orx can&apos;t create repos for you — cloning and pushing
-                still work if you have SSH keys.
-              </p>
-            )}
-            <div className="onb-actions">
-              <button className="btn ghost" onClick={() => setStep(0)}>
-                <ArrowLeft size={12} /> Back
-              </button>
-              <button className="btn ghost" onClick={() => load(false)} disabled={checking}>
-                <RefreshCw size={12} className={checking ? "spin" : ""} /> Re-check
-              </button>
-              <div style={{ flex: 1 }} />
-              <button className="btn primary" onClick={() => setStep(2)}>
-                Continue <ArrowRight size={13} />
-              </button>
-            </div>
-          </>
         ) : (
           <>
             <div className="onb-eyebrow">
-              <Wordmark /> · Step 3 of 3
+              <Wordmark /> · Step 2 of 2
             </div>
             <h2 className="onb-title">Usage analytics</h2>
             <p className="onb-sub">
@@ -225,7 +160,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
               any time in Settings → Storage.
             </p>
             <div className="onb-actions">
-              <button className="btn ghost" onClick={() => setStep(1)}>
+              <button className="btn ghost" onClick={() => setStep(0)}>
                 <ArrowLeft size={12} /> Back
               </button>
               <div style={{ flex: 1 }} />
@@ -241,31 +176,6 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
         )}
       </div>
     </div>
-  );
-}
-
-/** A shell command plus its own copy button, sharing one border so the button
- * reads as part of the command. Each chip owns its "Copied" state. */
-function CmdChip({ cmd }: { cmd: string }) {
-  const [copied, setCopied] = useState(false);
-  const copy = () => {
-    void navigator.clipboard.writeText(cmd).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    });
-  };
-  return (
-    <span className="onb-cmd-chip">
-      <code>{cmd}</code>
-      <button
-        className="onb-cmd-copy"
-        onClick={copy}
-        aria-label={copied ? "Copied" : "Copy command"}
-        title={copied ? "Copied" : "Copy"}
-      >
-        {copied ? <Check size={13} strokeWidth={3} /> : <Copy size={13} />}
-      </button>
-    </span>
   );
 }
 
@@ -313,86 +223,6 @@ function AgentCard({ h }: { h: Harness }) {
         </>
       ) : (
         <div className="onb-card-meta">{renderNote(h.agentNote)}</div>
-      )}
-    </div>
-  );
-}
-
-function GitCard({
-  git,
-  onUpdate,
-}: {
-  git: GitSettings | null;
-  onUpdate: (g: GitSettings) => void;
-}) {
-  // The PAT form is the fallback, not a peer of `gh auth login` — keep it
-  // behind a disclosure so the card offers one obvious action per row.
-  const [tokenOpen, setTokenOpen] = useState(false);
-  if (git === null) {
-    return (
-      <div className="onb-loading">
-        <span className="spinner" /> Checking git…
-      </div>
-    );
-  }
-  if (!git.gitVersion) {
-    return (
-      <div className="onb-card">
-        <div className="onb-card-head">
-          <span className="onb-card-name">git</span>
-          <span className="status-badge st-failed">
-            <span className="dot" /> Not found
-          </span>
-        </div>
-        <div className="onb-card-meta">Install git to clone projects, then re-open orx.</div>
-      </div>
-    );
-  }
-  const identity = [git.userName, git.userEmail && `<${git.userEmail}>`]
-    .filter(Boolean)
-    .join(" ");
-  return (
-    <div className="onb-card">
-      <div className="onb-card-row">
-        <span className="onb-card-name">GitHub</span>
-        <span className="onb-card-detail mono">
-          {git.githubTokenSource === "env"
-            ? "Token from GITHUB_TOKEN"
-            : git.githubTokenSource === "stored"
-              ? "Token saved in orx"
-              : git.githubTokenSource === "gh"
-                ? "Signed in via gh CLI"
-                : ""}
-        </span>
-        <span className={`status-badge ${git.githubTokenSource ? "st-done" : "st-starting"}`}>
-          {git.githubTokenSource ? <Check size={12} strokeWidth={3} /> : <span className="dot" />}
-          {git.githubTokenSource ? "Connected" : "Not connected"}
-        </span>
-      </div>
-      {!git.githubTokenSource && (
-        <>
-          <div className="onb-fix">
-            <span className="onb-fix-label">
-              {tokenOpen
-                ? "Paste a personal access token:"
-                : git.ghInstalled
-                  ? "Run this in your terminal to sign in:"
-                  : "Install the GitHub CLI, then run this to sign in:"}
-            </span>
-            <button className="onb-fix-alt" onClick={() => setTokenOpen((v) => !v)}>
-              {tokenOpen ? "Use gh instead" : "Paste a token instead"}
-            </button>
-          </div>
-          {tokenOpen ? <GitTokenForm onSaved={onUpdate} /> : <CmdChip cmd="gh auth login" />}
-        </>
-      )}
-      {!identity && (
-        <div className="onb-aside">
-          <div className="onb-aside-text">
-            Optional — so the agent&apos;s commits are attributed to you:
-          </div>
-          <CmdChip cmd={`git config --global user.name "Your Name" && git config --global user.email "you@example.com"`} />
-        </div>
       )}
     </div>
   );

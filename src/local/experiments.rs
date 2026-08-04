@@ -12,12 +12,17 @@ use super::model::{LocalExperiment, LocalProject};
 use super::slugify;
 
 /// First free slug within the project: `base`, `base-2`, `base-3`, …
-fn unique_slug(store: &Store, project_id: &str, base: &str) -> Result<String> {
-    let taken: HashSet<String> = store
-        .list_experiments_by_project(project_id)?
+fn unique_slug(store: &Store, project: &LocalProject, base: &str) -> Result<String> {
+    let mut taken: HashSet<String> = store
+        .list_experiments_by_project(&project.id)?
         .into_iter()
         .map(|e| e.slug)
         .collect();
+    for branch in git::local_branches(Path::new(&project.repo_path))? {
+        if let Some(slug) = branch.strip_prefix("orx/") {
+            taken.insert(slug.to_string());
+        }
+    }
     if !taken.contains(base) {
         return Ok(base.to_string());
     }
@@ -86,18 +91,17 @@ pub fn create_experiment(
         Some(s) => slugify(s),
         None => slugify(title.as_deref().unwrap_or("experiment")),
     };
-    let slug = unique_slug(store, &project.id, &base)?;
+    let slug = unique_slug(store, project, &base)?;
 
-    let repo = git::ensure_clone(
-        &project.github_owner,
-        &project.github_repo,
-        &project.baseline_branch,
-    )?;
+    let repo = Path::new(&project.repo_path);
     let fork_point = parent
         .map(|p| p.branch_name.as_str())
         .unwrap_or(&project.baseline_branch);
     let branch_name = format!("orx/{slug}");
-    git::create_experiment_branch(Path::new(&repo), fork_point, &branch_name)?;
+    let publication = project
+        .github_enabled()
+        .then_some((project.github_owner.as_str(), project.github_repo.as_str()));
+    git::create_experiment_branch(repo, fork_point, &branch_name, publication)?;
 
     // Inherit: explicit > parent's command > project default > "".
     let run_command = run_command
@@ -183,7 +187,17 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("orx-experiment-slug-test-{}", uuid::Uuid::new_v4()));
         let store = Store::open_at(root.clone()).unwrap();
-        assert_eq!(unique_slug(&store, "p1", "project").unwrap(), "project");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["init", "-b", "main"])
+            .status()
+            .unwrap()
+            .success());
+        let mut project = project("main");
+        project.repo_path = repo.to_string_lossy().into_owned();
+        assert_eq!(unique_slug(&store, &project, "project").unwrap(), "project");
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }

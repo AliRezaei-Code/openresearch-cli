@@ -26,6 +26,19 @@ pub struct LocalProject {
 }
 
 impl LocalProject {
+    pub fn github_enabled(&self) -> bool {
+        !self.github_owner.trim().is_empty() && !self.github_repo.trim().is_empty()
+    }
+
+    pub fn github_url(&self) -> Option<String> {
+        self.github_enabled().then(|| {
+            format!(
+                "https://github.com/{}/{}",
+                self.github_owner, self.github_repo
+            )
+        })
+    }
+
     /// Column order must match `store::PROJECT_COLS`.
     pub(crate) fn from_row(row: &rusqlite::Row<'_>) -> std::result::Result<Self, rusqlite::Error> {
         Ok(Self {

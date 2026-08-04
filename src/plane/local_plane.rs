@@ -135,11 +135,14 @@ impl ControlPlane for LocalPlane {
         let project = self.project()?;
         println!("{} (local)", project.name);
         println!("  id:      {}", project.id);
-        println!(
-            "  repo:    {}/{} (baseline branch: {})",
-            project.github_owner, project.github_repo, project.baseline_branch
-        );
-        println!("  clone:   {}", project.repo_path);
+        println!("  repo:    {}", project.repo_path);
+        println!("  branch:  {} (baseline)", project.baseline_branch);
+        if project.github_enabled() {
+            println!(
+                "  GitHub:  {}/{}",
+                project.github_owner, project.github_repo
+            );
+        }
         match project
             .run_command
             .as_deref()
@@ -293,7 +296,28 @@ impl ControlPlane for LocalPlane {
         // BEFORE the flag validations below, so e.g. `--host box1` with a default
         // of `ssh` is a valid launch, and before `backend_label` is captured, so
         // telemetry records the resolved backend.
-        crate::local::apply_compute_default(&mut args.backend, &mut args.flavor);
+        let project_id = &self.experiment()?.project_id;
+        let github_enabled = self
+            .store
+            .get_local_project(project_id)?
+            .ok_or_else(|| anyhow!("Local project {project_id} not found."))?
+            .github_enabled();
+        if !github_enabled {
+            match args.backend.as_deref() {
+                None => {
+                    args.backend = Some("local".to_string());
+                    args.flavor = None;
+                }
+                Some("local") => {}
+                Some(_) => {
+                    return Err(anyhow!(
+                        "Remote compute requires this project's GitHub repository. Enable GitHub from the Git tab, then retry."
+                    ));
+                }
+            }
+        } else {
+            crate::local::apply_compute_default(&mut args.backend, &mut args.flavor);
+        }
         if args.manifest.is_some() && args.backend.as_deref() != Some("k8s") {
             return Err(anyhow!("--manifest only applies with --backend k8s."));
         }

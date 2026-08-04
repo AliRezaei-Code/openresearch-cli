@@ -36,7 +36,7 @@ export function ProjectsHome({
   async function onDelete(p: Project) {
     const ok = window.confirm(
       `Delete project "${p.name}"?\n\nIts experiments, runs and chats are removed from orx. ` +
-        `The GitHub repo (${p.githubOwner}/${p.githubRepo}) is kept.`,
+        `The local folder (${p.path})${p.githubEnabled ? " and its GitHub repository" : ""} are kept.`,
     );
     if (!ok) return;
     setDeleting(p.id);
@@ -79,7 +79,7 @@ export function ProjectsHome({
               >
                 <span className="name">{p.name}</span>
                 <span className="repo mono">
-                  {p.githubOwner}/{p.githubRepo} · {p.baselineBranch}
+                  {p.path} · {p.baselineBranch}{p.githubEnabled ? " · GitHub enabled" : " · local only"}
                 </span>
                 {p.paperId && <span className="paper mono">arXiv {p.paperId}</span>}
                 <span className="time">created {timeAgo(p.createdAt)}</span>

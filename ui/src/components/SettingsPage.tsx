@@ -20,7 +20,7 @@ import {
   fmtDuration,
   getComputeSettings,
   getEnvVars,
-  getGitSettings,
+  getProjectGitStatus,
   getHarnesses,
   getHfSettings,
   getK8sSettings,
@@ -33,8 +33,9 @@ import {
   listInstances,
   setComputeDefault,
   provisionModal,
-  removeGitToken,
-  saveGitSettings,
+  enableProjectGithub,
+  initializeProjectGit,
+  pushProjectGithub,
   saveHfToken,
   saveK8sSettings,
   saveRaySettings,
@@ -54,7 +55,8 @@ import {
   type ComputeTargetId,
   type ComputeTargetSummary,
   type EnvVar,
-  type GitSettings,
+  type Project,
+  type ProjectGitStatus,
   type Harness,
   type HarnessId,
   type HfSettings,
@@ -1047,10 +1049,12 @@ function TargetStatusBadge({ t, isDefault }: { t: ComputeTargetSummary; isDefaul
 function DefaultFlavorEditor({
   target,
   flavor,
+  projectId,
   onSaved,
 }: {
   target: ComputeTargetId;
   flavor: string | null;
+  projectId?: string;
   onSaved: (s: ComputeSettings) => void;
 }) {
   const [value, setValue] = useState(flavor ?? "");
@@ -1065,7 +1069,7 @@ function DefaultFlavorEditor({
     setSaving(true);
     setError(null);
     try {
-      onSaved(await setComputeDefault({ backend: target, flavor: value.trim() || null }));
+      onSaved(await setComputeDefault({ backend: target, flavor: value.trim() || null, projectId }));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -1117,19 +1121,25 @@ function DefaultFlavorEditor({
 function TargetRow({
   target,
   isDefault,
+  isFallbackDefault,
   defaultFlavor,
   open,
   onToggle,
   onSettings,
   onError,
+  projectId,
+  onOpenGit,
 }: {
   target: ComputeTargetSummary;
   isDefault: boolean;
+  isFallbackDefault: boolean;
   defaultFlavor: string | null;
   open: boolean;
   onToggle: () => void;
   onSettings: (s: ComputeSettings) => void;
   onError: (msg: string) => void;
+  projectId?: string;
+  onOpenGit: () => void;
 }) {
   // Mounted on first expand, kept mounted (hidden) after — each section's own
   // mount-time fetch is the lazy detail load, and re-expanding doesn't refetch.
@@ -1141,7 +1151,7 @@ function TargetRow({
     if (settingDefault) return;
     setSettingDefault(true);
     try {
-      onSettings(await setComputeDefault({ backend }));
+      onSettings(await setComputeDefault({ backend, projectId }));
     } catch (err) {
       onError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -1150,19 +1160,31 @@ function TargetRow({
   }
 
   return (
-    <div className={`compute-row${open ? " open" : ""}`}>
+    <div className={`compute-row${open ? " open" : ""}${target.enabled ? "" : " disabled"}`}>
       {/* The head is a plain clickable div, NOT role="button": it holds real
           buttons (Make default, the chevron), and interactive elements must
           not nest. The chevron is the keyboard-reachable expand control. */}
-      <div className="compute-row-head" onClick={onToggle}>
+      <div className="compute-row-head" onClick={target.enabled ? onToggle : undefined}>
         <span className="compute-row-logo">
           <BackendLogo kind={TARGET_KIND[target.id]} size={18} />
         </span>
         <span className="compute-row-name">{TARGET_LABELS[target.id]}</span>
         <span className="compute-row-summary">{target.summary}</span>
         <TargetStatusBadge t={target} isDefault={isDefault} />
+        {!target.enabled && (
+          <button
+            type="button"
+            className="btn sm"
+            onClick={(event) => {
+              event.stopPropagation();
+              onOpenGit();
+            }}
+          >
+            {target.disabledReason}
+          </button>
+        )}
         {isDefault ? (
-          <span className="badge compute-default-pill">Default</span>
+          <span className="badge compute-default-pill">{isFallbackDefault ? "Local fallback" : "Default"}</span>
         ) : (
           <button
             type="button"
@@ -1171,7 +1193,7 @@ function TargetRow({
               e.stopPropagation(); // the header click is expand/collapse
               void setDefault(target.id);
             }}
-            disabled={settingDefault}
+            disabled={settingDefault || !target.enabled}
           >
             Make default
           </button>
@@ -1181,17 +1203,18 @@ function TargetRow({
           className="compute-chevron-btn"
           aria-expanded={open}
           aria-label={`${open ? "Collapse" : "Expand"} ${TARGET_LABELS[target.id]}`}
+          disabled={!target.enabled}
           onClick={(e) => {
             e.stopPropagation();
-            onToggle();
+            if (target.enabled) onToggle();
           }}
         >
           <ChevronDown size={16} className="compute-chevron" />
         </button>
       </div>
-      {visited && (
+      {visited && target.enabled && (
         <div className="compute-row-body" hidden={!open}>
-          {isDefault && (
+          {isDefault && !isFallbackDefault && (
             <p className="settings-note compute-default-note">
               The agent launches runs here unless you tell it otherwise, and so does{" "}
               <code>orx exp run</code> with no <code>--backend</code> flag.{" "}
@@ -1212,7 +1235,7 @@ function TargetRow({
             </p>
           )}
           {isDefault && FLAVORED_TARGETS.includes(target.id) && (
-            <DefaultFlavorEditor target={target.id} flavor={defaultFlavor} onSaved={onSettings} />
+            <DefaultFlavorEditor target={target.id} flavor={defaultFlavor} projectId={projectId} onSaved={onSettings} />
           )}
           {target.id === "local" && <LocalSection />}
           {target.id === "hf" && <HfSection />}
@@ -1228,7 +1251,7 @@ function TargetRow({
   );
 }
 
-function ComputeTab() {
+function ComputeTab({ project, onOpenGit }: { project: Project | null; onOpenGit: () => void }) {
   const [settings, setSettings] = useState<ComputeSettings | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<ComputeTargetId | null>(null);
@@ -1237,13 +1260,21 @@ function ComputeTab() {
   // overwritten by a slower background GET that was already in flight.
   const seqRef = useRef(0);
 
+  useEffect(() => {
+    seqRef.current++;
+    setSettings(null);
+    setExpanded(null);
+    setLoadError(null);
+    setError(null);
+  }, [project?.id]);
+
   // Refetched whenever a row expands/collapses (not just on mount): a form
   // saved inside a row (k8s context, HF token, …) changes the collapsed
   // summaries, and the toggle is the natural moment to catch up. Cheap by
   // contract — the endpoint only does fs/env probes.
   useEffect(() => {
     const seq = ++seqRef.current;
-    getComputeSettings()
+    getComputeSettings(project?.id)
       .then((s) => {
         if (seq !== seqRef.current) return;
         setSettings(s);
@@ -1260,7 +1291,7 @@ function ComputeTab() {
           return cur;
         });
       });
-  }, [expanded]);
+  }, [expanded, project?.id]);
 
   const apply = (s: ComputeSettings) => {
     seqRef.current++; // supersede any in-flight background GET
@@ -1270,6 +1301,11 @@ function ComputeTab() {
 
   // Server order is canonical (local first, then external backends).
   const targets = settings ? settings.targets : null;
+  const fallbackDefault =
+    settings?.defaultBackend === "local" &&
+    settings.configuredDefaultBackend !== null &&
+    settings.configuredDefaultBackend !== undefined &&
+    settings.configuredDefaultBackend !== "local";
 
   return (
     <>
@@ -1290,17 +1326,25 @@ function ComputeTab() {
           <div className="compute-list">
             {targets.map((t) => (
               <TargetRow
-                key={t.id}
+                key={`${project?.id ?? "none"}:${t.id}`}
                 target={t}
                 isDefault={settings?.defaultBackend === t.id}
+                isFallbackDefault={Boolean(fallbackDefault && t.id === "local")}
                 defaultFlavor={settings?.defaultFlavor ?? null}
-                open={expanded === t.id}
+                open={t.enabled && expanded === t.id}
                 onToggle={() => setExpanded((cur) => (cur === t.id ? null : t.id))}
                 onSettings={apply}
                 onError={setError}
+                projectId={project?.id}
+                onOpenGit={onOpenGit}
               />
             ))}
           </div>
+          {fallbackDefault && (
+            <p className="settings-note">
+              Using this machine while the project is local-only. Your saved {settings?.configuredDefaultBackend} default will return after GitHub is enabled.
+            </p>
+          )}
           <p className="compute-footnote">
             <Info size={14} aria-hidden="true" />
             <span>
@@ -1738,130 +1782,91 @@ function EnvVarsSection() {
 
 // --- git -----------------------------------------------------------------------
 
-function GitTab() {
-  const [settings, setSettings] = useState<GitSettings | null>(null);
-  const [name, setName] = useState("");
-  const [email, setEmail] = useState("");
+function GitTab({ project, onProjectUpdate }: { project: Project | null; onProjectUpdate: (project: Project) => void }) {
+  const [status, setStatus] = useState<ProjectGitStatus | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const seqRef = useRef(0);
 
-  useEffect(() => {
-    getGitSettings()
-      .then((s) => {
-        setSettings(s);
-        setName(s.userName ?? "");
-        setEmail(s.userEmail ?? "");
-      })
-      .catch(() => {});
-  }, []);
-
-  const unchanged =
-    settings !== null &&
-    name.trim() === (settings.userName ?? "") &&
-    email.trim() === (settings.userEmail ?? "");
-
-  async function submit(e: React.FormEvent) {
-    e.preventDefault();
-    if (saving || unchanged) return;
-    setSaving(true);
+  const load = () => {
+    const request = ++seqRef.current;
+    setStatus(null);
     setError(null);
-    try {
-      const next = await saveGitSettings({ userName: name.trim(), userEmail: email.trim() });
-      setSettings(next);
-      setName(next.userName ?? "");
-      setEmail(next.userEmail ?? "");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSaving(false);
-    }
-  }
+    if (!project) return;
+    void getProjectGitStatus(project.id)
+      .then((projectStatus) => {
+        if (request !== seqRef.current) return;
+        setStatus(projectStatus);
+      })
+      .catch((err) => {
+        if (request === seqRef.current) {
+          setError(err instanceof Error ? err.message : String(err));
+        }
+      });
+  };
+  useEffect(load, [project?.id]);
 
   return (
     <>
       <h1>Git</h1>
       <p className="settings-sub">
-        Experiment branches are committed and pushed from local clones with this identity.
+        Local Git powers experiments. GitHub publishing is optional and configured per project.
       </p>
-      {!settings ? (
+      {!project ? (
+        <div className="settings-card"><p className="settings-note">Open a project to inspect its repository and GitHub publication state.</p></div>
+      ) : error && !status ? (
+        <div className="error">{error}</div>
+      ) : !status ? (
         <div className="settings-loading">
           <span className="spinner" /> Loading…
         </div>
       ) : (
         <>
           <div className="settings-card">
-            <h3>Identity</h3>
-            <form className="form" onSubmit={submit}>
-              <div className="row2">
-                <label>
-                  user.name
-                  <input
-                    type="text"
-                    value={name}
-                    onChange={(e) => setName(e.target.value)}
-                    autoComplete="off"
-                  />
-                </label>
-                <label>
-                  user.email
-                  <input
-                    type="text"
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    autoComplete="off"
-                  />
-                </label>
-              </div>
-              {error && <div className="error">{error}</div>}
-              <div className="actions">
-                <button
-                  type="submit"
-                  className="btn primary"
-                  disabled={saving || unchanged || (!name.trim() && !email.trim())}
-                >
-                  {saving ? "Saving…" : "Save"}
-                </button>
-              </div>
-            </form>
+            <h3>Local repository</h3>
+            <div className="kv">
+              <span className="k">Path</span><span className="v mono">{status.path}</span>
+              <span className="k">Git</span><span className="v">{status.gitVersion ?? "not found"}</span>
+              <span className="k">State</span><span className="v">{status.initialized ? `${status.currentBranch ?? "detached"} · ${status.clean ? "clean" : "has changes"}` : "not initialized"}</span>
+              <span className="k">Baseline</span><span className="v mono">{status.baselineBranch}</span>
+              <span className="k">Remotes</span><span className="v">{status.remotes.length ? status.remotes.map((remote) => `${remote.name}: ${remote.url}`).join(" · ") : "none"}</span>
+            </div>
+            {!status.initialized && <div className="actions"><button className="btn primary" onClick={() => void initializeProjectGit(project.id).then(setStatus).catch((err) => setError(String(err)))}>Initialize Git</button></div>}
           </div>
           <div className="settings-card">
-            <h3>GitHub access</h3>
+            <h3>Identity</h3>
             <div className="kv">
-              <span className="k">git</span>
-              <span className="v">{settings.gitVersion ?? "not found"}</span>
-              <span className="k">Token</span>
-              <span className="v">
-                {settings.githubTokenSource === "env"
-                  ? "GITHUB_TOKEN env var"
-                  : settings.githubTokenSource === "stored"
-                    ? "token saved in orx"
-                    : settings.githubTokenSource === "gh"
-                      ? "gh CLI (gh auth token)"
-                      : "none found"}
-              </span>
+              <span className="k">user.name</span><span className="v">{status.identity.name ?? "not configured"} · {status.identity.nameSource ?? "missing"}</span>
+              <span className="k">user.email</span><span className="v">{status.identity.email ?? "not configured"} · {status.identity.emailSource ?? "missing"}</span>
             </div>
-            {!settings.githubTokenSource && (
+            <p className="settings-note">These are the effective repository values. Change them with <code>git config user.name</code> and <code>git config user.email</code> in the project folder.</p>
+          </div>
+          <div className="settings-card">
+            <h3>GitHub</h3>
+            <div className="kv">
+              <span className="k">Authentication</span><span className="v">{status.github.authenticated ? `Connected via ${status.github.tokenSource}` : "Not connected"}</span>
+              <span className="k">Project</span><span className="v">{status.github.enabled ? `${status.github.owner}/${status.github.repo}` : "Local only"}</span>
+              {status.github.enabled && <><span className="k">Sync</span><span className="v">{status.github.syncStatus}</span></>}
+            </div>
+            {!status.github.authenticated && (
               <>
                 <p className="settings-note">
-                  No GitHub token found — private repo clones and branch pushes will fail. Run{" "}
-                  <code>gh auth login</code>, or paste a personal access token:
+                  GitHub is optional. Connect only when you want remote compute or a hosted copy.
                 </p>
-                <GitTokenForm onSaved={setSettings} />
+                <GitTokenForm onSaved={() => load()} />
               </>
             )}
-            {settings.githubTokenSource === "stored" && (
+            {status.github.authenticated && !status.github.enabled && (
+              <div className="actions"><button className="btn primary" disabled={saving} onClick={() => { setSaving(true); void enableProjectGithub(project.id).then((result) => { setStatus(result.git); onProjectUpdate(result.project); }).catch((err) => setError(err instanceof Error ? err.message : String(err))).finally(() => setSaving(false)); }}>{saving ? "Publishing…" : "Enable GitHub for this project"}</button></div>
+            )}
+            {status.github.enabled && (
               <div className="actions">
-                <button
-                  className="btn"
-                  onClick={() => {
-                    void removeGitToken().then(setSettings).catch(() => {});
-                  }}
-                >
-                  Remove saved token
-                </button>
+                {status.github.url && <a className="btn" href={status.github.url} target="_blank" rel="noreferrer">Open on GitHub <ExternalLink size={12} /></a>}
+                <button className="btn primary" disabled={saving} onClick={() => { setSaving(true); void pushProjectGithub(project.id).then((result) => { setStatus(result.git); onProjectUpdate(result.project); }).catch((err) => setError(err instanceof Error ? err.message : String(err))).finally(() => setSaving(false)); }}>Push now</button>
               </div>
             )}
           </div>
+          {error && <div className="error">{error}</div>}
         </>
       )}
     </>
@@ -2249,11 +2254,21 @@ export const SETTINGS_NAV: { id: Tab; label: string; icon: React.ReactNode }[] =
 ];
 
 /** One settings section's content, shown in the middle pane in place of chat. */
-export function SettingsView({ tab }: { tab: Tab }) {
+export function SettingsView({
+  tab,
+  project,
+  onProjectUpdate,
+  onSelectTab,
+}: {
+  tab: Tab;
+  project: Project | null;
+  onProjectUpdate: (project: Project) => void;
+  onSelectTab: (tab: Tab) => void;
+}) {
   return (
     <div className="settings-view">
       {tab === "harnesses" && <HarnessesTab />}
-      {tab === "compute" && <ComputeTab />}
+      {tab === "compute" && <ComputeTab project={project} onOpenGit={() => onSelectTab("git")} />}
       {tab === "environment" && (
         <>
           <h1>Environment</h1>
@@ -2264,7 +2279,7 @@ export function SettingsView({ tab }: { tab: Tab }) {
         </>
       )}
       {tab === "instances" && <InstancesTab />}
-      {tab === "git" && <GitTab />}
+      {tab === "git" && <GitTab project={project} onProjectUpdate={onProjectUpdate} />}
       {tab === "storage" && <StorageTab />}
     </div>
   );

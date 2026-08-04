@@ -121,7 +121,7 @@ function escapeRegExp(s: string): string {
 // worktree. Relative paths name files in the click context's checkout and
 // inherit `contextSessionId`; the regex fallbacks encode the
 // ~/.cache/openresearch/ layouts from src/local/git.rs:
-// worktrees/<owner>/<repo>/<session>/… and repos/<owner>/<repo>/….
+// worktrees/<project-id>/<session>/… and the legacy repos/<owner>/<repo>/….
 function parseFilePath(
   rawPath: string,
   repoPath?: string,
@@ -149,7 +149,7 @@ function parseFilePath(
     // migrated to files/ in place, so it never appears in a live path.)
     const slugPat = slug ? escapeRegExp(slug) : "[^/]+";
     const fd = path.match(new RegExp(`/files/${slugPat}/(.+)$`));
-    const wt = fd ? null : path.match(/\/openresearch\/worktrees\/[^/]+\/[^/]+\/([^/]+)\/(.+)$/);
+    const wt = fd ? null : path.match(/\/openresearch\/worktrees\/[^/]+\/([^/]+)\/(.+)$/);
     const hub = fd || wt ? null : path.match(/\/openresearch\/repos\/[^/]+\/[^/]+\/(.+)$/);
     if (fd) {
       return { path: fd[1], source: "artifacts" };
@@ -728,7 +728,14 @@ export default function App() {
                 ) : null;
               })()
             ) : mainView !== "chat" ? (
-              <SettingsView tab={mainView} />
+              <SettingsView
+                tab={mainView}
+                project={activeProject}
+                onProjectUpdate={(project) =>
+                  setProjects((current) => (current ? upsert(current, project) : [project]))
+                }
+                onSelectTab={setMainView}
+              />
             ) : null}
           </ChatPanel>
         )}

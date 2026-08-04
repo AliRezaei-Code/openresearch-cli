@@ -8,6 +8,9 @@ export interface Project {
   githubRepo: string;
   baselineBranch: string;
   repoPath: string;
+  path: string;
+  githubEnabled: boolean;
+  githubUrl?: string | null;
   /** Absolute path of the project's artifacts directory, non-canonical to
    *  match paths agents inline into chat. */
   artifactsDir: string;
@@ -87,18 +90,12 @@ export const listProjects = () =>
 
 export interface NewProject {
   name: string;
-  githubOwner?: string;
-  githubRepo?: string;
-  githubOrganization?: string;
-  baselineBranch?: string;
+  path: string;
   runCommand?: string;
-  /** arXiv id the project starts from (versionless). */
   paperId?: string;
-  /** Create a blank private repo on the user's GitHub account instead. */
-  createRepo?: boolean;
-  /** Fork-by-copy the repo into a fresh `<repo>-<hash>` repo on the user's
-   * account. Applied automatically when they lack push access. */
-  forkRepo?: boolean;
+  cloneUrl?: string;
+  createFolder?: boolean;
+  initializeGit?: boolean;
 }
 
 export const createProject = (body: NewProject) =>
@@ -515,21 +512,29 @@ export interface ComputeTargetSummary {
    */
   unverified?: boolean;
   summary: string;
+  enabled: boolean;
+  disabledReason?: string | null;
 }
 
 export interface ComputeSettings {
   defaultBackend: ComputeTargetId | null;
   defaultFlavor: string | null;
   targets: ComputeTargetSummary[];
+  configuredDefaultBackend?: ComputeTargetId | null;
+  configuredDefaultFlavor?: string | null;
 }
 
-export const getComputeSettings = () => get<ComputeSettings>("/api/settings/compute");
+export const getComputeSettings = (projectId?: string) =>
+  get<ComputeSettings>(
+    `/api/settings/compute${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ""}`,
+  );
 
 /** Set (or clear, with backend: null) the default compute target. Responds
  * with the full compute payload so the caller reconciles in one shot. */
 export const setComputeDefault = (body: {
   backend: ComputeTargetId | null;
   flavor?: string | null;
+  projectId?: string;
 }) => post<ComputeSettings>("/api/settings/compute/default", body);
 
 export interface LocalGpu {
@@ -632,6 +637,43 @@ export const saveGitToken = (token: string) =>
 
 export const removeGitToken = () =>
   fetch("/api/settings/git/token", { method: "DELETE" }).then((r) => json<GitSettings>(r));
+
+export interface ProjectGitStatus {
+  path: string;
+  gitVersion: string | null;
+  initialized: boolean;
+  baselineBranch: string;
+  currentBranch: string | null;
+  clean: boolean | null;
+  remotes: { name: string; url: string }[];
+  identity: {
+    name: string | null;
+    email: string | null;
+    nameSource: "local" | "global" | null;
+    emailSource: "local" | "global" | null;
+  };
+  github: {
+    authenticated: boolean;
+    tokenSource: "env" | "stored" | "gh" | null;
+    enabled: boolean;
+    owner: string;
+    repo: string;
+    url: string | null;
+    syncStatus: string | null;
+  };
+}
+
+export const getProjectGitStatus = (projectId: string) =>
+  get<ProjectGitStatus>(`/api/projects/${projectId}/git`);
+
+export const initializeProjectGit = (projectId: string) =>
+  post<ProjectGitStatus>(`/api/projects/${projectId}/git/init`);
+
+export const enableProjectGithub = (projectId: string) =>
+  post<{ project: Project; git: ProjectGitStatus }>(`/api/projects/${projectId}/github`);
+
+export const pushProjectGithub = (projectId: string) =>
+  post<{ project: Project; git: ProjectGitStatus }>(`/api/projects/${projectId}/github/push`);
 
 export interface TelemetrySettings {
   /** Whether anonymous usage analytics is currently on. */

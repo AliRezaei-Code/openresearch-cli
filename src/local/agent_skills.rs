@@ -55,12 +55,16 @@ pub enum SkillSet {
 // public skill name) ----------------------------------------------------------
 
 const COMPUTE_LOCAL: &str = include_str!("../../agent-skills/orx-compute/SKILL.local.md");
+const COMPUTE_LOCAL_ONLY: &str = include_str!("../../agent-skills/orx-compute/SKILL.local-only.md");
 const COMPUTE_CLOUD: &str = include_str!("../../agent-skills/orx-compute/SKILL.md");
 const COMPUTE_K8S: &str = include_str!("../../agent-skills/orx-compute-k8s/SKILL.md");
 const EXPERIMENT_TREE_LOCAL: &str =
     include_str!("../../agent-skills/orx-experiment-tree/SKILL.local.md");
 const EXPERIMENT_TREE_CLOUD: &str = include_str!("../../agent-skills/orx-experiment-tree/SKILL.md");
 const GIT_EDITING: &str = include_str!("../../agent-skills/orx-git/SKILL.md");
+const EXPERIMENT_TREE_LOCAL_ONLY: &str =
+    include_str!("../../agent-skills/orx-experiment-tree/SKILL.local-only.md");
+const GIT_LOCAL_ONLY: &str = include_str!("../../agent-skills/orx-git/SKILL.local-only.md");
 const LIT: &str = include_str!("../../agent-skills/orx-lit/SKILL.md");
 const CREATE: &str = include_str!("../../agent-skills/orx-create/SKILL.md");
 const REPORTS_LOCAL: &str = include_str!("../../agent-skills/orx-reports/SKILL.local.md");
@@ -179,18 +183,53 @@ pub fn find(name: &str, set: SkillSet) -> Option<&'static AgentSkill> {
         .find(|s| s.name == want || s.name.strip_prefix("orx-") == Some(want))
 }
 
+pub fn available_in_session(skill: &AgentSkill, github_enabled: bool) -> bool {
+    github_enabled || skill.name != "orx-compute-k8s"
+}
+
+pub fn session_content(skill: &AgentSkill, github_enabled: bool) -> &'static str {
+    if github_enabled {
+        return skill.content;
+    }
+    match skill.name {
+        "orx-git" => GIT_LOCAL_ONLY,
+        "orx-compute" => COMPUTE_LOCAL_ONLY,
+        "orx-experiment-tree" => EXPERIMENT_TREE_LOCAL_ONLY,
+        _ => skill.content,
+    }
+}
+
+pub fn session_description(skill: &AgentSkill, github_enabled: bool) -> &'static str {
+    if github_enabled {
+        return skill.description;
+    }
+    match skill.name {
+        "orx-git" => "Read, edit, commit, and diff experiment code with local Git only.",
+        "orx-compute" => "Launch committed experiments on this machine and inspect their logs.",
+        _ => skill.description,
+    }
+}
+
 /// Write the [`SkillSet::Local`] modules as `<worktree>/<skills_dir_rel>/<name>/SKILL.md`,
 /// overwriting every file on every call (same freshness semantics as the
 /// playbook — zero drift). Returns `Err` on the first write failure; the caller
 /// treats it like a playbook-write error.
-pub fn ensure_session_skills(worktree: &Path, skills_dir_rel: &str) -> Result<()> {
+pub fn ensure_session_skills(
+    worktree: &Path,
+    skills_dir_rel: &str,
+    github_enabled: bool,
+) -> Result<()> {
     let base = worktree.join(skills_dir_rel);
     for skill in skills(SkillSet::Local) {
+        if !available_in_session(skill, github_enabled) {
+            continue;
+        }
         let dir = base.join(skill.name);
         std::fs::create_dir_all(&dir)
             .map_err(|e| anyhow!("Could not create {}: {}", dir.display(), e))?;
         let path = dir.join("SKILL.md");
-        std::fs::write(&path, skill.content)
+        let content = session_content(skill, github_enabled);
+        std::fs::write(&path, content)
             .map_err(|e| anyhow!("Could not write {}: {}", path.display(), e))?;
     }
     Ok(())
@@ -366,7 +405,7 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let rel = ".claude/skills";
-        ensure_session_skills(&tmp, rel).unwrap();
+        ensure_session_skills(&tmp, rel, true).unwrap();
 
         let base = tmp.join(rel);
         let expected: HashSet<&str> = skills(SkillSet::Local).iter().map(|s| s.name).collect();
@@ -384,7 +423,7 @@ mod tests {
         }
 
         // Idempotent: a second call overwrites in place and changes nothing.
-        ensure_session_skills(&tmp, rel).unwrap();
+        ensure_session_skills(&tmp, rel, true).unwrap();
         let got2: HashSet<String> = std::fs::read_dir(&base)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -392,5 +431,24 @@ mod tests {
         assert_eq!(got2, got, "second call is idempotent");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn local_only_session_skills_override_push_instructions() {
+        let tmp = std::env::temp_dir().join(format!(
+            "orx-local-only-skills-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let rel = ".agents/skills";
+        ensure_session_skills(&tmp, rel, false).unwrap();
+        let git = std::fs::read_to_string(tmp.join(rel).join("orx-git/SKILL.md")).unwrap();
+        assert!(git.contains("This project is local-only"));
+        assert!(!git.contains("git push"));
+        assert!(!git.contains("origin/"));
+        let compute = std::fs::read_to_string(tmp.join(rel).join("orx-compute/SKILL.md")).unwrap();
+        assert!(!compute.contains("branch tip"));
+        assert!(!compute.contains("git push"));
+        assert!(!tmp.join(rel).join("orx-compute-k8s").exists());
+        let _ = std::fs::remove_dir_all(tmp);
     }
 }
