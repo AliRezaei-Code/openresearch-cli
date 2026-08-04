@@ -633,22 +633,21 @@ export const saveGitToken = (token: string) =>
 export const removeGitToken = () =>
   fetch("/api/settings/git/token", { method: "DELETE" }).then((r) => json<GitSettings>(r));
 
-export interface TelemetrySettings {
-  /** Whether anonymous usage analytics is currently on. */
-  enabled: boolean;
-  /** When off, a short human reason (e.g. "--no-telemetry flag"); null when on. */
-  reason: string | null;
+/** A paper linked to the researcher profile during onboarding. */
+export interface LinkedPaper {
+  paperId: string;
+  title: string | null;
 }
 
-export const getTelemetry = () => get<TelemetrySettings>("/api/settings/telemetry");
+/** The local researcher profile captured in onboarding (settings.json). */
+export interface Profile {
+  background: string | null;
+  papers: LinkedPaper[];
+}
 
-export const setTelemetry = (enabled: boolean) =>
-  post<TelemetrySettings>("/api/settings/telemetry", { enabled });
+export const getProfile = () => get<Profile>("/api/settings/profile");
 
-/** Record the consent decision (agree/reject) once, when the user leaves the
- * onboarding step — fires unconditionally so opt-outs are counted too. */
-export const recordTelemetryConsent = (enabled: boolean) =>
-  post<{ ok: boolean }>("/api/settings/telemetry/consent", { enabled });
+export const setProfile = (body: Profile) => post<Profile>("/api/settings/profile", body);
 
 export type HarnessId = "claude-code" | "codex" | "opencode";
 
