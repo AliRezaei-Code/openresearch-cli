@@ -143,3 +143,152 @@ pub(crate) fn spawn_detached_supervise(run_id: &str) -> Result<()> {
         .map_err(|e| anyhow!("Could not spawn `orx supervise {}`: {}", run_id, e))?;
     Ok(())
 }
+
+/// Persist cancel intent and ensure an orphaned run gets a fresh supervisor.
+pub(crate) fn request_local_run_cancel(store: &Store, run_id: &str) -> Result<()> {
+    let lock_path = crate::store::log_path(run_id).with_extension("cancel.lock");
+    request_local_run_cancel_with(store, run_id, &lock_path, || {}, spawn_detached_supervise)
+}
+
+fn request_local_run_cancel_with(
+    store: &Store,
+    run_id: &str,
+    lock_path: &std::path::Path,
+    before_lock: impl FnOnce(),
+    spawn: impl FnOnce(&str) -> Result<()>,
+) -> Result<()> {
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path)?;
+    let mut cancel_lock = fd_lock::RwLock::new(lock_file);
+    before_lock();
+    let _cancel_guard = cancel_lock.write()?;
+    let prior = store
+        .get_run(run_id)?
+        .ok_or_else(|| anyhow!("Run {run_id} not found in the local store."))?
+        .cancel_requested;
+    store.set_cancel_requested(run_id, true)?;
+    if let Err(spawn_err) = spawn(run_id) {
+        if let Err(rollback_err) = store.set_cancel_requested(run_id, prior) {
+            return Err(anyhow!(
+                "Could not recover the supervisor: {spawn_err}; could not restore retryable cancel state: {rollback_err}"
+            ));
+        }
+        return Err(spawn_err);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::StoredRun;
+
+    fn run_fixture() -> StoredRun {
+        StoredRun {
+            id: "run-1".into(),
+            experiment_id: "experiment-1".into(),
+            project_id: "project-1".into(),
+            status: "running".into(),
+            backend_json: "{}".into(),
+            command: String::new(),
+            created_at: 1,
+            updated_at: 1,
+            ended_at: None,
+            exit_code: None,
+            commit_sha: None,
+            result_markdown: None,
+            cancel_requested: false,
+            chat_session_id: None,
+        }
+    }
+
+    #[test]
+    fn failed_supervisor_spawn_restores_cancel_retry() {
+        let dir =
+            std::env::temp_dir().join(format!("orx-cancel-spawn-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let run = run_fixture();
+        store.upsert_run(&run).unwrap();
+        let lock_path = dir.join("cancel.lock");
+
+        let result = request_local_run_cancel_with(
+            &store,
+            &run.id,
+            &lock_path,
+            || {},
+            |_| Err(anyhow!("synthetic spawn failure")),
+        );
+        assert!(result.is_err());
+        assert!(!store.get_run(&run.id).unwrap().unwrap().cancel_requested);
+
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_spawn_failure_preserves_successful_cancel_intent() {
+        let dir = std::env::temp_dir().join(format!(
+            "orx-cancel-concurrency-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let run = run_fixture();
+        store.upsert_run(&run).unwrap();
+        drop(store);
+        let lock_path = dir.join("cancel.lock");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+
+        let first_dir = dir.clone();
+        let first_lock = lock_path.clone();
+        let first = std::thread::spawn(move || {
+            let store = Store::open_at(first_dir).unwrap();
+            request_local_run_cancel_with(
+                &store,
+                "run-1",
+                &first_lock,
+                || {},
+                |_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Err(anyhow!("synthetic spawn failure"))
+                },
+            )
+            .unwrap_err();
+        });
+        entered_rx.recv().unwrap();
+
+        let second_dir = dir.clone();
+        let second_lock = lock_path.clone();
+        let second = std::thread::spawn(move || {
+            let store = Store::open_at(second_dir).unwrap();
+            request_local_run_cancel_with(
+                &store,
+                "run-1",
+                &second_lock,
+                || attempted_tx.send(()).unwrap(),
+                |_| Ok(()),
+            )
+            .unwrap();
+            completed_tx.send(()).unwrap();
+        });
+        attempted_rx.recv().unwrap();
+        let completed_while_locked = completed_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .is_ok();
+        release_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let store = Store::open_at(dir.clone()).unwrap();
+        assert!(!completed_while_locked);
+        assert!(store.get_run("run-1").unwrap().unwrap().cancel_requested);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

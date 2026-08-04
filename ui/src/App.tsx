@@ -918,7 +918,7 @@ export default function App() {
                           "changes",
                         );
                     }}
-                    onCancel={(runId) => void cancelRun(runId).catch(() => {})}
+                    onCancel={cancelRun}
                   />
                 )}
               </div>

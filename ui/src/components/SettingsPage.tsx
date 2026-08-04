@@ -47,6 +47,7 @@ import {
   type DataDirValidation,
   shortId,
   rayPreflight,
+  runDisplayStatus,
   slurmPreflight,
   sshPreflight,
   timeAgo,
@@ -2156,7 +2157,7 @@ function InstancesTable({ instances, emptyLabel }: { instances: Instance[]; empt
                 </td>
                 <td>{inst.projectName ?? shortId(inst.projectId)}</td>
                 <td>
-                  <StatusBadge status={inst.status} />
+                  <StatusBadge status={runDisplayStatus(inst)} />
                 </td>
                 <td>{timeAgo(inst.createdAt)}</td>
                 <td>{runtimeLabel(inst)}</td>
