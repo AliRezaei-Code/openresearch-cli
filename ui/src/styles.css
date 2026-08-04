@@ -2676,6 +2676,104 @@ textarea::placeholder {
   color: var(--muted);
   line-height: 1.5;
 }
+/* Step 3 (research background): a free-text blurb plus alphaXiv paper links. */
+.onb-textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 78px;
+  line-height: 1.5;
+  font-size: var(--fs-base);
+}
+.onb-paper-search {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+}
+.onb-paper-search input {
+  width: 100%;
+}
+.onb-paper-results {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  max-height: 200px;
+  overflow-y: auto;
+}
+.onb-paper-results button {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 8px 10px;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--border-variant);
+  text-align: left;
+  font: inherit;
+  color: var(--text);
+  cursor: pointer;
+}
+.onb-paper-results button:last-child {
+  border-bottom: none;
+}
+.onb-paper-results button:hover {
+  background: var(--surface);
+}
+.onb-paper-results .title {
+  font-size: var(--fs-md);
+  font-weight: var(--fw-medium);
+}
+.onb-paper-results .id {
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+.onb-paper-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+.onb-paper-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 4px 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-size: var(--fs-sm);
+  max-width: 100%;
+}
+.onb-paper-chip .title {
+  font-weight: var(--fw-medium);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 240px;
+}
+.onb-paper-chip .id {
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+.onb-paper-chip button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  border-radius: var(--radius-xs);
+}
+.onb-paper-chip button:hover {
+  color: var(--text);
+  background: var(--panel);
+}
 /* The identity command is long — let it wrap inside the chip rather than
    overflow the card. */
 .onb-aside .onb-cmd-chip {
