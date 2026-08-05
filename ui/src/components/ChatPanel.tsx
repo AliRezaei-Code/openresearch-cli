@@ -62,17 +62,7 @@ import {
 } from "./ModelPicker";
 import { ContextMeter } from "./ContextMeter";
 import { renderNote } from "./agentNote";
-
-const SELECTION_STORAGE_KEY = "orx:agent-selection";
-
-function loadSelection(): ModelSelection | null {
-  try {
-    const raw = localStorage.getItem(SELECTION_STORAGE_KEY);
-    return raw ? (JSON.parse(raw) as ModelSelection) : null;
-  } catch {
-    return null;
-  }
-}
+import { loadAgentSelection, saveAgentSelection } from "../agentSelection";
 
 // --- chat state --------------------------------------------------------------
 
@@ -1206,7 +1196,7 @@ export function ChatPanel({
     busySessions: new Set<string>(),
   });
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
-  const [selection, setSelection] = useState<ModelSelection | null>(loadSelection);
+  const [selection, setSelection] = useState<ModelSelection | null>(loadAgentSelection);
   // Unsent composer tweaks (model/mode/reasoning) for the *open* session — the
   // session's harness is fixed, so these override only its mutable settings and
   // are applied (and persisted server-side) on the next send. Cleared when the
@@ -1371,7 +1361,7 @@ export function ChatPanel({
     if (!composerSelection) return;
     const merged = { ...composerSelection, ...next };
     setSelection(merged);
-    localStorage.setItem(SELECTION_STORAGE_KEY, JSON.stringify(merged));
+    saveAgentSelection(merged);
     if (openSession) setSessionOverride((cur) => ({ ...cur, ...next }));
   };
   const setPermissionMode = (id: string) => selectModel({ permissionMode: id });

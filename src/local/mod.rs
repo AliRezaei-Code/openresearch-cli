@@ -14,6 +14,7 @@ pub mod chat;
 pub mod claude;
 pub mod codex;
 pub mod datadir;
+pub mod demo;
 pub mod experiments;
 pub mod files;
 pub mod git;

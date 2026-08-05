@@ -2608,6 +2608,24 @@ textarea::placeholder {
   border-radius: var(--radius-lg);
   padding: 18px 20px;
 }
+.onb-agent-choice {
+  width: 100%;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+.onb-agent-choice:not(:disabled):hover {
+  border-color: var(--muted);
+}
+.onb-agent-choice.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.onb-agent-choice:disabled {
+  cursor: default;
+}
 .onb-card-head {
   display: flex;
   align-items: center;

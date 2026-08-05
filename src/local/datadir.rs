@@ -268,7 +268,8 @@ fn finalize(target: &Path, total: u64, on_progress: &impl Fn(MoveProgress)) -> R
         copied_bytes: total,
         total_bytes: total,
     });
-    crate::config::set_settings_data_dir(Some(target.to_string_lossy().into_owned()))
+    crate::config::set_settings_data_dir(Some(target.to_string_lossy().into_owned()))?;
+    super::demo::repair_installed_origin(target)
 }
 
 /// Recursively copy `src` into `dst` (both dirs), accumulating copied bytes into

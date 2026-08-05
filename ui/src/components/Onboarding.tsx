@@ -6,30 +6,37 @@ import {
   getHarnesses,
   getProfile,
   harnessModelLabel,
+  completeOnboarding,
+  reasoningFor,
   searchPapers,
-  setProfile,
   type GitSettings,
   type Harness,
+  type HarnessId,
   type LinkedPaper,
   type PaperHit,
+  type Project,
 } from "../api";
 import { GitTokenForm } from "./GitTokenForm";
 import { renderNote } from "./agentNote";
 import { onHarnessAuth } from "../events";
+import { saveAgentSelection, type AgentSelection } from "../agentSelection";
 
 const RETRY_COPY = "Couldn't reach orx. Check it's still running, then re-check.";
 
 /** First-run walkthrough: the detected coding agents, then GitHub access, then a
- * short research-background prompt, then hand off to the (empty) projects page.
+ * short research-background prompt, then install and open the demo project.
  * Step 1 gates — orx can't chat without a signed-in agent. Steps 2 and 3 don't:
  * cloning/pushing work over SSH keys, and the background (a blurb + linked
- * papers) is optional, saved best-effort so it never blocks finishing. The
+ * papers) is optional, saved best-effort so it never blocks installation. The
  * data-dir choice lives in Settings → Storage (which can also *move* existing
  * data); usage analytics is opt-out via the CLI (`orx telemetry off`). */
-export function Onboarding({ onDone }: { onDone: () => void }) {
+export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
   const [step, setStep] = useState<0 | 1 | 2>(0);
   const [harnesses, setHarnesses] = useState<Harness[] | null>(null);
   const [git, setGit] = useState<GitSettings | null>(null);
+  const [finishing, setFinishing] = useState(false);
+  const [finishError, setFinishError] = useState<string | null>(null);
+  const [preferredHarness, setPreferredHarness] = useState<HarnessId | null>(null);
   const [checking, setChecking] = useState(false);
   // Step 3 (optional): a free-text background plus any alphaXiv papers linked
   // via title search. Prefilled from any saved profile so a replayed
@@ -40,6 +47,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   const [paperHits, setPaperHits] = useState<PaperHit[]>([]);
   const [searchingPapers, setSearchingPapers] = useState(false);
   const paperSeq = useRef(0);
+  const harnessSelectionInvalidated = useRef(false);
   // Per-probe, not one shared flag: a git failure must not put a connectivity
   // error on the harness gate it has nothing to do with — or worse, hide the
   // actionable "sign in" hint behind it.
@@ -90,6 +98,18 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
       .finally(() => setChecking(false));
   };
   useEffect(() => load(false), []);
+  useEffect(() => {
+    if (harnesses === null) return;
+    const ready = harnesses.filter((h) => h.agentReady);
+    setPreferredHarness((current) => {
+      if (current && !ready.some((h) => h.id === current)) {
+        harnessSelectionInvalidated.current = true;
+        return null;
+      }
+      if (current) return current;
+      return ready.length === 1 && !harnessSelectionInvalidated.current ? ready[0].id : null;
+    });
+  }, [harnesses]);
   useEffect(
     () =>
       onHarnessAuth(() => {
@@ -142,11 +162,24 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   };
   const removePaper = (id: string) => setPapers((cur) => cur.filter((p) => p.paperId !== id));
 
-  // Persist the profile, then finish. Best-effort — an empty or failed save
-  // must never trap the user on the last step.
-  const finish = () => {
-    void setProfile({ background: background.trim() || null, papers }).catch(() => {});
-    onDone();
+  const finishOnboarding = async () => {
+    const harness = harnesses?.find((item) => item.id === preferredHarness && item.agentReady);
+    if (!harness || finishing) return;
+    const selection = selectionFor(harness);
+    setFinishing(true);
+    setFinishError(null);
+    try {
+      const completion = await completeOnboarding(selection, {
+        background: background.trim() || null,
+        papers,
+      });
+      saveAgentSelection(completion.selection);
+      onDone(completion.project);
+    } catch (error) {
+      setFinishError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setFinishing(false);
+    }
   };
 
   return (
@@ -164,7 +197,17 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
             </p>
             <div className="onb-cards">
               {harnesses !== null ? (
-                harnesses.map((h) => <AgentCard key={h.id} h={h} />)
+                harnesses.map((h) => (
+                  <AgentCard
+                    key={h.id}
+                    h={h}
+                    selected={preferredHarness === h.id}
+                    onSelect={() => {
+                      harnessSelectionInvalidated.current = false;
+                      setPreferredHarness(h.id);
+                    }}
+                  />
+                ))
               ) : harnessError ? (
                 // Never a spinner next to an error — detection isn't running.
                 <div className="onb-card-meta">{RETRY_COPY}</div>
@@ -177,6 +220,9 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
             {harnesses !== null && !anyAgentReady && (
               <p className="onb-gate-hint">Sign in to at least one agent to continue.</p>
             )}
+            {harnesses !== null && anyAgentReady && preferredHarness === null && (
+              <p className="onb-gate-hint">Choose the agent you want to use for your demo.</p>
+            )}
             <div className="onb-actions">
               <button className="btn ghost" onClick={() => load(true, true)} disabled={checking}>
                 <RefreshCw size={12} className={checking ? "spin" : ""} /> Re-check
@@ -185,9 +231,13 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
               <button
                 className="btn primary"
                 onClick={() => setStep(1)}
-                disabled={!anyAgentReady}
+                disabled={!anyAgentReady || preferredHarness === null}
                 title={
-                  anyAgentReady ? undefined : "Sign in to at least one coding agent to continue"
+                  !anyAgentReady
+                    ? "Sign in to at least one coding agent to continue"
+                    : preferredHarness === null
+                      ? "Choose your preferred coding agent"
+                      : undefined
                 }
               >
                 Continue <ArrowRight size={13} />
@@ -257,6 +307,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                   className="onb-textarea"
                   value={background}
                   onChange={(e) => setBackground(e.target.value)}
+                  disabled={finishing}
                   rows={4}
                   placeholder="e.g. I work on sample-efficient RL for LLM post-training, focused on reward-model-free methods."
                 />
@@ -264,6 +315,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                   <input
                     value={paperQuery}
                     onChange={(e) => setPaperQuery(e.target.value)}
+                    disabled={finishing}
                     placeholder="Search alphaXiv by title to link a paper…"
                   />
                   {searchingPapers ? (
@@ -271,7 +323,12 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                   ) : paperHits.length > 0 ? (
                     <div className="onb-paper-results">
                       {paperHits.map((h) => (
-                        <button key={h.paperId} type="button" onClick={() => addPaper(h)}>
+                        <button
+                          key={h.paperId}
+                          type="button"
+                          onClick={() => addPaper(h)}
+                          disabled={finishing}
+                        >
                           <span className="title">{cleanPaperTitle(h.title)}</span>
                           <span className="id">{h.paperId}</span>
                         </button>
@@ -289,6 +346,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                           type="button"
                           aria-label={`Remove ${p.paperId}`}
                           onClick={() => removePaper(p.paperId)}
+                          disabled={finishing}
                         >
                           <X size={12} />
                         </button>
@@ -305,14 +363,32 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
               artifacts — change where they live any time in Settings → Storage.
             </p>
             <div className="onb-actions">
-              <button className="btn ghost" onClick={() => setStep(1)}>
+              <button className="btn ghost" onClick={() => setStep(1)} disabled={finishing}>
                 <ArrowLeft size={12} /> Back
               </button>
               <div style={{ flex: 1 }} />
-              <button className="btn primary" onClick={finish}>
-                Create your first project <ArrowRight size={13} />
+              <button
+                className="btn primary"
+                onClick={() => void finishOnboarding()}
+                disabled={finishing || preferredHarness === null}
+              >
+                {finishing ? (
+                  <>
+                    <span className="spinner" /> Installing demo…
+                  </>
+                ) : (
+                  <>
+                    Open demo project <ArrowRight size={13} />
+                  </>
+                )}
               </button>
             </div>
+            {preferredHarness === null && (
+              <p className="onb-gate-hint">
+                Your selected agent is no longer ready. Go back to Step 1 and choose another.
+              </p>
+            )}
+            {finishError && <p className="onb-gate-hint">{finishError}</p>}
           </>
         )}
       </div>
@@ -362,11 +438,35 @@ function agentBadge(h: Harness): { cls: string; label: string } {
   return { cls: "st-idle", label: "Not detected" };
 }
 
-function AgentCard({ h }: { h: Harness }) {
+function selectionFor(harness: Harness): AgentSelection {
+  const model = harness.models[0]?.id ?? null;
+  return {
+    harness: harness.id,
+    model,
+    permissionMode: harness.options?.defaultPermissionMode ?? null,
+    reasoningLevel: reasoningFor(harness, model).defaultId,
+  };
+}
+
+function AgentCard({
+  h,
+  selected,
+  onSelect,
+}: {
+  h: Harness;
+  selected: boolean;
+  onSelect: () => void;
+}) {
   const badge = agentBadge(h);
   const version = h.version?.replace(/\s*\(.*\)$/, "");
   return (
-    <div className="onb-card">
+    <button
+      type="button"
+      className={`onb-card onb-agent-choice${selected ? " selected" : ""}`}
+      disabled={!h.agentReady}
+      aria-pressed={selected}
+      onClick={onSelect}
+    >
       <div className="onb-card-head">
         <span className="onb-card-name">{h.name}</span>
         <span className={`status-badge ${badge.cls}`}>
@@ -396,7 +496,7 @@ function AgentCard({ h }: { h: Harness }) {
       ) : (
         <div className="onb-card-meta">{renderNote(h.agentNote)}</div>
       )}
-    </div>
+    </button>
   );
 }
 

@@ -9,11 +9,7 @@ use std::process::Command;
 use crate::error::{anyhow, Result};
 
 pub fn clones_root() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".cache")
-        .join("openresearch")
-        .join("repos")
+    cache_root().join("repos")
 }
 
 pub fn clone_path(owner: &str, repo: &str) -> PathBuf {
@@ -24,13 +20,18 @@ pub fn clone_path(owner: &str, repo: &str) -> PathBuf {
 /// (`~/.cache/openresearch/worktrees/<owner>/<repo>/<session-id>`). Kept
 /// outside `repos/` so a worktree can never collide with a real repo name.
 pub fn worktrees_root(owner: &str, repo: &str) -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".cache")
-        .join("openresearch")
-        .join("worktrees")
-        .join(owner)
-        .join(repo)
+    cache_root().join("worktrees").join(owner).join(repo)
+}
+
+fn cache_root() -> PathBuf {
+    std::env::var_os("ORX_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".cache")
+                .join("openresearch")
+        })
 }
 
 pub fn session_worktree_path(owner: &str, repo: &str, session_id: &str) -> PathBuf {
@@ -132,6 +133,10 @@ pub fn ensure_clone(owner: &str, repo: &str, baseline_branch: &str) -> Result<Pa
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow!("Could not create {}: {}", parent.display(), e))?;
     }
+    if let Some(origin) = super::demo::installed_origin(owner, repo) {
+        restore_local_clone(&dir, &origin, baseline_branch)?;
+        return Ok(dir);
+    }
     let target = dir.to_string_lossy().to_string();
     // Test seam: ORX_GIT_REMOTE_BASE=file:///some/root clones <base>/<owner>/<repo>.
     if let Ok(base) = std::env::var("ORX_GIT_REMOTE_BASE") {
@@ -155,6 +160,37 @@ pub fn ensure_clone(owner: &str, repo: &str, baseline_branch: &str) -> Result<Pa
     Ok(dir)
 }
 
+pub(crate) fn restore_local_clone(dir: &Path, origin: &Path, baseline_branch: &str) -> Result<()> {
+    if dir.exists()
+        && std::fs::read_dir(dir)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(true)
+    {
+        return Err(anyhow!(
+            "The reserved repository cache path {} is not empty; move it aside and retry.",
+            dir.display()
+        ));
+    }
+    std::fs::create_dir_all(dir)
+        .map_err(|e| anyhow!("Could not create {}: {}", dir.display(), e))?;
+    let origin = origin.to_string_lossy();
+    let result = (|| {
+        git(
+            Some(dir),
+            &["init", "--object-format=sha1", "-b", baseline_branch],
+        )?;
+        git(Some(dir), &["remote", "add", "origin", origin.as_ref()])?;
+        git(Some(dir), &["fetch", "origin"])?;
+        let baseline = format!("refs/remotes/origin/{baseline_branch}");
+        git(Some(dir), &["checkout", "-B", baseline_branch, &baseline])?;
+        assert_branch_exists(dir, "openresearch-demo", "nanochat", baseline_branch)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    result
+}
+
 /// Ensure a private worktree of the hub clone for one chat session, so
 /// parallel agents on the same project never share (or stomp) a checkout.
 /// Worktrees share the hub's object store and refs: a branch created in one
@@ -172,6 +208,41 @@ pub fn ensure_session_worktree(
 ) -> Result<PathBuf> {
     let hub = ensure_clone(owner, repo, baseline_branch)?;
     let dir = session_worktree_path(owner, repo, session_id);
+    ensure_session_worktree_in(&hub, &dir, owner, repo, baseline_branch, session_id)
+}
+
+pub(crate) fn ensure_session_worktree_in(
+    hub: &Path,
+    dir: &Path,
+    owner: &str,
+    repo: &str,
+    baseline_branch: &str,
+    session_id: &str,
+) -> Result<PathBuf> {
+    let base = format!("refs/remotes/origin/{baseline_branch}");
+    let start_ref = super::demo::session_start_ref(owner, repo, session_id).unwrap_or(&base);
+    ensure_worktree_from(hub, dir.to_path_buf(), start_ref)
+}
+
+/// Materialize a seeded session at an exact historical commit. The ordinary
+/// continuation path reuses this worktree on its first native turn.
+pub fn ensure_worktree_at(hub: &Path, dir: &Path, start_ref: &str) -> Result<PathBuf> {
+    if dir.join(".git").exists() && git(Some(dir), &["rev-parse", "--is-inside-work-tree"]).is_ok()
+    {
+        let expected = git(Some(hub), &["rev-parse", start_ref])?;
+        let actual = git(Some(dir), &["rev-parse", "HEAD"])?;
+        let status = git(Some(dir), &["status", "--porcelain"])?;
+        if actual != expected || !status.is_empty() {
+            return Err(anyhow!(
+                "The seeded nanochat worktree at {} is not clean at the expected experiment commit; move it aside and retry onboarding.",
+                dir.display()
+            ));
+        }
+    }
+    ensure_worktree_from(hub, dir.to_path_buf(), start_ref)
+}
+
+fn ensure_worktree_from(hub: &Path, dir: PathBuf, start_ref: &str) -> Result<PathBuf> {
     if dir.join(".git").exists() {
         // `.git` is a gitdir-pointer file in a worktree. Validate it — a wiped
         // hub clone (cache cleared, then re-cloned by ensure_clone above)
@@ -184,14 +255,16 @@ pub fn ensure_session_worktree(
     }
     // A manually deleted worktree dir leaves a stale registration behind that
     // would make `worktree add` at the same path fail.
-    let _ = git(Some(&hub), &["worktree", "prune"]);
+    let _ = git(Some(hub), &["worktree", "prune"]);
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow!("Could not create {}: {}", parent.display(), e))?;
     }
     let target = dir.to_string_lossy().to_string();
-    let base = format!("refs/remotes/origin/{baseline_branch}");
-    git(Some(&hub), &["worktree", "add", "--detach", &target, &base])?;
+    git(
+        Some(hub),
+        &["worktree", "add", "--detach", &target, start_ref],
+    )?;
     Ok(dir)
 }
 

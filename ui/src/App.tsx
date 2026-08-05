@@ -13,8 +13,10 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   cancelRun,
+  DEMO_PROJECT_ID,
   getArtifacts,
   listExperiments,
+  listChatSessions,
   listProjects,
   listRuns,
   openProject,
@@ -40,6 +42,7 @@ import { SettingsView, type SettingsTab } from "./components/SettingsPage";
 import { Tour, TOUR_DONE_KEY } from "./components/Tour";
 import { TreeView } from "./components/TreeView";
 import { useOrxEvents } from "./events";
+import { saveAgentSelection } from "./agentSelection";
 
 /** An experiment view open as a right-panel tab. */
 interface ExpViewDef {
@@ -267,9 +270,6 @@ export default function App() {
       return true; // storage unavailable — don't loop the walkthrough
     }
   });
-  // Set only when the walkthrough hands off, so the New project modal opens
-  // once — a later visit to Projects starts closed as usual.
-  const [justOnboarded, setJustOnboarded] = useState(false);
   // The spotlight tour of the workspace (Tour.tsx). Starting it normalizes
   // the layout so every tour target exists; those are the defaults, so
   // nothing needs restoring on finish/skip.
@@ -309,9 +309,30 @@ export default function App() {
   // Initial project list.
   useEffect(() => {
     listProjects()
-      .then((list) => {
+      .then(async (list) => {
+        const demo = list.find((project) => project.id === DEMO_PROJECT_ID);
+        const recoveredDemo = !onboarded ? demo : undefined;
+        if (recoveredDemo) {
+          const session = (await listChatSessions(recoveredDemo.id))[0];
+          if (!session) throw new Error("The seeded demo conversation is missing.");
+          saveAgentSelection({
+            harness: session.harness,
+            model: session.model,
+            permissionMode: session.permissionMode,
+            reasoningLevel: session.reasoningLevel,
+          });
+          setOnboarded((current) => {
+            if (current) return current;
+            try {
+              localStorage.setItem(ONBOARDED_KEY, "1");
+            } catch {
+              // The server-side demo row remains the durable completion marker.
+            }
+            return true;
+          });
+        }
         setProjects(list);
-        setProjectId((cur) => cur ?? list[0]?.id ?? null);
+        setProjectId((cur) => cur ?? recoveredDemo?.id ?? list[0]?.id ?? null);
       })
       .catch(() => setProjects([]));
   }, []);
@@ -638,8 +659,7 @@ export default function App() {
     );
   }
 
-  // First boot: agents walkthrough → git walkthrough → the (empty) projects
-  // page, where the first project gets created.
+  // First boot: the walkthrough installs and opens the embedded demo project.
   if (projects.length === 0) {
     return (
       <div className="app">
@@ -649,18 +669,17 @@ export default function App() {
             onOpen={setProjectId}
             onCreated={onProjectCreated}
             onDeleted={onProjectDeleted}
-            openNewProject={justOnboarded}
-            onNewProjectOpened={() => setJustOnboarded(false)}
           />
         ) : (
           <Onboarding
-            onDone={() => {
+            onDone={(project) => {
               try {
                 localStorage.setItem(ONBOARDED_KEY, "1");
               } catch {
                 // private mode etc. — the flow just replays next boot
               }
-              setJustOnboarded(true);
+              setProjects([project]);
+              setProjectId(project.id);
               setOnboarded(true);
             }}
           />
