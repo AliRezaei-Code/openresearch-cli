@@ -120,21 +120,11 @@ pub async fn submit_local_slurm(args: &crate::ExpRunArgs) -> Result<StoredRun> {
 
     // The login node clones from GitHub, so the branch tip must exist there.
     let commit_sha = {
-        let (owner, repo, baseline, branch) = (
-            project.github_owner.clone(),
-            project.github_repo.clone(),
-            project.baseline_branch.clone(),
-            exp.branch_name.clone(),
-        );
-        tokio::task::spawn_blocking(move || -> Result<String> {
-            let repo_path = git::ensure_clone(&owner, &repo, &baseline)?;
-            if !git::branch_on_remote(&repo_path, &branch)? {
-                git::push_branch(&repo_path, &branch)?;
-            }
-            git::branch_head_sha(&repo_path, &branch)
-        })
-        .await
-        .map_err(|e| anyhow!("git task failed: {e}"))??
+        let project = project.clone();
+        let branch = exp.branch_name.clone();
+        tokio::task::spawn_blocking(move || git::publish_branch_commit(&project, &branch))
+            .await
+            .map_err(|e| anyhow!("git task failed: {e}"))??
     };
 
     // Clone on the login node at submit time (compute nodes often lack
@@ -146,9 +136,10 @@ pub async fn submit_local_slurm(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     // helper reads the env at auth time instead.
     let setup_script = format!(
         "set -eo pipefail; \
-         git -c credential.helper='!f() {{ echo username=x-access-token; echo \"password=$GITHUB_TOKEN\"; }}; f' \
-         clone --depth 1 --branch {branch} {url} repo",
-        branch = crate::jobs::ssh::sh_quote(&exp.branch_name),
+         git init -q repo; cd repo; git remote add origin {url}; \
+         git -c credential.helper= -c credential.helper='!f() {{ echo username=x-access-token; echo \"password=$GITHUB_TOKEN\"; }}; f' \
+         fetch --depth 1 origin {commit}; git checkout --detach FETCH_HEAD",
+        commit = crate::jobs::ssh::sh_quote(&commit_sha),
         url = crate::jobs::ssh::sh_quote(&format!(
             "https://github.com/{}/{}.git",
             project.github_owner, project.github_repo

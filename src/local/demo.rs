@@ -218,6 +218,7 @@ fn seed_at(
         slug: "nanochat".into(),
         github_owner: OWNER.into(),
         github_repo: REPO.into(),
+        github_sync_enabled: false,
         baseline_branch: "main".into(),
         repo_path: repo.to_string_lossy().into_owned(),
         run_command: Some("bash runs/runcpu.sh".into()),
@@ -295,8 +296,7 @@ fn seed_at(
         .ok_or_else(|| anyhow!("demo repository is not under the reserved cache layout"))?;
     let worktree = cache_root
         .join("worktrees")
-        .join(OWNER)
-        .join(REPO)
+        .join(PROJECT_ID)
         .join(SESSION_ID);
     super::git::ensure_worktree_at(repo, &worktree, &commit_sha)?;
     let newly_created =
@@ -934,8 +934,7 @@ mod tests {
         let repo = root.join("cache/repos").join(OWNER).join(REPO);
         let worktree = root
             .join("cache/worktrees")
-            .join(OWNER)
-            .join(REPO)
+            .join(PROJECT_ID)
             .join(SESSION_ID);
         let store = Store::open_at(data.clone()).unwrap();
         seed_at(

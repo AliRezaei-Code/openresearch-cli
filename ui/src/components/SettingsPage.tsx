@@ -1,14 +1,12 @@
 import {
-  Blocks,
+  ArrowLeft,
   ChevronDown,
   Cpu,
   ExternalLink,
-  GitBranch,
-  HardDrive,
   Info,
   Plus,
   RefreshCw,
-  Server,
+  Settings,
   SquareTerminal,
   Trash2,
   X,
@@ -20,7 +18,8 @@ import {
   fmtDuration,
   getComputeSettings,
   getEnvVars,
-  getGitSettings,
+  getProjectGitStatus,
+  getProjectDefaults,
   getHarnesses,
   getHfSettings,
   getK8sSettings,
@@ -32,9 +31,11 @@ import {
   getSshHosts,
   listInstances,
   setComputeDefault,
+  setProjectDefaults,
   provisionModal,
-  removeGitToken,
-  saveGitSettings,
+  disableProjectGithub,
+  enableProjectGithub,
+  initializeProjectGit,
   saveHfToken,
   saveK8sSettings,
   saveRaySettings,
@@ -54,7 +55,9 @@ import {
   type ComputeTargetId,
   type ComputeTargetSummary,
   type EnvVar,
-  type GitSettings,
+  type Project,
+  type ProjectDefaultsSettings,
+  type ProjectGitStatus,
   type Harness,
   type HarnessId,
   type HfSettings,
@@ -80,7 +83,9 @@ import { ProgressBar } from "./ProgressBar";
 import { StatusBadge } from "./StatusBadge";
 
 export type SettingsTab =
+  | "settings"
   | "harnesses"
+  | "projects"
   | "compute"
   | "instances"
   | "environment"
@@ -124,7 +129,7 @@ function HarnessesTab() {
 
   return (
     <>
-      <h1>Harnesses</h1>
+      <h2>Harnesses</h2>
       <p className="settings-sub">
         Coding-agent setups detected on this machine. The research agent chat is served by
         OpenCode; Claude Code and Codex accounts surface their models in the composer's model
@@ -1047,10 +1052,12 @@ function TargetStatusBadge({ t, isDefault }: { t: ComputeTargetSummary; isDefaul
 function DefaultFlavorEditor({
   target,
   flavor,
+  projectId,
   onSaved,
 }: {
   target: ComputeTargetId;
   flavor: string | null;
+  projectId?: string;
   onSaved: (s: ComputeSettings) => void;
 }) {
   const [value, setValue] = useState(flavor ?? "");
@@ -1065,7 +1072,7 @@ function DefaultFlavorEditor({
     setSaving(true);
     setError(null);
     try {
-      onSaved(await setComputeDefault({ backend: target, flavor: value.trim() || null }));
+      onSaved(await setComputeDefault({ backend: target, flavor: value.trim() || null, projectId }));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -1117,19 +1124,23 @@ function DefaultFlavorEditor({
 function TargetRow({
   target,
   isDefault,
+  isFallbackDefault,
   defaultFlavor,
   open,
   onToggle,
   onSettings,
   onError,
+  projectId,
 }: {
   target: ComputeTargetSummary;
   isDefault: boolean;
+  isFallbackDefault: boolean;
   defaultFlavor: string | null;
   open: boolean;
   onToggle: () => void;
   onSettings: (s: ComputeSettings) => void;
   onError: (msg: string) => void;
+  projectId?: string;
 }) {
   // Mounted on first expand, kept mounted (hidden) after — each section's own
   // mount-time fetch is the lazy detail load, and re-expanding doesn't refetch.
@@ -1141,7 +1152,7 @@ function TargetRow({
     if (settingDefault) return;
     setSettingDefault(true);
     try {
-      onSettings(await setComputeDefault({ backend }));
+      onSettings(await setComputeDefault({ backend, projectId }));
     } catch (err) {
       onError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -1150,11 +1161,11 @@ function TargetRow({
   }
 
   return (
-    <div className={`compute-row${open ? " open" : ""}`}>
+    <div className={`compute-row${open ? " open" : ""}${target.enabled ? "" : " disabled"}`}>
       {/* The head is a plain clickable div, NOT role="button": it holds real
           buttons (Make default, the chevron), and interactive elements must
           not nest. The chevron is the keyboard-reachable expand control. */}
-      <div className="compute-row-head" onClick={onToggle}>
+      <div className="compute-row-head" onClick={target.enabled ? onToggle : undefined}>
         <span className="compute-row-logo">
           <BackendLogo kind={TARGET_KIND[target.id]} size={18} />
         </span>
@@ -1162,7 +1173,7 @@ function TargetRow({
         <span className="compute-row-summary">{target.summary}</span>
         <TargetStatusBadge t={target} isDefault={isDefault} />
         {isDefault ? (
-          <span className="badge compute-default-pill">Default</span>
+          <span className="badge compute-default-pill">{isFallbackDefault ? "Local fallback" : "Default"}</span>
         ) : (
           <button
             type="button"
@@ -1171,7 +1182,7 @@ function TargetRow({
               e.stopPropagation(); // the header click is expand/collapse
               void setDefault(target.id);
             }}
-            disabled={settingDefault}
+            disabled={settingDefault || !target.enabled}
           >
             Make default
           </button>
@@ -1181,17 +1192,18 @@ function TargetRow({
           className="compute-chevron-btn"
           aria-expanded={open}
           aria-label={`${open ? "Collapse" : "Expand"} ${TARGET_LABELS[target.id]}`}
+          disabled={!target.enabled}
           onClick={(e) => {
             e.stopPropagation();
-            onToggle();
+            if (target.enabled) onToggle();
           }}
         >
           <ChevronDown size={16} className="compute-chevron" />
         </button>
       </div>
-      {visited && (
+      {visited && target.enabled && (
         <div className="compute-row-body" hidden={!open}>
-          {isDefault && (
+          {isDefault && !isFallbackDefault && (
             <p className="settings-note compute-default-note">
               The agent launches runs here unless you tell it otherwise, and so does{" "}
               <code>orx exp run</code> with no <code>--backend</code> flag.{" "}
@@ -1212,7 +1224,7 @@ function TargetRow({
             </p>
           )}
           {isDefault && FLAVORED_TARGETS.includes(target.id) && (
-            <DefaultFlavorEditor target={target.id} flavor={defaultFlavor} onSaved={onSettings} />
+            <DefaultFlavorEditor target={target.id} flavor={defaultFlavor} projectId={projectId} onSaved={onSettings} />
           )}
           {target.id === "local" && <LocalSection />}
           {target.id === "hf" && <HfSection />}
@@ -1228,7 +1240,15 @@ function TargetRow({
   );
 }
 
-function ComputeTab() {
+function ComputeTab({
+  project,
+  onOpenGit,
+  onViewHistory,
+}: {
+  project: Project | null;
+  onOpenGit: () => void;
+  onViewHistory: () => void;
+}) {
   const [settings, setSettings] = useState<ComputeSettings | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<ComputeTargetId | null>(null);
@@ -1237,13 +1257,21 @@ function ComputeTab() {
   // overwritten by a slower background GET that was already in flight.
   const seqRef = useRef(0);
 
+  useEffect(() => {
+    seqRef.current++;
+    setSettings(null);
+    setExpanded(null);
+    setLoadError(null);
+    setError(null);
+  }, [project?.id]);
+
   // Refetched whenever a row expands/collapses (not just on mount): a form
   // saved inside a row (k8s context, HF token, …) changes the collapsed
   // summaries, and the toggle is the natural moment to catch up. Cheap by
   // contract — the endpoint only does fs/env probes.
   useEffect(() => {
     const seq = ++seqRef.current;
-    getComputeSettings()
+    getComputeSettings(project?.id)
       .then((s) => {
         if (seq !== seqRef.current) return;
         setSettings(s);
@@ -1260,7 +1288,7 @@ function ComputeTab() {
           return cur;
         });
       });
-  }, [expanded]);
+  }, [expanded, project?.id]);
 
   const apply = (s: ComputeSettings) => {
     seqRef.current++; // supersede any in-flight background GET
@@ -1270,6 +1298,33 @@ function ComputeTab() {
 
   // Server order is canonical (local first, then external backends).
   const targets = settings ? settings.targets : null;
+  const fallbackDefault =
+    settings?.defaultBackend === "local" &&
+    settings.configuredDefaultBackend !== null &&
+    settings.configuredDefaultBackend !== undefined &&
+    settings.configuredDefaultBackend !== "local";
+  const githubBlocksRemoteCompute = Boolean(
+    targets?.some(
+      (target) =>
+        target.id !== "local" &&
+        !target.enabled &&
+        target.disabledReason === "Connect GitHub to enable",
+    ),
+  );
+  const renderTarget = (target: ComputeTargetSummary) => (
+    <TargetRow
+      key={`${project?.id ?? "none"}:${target.id}`}
+      target={target}
+      isDefault={settings?.defaultBackend === target.id}
+      isFallbackDefault={Boolean(fallbackDefault && target.id === "local")}
+      defaultFlavor={settings?.defaultFlavor ?? null}
+      open={target.enabled && expanded === target.id}
+      onToggle={() => setExpanded((current) => (current === target.id ? null : target.id))}
+      onSettings={apply}
+      onError={setError}
+      projectId={project?.id}
+    />
+  );
 
   return (
     <>
@@ -1278,6 +1333,8 @@ function ComputeTab() {
         Where <code>orx exp run</code> executes. Pick a default target; the agent uses it when
         a launch doesn&apos;t name a backend (<code>--backend &lt;name&gt;</code> always wins).
       </p>
+      <ComputeActivity onViewHistory={onViewHistory} />
+      <h2 className="compute-section-title">Targets</h2>
       {loadError ? (
         <div className="error">{loadError}</div>
       ) : !targets ? (
@@ -1288,19 +1345,28 @@ function ComputeTab() {
         <>
           {error && <div className="error">{error}</div>}
           <div className="compute-list">
-            {targets.map((t) => (
-              <TargetRow
-                key={t.id}
-                target={t}
-                isDefault={settings?.defaultBackend === t.id}
-                defaultFlavor={settings?.defaultFlavor ?? null}
-                open={expanded === t.id}
-                onToggle={() => setExpanded((cur) => (cur === t.id ? null : t.id))}
-                onSettings={apply}
-                onError={setError}
-              />
-            ))}
+            {targets.filter((target) => target.id === "local").map(renderTarget)}
+            {githubBlocksRemoteCompute && (
+              <div className="compute-github-gate">
+                <div>
+                  <h3>Remote targets</h3>
+                  <p>
+                    Enable GitHub syncing for this project to push experiment branches and run
+                    them on remote compute.
+                  </p>
+                </div>
+                <button type="button" className="btn primary sm" onClick={onOpenGit}>
+                  Enable GitHub syncing
+                </button>
+              </div>
+            )}
+            {targets.filter((target) => target.id !== "local").map(renderTarget)}
           </div>
+          {fallbackDefault && (
+            <p className="settings-note">
+              Using this machine while the project is local-only. Your saved {settings?.configuredDefaultBackend} default will return after GitHub is enabled.
+            </p>
+          )}
           <p className="compute-footnote">
             <Info size={14} aria-hidden="true" />
             <span>
@@ -1736,133 +1802,259 @@ function EnvVarsSection() {
   );
 }
 
-// --- git -----------------------------------------------------------------------
+// --- project defaults ----------------------------------------------------------
 
-function GitTab() {
-  const [settings, setSettings] = useState<GitSettings | null>(null);
-  const [name, setName] = useState("");
-  const [email, setEmail] = useState("");
+function ProjectDefaultsTab() {
+  const [settings, setSettings] = useState<ProjectDefaultsSettings | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    getGitSettings()
-      .then((s) => {
-        setSettings(s);
-        setName(s.userName ?? "");
-        setEmail(s.userEmail ?? "");
-      })
-      .catch(() => {});
-  }, []);
+  const load = () => {
+    setError(null);
+    void getProjectDefaults()
+      .then(setSettings)
+      .catch((err) => setError(err instanceof Error ? err.message : String(err)));
+  };
+  useEffect(load, []);
 
-  const unchanged =
-    settings !== null &&
-    name.trim() === (settings.userName ?? "") &&
-    email.trim() === (settings.userEmail ?? "");
-
-  async function submit(e: React.FormEvent) {
-    e.preventDefault();
-    if (saving || unchanged) return;
+  const toggle = () => {
+    if (!settings || saving) return;
+    const enabled = !settings.githubForNewProjects;
     setSaving(true);
     setError(null);
-    try {
-      const next = await saveGitSettings({ userName: name.trim(), userEmail: email.trim() });
-      setSettings(next);
-      setName(next.userName ?? "");
-      setEmail(next.userEmail ?? "");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSaving(false);
-    }
-  }
+    void setProjectDefaults(enabled, true)
+      .then(setSettings)
+      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+      .finally(() => setSaving(false));
+  };
 
   return (
     <>
-      <h1>Git</h1>
-      <p className="settings-sub">
-        Experiment branches are committed and pushed from local clones with this identity.
-      </p>
+      <h2>General</h2>
+      <p className="settings-sub">Defaults applied when you create a project.</p>
       {!settings ? (
+        error ? <div className="error">{error}</div> : <div className="settings-loading"><span className="spinner" /> Loading…</div>
+      ) : (
+        <div className="settings-card project-defaults-card">
+          <div className="settings-card-head">
+            <h3>GitHub publishing</h3>
+            <span className={`badge ${settings.githubAuthenticated ? "ok" : ""}`}>
+              {settings.githubAuthenticated ? `Connected via ${settings.githubTokenSource}` : "Not connected"}
+            </span>
+          </div>
+          <div className="project-default-row">
+            <div>
+              <div className="project-default-title">Enable GitHub syncing for new projects</div>
+              <p>
+                When enabled, each new project gets a private GitHub repository. Experiment
+                branches are pushed automatically so their code can run on remote compute.
+              </p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={settings.githubForNewProjects}
+              aria-label="Enable GitHub syncing for new projects"
+              className={`settings-switch ${settings.githubForNewProjects ? "on" : ""}`}
+              disabled={saving || (!settings.githubAuthenticated && !settings.githubForNewProjects)}
+              onClick={toggle}
+            >
+              <span />
+            </button>
+          </div>
+          {!settings.githubAuthenticated && (
+            <div className="project-default-connect">
+              <p>Connect GitHub to make publishing the default for new projects.</p>
+              <GitTokenForm onSaved={load} />
+            </div>
+          )}
+          {error && <div className="error">{error}</div>}
+        </div>
+      )}
+    </>
+  );
+}
+
+// --- git -----------------------------------------------------------------------
+
+function GitTab({
+  project,
+  publicationError,
+  onProjectUpdate,
+}: {
+  project: Project | null;
+  publicationError: string | null;
+  onProjectUpdate: (project: Project) => void;
+}) {
+  const [status, setStatus] = useState<ProjectGitStatus | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [defaultPromptOpen, setDefaultPromptOpen] = useState(false);
+  const [defaultPromptSaving, setDefaultPromptSaving] = useState(false);
+  const [defaultPromptError, setDefaultPromptError] = useState<string | null>(null);
+  const seqRef = useRef(0);
+  const hasGithubRepository = Boolean(status?.github.owner && status.github.repo);
+
+  const load = () => {
+    const request = ++seqRef.current;
+    setStatus(null);
+    setError(null);
+    if (!project) return;
+    void getProjectGitStatus(project.id)
+      .then((projectStatus) => {
+        if (request !== seqRef.current) return;
+        setStatus(projectStatus);
+      })
+      .catch((err) => {
+        if (request === seqRef.current) {
+          setError(err instanceof Error ? err.message : String(err));
+        }
+      });
+  };
+  useEffect(load, [project?.id]);
+
+  const syncErrorMessage = (err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.toLowerCase().includes("archived")) {
+      return "GitHub rejected the push because this repository is archived and read-only. The local project is still available. Unarchive the repository on GitHub, then enable syncing here.";
+    }
+    if (message.includes("(fetch first)") || message.includes("non-fast-forward")) {
+      return "GitHub contains changes that are not in this local project. Pull the latest GitHub changes and resolve any conflicts in Git, then try enabling syncing again.";
+    }
+    if (message.includes("403") || message.toLowerCase().includes("permission denied")) {
+      return "GitHub rejected the push. Make sure your connected account has write access to this repository, then try again.";
+    }
+    return message;
+  };
+
+  const enableSync = () => {
+    if (!project) return;
+    setSaving(true);
+    setError(null);
+    void enableProjectGithub(project.id)
+      .then((result) => {
+        setStatus(result.git);
+        onProjectUpdate(result.project);
+        void getProjectDefaults()
+          .then((defaults) => {
+            if (!defaults.githubForNewProjects && !defaults.githubDefaultPromptSeen) {
+              setDefaultPromptOpen(true);
+            }
+          })
+          .catch(() => {});
+      })
+      .catch((err) => setError(syncErrorMessage(err)))
+      .finally(() => setSaving(false));
+  };
+
+  const finishDefaultPrompt = (enabled: boolean) => {
+    setDefaultPromptSaving(true);
+    setDefaultPromptError(null);
+    void setProjectDefaults(enabled, true)
+      .then(() => setDefaultPromptOpen(false))
+      .catch((err) => setDefaultPromptError(err instanceof Error ? err.message : String(err)))
+      .finally(() => setDefaultPromptSaving(false));
+  };
+
+  return (
+    <>
+      <h1>Repository</h1>
+      <p className="settings-sub">
+        Git and GitHub settings for <strong>{project?.name ?? "the current project"}</strong>.
+        Local Git powers experiments; publishing is optional.
+      </p>
+      {!project ? (
+        <div className="settings-card"><p className="settings-note">Open a project to inspect its repository and GitHub publication state.</p></div>
+      ) : error && !status ? (
+        <div className="error">{error}</div>
+      ) : !status ? (
         <div className="settings-loading">
           <span className="spinner" /> Loading…
         </div>
       ) : (
         <>
-          <div className="settings-card">
-            <h3>Identity</h3>
-            <form className="form" onSubmit={submit}>
-              <div className="row2">
-                <label>
-                  user.name
-                  <input
-                    type="text"
-                    value={name}
-                    onChange={(e) => setName(e.target.value)}
-                    autoComplete="off"
-                  />
-                </label>
-                <label>
-                  user.email
-                  <input
-                    type="text"
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    autoComplete="off"
-                  />
-                </label>
-              </div>
-              {error && <div className="error">{error}</div>}
-              <div className="actions">
-                <button
-                  type="submit"
-                  className="btn primary"
-                  disabled={saving || unchanged || (!name.trim() && !email.trim())}
-                >
-                  {saving ? "Saving…" : "Save"}
-                </button>
-              </div>
-            </form>
-          </div>
-          <div className="settings-card">
-            <h3>GitHub access</h3>
+          <div className="settings-card git-settings-card">
+            <h3>Local repository</h3>
             <div className="kv">
-              <span className="k">git</span>
-              <span className="v">{settings.gitVersion ?? "not found"}</span>
-              <span className="k">Token</span>
-              <span className="v">
-                {settings.githubTokenSource === "env"
-                  ? "GITHUB_TOKEN env var"
-                  : settings.githubTokenSource === "stored"
-                    ? "token saved in orx"
-                    : settings.githubTokenSource === "gh"
-                      ? "gh CLI (gh auth token)"
-                      : "none found"}
-              </span>
+              <span className="k">Path</span><span className="v mono">{status.path}</span>
+              <span className="k">Git</span><span className="v">{status.gitVersion ?? "not found"}</span>
+              <span className="k">State</span><span className="v">{status.initialized ? `${status.currentBranch ?? "detached"} · ${status.clean ? "clean" : "has changes"}` : "not initialized"}</span>
+              <span className="k">Baseline</span><span className="v mono">{status.baselineBranch}</span>
+              <span className="k">Remotes</span><span className="v">{status.remotes.length ? status.remotes.map((remote) => `${remote.name}: ${remote.url}`).join(" · ") : "none"}</span>
             </div>
-            {!settings.githubTokenSource && (
+            {!status.initialized && <div className="git-card-actions"><button className="btn primary" onClick={() => void initializeProjectGit(project.id).then(setStatus).catch((err) => setError(String(err)))}>Initialize Git</button></div>}
+          </div>
+          <div className="settings-card git-settings-card">
+            <h3>GitHub</h3>
+            <div className="kv">
+              <span className="k">Authentication</span><span className="v"><span className={`badge ${status.github.authenticated ? "ok" : ""}`}>{status.github.authenticated ? "Connected" : "Not connected"}</span>{status.github.authenticated && <span className="git-detail-meta">via {status.github.tokenSource}</span>}</span>
+              <span className="k">Project</span><span className="v">{hasGithubRepository ? <><span className="mono">{status.github.owner}/{status.github.repo}</span>{!status.github.enabled && <span className="badge git-detail-meta">Syncing off</span>}</> : <span className="badge">Local only</span>}</span>
+              {status.github.enabled && <><span className="k">Sync</span><span className="v">{status.github.syncStatus}</span></>}
+            </div>
+            {!status.github.authenticated && (
               <>
-                <p className="settings-note">
-                  No GitHub token found — private repo clones and branch pushes will fail. Run{" "}
-                  <code>gh auth login</code>, or paste a personal access token:
+                <p className="git-card-helper">
+                  GitHub is optional. Connect only when you want remote compute or a hosted copy.
                 </p>
-                <GitTokenForm onSaved={setSettings} />
+                <GitTokenForm onSaved={() => load()} />
               </>
             )}
-            {settings.githubTokenSource === "stored" && (
-              <div className="actions">
-                <button
-                  className="btn"
-                  onClick={() => {
-                    void removeGitToken().then(setSettings).catch(() => {});
-                  }}
-                >
-                  Remove saved token
-                </button>
-              </div>
+            {status.github.authenticated && !status.github.enabled && (
+              <>
+                <p className="git-card-helper">
+                  {hasGithubRepository
+                    ? "Use this repository for automatic experiment-branch pushes when your connected account can write to it. Otherwise, OpenResearch creates a separate private repository for syncing and remote compute."
+                    : "Create a private repository for this project and automatically push experiment branches so they can run on remote compute."}
+                </p>
+                <div className="git-card-actions">
+                  {hasGithubRepository && status.github.url && <a className="btn" href={status.github.url} target="_blank" rel="noreferrer">Open on GitHub <ExternalLink size={12} /></a>}
+                  <button className="btn primary" disabled={saving} onClick={enableSync}>{saving ? "Enabling…" : "Enable GitHub syncing"}</button>
+                </div>
+              </>
+            )}
+            {status.github.enabled && (
+              <>
+                <p className="git-card-helper">
+                  Disabling syncing stops automatic pushes and remote compute. It does not delete
+                  the GitHub repository or any code already pushed there.
+                </p>
+                <div className="git-card-actions">
+                  {status.github.url && <a className="btn" href={status.github.url} target="_blank" rel="noreferrer">Open on GitHub <ExternalLink size={12} /></a>}
+                  <button className="btn" disabled={saving} onClick={() => { setSaving(true); void disableProjectGithub(project.id).then((result) => { setStatus(result.git); onProjectUpdate(result.project); }).catch((err) => setError(err instanceof Error ? err.message : String(err))).finally(() => setSaving(false)); }}>{saving ? "Updating…" : "Disable syncing"}</button>
+                </div>
+              </>
             )}
           </div>
+          {publicationError && <div className="error">{syncErrorMessage(publicationError)}</div>}
+          {error && <div className="error">{syncErrorMessage(error)}</div>}
         </>
+      )}
+      {defaultPromptOpen && (
+        <div className="modal-backdrop" onClick={() => finishDefaultPrompt(false)}>
+          <div
+            className="modal github-default-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="github-default-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h2 id="github-default-title">Make GitHub syncing the default?</h2>
+            <p>
+              This is useful if you expect to regularly run projects on remote compute. New
+              projects will enable GitHub syncing automatically, creating a private repository
+              when needed and pushing experiment branches for remote runs.
+            </p>
+            {defaultPromptError && <div className="error">{defaultPromptError}</div>}
+            <div className="github-default-actions">
+              <button className="btn" disabled={defaultPromptSaving} onClick={() => finishDefaultPrompt(false)}>
+                Not now
+              </button>
+              <button className="btn primary" disabled={defaultPromptSaving} onClick={() => finishDefaultPrompt(true)}>
+                {defaultPromptSaving ? "Saving…" : "Make default"}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </>
   );
@@ -1977,7 +2169,7 @@ function StorageTab() {
 
   return (
     <>
-      <h1>Storage</h1>
+      <h2>Storage</h2>
       <p className="settings-sub">
         Where orx keeps everything on this machine — the local database, run logs, artifacts, and
         chat attachments for <strong>all</strong> projects. Moving it copies the whole store to the
@@ -2169,7 +2361,7 @@ function InstancesTable({ instances, emptyLabel }: { instances: Instance[]; empt
   );
 }
 
-function InstancesTab() {
+function ComputeActivity({ onViewHistory }: { onViewHistory: () => void }) {
   const [instances, setInstances] = useState<Instance[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -2182,8 +2374,8 @@ function InstancesTab() {
     return () => clearInterval(t);
   }, []);
 
-  // Point-in-time snapshot: the tab remounts (and so refetches) on every open,
-  // and this button refreshes in place while sitting on it — the run.updated
+  // Point-in-time snapshot: the page refetches on every open, and this button
+  // refreshes in place while sitting on it — the run.updated
   // SSE stream carries no projectName, so it can't drive this list directly.
   const load = () => {
     setRefreshing(true);
@@ -2205,32 +2397,77 @@ function InstancesTab() {
   const past = instances?.filter((i) => !isLive(i.status)).sort(byRecent);
 
   return (
-    <>
-      <div className="settings-head-row">
-        <h1>Instances</h1>
-        <button className="btn sm" onClick={load} disabled={refreshing}>
-          <RefreshCw size={12} className={refreshing ? "spin" : ""} /> Refresh
-        </button>
+    <section className="compute-activity">
+      <div className="compute-activity-head">
+        <div>
+          <h2>
+            Running instances
+            {running && running.length > 0 && <span className="count-badge">{running.length}</span>}
+          </h2>
+          <p>Compute currently active across all projects.</p>
+        </div>
+        <div className="compute-activity-actions">
+          <button className="btn sm" onClick={load} disabled={refreshing}>
+            <RefreshCw size={12} className={refreshing ? "spin" : ""} /> Refresh
+          </button>
+          <button className="btn sm" onClick={onViewHistory}>
+            {`View history${past?.length ? ` (${past.length})` : ""}`}
+          </button>
+        </div>
       </div>
-      <p className="settings-sub">
-        Compute spun up across all projects — this machine, Modal, Hugging Face, SSH, Kubernetes,
-        Slurm, and OpenResearch.
-      </p>
       {error && <div className="error">{error}</div>}
       {!running || !past ? (
         <div className="settings-loading">
           <span className="spinner" /> Loading…
         </div>
+      ) : <InstancesTable instances={running} emptyLabel="Nothing running right now." />}
+    </section>
+  );
+}
+
+function InstanceHistory({ onBack }: { onBack: () => void }) {
+  const [instances, setInstances] = useState<Instance[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [, setTick] = useState(0);
+
+  useEffect(() => {
+    const timer = setInterval(() => setTick((tick) => tick + 1), 30_000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const load = () => {
+    setRefreshing(true);
+    listInstances()
+      .then((rows) => {
+        setInstances(rows.sort((a, b) => b.createdAt - a.createdAt));
+        setError(null);
+      })
+      .catch((err) => {
+        setError(err instanceof Error ? err.message : String(err));
+        setInstances((current) => current ?? []);
+      })
+      .finally(() => setRefreshing(false));
+  };
+  useEffect(load, []);
+
+  return (
+    <>
+      <button type="button" className="settings-back" onClick={onBack}>
+        <ArrowLeft size={14} /> Back to Compute
+      </button>
+      <div className="settings-head-row">
+        <h1>Instance history</h1>
+        <button className="btn sm" onClick={load} disabled={refreshing}>
+          <RefreshCw size={12} className={refreshing ? "spin" : ""} /> Refresh
+        </button>
+      </div>
+      <p className="settings-sub">Every compute instance spun up across your projects.</p>
+      {error && <div className="error">{error}</div>}
+      {!instances ? (
+        <div className="settings-loading"><span className="spinner" /> Loading…</div>
       ) : (
-        <>
-          <h2 className="instances-section-title">
-            Running
-            {running.length > 0 && <span className="count-badge">{running.length}</span>}
-          </h2>
-          <InstancesTable instances={running} emptyLabel="Nothing running right now." />
-          <h2 className="instances-section-title">Past</h2>
-          <InstancesTable instances={past} emptyLabel="No past instances yet." />
-        </>
+        <InstancesTable instances={instances} emptyLabel="No instances yet." />
       )}
     </>
   );
@@ -2238,22 +2475,78 @@ function InstancesTab() {
 
 // --- embedded view -----------------------------------------------------------
 
-/** Rail nav entries, one per settings section (rendered in the agents rail). */
-export const SETTINGS_NAV: { id: Tab; label: string; icon: React.ReactNode }[] = [
-  { id: "harnesses", label: "Harnesses", icon: <Blocks size={15} /> },
-  { id: "compute", label: "Compute", icon: <Cpu size={15} /> },
-  { id: "instances", label: "Instances", icon: <Server size={15} /> },
-  { id: "environment", label: "Environment", icon: <SquareTerminal size={15} /> },
-  { id: "git", label: "Git", icon: <GitBranch size={15} /> },
-  { id: "storage", label: "Storage", icon: <HardDrive size={15} /> },
+type SettingsNavItem = {
+  id: Tab;
+  label: string;
+  icon: React.ReactNode;
+  activeTabs: Tab[];
+};
+
+const SETTINGS_SECTIONS: Tab[] = ["projects", "harnesses", "storage"];
+
+/** Primary rail entries. Configuration sections share the Settings entry. */
+export const SETTINGS_NAV: SettingsNavItem[] = [
+  {
+    id: "compute",
+    label: "Compute",
+    icon: <Cpu size={15} />,
+    activeTabs: ["compute", "instances"],
+  },
+  { id: "environment", label: "Environment", icon: <SquareTerminal size={15} />, activeTabs: ["environment"] },
+  {
+    id: "settings",
+    label: "Settings",
+    icon: <Settings size={15} />,
+    activeTabs: ["settings", ...SETTINGS_SECTIONS],
+  },
 ];
 
+function isSettingsSection(tab: Tab): boolean {
+  return SETTINGS_SECTIONS.includes(tab);
+}
+
 /** One settings section's content, shown in the middle pane in place of chat. */
-export function SettingsView({ tab }: { tab: Tab }) {
+export function SettingsView({
+  tab,
+  project,
+  githubPublicationError,
+  onProjectUpdate,
+  onSelectTab,
+}: {
+  tab: Tab;
+  project: Project | null;
+  githubPublicationError: string | null;
+  onProjectUpdate: (project: Project) => void;
+  onSelectTab: (tab: Tab) => void;
+}) {
+  const showsSettings = tab === "settings" || isSettingsSection(tab);
+
   return (
     <div className="settings-view">
-      {tab === "harnesses" && <HarnessesTab />}
-      {tab === "compute" && <ComputeTab />}
+      {showsSettings && (
+        <>
+          <h1>Settings</h1>
+          <div className="settings-stack">
+            <section className="settings-stack-section">
+              <ProjectDefaultsTab />
+            </section>
+            <section className="settings-stack-section">
+              <HarnessesTab />
+            </section>
+            <section className="settings-stack-section">
+              <StorageTab />
+            </section>
+          </div>
+        </>
+      )}
+      {tab === "compute" && (
+        <ComputeTab
+          project={project}
+          onOpenGit={() => onSelectTab("git")}
+          onViewHistory={() => onSelectTab("instances")}
+        />
+      )}
+      {tab === "instances" && <InstanceHistory onBack={() => onSelectTab("compute")} />}
       {tab === "environment" && (
         <>
           <h1>Environment</h1>
@@ -2263,9 +2556,13 @@ export function SettingsView({ tab }: { tab: Tab }) {
           <EnvVarsSection />
         </>
       )}
-      {tab === "instances" && <InstancesTab />}
-      {tab === "git" && <GitTab />}
-      {tab === "storage" && <StorageTab />}
+      {tab === "git" && (
+        <GitTab
+          project={project}
+          publicationError={githubPublicationError}
+          onProjectUpdate={onProjectUpdate}
+        />
+      )}
     </div>
   );
 }

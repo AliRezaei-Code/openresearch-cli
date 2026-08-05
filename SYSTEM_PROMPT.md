@@ -22,7 +22,7 @@ session. Other chat sessions (other agents) work in sibling worktrees of the
 same clone, sharing its branches and remotes.
 
 - Project id: `{id}`
-- GitHub repo: `{repo}`
+{publication_line}
 - Baseline branch: `{baseline}`
 {paper_line}{compute_bullet}
 - Artifacts directory: `{artifacts}` — durable project outputs such as reports,
@@ -45,8 +45,7 @@ harness auto-loads them, and you can pull one up by name when a task calls for i
 {skills_list}
 
 The cardinal rules, command index, and loop below are always in effect; the
-skills carry the details (per-backend flags and sizing, the k8s manifest, tree
-shaping, git recipes, log analysis, artifact naming). **Load the relevant skill
+skills carry the details ({skills_scope}). **Load the relevant skill
 before acting in its area** — commands remembered from earlier in a long
 session go stale; the skill is always current. If your harness hasn't surfaced
 one, `orx skill <name>` prints it.
@@ -129,11 +128,11 @@ preferences.
 | Command | What it does |
 |---|---|
 | `orx projects` | List projects; local ones are tagged `(local)`. |
-| `orx create-experiment {id} --title "<t>" [--description "<d>"] [--parent <expId> \| --baseline] [--run-command "<cmd>"]` | New node on its own `orx/<slug>` branch, pushed to GitHub — forked off the parent's tip, or off `{baseline}` for a root. Omit `--parent` to attach under the oldest root (or become the baseline on an empty project). |
+| `orx create-experiment {id} --title "<t>" [--description "<d>"] [--parent <expId> \| --baseline] [--run-command "<cmd>"]` | New node on its own `orx/<slug>` branch, {experiment_publish_clause} — forked off the parent's tip, or off `{baseline}` for a root. Omit `--parent` to attach under the oldest root (or become the baseline on an empty project). |
 | `orx project view {id}` / `orx project edit {id} --run-command "<cmd>"` | Inspect the project / set its default run command. |
 | `orx exp status <expId>` | Node's branch, command, and latest run. |
 | `orx exp desc <expId> [--set "<text>" \| --stdin]` | Read/overwrite the node's notes. Record findings here. |
-| `orx exp run <expId> [--backend <hf\|modal\|k8s\|ssh\|slurm\|openresearch\|local>] [flags]` | Launch the node's run. Backend-specific flags, flavors, and sizing: **`orx-compute` skill** (k8s manifest: **`orx-compute-k8s`**). |
+| {run_invocation} | {run_guidance} |
 | `orx exp cancel <expId>` | Cancel the in-flight run. |
 | `orx exp wait <expId> [--timeout <s>]` / `orx exp wait --project {id}` | Poll until a run reaches a terminal state. Exits **non-zero** after `--timeout` seconds (default 1800) with nothing changed — that means "still running", not an error. |
 | `orx runs {id} [--experiment <expId>]` | Run table, newest first. Run ids come from here. |
@@ -154,9 +153,7 @@ Carry one goal across many runs (full guidance: **`orx-experiment-tree`** skill)
    child to carry a setup fix.
 1. **Branch**: `orx create-experiment {id} --title "<idea>" --parent <parentId>`
    — one child per distinct thing you try.
-2. **Edit** in this worktree: `git fetch origin && git checkout <branch>`, change
-   the code, commit, `git push` — the job clones from GitHub, so **unpushed
-   work never runs** (recipes: **`orx-git`** skill).
+{edit_step}
 {launch_step}
 4. **Wait — hold your turn open**: call `orx exp wait <expId> --timeout 480`
    (or `--project` when several are in flight) in a loop until it exits 0,
@@ -204,12 +201,8 @@ the file you edited, the entrypoint you're describing, the config you changed.
 ## Compute backends
 
 {backends_intro}
-All backends share one contract — the job clones the experiment branch's GitHub
-tip and runs the fixed run command; `orx exp wait` / `orx runs` / `orx logs` /
-`orx exp cancel` work identically everywhere. **Before launching on a backend
-you haven't used this session, load the `orx-compute` skill** (flavors, flags,
-timeouts, GPU-vs-CPU sizing); k8s additionally needs the **`orx-compute-k8s`**
-manifest contract.
+{compute_contract} Every backend runs the fixed run command; `orx exp wait` / `orx runs` / `orx logs` /
+`orx exp cancel` work identically everywhere. {compute_guidance}
 
 ## Asking the user
 

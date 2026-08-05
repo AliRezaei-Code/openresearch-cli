@@ -12,6 +12,7 @@ pub struct LocalProject {
     pub slug: String,
     pub github_owner: String,
     pub github_repo: String,
+    pub github_sync_enabled: bool,
     /// Fork point for baseline roots and the clone's default checkout — not
     /// where any experiment lives (legacy roots predating per-baseline
     /// branches may still ride it).
@@ -26,6 +27,23 @@ pub struct LocalProject {
 }
 
 impl LocalProject {
+    pub fn github_enabled(&self) -> bool {
+        self.github_sync_enabled && self.has_github_repository()
+    }
+
+    pub fn has_github_repository(&self) -> bool {
+        !self.github_owner.trim().is_empty() && !self.github_repo.trim().is_empty()
+    }
+
+    pub fn github_url(&self) -> Option<String> {
+        self.has_github_repository().then(|| {
+            format!(
+                "https://github.com/{}/{}",
+                self.github_owner, self.github_repo
+            )
+        })
+    }
+
     /// Column order must match `store::PROJECT_COLS`.
     pub(crate) fn from_row(row: &rusqlite::Row<'_>) -> std::result::Result<Self, rusqlite::Error> {
         Ok(Self {
@@ -34,12 +52,13 @@ impl LocalProject {
             slug: row.get(2)?,
             github_owner: row.get(3)?,
             github_repo: row.get(4)?,
-            baseline_branch: row.get(5)?,
-            repo_path: row.get(6)?,
-            run_command: row.get(7)?,
-            paper_id: row.get(8)?,
-            created_at: row.get(9)?,
-            updated_at: row.get(10)?,
+            github_sync_enabled: row.get(5)?,
+            baseline_branch: row.get(6)?,
+            repo_path: row.get(7)?,
+            run_command: row.get(8)?,
+            paper_id: row.get(9)?,
+            created_at: row.get(10)?,
+            updated_at: row.get(11)?,
         })
     }
 }

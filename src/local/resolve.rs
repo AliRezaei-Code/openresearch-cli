@@ -107,6 +107,7 @@ mod tests {
             slug: format!("slug-{id}"),
             github_owner: "o".to_string(),
             github_repo: "r".to_string(),
+            github_sync_enabled: true,
             baseline_branch: "main".to_string(),
             repo_path: "/tmp/repo".to_string(),
             run_command: None,

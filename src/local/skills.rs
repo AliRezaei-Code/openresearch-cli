@@ -55,6 +55,18 @@ Workflow:
 4. Publish: `trackio logbook publish <hf-username>/<openreview-id>` (the OpenReview ID from the paper reference above; after later edits, `trackio logbook sync`).
 "#;
 
+const ICML_REPRO_LOCAL_TEMPLATE: &str = r#"Prepare an ICML 2026 reproduction in this local-only project.
+
+Paper: {args}
+
+The challenge workflow requires Hugging Face Jobs and publication, which are
+not available while this project is local-only. Do not launch `hf jobs` or
+bypass the OpenResearch compute gate. Explain that the user must explicitly
+enable GitHub for this project in the Git tab before the challenge workflow can
+run. Until then, you may read the paper and outline a local experiment plan,
+but do not provision external compute or publish a logbook.
+"#;
+
 const REPRODUCE_PAPER_TEMPLATE: &str = r#"Reproduce a research paper claim by claim on the user's compute.
 
 Paper and compute: {args}
@@ -211,6 +223,50 @@ Finish by reporting:
 Do not stop after creating the notebook. Finish only after the reproduction is analyzed, the notebook is validated, public links work, and provenance is recorded in the experiment tree.
 "#;
 
+const REPRODUCE_PAPER_LOCAL_TEMPLATE: &str = r#"Reproduce a research paper claim by claim in this local-only project.
+
+Paper and compute: {args}
+
+Use the configured local repository and `orx` experiment tree. Read the paper,
+enumerate its empirical claims, and choose the smallest honest reproduction
+that fits this machine. Create experiment nodes for meaningful variants, make
+each change on its printed local branch, commit it, and launch only with
+`orx exp run <experiment-id> --backend local`. Keep the inherited run command
+fixed. Wait with `orx exp wait --project <project-id>`, inspect `orx runs`, and
+read every terminal run with `orx logs <run-id>`.
+
+Record the paper number, observed number, scale or substitutions, sample size,
+scoring method, runtime, and an honest assessment in `orx exp desc`. Repair a
+node in place when a run answers nothing; branch a child after a meaningful
+result.
+
+Produce a self-contained local report under the project's Artifacts directory,
+with figures in an adjacent `images/` folder. Open with the strongest result,
+separate paper evidence from observed evidence, and link experiment branches by
+name without assuming hosted URLs. Do not publish, change repository visibility,
+or contact a Git hosting service. If the user later wants hosted artifacts or
+external compute, ask them to enable GitHub from the Git tab first.
+"#;
+
+const PAPER_TO_MARIMO_LOCAL_TEMPLATE: &str = r#"Reproduce a paper's main illustrative claim and create a self-contained local marimo tutorial.
+
+Paper, compute, and preferences: {args}
+
+This project is local-only. Read the paper, choose one illustrative empirical
+claim, and use committed `orx/*` experiment branches with
+`orx exp run <experiment-id> --backend local`. Keep formal evidence in run
+logs, record conclusions with `orx exp desc`, and state every downscaling or
+substitution honestly.
+
+Create a tutorial-style marimo notebook in the project's Artifacts directory.
+Embed the already-produced small results so opening the notebook does not rerun
+expensive work. Validate it with `marimo check <notebook.py>` and provide local
+`marimo edit` and `marimo run` commands. Do not create public links, edit a
+README as a publication surface, change visibility, or contact GitHub. Hosted
+Molab publication can be a later explicit step after the user enables GitHub
+for this project.
+"#;
+
 pub const CATALOG: &[Skill] = &[
     Skill {
         name: "lit-review",
@@ -244,7 +300,7 @@ pub const CATALOG: &[Skill] = &[
 
 /// Expand a leading `/name [args]` into the skill's full prompt. `None` when
 /// the text is not a known slash-skill (sent to the harness untouched).
-pub fn expand(text: &str) -> Option<String> {
+pub fn expand(text: &str, github_enabled: bool) -> Option<String> {
     let rest = text.strip_prefix('/')?;
     let (cmd, args) = match rest.split_once(char::is_whitespace) {
         Some((cmd, args)) => (cmd, args.trim()),
@@ -252,12 +308,24 @@ pub fn expand(text: &str) -> Option<String> {
     };
     let skill = CATALOG.iter().find(|s| s.name == cmd)?;
     let args = if args.is_empty() { skill.no_args } else { args };
-    Some(skill.template.replace("{args}", args))
+    let template = if github_enabled {
+        skill.template
+    } else {
+        match skill.name {
+            "icml-repro" => ICML_REPRO_LOCAL_TEMPLATE,
+            "reproduce-paper" => REPRODUCE_PAPER_LOCAL_TEMPLATE,
+            "paper-to-marimo" => PAPER_TO_MARIMO_LOCAL_TEMPLATE,
+            _ => skill.template,
+        }
+    };
+    Some(template.replace("{args}", args))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::expand;
+    fn expand(text: &str) -> Option<String> {
+        super::expand(text, true)
+    }
 
     #[test]
     fn expands_known_skill_with_args() {
@@ -353,5 +421,19 @@ mod tests {
         assert!(expand("/unknown thing").is_none());
         assert!(expand("hello /lit-review").is_none());
         assert!(expand("just text").is_none());
+    }
+
+    #[test]
+    fn local_publication_skills_keep_artifacts_local() {
+        let reproduce = super::expand("/reproduce-paper example", false).unwrap();
+        assert!(reproduce.contains("local-only"));
+        assert!(!reproduce.contains("git push"));
+        assert!(!reproduce.contains("public GitHub"));
+        let marimo = super::expand("/paper-to-marimo example", false).unwrap();
+        assert!(marimo.contains("Artifacts directory"));
+        assert!(!marimo.contains("git push"));
+        let icml = super::expand("/icml-repro example", false).unwrap();
+        assert!(icml.contains("local-only"));
+        assert!(icml.contains("Do not launch `hf jobs`"));
     }
 }

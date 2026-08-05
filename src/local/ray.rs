@@ -111,28 +111,18 @@ pub async fn submit_local_ray(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     })?;
 
     let commit_sha = {
-        let (owner, repo, baseline, branch) = (
-            project.github_owner.clone(),
-            project.github_repo.clone(),
-            project.baseline_branch.clone(),
-            exp.branch_name.clone(),
-        );
-        tokio::task::spawn_blocking(move || -> Result<String> {
-            let repo_path = git::ensure_clone(&owner, &repo, &baseline)?;
-            if !git::branch_on_remote(&repo_path, &branch)? {
-                git::push_branch(&repo_path, &branch)?;
-            }
-            git::branch_head_sha(&repo_path, &branch)
-        })
-        .await
-        .map_err(|e| anyhow!("git task failed: {e}"))??
+        let project = project.clone();
+        let branch = exp.branch_name.clone();
+        tokio::task::spawn_blocking(move || git::publish_branch_commit(&project, &branch))
+            .await
+            .map_err(|e| anyhow!("git task failed: {e}"))??
     };
 
     let run_id = uuid::Uuid::new_v4().to_string();
     // Ray submission ids: letters, digits, dashes, underscores.
     let submission_id = format!("orx-{}", run_id.replace('-', ""));
     let script = hf_clone_script(
-        &exp.branch_name,
+        &commit_sha,
         &project.github_owner,
         &project.github_repo,
         &run_command,
