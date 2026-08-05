@@ -98,14 +98,31 @@ async fn wait(
 
 // --- job-launch helpers shared with the src/local/* backends -----------------
 
-/// Clone the experiment branch tip and run the fixed command. GITHUB_TOKEN
-/// (passed as a job secret when present locally) authenticates private
-/// repos via bash's ${VAR:+...} — the URL stays tokenless without it.
-pub(crate) fn hf_clone_script(branch: &str, owner: &str, repo: &str, cmd: &str) -> String {
+/// Fetch one recorded commit and run the fixed command. GITHUB_TOKEN
+/// (passed as a job secret when present locally) authenticates private repos
+/// through an ephemeral credential helper; the URL and git config stay tokenless.
+pub(crate) fn hf_clone_script(git_ref: &str, owner: &str, repo: &str, cmd: &str) -> String {
+    let url = shell_quote(&format!("https://github.com/{owner}/{repo}.git"));
     format!(
         "set -eo pipefail; command -v git >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq git); \
-         git clone --depth 1 --branch {branch} \"https://${{GITHUB_TOKEN:+x-access-token:${{GITHUB_TOKEN}}@}}github.com/{owner}/{repo}.git\" repo; \
-         cd repo; {cmd}"
+         git init -q repo; cd repo; \
+         git remote add origin {url}; \
+         git -c credential.helper= -c credential.helper='!f() {{ echo username=x-access-token; echo \"password=$GITHUB_TOKEN\"; }}; f' \
+         fetch --depth 1 origin {git_ref}; git checkout --detach FETCH_HEAD; {cmd}",
+        git_ref = shell_quote(git_ref),
+    )
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+pub(crate) fn local_clone_script(repo_path: &str, commit_sha: &str, cmd: &str) -> String {
+    format!(
+        "set -eo pipefail; git clone --no-checkout --local {} repo; cd repo; git checkout --detach {}; {}",
+        shell_quote(repo_path),
+        shell_quote(commit_sha),
+        cmd
     )
 }
 
@@ -142,4 +159,18 @@ pub(crate) fn spawn_detached_supervise(run_id: &str) -> Result<()> {
     cmd.spawn()
         .map_err(|e| anyhow!("Could not spawn `orx supervise {}`: {}", run_id, e))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod clone_script_tests {
+    use super::*;
+
+    #[test]
+    fn remote_clone_fetches_recorded_commit_detached() {
+        let script = hf_clone_script("abc123", "owner", "repo", "python run.py");
+        assert!(script.contains("fetch --depth 1 origin 'abc123'"));
+        assert!(script.contains("checkout --detach FETCH_HEAD"));
+        assert!(!script.contains("--branch"));
+        assert!(!script.contains("x-access-token:${GITHUB_TOKEN}@"));
+    }
 }

@@ -112,7 +112,31 @@ const SYSTEM_PROMPT: &str = include_str!("../../SYSTEM_PROMPT.md");
 fn playbook_md(project: &LocalProject) -> String {
     let id = &project.id;
     let name = &project.name;
-    let repo = format!("{}/{}", project.github_owner, project.github_repo);
+    let publication_line = if project.github_enabled() {
+        format!(
+            "- GitHub repository: {}",
+            project
+                .github_url()
+                .expect("enabled project has publication metadata")
+        )
+    } else {
+        "- GitHub: not enabled — this project is local-only".to_string()
+    };
+    let experiment_publish_clause = if project.github_enabled() {
+        "created locally and pushed to GitHub"
+    } else {
+        "created locally and never pushed"
+    };
+    let edit_step = if project.github_enabled() {
+        "2. **Edit** in this worktree: check out `<branch>`, change the code, commit, and `git push`. Remote runs use the pushed commit."
+    } else {
+        "2. **Edit** in this worktree: check out `<branch>`, change the code, and commit. Never push; local runs clone the recorded local commit."
+    };
+    let compute_contract = if project.github_enabled() {
+        "Remote backends clone the pushed GitHub commit; the local backend clones the recorded commit directly from the project folder."
+    } else {
+        "This project is local-only: only the `local` backend is available, and it clones the recorded commit directly from the project folder."
+    };
     let baseline = &project.baseline_branch;
     let artifacts = super::files::files_dir(project)
         .to_string_lossy()
@@ -132,15 +156,33 @@ fn playbook_md(project: &LocalProject) -> String {
     // resolution in `exp run` stays authoritative either way: the agent is
     // told to OMIT `--backend`, never to echo the default back, so even a
     // stale prompt launches on the current default.
-    let compute_default = crate::config::compute_default();
-    let compute_bullet = match &compute_default {
+    let configured_compute_default = crate::config::compute_default();
+    let compute_default = if project.github_enabled() {
+        Some(
+            configured_compute_default
+                .clone()
+                .unwrap_or_else(|| ("local".to_string(), None)),
+        )
+    } else {
+        Some(("local".to_string(), None))
+    };
+    let compute_default_source = if configured_compute_default.is_some() {
+        "the user's configured default"
+    } else {
+        "the local fallback"
+    };
+    let compute_bullet = if !project.github_enabled() {
+        "- Compute: **local only** — run recorded commits on this machine. External backends remain unavailable until the user enables GitHub in the Git tab."
+            .to_string()
+    } else {
+        match &compute_default {
         Some((b, f)) => {
             let flavor_part = f
                 .as_ref()
                 .map_or(String::new(), |f| format!(" (`--flavor {f}`)"));
             format!(
-                "- Compute: default target **{b}**{flavor_part} — the user set it in \
-                 Settings → Compute; omit `--backend` on `orx exp run` to launch there. \
+                "- Compute: default target **{b}**{flavor_part} — {compute_default_source}; omit `--backend` \
+                 on `orx exp run` to launch there. \
                  Use another backend only when the user names one (see \"Compute backends\")"
             )
         }
@@ -150,44 +192,70 @@ fn playbook_md(project: &LocalProject) -> String {
                  backends\")"
                 .to_string()
         }
+        }
     };
-    let backends_intro = match &compute_default {
-        Some((b, f)) => {
-            let flavor_part = f
-                .as_ref()
-                .map_or(String::new(), |f| format!(" --flavor {f}"));
-            // The omit-instruction must match what a bare launch actually
-            // needs: with a saved flavor both flags can go; a flavor-required
-            // backend without one still needs --flavor; ssh always needs
-            // --host. Contradicting the launch validation here sends the
-            // agent into a guaranteed-failing command.
-            let omit_hint = if f.is_some() {
-                "Omit it (and `--flavor`) to use the default.".to_string()
-            } else if super::FLAVOR_REQUIRED_BACKENDS.contains(&b.as_str()) {
-                "Omit `--backend` to use the default, but still pass `--flavor` — no default \
+    let backends_intro = if !project.github_enabled() {
+        "`orx exp run` uses only the `local` backend for this project. Do not select, configure, or contact an external backend."
+            .to_string()
+    } else {
+        match &compute_default {
+            Some((b, f)) => {
+                let flavor_part = f
+                    .as_ref()
+                    .map_or(String::new(), |f| format!(" --flavor {f}"));
+                // The omit-instruction must match what a bare launch actually
+                // needs: with a saved flavor both flags can go; a flavor-required
+                // backend without one still needs --flavor; ssh always needs
+                // --host. Contradicting the launch validation here sends the
+                // agent into a guaranteed-failing command.
+                let omit_hint = if f.is_some() {
+                    "Omit it (and `--flavor`) to use the default.".to_string()
+                } else if super::FLAVOR_REQUIRED_BACKENDS.contains(&b.as_str()) {
+                    "Omit `--backend` to use the default, but still pass `--flavor` — no default \
                  flavor is saved."
-                    .to_string()
-            } else {
-                "Omit it to use the default.".to_string()
-            };
-            let mut s = format!(
-                "`orx exp run` launches on the user's configured default — **{b}{flavor_part}** \
+                        .to_string()
+                } else {
+                    "Omit it to use the default.".to_string()
+                };
+                let mut s = format!(
+                    "`orx exp run` launches on {compute_default_source} — **{b}{flavor_part}** \
                  — when you omit `--backend`. {omit_hint} \
                  Deviate only when the user names another backend for the task or this \
                  conversation — a connected token for some other backend is NOT a signal to \
                  switch."
-            );
-            if b == "ssh" {
-                s.push_str(" (`--host <alias>` is still required on every launch.)");
+                );
+                if b == "ssh" {
+                    s.push_str(" (`--host <alias>` is still required on every launch.)");
+                }
+                s
             }
-            s
-        }
-        None => "`orx exp run` requires an explicit `--backend` — **there is no default**.\n\
+            None => "`orx exp run` requires an explicit `--backend` — **there is no default**.\n\
                  Which backend to use is the user's decision: if the task doesn't name one and\n\
                  the user hasn't already picked one in this conversation, ask before launching."
-            .to_string(),
+                .to_string(),
+        }
     };
-    let launch_step = if compute_default.is_some() {
+    let (run_invocation, run_guidance, compute_guidance) = if project.github_enabled() {
+        (
+            "`orx exp run <expId> [--backend <hf|modal|k8s|ssh|slurm|openresearch|local>] [flags]`",
+            "Launch the node's run. Backend flags, flavors, and sizing: **`orx-compute` skill** (k8s manifest: **`orx-compute-k8s`**).",
+            "Before launching on a backend you have not used this session, load the `orx-compute` skill; k8s additionally needs `orx-compute-k8s`.",
+        )
+    } else {
+        (
+            "`orx exp run <expId> --backend local`",
+            "Launch the recorded commit on this machine. External backends are unavailable until the user enables GitHub.",
+            "Load `orx-compute` for the local launch/wait contract. Do not configure or contact external providers.",
+        )
+    };
+    let skills_scope = if project.github_enabled() {
+        "backend flags and sizing, the k8s manifest, tree shaping, git recipes, log analysis, and artifact naming"
+    } else {
+        "local runs, tree shaping, local git recipes, log analysis, and artifact naming"
+    };
+    let launch_step = if !project.github_enabled() {
+        "3. **Launch locally**: `orx exp run <expId> --backend local`. External backends are unavailable until the user enables GitHub in the Git tab."
+    } else if compute_default.is_some() {
         "3. **Launch**: `orx exp run <expId>` — omitting `--backend` uses the default\n   \
          target (flags the default still needs are listed under \"Compute backends\") —\n   \
          or name one explicitly (`--flavor` for hf/modal/ray, `--host` for ssh/slurm; k8s\n   \
@@ -202,7 +270,11 @@ fn playbook_md(project: &LocalProject) -> String {
     // the playbook index and the files on disk can never drift.
     let skills_list = super::agent_skills::skills(super::agent_skills::SkillSet::Local)
         .iter()
-        .map(|s| format!("- **{}** — {}", s.name, s.description))
+        .filter(|skill| super::agent_skills::available_in_session(skill, project.github_enabled()))
+        .map(|s| {
+            let description = super::agent_skills::session_description(s, project.github_enabled());
+            format!("- **{}** — {description}", s.name)
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let template = SYSTEM_PROMPT
@@ -212,7 +284,10 @@ fn playbook_md(project: &LocalProject) -> String {
     template
         .replace("{name}", name)
         .replace("{id}", id)
-        .replace("{repo}", &repo)
+        .replace("{publication_line}", &publication_line)
+        .replace("{experiment_publish_clause}", experiment_publish_clause)
+        .replace("{edit_step}", edit_step)
+        .replace("{compute_contract}", compute_contract)
         .replace("{baseline}", baseline)
         .replace("{paper_line}", &paper_line)
         .replace("{compute_bullet}", &compute_bullet)
@@ -220,6 +295,10 @@ fn playbook_md(project: &LocalProject) -> String {
         .replace("{skills_list}", &skills_list)
         .replace("{launch_step}", launch_step)
         .replace("{backends_intro}", &backends_intro)
+        .replace("{run_invocation}", run_invocation)
+        .replace("{run_guidance}", run_guidance)
+        .replace("{compute_guidance}", compute_guidance)
+        .replace("{skills_scope}", skills_scope)
 }
 
 /// Keep the files we drop into the checkout out of `git status` / accidental
@@ -228,7 +307,10 @@ fn playbook_md(project: &LocalProject) -> String {
 /// `.git/info/exclude` is shared by every session worktree (a worktree's own
 /// `.git` is just a pointer file). Best-effort.
 fn exclude_agent_files(hub: &Path) {
-    let path = hub.join(".git").join("info").join("exclude");
+    let Ok(git_dir) = git::common_git_dir(hub) else {
+        return;
+    };
+    let path = git_dir.join("info").join("exclude");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let missing: Vec<&str> = [
         "opencode.json",
@@ -275,12 +357,7 @@ pub fn ensure_playbook(
     session_id: &str,
     session_skills_dir: Option<&str>,
 ) -> Result<(PathBuf, PathBuf)> {
-    let workdir = git::ensure_session_worktree(
-        &project.github_owner,
-        &project.github_repo,
-        &project.baseline_branch,
-        session_id,
-    )?;
+    let workdir = git::ensure_session_worktree(project, session_id)?;
     let playbook = workdir.join(PLAYBOOK_REL);
     if let Some(parent) = playbook.parent() {
         std::fs::create_dir_all(parent)
@@ -291,13 +368,10 @@ pub fn ensure_playbook(
     // Modular skills, written fresh beside the playbook (same freshness
     // semantics) so this session's agent discovers them natively.
     if let Some(dir) = session_skills_dir {
-        super::agent_skills::ensure_session_skills(&workdir, dir)?;
+        super::agent_skills::ensure_session_skills(&workdir, dir, project.github_enabled())?;
     }
     // One shared exclude covers every worktree.
-    exclude_agent_files(&git::clone_path(
-        &project.github_owner,
-        &project.github_repo,
-    ));
+    exclude_agent_files(Path::new(&project.repo_path));
     // The playbook points the agent at the artifacts dir — make sure it exists.
     let _ = super::files::ensure_dir(project);
     Ok((workdir, playbook))
@@ -605,6 +679,7 @@ mod tests {
             slug: "test-project".into(),
             github_owner: "acme".into(),
             github_repo: "widget".into(),
+            github_sync_enabled: true,
             baseline_branch: "main".into(),
             repo_path: "/tmp/nonexistent".into(),
             run_command: None,
@@ -666,6 +741,10 @@ mod tests {
             "{skills_list}",
             "{launch_step}",
             "{backends_intro}",
+            "{run_invocation}",
+            "{run_guidance}",
+            "{compute_guidance}",
+            "{skills_scope}",
         ] {
             assert!(!md.contains(token), "unresolved placeholder {token}");
         }
@@ -686,5 +765,19 @@ mod tests {
         assert!(!md.contains("## Memory"));
         assert!(!md.contains("User memory"));
         assert!(!md.contains("Project memory"));
+    }
+
+    #[test]
+    fn local_only_playbook_requires_commits_without_pushes() {
+        let mut project = sample_project();
+        project.github_owner.clear();
+        project.github_repo.clear();
+        let md = playbook_md(&project);
+        assert!(md.contains("GitHub: not enabled"));
+        assert!(md.contains("Never push; local runs clone the recorded local commit"));
+        assert!(md.contains("Compute: **local only**"));
+        assert!(md.contains("`orx exp run <expId> --backend local`"));
+        assert!(!md.contains("orx-compute-k8s"));
+        assert!(!md.contains("--backend <hf|modal"));
     }
 }

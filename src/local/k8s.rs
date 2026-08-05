@@ -121,26 +121,19 @@ pub async fn submit_local_k8s(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     // The job clones from GitHub, so the branch tip must exist there — and the
     // manifest is read from that same tip, not the working tree.
     let (commit_sha, manifest) = {
-        let (owner, repo, baseline, branch, path) = (
-            project.github_owner.clone(),
-            project.github_repo.clone(),
-            project.baseline_branch.clone(),
-            exp.branch_name.clone(),
-            manifest_path.clone(),
-        );
+        let project = project.clone();
+        let branch = exp.branch_name.clone();
+        let path = manifest_path.clone();
         tokio::task::spawn_blocking(move || -> Result<(String, String)> {
-            let repo_path = git::ensure_clone(&owner, &repo, &baseline)?;
-            if !git::branch_on_remote(&repo_path, &branch)? {
-                git::push_branch(&repo_path, &branch)?;
-            }
-            let sha = git::branch_head_sha(&repo_path, &branch)?;
-            let manifest = git::file_at(&repo_path, &sha, &path).map_err(|_| {
-                anyhow!(
-                    "No manifest at '{path}' on branch '{branch}' — write one, commit, \
+            let sha = git::publish_branch_commit(&project, &branch)?;
+            let manifest = git::file_at(std::path::Path::new(&project.repo_path), &sha, &path)
+                .map_err(|_| {
+                    anyhow!(
+                        "No manifest at '{path}' on branch '{branch}' — write one, commit, \
                      and push (jobs run the branch tip, so an uncommitted manifest \
                      doesn't exist yet). Pass --manifest <path> if it lives elsewhere."
-                )
-            })?;
+                    )
+                })?;
             Ok((sha, manifest))
         })
         .await
@@ -149,7 +142,7 @@ pub async fn submit_local_k8s(args: &crate::ExpRunArgs) -> Result<StoredRun> {
 
     let run_id = uuid::Uuid::new_v4().to_string();
     let script = hf_clone_script(
-        &exp.branch_name,
+        &commit_sha,
         &project.github_owner,
         &project.github_repo,
         &run_command,

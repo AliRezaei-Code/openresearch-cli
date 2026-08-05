@@ -12,6 +12,9 @@ export function BranchPill({
   repo: string;
   branch: string;
 }) {
+  if (!owner || !repo) {
+    return <span className="files-pill"><code>{branch}</code></span>;
+  }
   return (
     <a
       className="files-pill"

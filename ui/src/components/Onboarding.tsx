@@ -1,59 +1,50 @@
-import { ArrowLeft, ArrowRight, Check, Copy, RefreshCw, X } from "lucide-react";
+import { ArrowLeft, ArrowRight, Check, RefreshCw, X } from "lucide-react";
 import { Wordmark } from "./Wordmark";
 import { useEffect, useRef, useState } from "react";
 import {
-  getGitSettings,
   getHarnesses,
   getProfile,
+  getTelemetry,
   harnessModelLabel,
+  recordTelemetryConsent,
   searchPapers,
   setProfile,
-  type GitSettings,
+  setTelemetry,
   type Harness,
   type LinkedPaper,
   type PaperHit,
+  type TelemetrySettings,
 } from "../api";
-import { GitTokenForm } from "./GitTokenForm";
 import { renderNote } from "./agentNote";
 import { onHarnessAuth } from "../events";
 
 const RETRY_COPY = "Couldn't reach orx. Check it's still running, then re-check.";
 
-/** First-run walkthrough: the detected coding agents, then GitHub access, then a
- * short research-background prompt, then hand off to the (empty) projects page.
- * Step 1 gates — orx can't chat without a signed-in agent. Steps 2 and 3 don't:
- * cloning/pushing work over SSH keys, and the background (a blurb + linked
- * papers) is optional, saved best-effort so it never blocks finishing. The
- * data-dir choice lives in Settings → Storage (which can also *move* existing
- * data); usage analytics is opt-out via the CLI (`orx telemetry off`). */
+/** First-run walkthrough: coding agents, research profile, then analytics consent.
+ * The data-dir choice deliberately lives in Settings → Storage instead:
+ * the default suits almost everyone, and Settings can also *move* existing
+ * data, which this flow never could. */
 export function Onboarding({ onDone }: { onDone: () => void }) {
   const [step, setStep] = useState<0 | 1 | 2>(0);
   const [harnesses, setHarnesses] = useState<Harness[] | null>(null);
-  const [git, setGit] = useState<GitSettings | null>(null);
+  const [telemetry, setTelemetryState] = useState<TelemetrySettings | null>(null);
+  const [telemetrySaving, setTelemetrySaving] = useState(false);
   const [checking, setChecking] = useState(false);
-  // Step 3 (optional): a free-text background plus any alphaXiv papers linked
-  // via title search. Prefilled from any saved profile so a replayed
-  // walkthrough doesn't look empty.
   const [background, setBackground] = useState("");
   const [papers, setPapers] = useState<LinkedPaper[]>([]);
   const [paperQuery, setPaperQuery] = useState("");
   const [paperHits, setPaperHits] = useState<PaperHit[]>([]);
   const [searchingPapers, setSearchingPapers] = useState(false);
   const paperSeq = useRef(0);
-  // Per-probe, not one shared flag: a git failure must not put a connectivity
-  // error on the harness gate it has nothing to do with — or worse, hide the
-  // actionable "sign in" hint behind it.
+  // Per-probe, not one shared flag: a telemetry failure must not put a
+  // connectivity error on a gate it has nothing to do with — or worse, hide
+  // the actionable "sign in" hint behind it.
   const [harnessError, setHarnessError] = useState(false);
-  const [gitError, setGitError] = useState(false);
 
   // Step 1 requires one genuinely usable harness. A failed or inconclusive
   // detection never bypasses the gate; the user can re-check without being
   // tricked into a chat configuration that cannot run.
   const anyAgentReady = harnesses?.some((h) => h.agentReady) ?? false;
-
-  // Drives the nudge on step 2 only — that step doesn't gate, so an unknown
-  // answer costs nothing.
-  const githubConnected = git?.githubTokenSource != null;
 
   // Drops a slow probe whose answer a newer load — or a token save — has
   // already superseded, so a Save landing mid-refresh isn't overwritten by the
@@ -63,13 +54,12 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
     const seq = ++loadSeq.current;
     setChecking(true);
     setHarnessError(false);
-    setGitError(false);
     const fresh = () => seq === loadSeq.current;
     void Promise.allSettled([
       getHarnesses(refresh, retryRejected).then((h) => fresh() && setHarnesses(h)),
-      getGitSettings().then((g) => fresh() && setGit(g)),
+      getTelemetry().then((t) => fresh() && setTelemetryState(t)),
     ])
-      .then(([harness, git]) => {
+      .then(([harness]) => {
         if (!fresh()) return;
         // Clear the stale answer too, so "errored", "loading" and "loaded"
         // stay mutually exclusive — otherwise a failed re-check leaves old
@@ -77,10 +67,6 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
         if (harness.status === "rejected") {
           setHarnessError(true);
           setHarnesses(null);
-        }
-        if (git.status === "rejected") {
-          setGitError(true);
-          setGit(null);
         }
       })
       // Not sequence-guarded: this is "a load is running", not data a stale
@@ -102,50 +88,55 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
       }),
     [],
   );
-  // Prefill from any saved profile — best-effort, never gates the step.
   useEffect(() => {
     void getProfile()
-      .then((p) => {
-        setBackground(p.background ?? "");
-        setPapers(p.papers);
+      .then((profile) => {
+        setBackground(profile.background ?? "");
+        setPapers(profile.papers);
       })
       .catch(() => {});
   }, []);
-
-  // Debounced title search; `paperSeq` drops superseded responses.
   useEffect(() => {
-    const q = paperQuery.trim();
-    if (q.length < 3) {
+    const query = paperQuery.trim();
+    if (query.length < 3) {
       setPaperHits([]);
       setSearchingPapers(false);
       return;
     }
-    const seq = ++paperSeq.current;
+    const request = ++paperSeq.current;
     setSearchingPapers(true);
-    const t = setTimeout(() => {
-      searchPapers(q)
-        .then((res) => seq === paperSeq.current && setPaperHits(res))
-        .catch(() => seq === paperSeq.current && setPaperHits([]))
-        .finally(() => seq === paperSeq.current && setSearchingPapers(false));
+    const timer = setTimeout(() => {
+      void searchPapers(query)
+        .then((results) => request === paperSeq.current && setPaperHits(results))
+        .catch(() => request === paperSeq.current && setPaperHits([]))
+        .finally(() => request === paperSeq.current && setSearchingPapers(false));
     }, 350);
-    return () => clearTimeout(t);
+    return () => clearTimeout(timer);
   }, [paperQuery]);
 
-  const addPaper = (h: PaperHit) => {
-    setPapers((cur) =>
-      cur.some((p) => p.paperId === h.paperId)
-        ? cur
-        : [...cur, { paperId: h.paperId, title: cleanPaperTitle(h.title) }],
+  const addPaper = (hit: PaperHit) => {
+    setPapers((current) =>
+      current.some((paper) => paper.paperId === hit.paperId)
+        ? current
+        : [...current, { paperId: hit.paperId, title: cleanPaperTitle(hit.title) }],
     );
     setPaperQuery("");
     setPaperHits([]);
   };
-  const removePaper = (id: string) => setPapers((cur) => cur.filter((p) => p.paperId !== id));
+  const removePaper = (paperId: string) =>
+    setPapers((current) => current.filter((paper) => paper.paperId !== paperId));
 
-  // Persist the profile, then finish. Best-effort — an empty or failed save
-  // must never trap the user on the last step.
-  const finish = () => {
+  const saveProfile = () => {
     void setProfile({ background: background.trim() || null, papers }).catch(() => {});
+    setStep(2);
+  };
+
+  // Leaving step 3 → record the final consent decision once (agree or reject),
+  // so every user who reaches the analytics step is counted, including those who
+  // accept the default. Default to enabled if the setting hasn't loaded yet
+  // (that's the default state shown). Best-effort — never block finishing.
+  const finishOnboarding = () => {
+    void recordTelemetryConsent(telemetry?.enabled ?? true).catch(() => {});
     onDone();
   };
 
@@ -199,81 +190,34 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
             <div className="onb-eyebrow">
               <Wordmark /> · Step 2 of 3
             </div>
-            <h2 className="onb-title">Connect GitHub</h2>
-            <p className="onb-sub">
-              orx clones your GitHub repos and pushes each experiment as a branch.
-            </p>
-            <div className="onb-cards">
-              {gitError ? (
-                <div className="onb-card-meta">{RETRY_COPY}</div>
-              ) : (
-                <GitCard
-                  git={git}
-                  onUpdate={(g) => {
-                    // A save is newer than any probe still in flight.
-                    loadSeq.current++;
-                    setGit(g);
-                    setGitError(false);
-                  }}
-                />
-              )}
-            </div>
-            {/* Soft, and honestly so: cloning and pushing work over SSH keys
-                (ensure_clone tries ssh first), so a token is a convenience,
-                not a requirement. State what's missing; never block on it. A
-                disabled Continue beside an enabled Skip just reads as a bug. */}
-            {git !== null && !githubConnected && (
-              <p className="onb-gate-hint">
-                Without GitHub access, orx can&apos;t create repos for you — cloning and pushing
-                still work if you have SSH keys.
-              </p>
-            )}
-            <div className="onb-actions">
-              <button className="btn ghost" onClick={() => setStep(0)}>
-                <ArrowLeft size={12} /> Back
-              </button>
-              <button className="btn ghost" onClick={() => load(false)} disabled={checking}>
-                <RefreshCw size={12} className={checking ? "spin" : ""} /> Re-check
-              </button>
-              <div style={{ flex: 1 }} />
-              <button className="btn primary" onClick={() => setStep(2)}>
-                Continue <ArrowRight size={13} />
-              </button>
-            </div>
-          </>
-        ) : (
-          <>
-            <div className="onb-eyebrow">
-              <Wordmark /> · Step 3 of 3
-            </div>
             <h2 className="onb-title">Tell us about your research</h2>
             <p className="onb-sub">
-              A sentence or two about what you work on helps orx tailor its research. All optional;
-              you can skip and add this later.
+              A sentence or two about what you work on helps orx tailor its research. Everything
+              here is optional.
             </p>
             <div className="onb-cards">
               <div className="onb-card">
                 <textarea
                   className="onb-textarea"
                   value={background}
-                  onChange={(e) => setBackground(e.target.value)}
+                  onChange={(event) => setBackground(event.target.value)}
                   rows={4}
                   placeholder="e.g. I work on sample-efficient RL for LLM post-training, focused on reward-model-free methods."
                 />
                 <div className="onb-paper-search">
                   <input
                     value={paperQuery}
-                    onChange={(e) => setPaperQuery(e.target.value)}
+                    onChange={(event) => setPaperQuery(event.target.value)}
                     placeholder="Search alphaXiv by title to link a paper…"
                   />
                   {searchingPapers ? (
                     <div className="onb-card-meta">Searching alphaXiv…</div>
                   ) : paperHits.length > 0 ? (
                     <div className="onb-paper-results">
-                      {paperHits.map((h) => (
-                        <button key={h.paperId} type="button" onClick={() => addPaper(h)}>
-                          <span className="title">{cleanPaperTitle(h.title)}</span>
-                          <span className="id">{h.paperId}</span>
+                      {paperHits.map((hit) => (
+                        <button key={hit.paperId} type="button" onClick={() => addPaper(hit)}>
+                          <span className="title">{cleanPaperTitle(hit.title)}</span>
+                          <span className="id">{hit.paperId}</span>
                         </button>
                       ))}
                     </div>
@@ -281,14 +225,14 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 </div>
                 {papers.length > 0 && (
                   <div className="onb-paper-chips">
-                    {papers.map((p) => (
-                      <span key={p.paperId} className="onb-paper-chip">
-                        <span className="title">{p.title || p.paperId}</span>
-                        <span className="id">{p.paperId}</span>
+                    {papers.map((paper) => (
+                      <span key={paper.paperId} className="onb-paper-chip">
+                        <span className="title">{paper.title || paper.paperId}</span>
+                        <span className="id">{paper.paperId}</span>
                         <button
                           type="button"
-                          aria-label={`Remove ${p.paperId}`}
-                          onClick={() => removePaper(p.paperId)}
+                          aria-label={`Remove ${paper.paperId}`}
+                          onClick={() => removePaper(paper.paperId)}
                         >
                           <X size={12} />
                         </button>
@@ -298,18 +242,56 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
                 )}
               </div>
             </div>
+            <p className="onb-aside-text" style={{ marginTop: 12 }}>
+              Your background stays on this machine alongside your other OpenResearch data.
+            </p>
+            <div className="onb-actions">
+              <button className="btn ghost" onClick={() => setStep(0)}>
+                <ArrowLeft size={12} /> Back
+              </button>
+              <div style={{ flex: 1 }} />
+              <button className="btn primary" onClick={saveProfile}>
+                Continue <ArrowRight size={13} />
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="onb-eyebrow">
+              <Wordmark /> · Step 3 of 3
+            </div>
+            <h2 className="onb-title">Usage analytics</h2>
+            <p className="onb-sub">
+              orx can send anonymous usage analytics to help improve the tool. No code, prompts,
+              file contents, repo names, or project/session identifiers are ever sent — just a
+              random per-install id, CLI version, OS and architecture, CI flag, coarse install
+              type, and coarse events such as commands, onboarding completion, project creation,
+              and chat-session starts.
+            </p>
+            <div className="onb-cards">
+              <TelemetryCard
+                telemetry={telemetry}
+                saving={telemetrySaving}
+                onSavingChange={setTelemetrySaving}
+                onUpdate={setTelemetryState}
+              />
+            </div>
             {/* The data dir moved to Settings → Storage; still disclose where
                 things land so the location isn't a surprise. */}
             <p className="onb-aside-text" style={{ marginTop: 12 }}>
-              Your background stays on this machine, alongside your database, run logs, and
-              artifacts — change where they live any time in Settings → Storage.
+              Your database, run logs, and artifacts stay on this machine — change where they live
+              any time in Settings → Storage.
             </p>
             <div className="onb-actions">
               <button className="btn ghost" onClick={() => setStep(1)}>
                 <ArrowLeft size={12} /> Back
               </button>
               <div style={{ flex: 1 }} />
-              <button className="btn primary" onClick={finish}>
+              <button
+                className="btn primary"
+                onClick={finishOnboarding}
+                disabled={telemetrySaving}
+              >
                 Create your first project <ArrowRight size={13} />
               </button>
             </div>
@@ -320,35 +302,8 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   );
 }
 
-/** Fast-search titles carry scrape cruft: "[1706.03762] Title - arXiv".
- * Kept in sync with NewProjectForm's cleanTitle. */
 function cleanPaperTitle(title: string): string {
   return title.replace(/^\[[^\]]*\]\s*/, "").replace(/\s*[-–|]\s*arXiv\s*$/i, "");
-}
-
-/** A shell command plus its own copy button, sharing one border so the button
- * reads as part of the command. Each chip owns its "Copied" state. */
-function CmdChip({ cmd }: { cmd: string }) {
-  const [copied, setCopied] = useState(false);
-  const copy = () => {
-    void navigator.clipboard.writeText(cmd).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    });
-  };
-  return (
-    <span className="onb-cmd-chip">
-      <code>{cmd}</code>
-      <button
-        className="onb-cmd-copy"
-        onClick={copy}
-        aria-label={copied ? "Copied" : "Copy command"}
-        title={copied ? "Copied" : "Copy"}
-      >
-        {copied ? <Check size={13} strokeWidth={3} /> : <Copy size={13} />}
-      </button>
-    </span>
-  );
 }
 
 /** Agent notes carry the command to run in backticks (`claude auth login`) —
@@ -400,80 +355,77 @@ function AgentCard({ h }: { h: Harness }) {
   );
 }
 
-function GitCard({
-  git,
+function TelemetryCard({
+  telemetry,
+  saving,
+  onSavingChange,
   onUpdate,
 }: {
-  git: GitSettings | null;
-  onUpdate: (g: GitSettings) => void;
+  telemetry: TelemetrySettings | null;
+  saving: boolean;
+  onSavingChange: (saving: boolean) => void;
+  onUpdate: (t: TelemetrySettings) => void;
 }) {
-  // The PAT form is the fallback, not a peer of `gh auth login` — keep it
-  // behind a disclosure so the card offers one obvious action per row.
-  const [tokenOpen, setTokenOpen] = useState(false);
-  if (git === null) {
+  if (telemetry === null) {
     return (
       <div className="onb-loading">
-        <span className="spinner" /> Checking git…
+        <span className="spinner" /> Checking analytics…
       </div>
     );
   }
-  if (!git.gitVersion) {
-    return (
-      <div className="onb-card">
-        <div className="onb-card-head">
-          <span className="onb-card-name">git</span>
-          <span className="status-badge st-failed">
-            <span className="dot" /> Not found
-          </span>
-        </div>
-        <div className="onb-card-meta">Install git to clone projects, then re-open orx.</div>
-      </div>
-    );
-  }
-  const identity = [git.userName, git.userEmail && `<${git.userEmail}>`]
-    .filter(Boolean)
-    .join(" ");
+  const on = telemetry.enabled;
+  // A per-run override (e.g. `--no-telemetry`) that isn't the persisted setting:
+  // the toggle writes the persisted flag, but this run stays off regardless.
+  const overridden = !on && telemetry.reason !== null && telemetry.reason !== "disabled via `orx telemetry off`";
+  const choose = (enabled: boolean) => {
+    if (saving || enabled === on) return;
+    onSavingChange(true);
+    void setTelemetry(enabled)
+      .then(onUpdate)
+      .catch(() => {})
+      .finally(() => onSavingChange(false));
+  };
   return (
     <div className="onb-card">
-      <div className="onb-card-row">
-        <span className="onb-card-name">GitHub</span>
-        <span className="onb-card-detail mono">
-          {git.githubTokenSource === "env"
-            ? "Token from GITHUB_TOKEN"
-            : git.githubTokenSource === "stored"
-              ? "Token saved in orx"
-              : git.githubTokenSource === "gh"
-                ? "Signed in via gh CLI"
-                : ""}
-        </span>
-        <span className={`status-badge ${git.githubTokenSource ? "st-done" : "st-starting"}`}>
-          {git.githubTokenSource ? <Check size={12} strokeWidth={3} /> : <span className="dot" />}
-          {git.githubTokenSource ? "Connected" : "Not connected"}
-        </span>
+      <div className="onb-card-head">
+        <div>
+          <div className="onb-card-name">Share anonymous usage analytics</div>
+          <div className="onb-card-meta" style={{ marginTop: 2 }}>
+            {on
+              ? "On — helps prioritize what to build next."
+              : overridden
+                ? `Off — ${telemetry.reason}.`
+                : "Off — you can turn it back on anytime."}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 6, flex: "none" }}>
+          <button
+            className={`btn ${on ? "primary" : "ghost"}`}
+            onClick={() => choose(true)}
+            disabled={saving}
+            aria-pressed={on}
+          >
+            {on ? <Check size={12} strokeWidth={3} /> : null} On
+          </button>
+          <button
+            className={`btn ${!on ? "primary" : "ghost"}`}
+            onClick={() => choose(false)}
+            disabled={saving}
+            aria-pressed={!on}
+          >
+            {!on ? <Check size={12} strokeWidth={3} /> : null} Off
+          </button>
+        </div>
       </div>
-      {!git.githubTokenSource && (
-        <>
-          <div className="onb-fix">
-            <span className="onb-fix-label">
-              {tokenOpen
-                ? "Paste a personal access token:"
-                : git.ghInstalled
-                  ? "Run this in your terminal to sign in:"
-                  : "Install the GitHub CLI, then run this to sign in:"}
-            </span>
-            <button className="onb-fix-alt" onClick={() => setTokenOpen((v) => !v)}>
-              {tokenOpen ? "Use gh instead" : "Paste a token instead"}
-            </button>
-          </div>
-          {tokenOpen ? <GitTokenForm onSaved={onUpdate} /> : <CmdChip cmd="gh auth login" />}
-        </>
-      )}
-      {!identity && (
-        <div className="onb-aside">
-          <div className="onb-aside-text">
-            Optional — so the agent&apos;s commits are attributed to you:
-          </div>
-          <CmdChip cmd={`git config --global user.name "Your Name" && git config --global user.email "you@example.com"`} />
+      <div className="onb-card-meta" style={{ marginTop: 12 }}>
+        Sent: a random per-install id, CLI version, OS/architecture, CI flag, coarse install type,
+        and coarse usage events. Never sent: code, prompts, file contents, paths, repo names, or
+        project/session identifiers. Change anytime in Settings or with{" "}
+        <code>orx telemetry off</code>.
+      </div>
+      {overridden && (
+        <div className="onb-card-meta" style={{ marginTop: 8 }}>
+          Note: this run is off because of {telemetry.reason}, which overrides the saved choice.
         </div>
       )}
     </div>
