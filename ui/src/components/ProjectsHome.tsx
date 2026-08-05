@@ -1,6 +1,6 @@
 import { Plus, Trash2 } from "lucide-react";
 import { Wordmark } from "./Wordmark";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { deleteProject, timeAgo, type Project } from "../api";
 import { NewProjectForm } from "./NewProjectForm";
 
@@ -9,29 +9,14 @@ export function ProjectsHome({
   onOpen,
   onCreated,
   onDeleted,
-  openNewProject = false,
-  onNewProjectOpened,
 }: {
   projects: Project[];
   onOpen: (id: string) => void;
   onCreated: (project: Project, githubPublicationError: string | null) => void;
   onDeleted: (id: string) => void;
-  /** Open the New project modal on mount — onboarding ends on "Create your
-   * first project", so landing behind an empty page would ask for that click
-   * twice. Only the post-onboarding hand-off sets this. */
-  openNewProject?: boolean;
-  /** Clear the hand-off flag, so a later remount doesn't re-open the modal. */
-  onNewProjectOpened?: () => void;
 }) {
-  const [modalOpen, setModalOpen] = useState(openNewProject);
+  const [modalOpen, setModalOpen] = useState(false);
   const [deleting, setDeleting] = useState<string | null>(null);
-
-  // Consume the hand-off once: the flag lives in App, and leaving it set would
-  // re-open the modal on any later remount of this page.
-  useEffect(() => {
-    if (openNewProject) onNewProjectOpened?.();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   async function onDelete(p: Project) {
     const hasGithubRepository = Boolean(p.githubUrl || (p.githubOwner && p.githubRepo));

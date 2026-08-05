@@ -13,8 +13,12 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   cancelRun,
+  DEMO_FIGURE_SESSION_ID,
+  DEMO_LITERATURE_SESSION_ID,
+  DEMO_PROJECT_ID,
   getArtifacts,
   listExperiments,
+  listChatSessions,
   listProjects,
   listRuns,
   openProject,
@@ -38,8 +42,10 @@ import { RunsTable } from "./components/RunsTable";
 import { Md } from "./components/Md";
 import { SettingsView, type SettingsTab } from "./components/SettingsPage";
 import { Tour, TOUR_DONE_KEY } from "./components/Tour";
+import { clearReadDemoSessions } from "./demoSessionState";
 import { TreeView } from "./components/TreeView";
 import { useOrxEvents } from "./events";
+import { saveAgentSelection } from "./agentSelection";
 
 /** An experiment view open as a right-panel tab. */
 interface ExpViewDef {
@@ -109,6 +115,65 @@ interface CodeTabDef {
 
 const sameCodeTab = (a: CodeTabDef, b: CodeTabDef) => a.branch === b.branch;
 
+type RightTab =
+  | "experiments"
+  | "files"
+  | ExpViewDef
+  | FileViewDef
+  | PlanViewDef
+  | SubagentViewDef
+  | CodeTabDef;
+
+interface RightPaneSessionState {
+  rightTab: RightTab;
+  expTabs: ExpViewDef[];
+  fileTabs: FileViewDef[];
+  planTabs: PlanViewDef[];
+  subagentTabs: SubagentViewDef[];
+  codeTabs: CodeTabDef[];
+  filesView: WorktreeView;
+  filesToggled: ReadonlySet<string>;
+  selectedRunId: string | null;
+  view: "tree" | "table";
+  scope: "agent" | "project";
+  panelOpen: boolean;
+  panelMax: boolean;
+}
+
+function initialRightPaneSessionState(sessionId?: string): RightPaneSessionState {
+  const initial: RightPaneSessionState = {
+    rightTab: "experiments",
+    expTabs: [],
+    fileTabs: [],
+    planTabs: [],
+    subagentTabs: [],
+    codeTabs: [],
+    filesView: "files",
+    filesToggled: new Set(),
+    selectedRunId: null,
+    view: "tree",
+    scope: "project",
+    panelOpen: true,
+    panelMax: false,
+  };
+  if (sessionId === DEMO_FIGURE_SESSION_ID) {
+    const fileTabs: FileViewDef[] = [
+      { path: "nanochat-base-training-curves.svg", source: "artifacts" },
+      { path: "nanochat-sft-training-curves.svg", source: "artifacts" },
+      { path: "nanochat-training-throughput.svg", source: "artifacts" },
+      { path: "nanochat-core-evaluation.svg", source: "artifacts" },
+    ];
+    return { ...initial, rightTab: fileTabs[0], fileTabs };
+  }
+  if (sessionId === DEMO_LITERATURE_SESSION_ID) {
+    const fileTabs: FileViewDef[] = [
+      { path: "nanochat-bottleneck-diagnosis.md", source: "artifacts" },
+    ];
+    return { ...initial, rightTab: fileTabs[0], fileTabs };
+  }
+  return initial;
+}
+
 /** Escape a string for literal use inside a RegExp. */
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -133,6 +198,10 @@ function parseFilePath(
   let sessionId: string | undefined;
   const clone = repoPath?.replace(/\/+$/, "");
   const artifacts = artifactsDir?.replace(/\/+$/, "");
+  if (path.startsWith("artifacts/")) {
+    path = path.slice("artifacts/".length);
+    return path ? { path, source: "artifacts" } : null;
+  }
   if (!path.startsWith("/")) {
     sessionId = contextSessionId;
   } else if (artifacts && (path === artifacts || path.startsWith(`${artifacts}/`))) {
@@ -233,15 +302,7 @@ export default function App() {
   // Right-panel tab strip: pinned Experiments/Files homes plus a closable tab per
   // opened experiment view / project file. The same experiment can keep both
   // its overview and terminal open.
-  const [rightTab, setRightTab] = useState<
-    | "experiments"
-    | "files"
-    | ExpViewDef
-    | FileViewDef
-    | PlanViewDef
-    | SubagentViewDef
-    | CodeTabDef
-  >("experiments");
+  const [rightTab, setRightTab] = useState<RightTab>("experiments");
   const [expTabs, setExpTabs] = useState<ExpViewDef[]>([]);
   const [fileTabs, setFileTabs] = useState<FileViewDef[]>([]);
   const [planTabs, setPlanTabs] = useState<PlanViewDef[]>([]);
@@ -264,6 +325,50 @@ export default function App() {
     projectId: string;
     message: string;
   } | null>(null);
+  const rightPaneStatesRef = useRef(new Map<string, RightPaneSessionState>());
+  const currentRightPaneStateRef = useRef<RightPaneSessionState>(initialRightPaneSessionState());
+  const activeSessionIdRef = useRef<string | null>(null);
+  currentRightPaneStateRef.current = {
+    rightTab,
+    expTabs,
+    fileTabs,
+    planTabs,
+    subagentTabs,
+    codeTabs,
+    filesView,
+    filesToggled,
+    selectedRunId,
+    view,
+    scope,
+    panelOpen,
+    panelMax,
+  };
+  const onActiveSessionChange = useCallback((nextSessionId: string | null) => {
+    const previousSessionId = activeSessionIdRef.current;
+    if (previousSessionId === nextSessionId) return;
+    if (previousSessionId) {
+      rightPaneStatesRef.current.set(previousSessionId, currentRightPaneStateRef.current);
+    }
+    const nextState = nextSessionId
+      ? (rightPaneStatesRef.current.get(nextSessionId) ??
+        initialRightPaneSessionState(nextSessionId))
+      : initialRightPaneSessionState();
+    setRightTab(nextState.rightTab);
+    setExpTabs(nextState.expTabs);
+    setFileTabs(nextState.fileTabs);
+    setPlanTabs(nextState.planTabs);
+    setSubagentTabs(nextState.subagentTabs);
+    setCodeTabs(nextState.codeTabs);
+    setFilesView(nextState.filesView);
+    setFilesToggled(nextState.filesToggled);
+    setSelectedRunId(nextState.selectedRunId);
+    setView(nextState.view);
+    setScope(nextState.scope);
+    setPanelOpen(nextState.panelOpen);
+    setPanelMax(nextState.panelMax);
+    activeSessionIdRef.current = nextSessionId;
+    setActiveSessionId(nextSessionId);
+  }, []);
   const [onboarded, setOnboarded] = useState(() => {
     try {
       return localStorage.getItem(ONBOARDED_KEY) === "1";
@@ -271,9 +376,6 @@ export default function App() {
       return true; // storage unavailable — don't loop the walkthrough
     }
   });
-  // Set only when the walkthrough hands off, so the New project modal opens
-  // once — a later visit to Projects starts closed as usual.
-  const [justOnboarded, setJustOnboarded] = useState(false);
   // The spotlight tour of the workspace (Tour.tsx). Starting it normalizes
   // the layout so every tour target exists; those are the defaults, so
   // nothing needs restoring on finish/skip.
@@ -313,9 +415,39 @@ export default function App() {
   // Initial project list.
   useEffect(() => {
     listProjects()
-      .then((list) => {
+      .then(async (list) => {
+        if (import.meta.env.DEV && list.length === 0) {
+          try {
+            localStorage.removeItem(TOUR_DONE_KEY);
+          } catch {
+            // The tour will start from in-memory state when storage is unavailable.
+          }
+          clearReadDemoSessions();
+          setOnboarded(false);
+        }
+        const demo = list.find((project) => project.id === DEMO_PROJECT_ID);
+        const recoveredDemo = !onboarded ? demo : undefined;
+        if (recoveredDemo) {
+          const session = (await listChatSessions(recoveredDemo.id))[0];
+          if (!session) throw new Error("The seeded demo conversation is missing.");
+          saveAgentSelection({
+            harness: session.harness,
+            model: session.model,
+            permissionMode: session.permissionMode,
+            reasoningLevel: session.reasoningLevel,
+          });
+          setOnboarded((current) => {
+            if (current) return current;
+            try {
+              localStorage.setItem(ONBOARDED_KEY, "1");
+            } catch {
+              // The server-side demo row remains the durable completion marker.
+            }
+            return true;
+          });
+        }
         setProjects(list);
-        setProjectId((cur) => cur ?? list[0]?.id ?? null);
+        setProjectId((cur) => cur ?? recoveredDemo?.id ?? list[0]?.id ?? null);
       })
       .catch(() => setProjects([]));
   }, []);
@@ -331,6 +463,12 @@ export default function App() {
   // Per-project data. Harness agents spawn lazily on the first chat message.
   useEffect(() => {
     if (!projectId) return;
+    const previousSessionId = activeSessionIdRef.current;
+    if (previousSessionId) {
+      rightPaneStatesRef.current.set(previousSessionId, currentRightPaneStateRef.current);
+    }
+    activeSessionIdRef.current = null;
+    setActiveSessionId(null);
     // Record the visit; the resulting project.updated SSE event refreshes the
     // list's recency order.
     openProject(projectId).catch(() => {});
@@ -348,8 +486,6 @@ export default function App() {
     setRightTab("experiments");
     // Scoping is an explicit per-project choice — don't let Agent scope
     // re-bind to whichever session ChatPanel auto-selects in the next project.
-    // (activeSessionId needs no reset here: ChatPanel owns it and re-reports
-    // null on its own project-switch effect.)
     setScope("project");
     listExperiments(projectId).then(setExperiments).catch(() => {});
     listRuns(projectId).then(setRuns).catch(() => {});
@@ -556,11 +692,6 @@ export default function App() {
     setPanelOpen(true);
   }, []);
 
-  useEffect(() => {
-    setFilesView("files");
-    setFilesToggled(new Set());
-  }, [activeSessionId]);
-
   // Drag the panel's left edge to resize; width persists across reloads.
   const resizePanel = (e: React.PointerEvent) => {
     e.preventDefault();
@@ -646,8 +777,7 @@ export default function App() {
     );
   }
 
-  // First boot: agents walkthrough → git walkthrough → the (empty) projects
-  // page, where the first project gets created.
+  // First boot: the walkthrough installs and opens the embedded demo project.
   if (projects.length === 0) {
     return (
       <div className="app">
@@ -657,18 +787,19 @@ export default function App() {
             onOpen={setProjectId}
             onCreated={onProjectCreated}
             onDeleted={onProjectDeleted}
-            openNewProject={justOnboarded}
-            onNewProjectOpened={() => setJustOnboarded(false)}
           />
         ) : (
           <Onboarding
-            onDone={() => {
+            onDone={(project) => {
+              clearReadDemoSessions();
               try {
                 localStorage.setItem(ONBOARDED_KEY, "1");
+                localStorage.removeItem(TOUR_DONE_KEY);
               } catch {
                 // private mode etc. — the flow just replays next boot
               }
-              setJustOnboarded(true);
+              setProjects([project]);
+              setProjectId(project.id);
               setOnboarded(true);
             }}
           />
@@ -720,7 +851,7 @@ export default function App() {
             onOpenSubagent={openSubagentTab}
             onOpenWorktree={openWorktreeTab}
             onStartTour={startTour}
-            onActiveSessionChange={setActiveSessionId}
+            onActiveSessionChange={onActiveSessionChange}
           >
             {mainView === "artifacts" ? (
               (() => {

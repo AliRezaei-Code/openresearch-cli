@@ -1,5 +1,10 @@
 // Typed client for the orx up local HTTP API (/api/*). All wire JSON is camelCase.
 
+export const DEMO_PROJECT_ID = "demo_nanochat_v1";
+export const DEMO_MAIN_SESSION_ID = "chat_demo_nanochat_v1";
+export const DEMO_FIGURE_SESSION_ID = "chat_demo_nanochat_figures_v1";
+export const DEMO_LITERATURE_SESSION_ID = "chat_demo_nanochat_literature_v1";
+
 export interface Project {
   id: string;
   name: string;
@@ -87,6 +92,19 @@ const patch = <T>(url: string, body: unknown) =>
 
 export const listProjects = () =>
   get<{ projects: Project[] }>("/api/projects").then((r) => r.projects);
+
+export interface OnboardingSelection {
+  harness: HarnessId;
+  model: string | null;
+  permissionMode: string | null;
+  reasoningLevel: string | null;
+}
+
+export const completeOnboarding = (selection: OnboardingSelection, profile: Profile) =>
+  post<{ project: Project; selection: OnboardingSelection }>(
+    "/api/onboarding/complete",
+    { ...selection, ...profile },
+  );
 
 export interface ProjectPathStatus {
   gitVersion: string | null;

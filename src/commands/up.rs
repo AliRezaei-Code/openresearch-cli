@@ -244,6 +244,7 @@ impl ProjectLifecycle {
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/onboarding/complete", post(complete_onboarding))
         .route("/api/project-path/status", get(project_path_status))
         .route("/api/project-path/pick", post(pick_project_folder))
         .route("/api/projects", get(list_projects).post(create_project))
@@ -447,6 +448,51 @@ impl From<&StoredRun> for ApiRun {
 
 async fn health() -> Json<Value> {
     Json(json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompleteOnboardingReq {
+    harness: String,
+    model: Option<String>,
+    permission_mode: Option<String>,
+    reasoning_level: Option<String>,
+    #[serde(default)]
+    background: Option<String>,
+    #[serde(default)]
+    papers: Vec<crate::telemetry::ProfilePaper>,
+}
+
+async fn complete_onboarding(
+    State(state): State<AppState>,
+    Json(req): Json<CompleteOnboardingReq>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    if !local::harness::is_chat_harness(&req.harness) {
+        return Err(bad_request(format!("unknown harness: {}", req.harness)));
+    }
+    let nonempty = |value: Option<String>| value.filter(|item| !item.trim().is_empty());
+    let selection = local::demo::DemoSelection {
+        harness: req.harness,
+        model: nonempty(req.model),
+        permission_mode: nonempty(req.permission_mode),
+        reasoning_level: nonempty(req.reasoning_level),
+    };
+    let background = req.background.map(|value| value.trim().to_string());
+    let papers = req.papers;
+    let completion = tokio::task::spawn_blocking(move || {
+        let _ = crate::telemetry::set_profile(background, papers);
+        local::demo::complete_onboarding(selection)
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("demo seed task failed: {e}")))??;
+    if completion.newly_created {
+        crate::telemetry::capture_onboarding_completed();
+    }
+    Ok(Json(json!({
+        "project": project_json(&completion.project),
+        "selection": completion.selection,
+    })))
 }
 
 /// Slash-skills the composer's `/` dropdown offers (expanded server-side).
@@ -1163,8 +1209,8 @@ where
         .map_err(|e| ApiError::from(anyhow!("git task failed: {e}")))?
 }
 
-/// Cumulative diff of a run's commit vs its experiment's parent branch —
-/// "everything this experiment changed as of this run".
+/// Cumulative diff of a run's commit vs its experiment's parent branch. A root
+/// experiment on a distinct branch compares against the project's baseline.
 async fn run_diff(Path(id): Path<String>) -> ApiResult {
     blocking_api(move || {
         let store = Store::open()?;
@@ -1176,17 +1222,20 @@ async fn run_diff(Path(id): Path<String>) -> ApiResult {
         let exp = store
             .get_local_experiment(&run.experiment_id)?
             .ok_or_else(|| not_found("experiment"))?;
-        let parent_id = exp
-            .parent_experiment_id
-            .ok_or_else(|| bad_request("baseline runs have no parent branch to diff against"))?;
-        let parent = store
-            .get_local_experiment(&parent_id)?
-            .ok_or_else(|| not_found("parent experiment"))?;
         let project = store
             .get_local_project(&exp.project_id)?
             .ok_or_else(|| not_found("project"))?;
+        let base = match exp.parent_experiment_id {
+            Some(parent_id) => {
+                store
+                    .get_local_experiment(&parent_id)?
+                    .ok_or_else(|| not_found("parent experiment"))?
+                    .branch_name
+            }
+            None => project.baseline_branch.clone(),
+        };
         let repo = std::path::Path::new(&project.repo_path);
-        let payload = local::git::diff_range(repo, &parent.branch_name, &sha)?;
+        let payload = local::git::diff_range(repo, &base, &sha)?;
         Ok(Json(diff_json(payload)))
     })
     .await
@@ -1199,23 +1248,22 @@ async fn experiment_diff(Path(id): Path<String>) -> ApiResult {
         let exp = store
             .get_local_experiment(&id)?
             .ok_or_else(|| not_found("experiment"))?;
-        let Some(parent_id) = &exp.parent_experiment_id else {
-            return Ok(Json(diff_json(local::git::DiffPayload {
-                diff: String::new(),
-                truncated: false,
-                bytes_read: 0,
-            })));
-        };
-        let parent = store
-            .get_local_experiment(parent_id)?
-            .ok_or_else(|| not_found("parent experiment"))?;
         let project = store
             .get_local_project(&exp.project_id)?
             .ok_or_else(|| not_found("project"))?;
+        let base = match &exp.parent_experiment_id {
+            Some(parent_id) => {
+                store
+                    .get_local_experiment(parent_id)?
+                    .ok_or_else(|| not_found("parent experiment"))?
+                    .branch_name
+            }
+            None => project.baseline_branch.clone(),
+        };
         let repo = std::path::Path::new(&project.repo_path);
         Ok(Json(diff_json(local::git::diff_range(
             repo,
-            &parent.branch_name,
+            &base,
             &exp.branch_name,
         )?)))
     })
@@ -1241,6 +1289,12 @@ async fn experiment_commits(Path(id): Path<String>) -> ApiResult {
                     .ok_or_else(|| not_found("parent experiment"))?;
                 local::git::list_commits_between(repo, &parent.branch_name, &exp.branch_name, 100)?
             }
+            None if exp.branch_name != project.baseline_branch => local::git::list_commits_between(
+                repo,
+                &project.baseline_branch,
+                &exp.branch_name,
+                100,
+            )?,
             None => local::git::list_commits(repo, &exp.branch_name, 25)?,
         };
         let commits: Vec<Value> = commits
@@ -3304,6 +3358,7 @@ async fn create_chat_session(
         reasoning_level: nonempty(req.reasoning_level),
         archived: false,
         context_usage_json: None,
+        bootstrap_context: None,
         created_at: now_ms(),
         updated_at: now_ms(),
     };

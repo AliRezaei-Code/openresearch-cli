@@ -13,15 +13,9 @@ import {
 } from "../api";
 import { renderNote } from "./agentNote";
 import { onHarnessAuth } from "../events";
+import type { AgentSelection } from "../agentSelection";
 
-export interface ModelSelection {
-  harness: HarnessId;
-  model: string | null; // null = the harness's default model
-  /** Permission-mode wire id (null = harness default). */
-  permissionMode: string | null;
-  /** Reasoning-level wire id (null = harness default). */
-  reasoningLevel: string | null;
-}
+export type ModelSelection = AgentSelection;
 
 export const HARNESS_LABELS: Record<HarnessId, string> = {
   "claude-code": "Claude Code",
