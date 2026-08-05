@@ -28,6 +28,10 @@ import {
   chatAttachmentUrl,
   createChatSession,
   deleteChatSession,
+  DEMO_FIGURE_SESSION_ID,
+  DEMO_LITERATURE_SESSION_ID,
+  DEMO_MAIN_SESSION_ID,
+  DEMO_PROJECT_ID,
   getChatMessages,
   getSkills,
   interruptChat,
@@ -63,6 +67,7 @@ import {
 import { ContextMeter } from "./ContextMeter";
 import { renderNote } from "./agentNote";
 import { loadAgentSelection, saveAgentSelection } from "../agentSelection";
+import { loadReadDemoSessions, markDemoSessionRead } from "../demoSessionState";
 
 // --- chat state --------------------------------------------------------------
 
@@ -970,6 +975,7 @@ function TitleReveal({ title, animate }: { title: string; animate: boolean }) {
 function SessionRow({
   session,
   active,
+  unread,
   busy,
   waiting,
   revealTitle,
@@ -980,6 +986,7 @@ function SessionRow({
 }: {
   session: ChatSession;
   active: boolean;
+  unread: boolean;
   busy: boolean;
   /** Turn held on an unanswered card: steady dot, not the working pulse. */
   waiting: boolean;
@@ -1024,7 +1031,7 @@ function SessionRow({
       ref={ref}
       role="button"
       tabIndex={0}
-      className={`session-row ${active ? "active" : ""} ${open ? "menu-open" : ""} ${
+      className={`session-row ${active ? "active" : ""} ${unread ? "unread" : ""} ${open ? "menu-open" : ""} ${
         editing ? "editing" : ""
       }`}
       title={`${HARNESS_LABELS[session.harness]}${session.model ? ` · ${session.model}` : ""}`}
@@ -1051,7 +1058,11 @@ function SessionRow({
       }}
     >
       <span className="session-dot">
-        {busy && <span className={`busy-dot ${waiting ? "waiting" : ""}`} />}
+        {busy ? (
+          <span className={`busy-dot ${waiting ? "waiting" : ""}`} />
+        ) : (
+          unread && <span className="unread-dot" />
+        )}
       </span>
       {editing ? (
         <input
@@ -1187,6 +1198,7 @@ export function ChatPanel({
 }) {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [unreadSessionIds, setUnreadSessionIds] = useState<ReadonlySet<string>>(new Set());
   const [sessionFilter, setSessionFilter] = useState<SessionFilter>("active");
   const [draft, setDraft] = useState("");
   // Pasted/dropped images waiting in the composer, as data URLs.
@@ -1423,6 +1435,16 @@ export function ChatPanel({
     // against the new project's list — tombstoning the entire old project.
     sessionsRef.current = [];
     setActiveId(null);
+    const readDemoSessions = loadReadDemoSessions();
+    setUnreadSessionIds(
+      projectId === DEMO_PROJECT_ID
+        ? new Set(
+            [DEMO_FIGURE_SESSION_ID, DEMO_LITERATURE_SESSION_ID].filter(
+              (sessionId) => !readDemoSessions.has(sessionId),
+            ),
+          )
+        : new Set(),
+    );
     setDraft("");
     setPickedSkill(null);
     setAttachments([]);
@@ -1432,7 +1454,16 @@ export function ChatPanel({
     seenTitles.current = new Map();
     void syncSessionList().then((list) => {
       // Prefer the newest non-archived session; archived ones stay hidden.
-      if (list) setActiveId((cur) => cur ?? list.find((s) => !s.archived)?.id ?? null);
+      if (list)
+        setActiveId(
+          (cur) =>
+            cur ??
+            (projectId === DEMO_PROJECT_ID
+              ? list.find((session) => session.id === DEMO_MAIN_SESSION_ID)?.id
+              : undefined) ??
+            list.find((session) => !session.archived)?.id ??
+            null,
+        );
     });
   }, [projectId, syncSessionList]);
 
@@ -1867,6 +1898,12 @@ export function ChatPanel({
     deletedIds.current.add(sessionId);
     setSessions((cur) => cur.filter((s) => s.id !== sessionId));
     setActiveId((cur) => (cur === sessionId ? null : cur));
+    setUnreadSessionIds((current) => {
+      if (!current.has(sessionId)) return current;
+      const next = new Set(current);
+      next.delete(sessionId);
+      return next;
+    });
     loadedSessions.current.delete(sessionId);
     seenTitles.current.delete(sessionId);
     dispatch({ type: "forget", sessionId });
@@ -2006,11 +2043,19 @@ export function ChatPanel({
             key={s.id}
             session={s}
             active={s.id === activeId && mainView === "chat"}
+            unread={unreadSessionIds.has(s.id)}
             busy={state.busySessions.has(s.id)}
             waiting={waitingSessions.has(s.id)}
             revealTitle={titleReveals.get(s.id)}
             onOpen={() => {
               setActiveId(s.id);
+              if (projectId === DEMO_PROJECT_ID) markDemoSessionRead(s.id);
+              setUnreadSessionIds((current) => {
+                if (!current.has(s.id)) return current;
+                const next = new Set(current);
+                next.delete(s.id);
+                return next;
+              });
               onSelectMainView("chat");
             }}
             onRename={(title) => rename(s, title)}

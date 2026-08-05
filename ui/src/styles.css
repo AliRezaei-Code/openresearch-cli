@@ -957,6 +957,9 @@ textarea::placeholder {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.session-row.unread .session-title {
+  font-weight: var(--fw-semibold);
+}
 /* An auto-generated title materializes character by character when it replaces
    the first-line placeholder. Quiet on purpose: no color, no scale, no layout
    shift — the parent keeps its single-line box and its ellipsis. Each character
@@ -990,8 +993,8 @@ textarea::placeholder {
   display: none;
   align-items: center;
   justify-content: center;
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
   margin: -2px 0;
   border-radius: var(--radius-sm);
   color: var(--muted);
@@ -1020,6 +1023,13 @@ textarea::placeholder {
   border-radius: 50%;
   background: var(--primary);
   animation: pulse 1.2s infinite;
+  flex-shrink: 0;
+}
+.session-row .unread-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--primary);
   flex-shrink: 0;
 }
 /* Turn held on an unanswered card: ready for the user — steady, no pulse. */
@@ -1161,7 +1171,6 @@ textarea::placeholder {
   color: var(--text);
   min-width: 0;
 }
-
 .reasoning {
   color: var(--muted);
   font-size: var(--fs-md);
@@ -2621,6 +2630,22 @@ textarea::placeholder {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+.onb-card-identity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.onb-agent-logo {
+  display: block;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  fill: currentColor;
+}
+.onb-agent-logo.claude {
+  color: #d97757;
 }
 .onb-card-name {
   font-weight: var(--fw-semibold);

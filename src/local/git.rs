@@ -39,10 +39,7 @@ pub fn session_worktree_path(project_id: &str, session_id: &str) -> PathBuf {
 }
 
 fn legacy_worktrees_root(owner: &str, repo: &str) -> PathBuf {
-    cache_root()
-        .join("worktrees")
-        .join(owner)
-        .join(repo)
+    cache_root().join("worktrees").join(owner).join(repo)
 }
 
 fn legacy_session_worktree_path(owner: &str, repo: &str, session_id: &str) -> PathBuf {
@@ -485,6 +482,11 @@ pub fn ensure_clone(owner: &str, repo: &str, baseline_branch: &str) -> Result<Pa
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow!("Could not create {}: {}", parent.display(), e))?;
     }
+    if let Some(origin) = super::demo::installed_origin(owner, repo) {
+        restore_local_repository(&dir, &origin, baseline_branch)?;
+        assert_branch_exists(&dir, owner, repo, baseline_branch)?;
+        return Ok(dir);
+    }
     let target = dir.to_string_lossy().to_string();
     // Test seam: ORX_GIT_REMOTE_BASE=file:///some/root clones <base>/<owner>/<repo>.
     if let Ok(base) = std::env::var("ORX_GIT_REMOTE_BASE") {
@@ -508,6 +510,64 @@ pub fn ensure_clone(owner: &str, repo: &str, baseline_branch: &str) -> Result<Pa
     Ok(dir)
 }
 
+pub(crate) fn restore_local_repository(
+    dir: &Path,
+    origin: &Path,
+    baseline_branch: &str,
+) -> Result<()> {
+    if dir.exists() {
+        return Err(anyhow!(
+            "Refusing to overwrite the invalid repository cache at {}.",
+            dir.display()
+        ));
+    }
+    let parent = dir
+        .parent()
+        .ok_or_else(|| anyhow!("Repository cache path has no parent."))?;
+    std::fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(".orx-repository-{}", uuid::Uuid::new_v4()));
+    let tmp_arg = tmp.to_string_lossy().into_owned();
+    let origin_arg = origin.to_string_lossy().into_owned();
+    let result: Result<()> = (|| {
+        git(None, &["init", "--quiet", &tmp_arg])?;
+        git(Some(&tmp), &["remote", "add", "origin", &origin_arg])?;
+        git(
+            Some(&tmp),
+            &[
+                "fetch",
+                "--quiet",
+                "origin",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        )?;
+        let branches = git(
+            Some(&tmp),
+            &[
+                "for-each-ref",
+                "--format=%(refname:strip=3)",
+                "refs/remotes/origin",
+            ],
+        )?;
+        for branch in branches.lines().filter(|branch| *branch != "HEAD") {
+            git(
+                Some(&tmp),
+                &[
+                    "update-ref",
+                    &format!("refs/heads/{branch}"),
+                    &format!("refs/remotes/origin/{branch}"),
+                ],
+            )?;
+        }
+        git(Some(&tmp), &["checkout", "--quiet", baseline_branch])?;
+        std::fs::rename(&tmp, dir)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+    result
+}
+
 /// Ensure a private worktree of the hub clone for one chat session, so
 /// parallel agents on the same project never share (or stomp) a checkout.
 /// Worktrees share the hub's object store and refs: a branch created in one
@@ -526,12 +586,9 @@ pub fn ensure_session_worktree(
         return Err(anyhow!("{} is not a Git repository", repo_path.display()));
     }
     let dir = existing_session_worktree_path(project, session_id);
-    let start_ref = super::demo::session_start_ref(
-        &project.github_owner,
-        &project.github_repo,
-        session_id,
-    )
-    .unwrap_or(&project.baseline_branch);
+    let start_ref =
+        super::demo::session_start_ref(&project.github_owner, &project.github_repo, session_id)
+            .unwrap_or(&project.baseline_branch);
     git(Some(repo_path), &["rev-parse", "--verify", start_ref])?;
     ensure_worktree_from(repo_path, dir, start_ref)
 }
@@ -550,17 +607,16 @@ pub(crate) fn ensure_session_worktree_in(
 }
 
 pub fn ensure_worktree_at(repo: &Path, dir: &Path, start_ref: &str) -> Result<PathBuf> {
-    if dir.join(".git").exists() {
-        if git(Some(&dir), &["rev-parse", "--is-inside-work-tree"]).is_ok() {
-            let expected = git(Some(repo), &["rev-parse", start_ref])?;
-            let actual = git(Some(dir), &["rev-parse", "HEAD"])?;
-            let status = git(Some(dir), &["status", "--porcelain"])?;
-            if actual != expected || !status.is_empty() {
-                return Err(anyhow!(
-                    "The seeded nanochat worktree at {} is not clean at the expected experiment commit; move it aside and retry onboarding.",
-                    dir.display()
-                ));
-            }
+    if dir.join(".git").exists() && git(Some(dir), &["rev-parse", "--is-inside-work-tree"]).is_ok()
+    {
+        let expected = git(Some(repo), &["rev-parse", start_ref])?;
+        let actual = git(Some(dir), &["rev-parse", "HEAD"])?;
+        let status = git(Some(dir), &["status", "--porcelain"])?;
+        if actual != expected || !status.is_empty() {
+            return Err(anyhow!(
+                "The seeded nanochat worktree at {} is not clean at the expected experiment commit; move it aside and retry onboarding.",
+                dir.display()
+            ));
         }
     }
     ensure_worktree_from(repo, dir.to_path_buf(), start_ref)

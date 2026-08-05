@@ -1,6 +1,9 @@
 // Typed client for the orx up local HTTP API (/api/*). All wire JSON is camelCase.
 
 export const DEMO_PROJECT_ID = "demo_nanochat_v1";
+export const DEMO_MAIN_SESSION_ID = "chat_demo_nanochat_v1";
+export const DEMO_FIGURE_SESSION_ID = "chat_demo_nanochat_figures_v1";
+export const DEMO_LITERATURE_SESSION_ID = "chat_demo_nanochat_literature_v1";
 
 export interface Project {
   id: string;

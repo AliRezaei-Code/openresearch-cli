@@ -1,5 +1,5 @@
 //! The first-run nanochat project: embedded source, deterministic local Git
-//! history, and one curated harness-native conversation.
+//! history, and three curated harness-native conversations.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,6 +20,12 @@ const RUN_ID: &str = "demo_nanochat_run_v1";
 const SESSION_ID: &str = "chat_demo_nanochat_v1";
 const USER_MESSAGE_ID: &str = "msg_demo_nanochat_user_v1";
 const ASSISTANT_MESSAGE_ID: &str = "msg_demo_nanochat_assistant_v1";
+const FIGURE_SESSION_ID: &str = "chat_demo_nanochat_figures_v1";
+const FIGURE_USER_MESSAGE_ID: &str = "msg_demo_nanochat_figures_user_v1";
+const FIGURE_ASSISTANT_MESSAGE_ID: &str = "msg_demo_nanochat_figures_assistant_v1";
+const LITERATURE_SESSION_ID: &str = "chat_demo_nanochat_literature_v1";
+const LITERATURE_USER_MESSAGE_ID: &str = "msg_demo_nanochat_literature_user_v1";
+const LITERATURE_ASSISTANT_MESSAGE_ID: &str = "msg_demo_nanochat_literature_assistant_v1";
 const OWNER: &str = "openresearch-demo";
 const REPO: &str = "nanochat";
 const BRANCH: &str = "orx/cpu-apple-silicon-end-to-end-baseline";
@@ -27,6 +33,24 @@ const BASELINE_SHA: &str = "1b3a42272a65478d26306696cb7bcb80e26c2e18";
 const EXPERIMENT_SHA: &str = "346231fe75f91cd62b3040195993f33dc0e1853b";
 
 const USER_PROMPT: &str = "Run nanochat's CPU/Apple-Silicon pipeline end-to-end with bash runs/runcpu.sh (the local shrunk-down version, not speedrun.sh, ~40 min), streaming output and surfacing val_bpb/eval numbers as they appear, fixing any setup errors in place, and when it finishes chat with the model via python -m scripts.chat_cli -p \"What is the capital of France?\" to confirm it works.";
+
+const FIGURE_USER_PROMPT: &str = "Using nanochat’s recorded base-training and SFT logs, create publication-quality SVG-only figures for base and SFT loss/validation BPB, Apple-Silicon throughput, and CORE evaluation results. Use Helvetica Neue, a restrained academic style, exact metric labels, colorblind-safe colors, and no decorative infographics or PNG duplicates.";
+
+const LITERATURE_USER_PROMPT: &str = "My 73.5M-parameter nanochat model was pretrained on 81.9M tokens and then SFT-tuned on SmolTalk, MMLU, and GSM8K. SFT validation loss improved substantially, but generation remains repetitive and benchmark performance is weak. Based on the literature, is the main bottleneck insufficient pretraining, model size, data quality, or the SFT recipe—and what experiment should I run next?";
+
+const FIGURE_BOOTSTRAP_CONTEXT: &str = r#"You are continuing a live OpenResearch demo session. The user asked you to turn nanochat's recorded base-training and SFT logs into four publication-quality SVG-only figures using Helvetica Neue, exact metric labels, colorblind-safe colors, and a restrained academic style.
+
+You inspected the complete recorded logs, parsed all 5,000 base-training loss points, all 1,499 SFT loss points, validation BPB checkpoints, phase throughput, and CORE evaluation metrics. You generated and visually checked these four durable artifacts: nanochat-base-training-curves.svg, nanochat-sft-training-curves.svg, nanochat-training-throughput.svg, and nanochat-core-evaluation.svg. No PNG duplicates or decorative infographics were retained.
+
+Continue naturally from this completed state. The figures already exist in the project's Artifacts area; do not claim to regenerate them unless the user asks you to."#;
+
+const LITERATURE_BOOTSTRAP_CONTEXT: &str = r#"You are continuing a live OpenResearch demo session. The user asked whether weak, repetitive generations from the completed 73.5M-parameter nanochat run were primarily caused by insufficient pretraining, model size, data quality, or the SFT recipe.
+
+You inspected the recorded training evidence and relevant scaling, alignment, and small-model literature. You concluded that insufficient pretraining is the primary bottleneck, model size is a secondary ceiling, and SFT likely amplifies repetition without being able to create knowledge absent from pretraining. The model saw 81.92M tokens, or 3.53 tokens per nanochat scaling parameter, and base validation BPB was still improving at step 5,000.
+
+You recommended a one-factor pretraining-token ablation: keep the d6 model and every other recipe choice fixed, train from scratch to nanochat's target ratio of 12 (278,396,928 tokens / 16,992 steps), evaluate checkpoints at 5,000, about 11,000, and 16,992 steps, then apply the identical 1,500-step SFT recipe only to the final checkpoint. The full note is saved as nanochat-bottleneck-diagnosis.md.
+
+Continue naturally from this completed state."#;
 
 const BOOTSTRAP_CONTEXT: &str = r#"You are continuing a live OpenResearch demo session. The following exchange already happened and is authoritative project context.
 
@@ -78,41 +102,7 @@ The final command loaded the step-1499 SFT checkpoint on MPS and answered: “Pa
 - Made the chat CLI reuse the project environment and recorded cache location.
 "#;
 
-const RUN_LOG: &str = r#"nanochat CPU / Apple-Silicon demo run
-command: bash runs/runcpu.sh
-
-Tokenizer trained: vocab_size=32768, validation compression=4.69 bytes/token
-Base model: depth=6, parameters=73.5M, sequence_length=512
-step 0    val_bpb 3.195800
-step 100  val_bpb 1.940739
-step 1000 val_bpb 1.371813
-step 2500 val_bpb 1.248040
-step 4000 val_bpb 1.187774
-step 5000 val_bpb 1.165758
-base training complete: 81.92M tokens in 131.55 minutes
-
-base_eval train_bpb=1.152185 val_bpb=1.119301
-CORE bigbench_qa_wikidata accuracy=0.0000
-CORE openbook_qa accuracy=0.2500
-CORE winogrande accuracy=0.5625 centered=0.1250
-CORE bigbench_operators accuracy=0.0000
-
-SFT step 0    val_bpb 1.0174
-SFT step 200  val_bpb 1.0580
-SFT step 400  val_bpb 0.9914
-SFT step 600  val_bpb 0.9513
-SFT step 800  val_bpb 0.9141
-SFT step 1000 val_bpb 0.8483
-SFT step 1200 val_bpb 0.7950
-SFT step 1400 val_bpb 0.7486
-SFT step 1499 val_bpb 0.7389
-SFT complete in 39.07 minutes
-
-Loaded SFT checkpoint model_001499.pt on MPS
-Assistant: Paris is a city known for its historical and cultural significance. The capital of France is Paris.
-
-run completed successfully
-"#;
+const RUN_LOG: &str = include_str!("../../demo/nanochat/run-output.txt");
 
 #[derive(RustEmbed)]
 #[folder = "demo/nanochat/base/"]
@@ -121,6 +111,13 @@ struct BaseAssets;
 #[derive(RustEmbed)]
 #[folder = "demo/nanochat/experiment/"]
 struct ExperimentAssets;
+
+#[derive(RustEmbed)]
+#[folder = "demo/nanochat/figures/"]
+struct FigureAssets;
+
+const BOTTLENECK_REPORT: &str =
+    include_str!("../../demo/nanochat/reports/nanochat-bottleneck-diagnosis.md");
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -156,7 +153,13 @@ pub(crate) fn installed_origin(owner: &str, repo: &str) -> Option<PathBuf> {
 }
 
 pub(crate) fn session_start_ref(owner: &str, repo: &str, session_id: &str) -> Option<&'static str> {
-    (owner == OWNER && repo == REPO && session_id == SESSION_ID).then_some(EXPERIMENT_SHA)
+    (owner == OWNER
+        && repo == REPO
+        && matches!(
+            session_id,
+            SESSION_ID | FIGURE_SESSION_ID | LITERATURE_SESSION_ID
+        ))
+    .then_some(EXPERIMENT_SHA)
 }
 
 /// Repoint the embedded demo's local origin after the data directory moves.
@@ -208,13 +211,22 @@ fn seed_at(
     let files = data_root.join("files").join("nanochat");
     std::fs::create_dir_all(&files)?;
     std::fs::write(files.join("cpu-apple-silicon-pipeline-results.md"), REPORT)?;
+    std::fs::write(
+        files.join("nanochat-bottleneck-diagnosis.md"),
+        BOTTLENECK_REPORT,
+    )?;
+    for name in FigureAssets::iter() {
+        let asset = FigureAssets::get(name.as_ref())
+            .ok_or_else(|| anyhow!("embedded demo figure is missing: {name}"))?;
+        std::fs::write(files.join(name.as_ref()), asset.data.as_ref())?;
+    }
     let logs = data_root.join("run-logs");
     std::fs::create_dir_all(&logs)?;
     std::fs::write(logs.join(format!("{RUN_ID}.log")), RUN_LOG)?;
 
     let project = LocalProject {
         id: PROJECT_ID.into(),
-        name: "nanochat".into(),
+        name: "nanochat (demo)".into(),
         slug: "nanochat".into(),
         github_owner: OWNER.into(),
         github_repo: REPO.into(),
@@ -266,9 +278,9 @@ fn seed_at(
         native_session_id: None,
         title: Some("Run Nanochat CPU Pipeline End-to-End".into()),
         title_source: Some("generated".into()),
-        model: selection.model,
-        permission_mode: selection.permission_mode,
-        reasoning_level: selection.reasoning_level,
+        model: selection.model.clone(),
+        permission_mode: selection.permission_mode.clone(),
+        reasoning_level: selection.reasoning_level.clone(),
         archived: false,
         context_usage_json: None,
         bootstrap_context: Some(BOOTSTRAP_CONTEXT.into()),
@@ -289,6 +301,72 @@ fn seed_at(
         parts_json: serde_json::to_string(&assistant_parts(&selection.harness))?,
         created_at: 1_785_824_322_629,
     };
+    let figure_session = StoredChatSession {
+        id: FIGURE_SESSION_ID.into(),
+        project_id: PROJECT_ID.into(),
+        harness: selection.harness.clone(),
+        native_session_id: None,
+        title: Some("Visualize Nanochat Training Results".into()),
+        title_source: Some("generated".into()),
+        model: selection.model.clone(),
+        permission_mode: selection.permission_mode.clone(),
+        reasoning_level: selection.reasoning_level.clone(),
+        archived: false,
+        context_usage_json: None,
+        bootstrap_context: Some(FIGURE_BOOTSTRAP_CONTEXT.into()),
+        created_at: 1_785_824_322_630,
+        updated_at: 1_785_879_263_858,
+    };
+    let figure_user = StoredChatMessage {
+        id: FIGURE_USER_MESSAGE_ID.into(),
+        session_id: FIGURE_SESSION_ID.into(),
+        role: "user".into(),
+        parts_json: serde_json::to_string(&vec![WirePart::text(
+            "figure-user-prompt",
+            FIGURE_USER_PROMPT,
+        )])?,
+        created_at: 1_785_824_322_631,
+    };
+    let figure_assistant = StoredChatMessage {
+        id: FIGURE_ASSISTANT_MESSAGE_ID.into(),
+        session_id: FIGURE_SESSION_ID.into(),
+        role: "assistant".into(),
+        parts_json: serde_json::to_string(&figure_assistant_parts(&selection.harness))?,
+        created_at: 1_785_824_322_633,
+    };
+    let literature_session = StoredChatSession {
+        id: LITERATURE_SESSION_ID.into(),
+        project_id: PROJECT_ID.into(),
+        harness: selection.harness.clone(),
+        native_session_id: None,
+        title: Some("Diagnosing Nanochat Training Bottlenecks".into()),
+        title_source: Some("generated".into()),
+        model: selection.model,
+        permission_mode: selection.permission_mode,
+        reasoning_level: selection.reasoning_level,
+        archived: false,
+        context_usage_json: None,
+        bootstrap_context: Some(LITERATURE_BOOTSTRAP_CONTEXT.into()),
+        created_at: 1_785_824_322_634,
+        updated_at: 1_785_879_263_857,
+    };
+    let literature_user = StoredChatMessage {
+        id: LITERATURE_USER_MESSAGE_ID.into(),
+        session_id: LITERATURE_SESSION_ID.into(),
+        role: "user".into(),
+        parts_json: serde_json::to_string(&vec![WirePart::text(
+            "literature-user-prompt",
+            LITERATURE_USER_PROMPT,
+        )])?,
+        created_at: 1_785_824_322_635,
+    };
+    let literature_assistant = StoredChatMessage {
+        id: LITERATURE_ASSISTANT_MESSAGE_ID.into(),
+        session_id: LITERATURE_SESSION_ID.into(),
+        role: "assistant".into(),
+        parts_json: serde_json::to_string(&literature_assistant_parts(&selection.harness))?,
+        created_at: 1_785_824_322_636,
+    };
     let cache_root = repo
         .parent()
         .and_then(Path::parent)
@@ -299,8 +377,30 @@ fn seed_at(
         .join(PROJECT_ID)
         .join(SESSION_ID);
     super::git::ensure_worktree_at(repo, &worktree, &commit_sha)?;
-    let newly_created =
-        store.create_demo_snapshot(&project, &experiment, &run, &session, &[user, assistant])?;
+    let figure_worktree = cache_root
+        .join("worktrees")
+        .join(PROJECT_ID)
+        .join(FIGURE_SESSION_ID);
+    super::git::ensure_worktree_at(repo, &figure_worktree, &commit_sha)?;
+    let literature_worktree = cache_root
+        .join("worktrees")
+        .join(PROJECT_ID)
+        .join(LITERATURE_SESSION_ID);
+    super::git::ensure_worktree_at(repo, &literature_worktree, &commit_sha)?;
+    let newly_created = store.create_demo_snapshot(
+        &project,
+        &experiment,
+        &run,
+        &[session, figure_session, literature_session],
+        &[
+            user,
+            assistant,
+            figure_user,
+            figure_assistant,
+            literature_user,
+            literature_assistant,
+        ],
+    )?;
     validate_snapshot(store, repo, newly_created)
 }
 
@@ -328,8 +428,10 @@ fn validate_snapshot(store: &Store, repo: &Path, newly_created: bool) -> Result<
         || runs[0].status != "done"
         || runs[0].exit_code != Some(0)
         || runs[0].commit_sha.as_deref() != Some(EXPERIMENT_SHA)
-        || sessions.len() != 1
+        || sessions.len() != 3
         || sessions[0].id != SESSION_ID
+        || sessions[1].id != FIGURE_SESSION_ID
+        || sessions[2].id != LITERATURE_SESSION_ID
     {
         return Err(anyhow!(
             "the reserved demo project is incomplete or modified; delete it and retry onboarding"
@@ -346,7 +448,32 @@ fn validate_snapshot(store: &Store, repo: &Path, newly_created: bool) -> Result<
             "the reserved demo conversation is incomplete or modified; delete it and retry onboarding"
         ));
     }
-    let stored = &sessions[0];
+    let figure_messages = store.list_chat_messages(FIGURE_SESSION_ID)?;
+    if figure_messages.len() != 2
+        || figure_messages[0].id != FIGURE_USER_MESSAGE_ID
+        || figure_messages[0].role != "user"
+        || figure_messages[1].id != FIGURE_ASSISTANT_MESSAGE_ID
+        || figure_messages[1].role != "assistant"
+    {
+        return Err(anyhow!(
+            "the reserved demo figure conversation is incomplete or modified; delete it and retry onboarding"
+        ));
+    }
+    let literature_messages = store.list_chat_messages(LITERATURE_SESSION_ID)?;
+    if literature_messages.len() != 2
+        || literature_messages[0].id != LITERATURE_USER_MESSAGE_ID
+        || literature_messages[0].role != "user"
+        || literature_messages[1].id != LITERATURE_ASSISTANT_MESSAGE_ID
+        || literature_messages[1].role != "assistant"
+    {
+        return Err(anyhow!(
+            "the reserved demo literature conversation is incomplete or modified; delete it and retry onboarding"
+        ));
+    }
+    let stored = sessions
+        .iter()
+        .find(|session| session.id == SESSION_ID)
+        .ok_or_else(|| anyhow!("the reserved demo session is missing"))?;
     Ok(DemoCompletion {
         project,
         newly_created,
@@ -359,10 +486,75 @@ fn validate_snapshot(store: &Store, repo: &Path, newly_created: bool) -> Result<
     })
 }
 
+const BASE_VALIDATION: &[(u16, &str)] = &[
+    (0, "3.195800"),
+    (100, "1.940739"),
+    (200, "1.762539"),
+    (300, "1.656100"),
+    (400, "1.589013"),
+    (500, "1.530241"),
+    (600, "1.478824"),
+    (700, "1.438952"),
+    (800, "1.411252"),
+    (900, "1.389210"),
+    (1_000, "1.371813"),
+    (1_100, "1.357232"),
+    (1_200, "1.345296"),
+    (1_300, "1.332653"),
+    (1_400, "1.323681"),
+    (1_500, "1.315164"),
+    (1_600, "1.307505"),
+    (1_700, "1.302495"),
+    (1_800, "1.294347"),
+    (1_900, "1.287435"),
+    (2_000, "1.279230"),
+    (2_100, "1.272744"),
+    (2_200, "1.266337"),
+    (2_300, "1.259622"),
+    (2_400, "1.253774"),
+    (2_500, "1.248040"),
+    (2_600, "1.243302"),
+    (2_700, "1.237713"),
+    (2_800, "1.233837"),
+    (2_900, "1.228945"),
+    (3_000, "1.224042"),
+    (3_100, "1.220255"),
+    (3_200, "1.216421"),
+    (3_300, "1.211869"),
+    (3_400, "1.208286"),
+    (3_500, "1.204212"),
+    (3_600, "1.200893"),
+    (3_700, "1.197689"),
+    (3_800, "1.194168"),
+    (3_900, "1.191109"),
+    (4_000, "1.187774"),
+    (4_100, "1.185122"),
+    (4_200, "1.182477"),
+    (4_300, "1.179723"),
+    (4_400, "1.176897"),
+    (4_500, "1.174323"),
+    (4_600, "1.172274"),
+    (4_700, "1.170340"),
+    (4_800, "1.168470"),
+    (4_900, "1.167120"),
+    (5_000, "1.165758"),
+];
+
+const SFT_PROGRESS: &[&str] = &[
+    "The memory-safe SFT run is healthy: step 100 loss is **3.2589**, down from 6.17 during initialization, with no skipped-loop or `NaN` recurrence.",
+    "The run passed step 200 without invoking the memory-heavy ChatCORE path. SFT validation BPB is **1.0580**, and training has continued to step 214 with finite loss.",
+    "SFT validation improved at step 400 to **0.9914** (from 1.0580 at step 200 and 1.0174 initially). Training is at step 427/1,500 with finite loss, so the repaired strategy is now improving held-out BPB.",
+    "Step 600 SFT validation BPB improved further to **0.9513**. The sequence is now 1.0174 → 1.0580 → 0.9914 → 0.9513, and training has reached step 607/1,500.",
+    "Step 800 SFT validation BPB is **0.9141**, continuing the improvement from 0.9513 at step 600. Training is now past halfway at step 814/1,500.",
+    "SFT reached step 1,000/1,500 cleanly. Validation BPB improved to **0.8483** (from 1.0174 at step 0 and 0.9141 at step 800), so the resumed training is converging normally.",
+    "Step 1,200 validation BPB is **0.7950**, another clear improvement from 0.8483 at step 1,000. No NaNs or empty-target batches have occurred.",
+    "Step 1,400 validation BPB is **0.7486**. The full validation trajectory is monotonic after the early step-200 bump: 1.0174 → 1.0580 → 0.9914 → 0.9513 → 0.9141 → 0.8483 → 0.7950 → 0.7486. About 100 training steps plus final save/chat remain.",
+];
+
 fn assistant_parts(harness: &str) -> Vec<WirePart> {
     let mut parts = vec![WirePart::text(
         "intro",
-        "I’ll inspect the local CPU path, make the known portability and SFT safeguards part of the experiment before launch, then run the full pipeline once and surface the meaningful checkpoints through the final chat confirmation.",
+        "I’ll keep this attached to one CPU / Apple-Silicon baseline, inspect the exact local pipeline, make the portability and SFT safeguards part of the experiment before launch, then stay on the streamed output through tokenizer training, base training and evaluation, SFT, and the final chat check.",
     )];
     if harness == "opencode" {
         parts.push(tool_part(
@@ -374,7 +566,7 @@ fn assistant_parts(harness: &str) -> Vec<WirePart> {
                 { "content": "Confirm chat output and save results", "status": "completed", "priority": "medium" }
             ]}),
             None,
-            Some("Track nanochat demo"),
+            Some("Track the nanochat pipeline"),
         ));
     }
     let (read_name, read_input, edit_name, edit_input, shell_name) = match harness {
@@ -413,12 +605,12 @@ fn assistant_parts(harness: &str) -> Vec<WirePart> {
         "inspect",
         read_name,
         read_input,
-        Some("CPU pipeline, SFT packing, and chat entry point inspected."),
+        Some("Inspected runs/runcpu.sh, scripts/chat_sft.py, and scripts/chat_cli.py. The pipeline trains a 32,768-token BPE tokenizer, a depth-6 base model for 5,000 steps, runs base evaluation, fine-tunes for 1,500 steps, then opens chat_cli against the saved SFT checkpoint."),
         Some("Inspect CPU pipeline"),
     ));
     parts.push(WirePart::text(
         "inspection-summary",
-        "The run is suitable for a local MPS baseline, but I’m hardening four failure boundaries before spending compute: keep caches inside the checkout, reject overlength SFT conversations, skip batches with no supervised targets, and disable periodic ChatCORE so unified-memory pressure cannot kill an otherwise healthy SFT run.",
+        "The project is fresh and the requested command supplies the complete execution recipe. Before spending compute, I’m making the final working safeguards explicit: keep nanochat and uv caches inside the checkout; exclude conversations longer than the 513-token SFT row; discard batches with no supervised targets; start SFT from the clean base weights with fresh optimizer state; disable periodic ChatCORE on unified memory while retaining validation BPB; and make the outer chat command re-enter the uv environment.",
     ));
     parts.push(tool_part(
         "portable-fixes",
@@ -429,36 +621,119 @@ fn assistant_parts(harness: &str) -> Vec<WirePart> {
     ));
     parts.push(WirePart::text(
         "experiment-created",
-        "With those safeguards committed, I created the CPU / Apple-Silicon end-to-end baseline experiment. I’m launching its single local run now.",
+        "The baseline is now fixed to one end-to-end command: the CPU/MPS pipeline followed immediately by the one-shot France prompt. I created the CPU / Apple-Silicon end-to-end baseline experiment and I’m launching its single local run now; I’ll keep reading the supervised log and surface every validation checkpoint as it lands.",
     ));
     parts.push(tool_part(
         "launch",
         shell_name,
         json!({ "command": "orx exp run demo_nanochat_cpu_v1 --backend local --force" }),
-        Some("Run started on Apple Silicon (MPS)."),
+        Some("✓ Local run started.\nbackend  local\ncommand  bash runs/runcpu.sh && python -m scripts.chat_cli -p \"What is the capital of France?\""),
         Some("Launch the new baseline experiment"),
     ));
     parts.push(WirePart::text(
-        "base-progress",
-        "Tokenizer training completed at 4.69 bytes/token. The 6-layer, 73.5M-parameter base model then trained for 5,000 steps over 81.92M tokens. Validation BPB improved from 3.195800 initially to 1.371813 at step 1,000, 1.248040 at step 2,500, and 1.165758 at step 5,000.",
+        "environment-setup",
+        "The run cloned cleanly, created `.venv`, resolved 105 packages, and installed the CPU PyTorch stack. No training metric has appeared yet; setup is progressing normally.",
     ));
     parts.push(tool_part(
-        "evaluate",
+        "setup-log",
         shell_name,
-        json!({ "command": "orx logs demo_nanochat_run_v1 --bytes 16000" }),
-        Some("base_eval train_bpb=1.152185 val_bpb=1.119301\nCORE openbook_qa=0.2500 winogrande=0.5625"),
-        Some("Read evaluation and SFT progress"),
+        json!({ "command": "orx logs demo_nanochat_run_v1 --bytes 12000" }),
+        Some("Using CPython 3.10.19\nCreating virtual environment at: .venv\nResolved 105 packages\nPrepared 40 packages\nInstalled 40 packages"),
+        Some("Read environment setup"),
     ));
     parts.push(WirePart::text(
-        "sft-progress",
-        "Base evaluation finished at train/validation BPB 1.152185/1.119301. SFT stayed finite through all 1,500 steps and improved validation BPB from 1.0174 to 0.7389, with intermediate checkpoints at 0.9914, 0.9141, 0.8483, 0.7950, and 0.7486.",
+        "dataset-download",
+        "Environment setup is complete. The dataset stage is active: all 9 ClimbMix shards are being downloaded in parallel. Training has not started yet, so there is no `val_bpb` to report.",
+    ));
+    parts.push(tool_part(
+        "dataset-log",
+        shell_name,
+        json!({ "command": "orx logs demo_nanochat_run_v1 --bytes 16000" }),
+        Some("Downloading 9 shards using 4 workers...\nSuccessfully downloaded shard_00000.parquet\nSuccessfully downloaded shard_00001.parquet\nSuccessfully downloaded shard_00002.parquet\nSuccessfully downloaded shard_00003.parquet\nSuccessfully downloaded shard_00004.parquet\nSuccessfully downloaded shard_00005.parquet\nSuccessfully downloaded shard_00006.parquet\nSuccessfully downloaded shard_00007.parquet\nSuccessfully downloaded shard_06542.parquet\nDone! Downloaded: 9/9 shards"),
+        Some("Stream dataset setup"),
+    ));
+    parts.push(WirePart::text(
+        "tokenizer-start",
+        "All 9 dataset shards are downloaded. Tokenizer training has started with `max_chars=2,000,000,000`, `doc_cap=10,000`, and vocabulary size 32,768. The run is healthy and has moved past setup and data acquisition.",
+    ));
+    parts.push(tool_part(
+        "tokenizer-log",
+        shell_name,
+        json!({ "command": "orx logs demo_nanochat_run_v1 --bytes 32000" }),
+        Some("Starting BPE training: 32503 merges to compute\nProgress: 25% (8126/32503 merges)\nProgress: 50% (16251/32503 merges)\nProgress: 75% (24378/32503 merges)\nProgress: 100% (32503/32503 merges)\nFinished training: 32503 merges completed\nTraining time: 42.69s\nclimbmix-val 3024593 bytes 644939 tokens 4.69 bytes/token"),
+        Some("Stream tokenizer training"),
+    ));
+    parts.push(WirePart::text(
+        "tokenizer-complete",
+        "Tokenizer training finished in 42.69s. Its validation text compression was 4.69 bytes/token (644,939 tokens over 3,024,593 bytes), about 1.2% better than GPT‑2 and 2.2% behind GPT‑4 on that sample. Base training is now running on MPS: 6 layers, 73.5M parameters, 5,000 iterations, 81.92M tokens. I’m watching every `val_bpb` checkpoint.",
+    ));
+    parts.push(tool_part(
+        "base-log",
+        shell_name,
+        json!({ "command": "orx logs demo_nanochat_run_v1 --bytes 100000" }),
+        Some("Autodetected device type: mps\nCOMPUTE_DTYPE: torch.float32 (auto-detected: no CUDA (CPU/MPS))\nWARNING: Flash Attention 3 not available, using PyTorch SDPA fallback\nVocab size: 32,768\nNumber of parameters: 73,454,976\nTraining for 5,000 steps / 81,920,000 tokens"),
+        Some("Stream base training"),
+    ));
+    for (index, (step, bpb)) in BASE_VALIDATION.iter().enumerate() {
+        let text = if *step == 0 {
+            format!("Base-model initialization is complete. Initial validation BPB is **{bpb}** and the first MPS optimizer steps are advancing normally.")
+        } else if *step == 100 {
+            format!("First trained validation point: **step {step} `val_bpb = {bpb}`**, down from 3.195800 at initialization. Training is stable at roughly 10–11k tokens/s.")
+        } else if *step == 2_500 {
+            format!("Halfway through base training: **step 2,500 `val_bpb = {bpb}`**. The validation curve has improved at every checkpoint and the measured remaining base ETA is about 67 minutes.")
+        } else if *step == 5_000 {
+            format!("Base training finished: **final step 5,000 `val_bpb = {bpb}`**, down from 3.195800 at initialization. The base phase took 131.55 minutes on this Mac and the pipeline is moving into `base_eval`.")
+        } else {
+            format!("New validation: **step {step} `val_bpb = {bpb}`**. The base run remains stable and the validation curve continues improving.")
+        };
+        parts.push(WirePart::text(format!("base-progress-{index}"), text));
+    }
+    parts.push(tool_part(
+        "base-eval-log",
+        shell_name,
+        json!({ "command": "orx logs demo_nanochat_run_v1 --bytes 100000" }),
+        Some("Total training time: 131.55m\nMinimum validation bpb: 1.165758\n\nBPB Evaluation\ntrain bpb: 1.152185\nval bpb: 1.119301\n\nCORE Evaluation\nbigbench_qa_wikidata accuracy: 0.0000\nopenbook_qa accuracy: 0.2500\nwinogrande accuracy: 0.5625 | centered: 0.1250\nbigbench_operators accuracy: 0.0000"),
+        Some("Read base evaluation"),
+    ));
+    parts.push(WirePart::text(
+        "base-eval",
+        "`base_eval` reported **train BPB 1.152185** and **validation BPB 1.119301**. The explicit capped CORE scores were OpenBookQA **0.2500**, Winogrande **0.5625** (centered 0.1250), Wikidata **0.0000**, and operators **0.0000**. The pipeline is now loading the clean step-5,000 base checkpoint for SFT.",
+    ));
+    parts.push(tool_part(
+        "sft-log",
+        shell_name,
+        json!({ "command": "orx logs demo_nanochat_run_v1 --bytes 100000" }),
+        Some("Autodetected device type: mps\nLoading model from $ORX_RUN_DIR/repo/.cache/nanochat/base_checkpoints/d6 with step 5000\nTraining mixture: 789,759 rows (MMLU x3, GSM8K x4)\nStep 00000 | Validation bpb: 1.0174\nstep 00001 | loss: 1.817033\nstep 00004 | loss: 6.121520\nstep 00017 | loss: 5.378817\nstep 00100 | loss: 3.2589"),
+        Some("Stream supervised fine-tuning"),
+    ));
+    parts.push(WirePart::text(
+        "sft-start",
+        "SFT loaded the clean base weights with a fresh optimizer and reported initial validation BPB **1.0174**. The packing guard is keeping over-capacity conversations out of the 513-token rows, all supervised batches are finite, and periodic ChatCORE is disabled to keep Apple-Silicon unified-memory pressure bounded.",
+    ));
+    for (index, text) in SFT_PROGRESS.iter().enumerate() {
+        parts.push(WirePart::text(format!("sft-progress-{index}"), *text));
+    }
+    parts.push(tool_part(
+        "sft-complete-log",
+        shell_name,
+        json!({ "command": "orx logs demo_nanochat_run_v1 --bytes 100000" }),
+        Some("step 01498 (99.93%) | loss: 2.052968 | total time: 39.04m\nstep 01499 (100.00%) | loss: 2.026530 | total time: 39.07m\nStep 01499 | Validation bpb: 0.7389\nSaved model parameters to: $ORX_RUN_DIR/repo/.cache/nanochat/chatsft_checkpoints/d6/model_001499.pt\nTotal training time: 39.07m\nMinimum validation bpb: 0.7389"),
+        Some("Read final SFT checkpoint"),
+    ));
+    parts.push(WirePart::text(
+        "sft-complete",
+        "SFT finished successfully: final and minimum validation BPB is **0.7389**, and checkpoint `model_001499.pt` is saved. The outer command is re-entering nanochat’s uv environment and loading that checkpoint for the requested France prompt now.",
     ));
     parts.push(tool_part(
         "confirm",
         shell_name,
-        json!({ "command": "orx logs demo_nanochat_run_v1 --bytes 4000" }),
-        Some("Paris is a city known for its historical and cultural significance. The capital of France is Paris."),
+        json!({ "command": "orx logs demo_nanochat_run_v1 --bytes 12000" }),
+        Some("Using completed SFT checkpoint model_001499.pt\nAutodetected device type: mps\nLoading model from $ORX_RUN_DIR/repo/.cache/nanochat/chatsft_checkpoints/d6 with step 1499\n\nAssistant:\n\nParis\nParis is a city known for its historical and cultural significance. The capital of France is Paris."),
         Some("Confirm the trained chat model"),
+    ));
+    parts.push(WirePart::text(
+        "chat-confirmed",
+        "The CLI loaded SFT checkpoint 1499 on MPS and answered correctly: **“Paris … The capital of France is Paris.”** Its later continuation became repetitive, reflecting the tiny local model, but inference worked and the requested answer was correct. I’m preserving the complete tokenizer, base, evaluation, SFT, and chat record in the artifact now.",
     ));
     let (report_tool, report_input) = match harness {
         "claude-code" => (
@@ -483,7 +758,332 @@ fn assistant_parts(harness: &str) -> Vec<WirePart> {
     ));
     parts.push(WirePart::text(
         "final",
-        "The single end-to-end run is complete. Base training finished at validation BPB **1.165758**, base evaluation reported **1.152185 / 1.119301** train/validation BPB, SFT converged to **0.7389**, and the saved checkpoint correctly answered **Paris**. I preserved the cleaned log and full results in the project artifact.",
+        "Pipeline completed successfully.\n\n- Base training: 5,000 steps, 81.92M tokens, 131.55 min\n- Final base validation BPB: **1.165758**\n- Base evaluation train/validation BPB: **1.152185 / 1.119301**\n- CORE accuracy: OpenBookQA **0.2500**, Winogrande **0.5625**, Wikidata/operators **0.0000**\n- SFT: 1,500 steps, 39.07 min\n- Final/minimum SFT validation BPB: **0.7389**\n- Final run status: **done**\n\nThe CLI loaded SFT checkpoint 1499 on MPS and answered **Paris**. I preserved the full stitched run log and `cpu-apple-silicon-pipeline-results.md` in the project artifact.",
+    ));
+    parts
+}
+
+fn figure_assistant_parts(harness: &str) -> Vec<WirePart> {
+    let (read_tool, shell_tool, edit_tool, read_input, edit_input) = match harness {
+        "claude-code" => (
+            "Read",
+            "Bash",
+            "Edit",
+            json!({
+                "file_path": "cpu-apple-silicon-pipeline-results.md",
+                "filePath": "cpu-apple-silicon-pipeline-results.md"
+            }),
+            json!({
+                "file_path": "$TMPDIR/create_nanochat_publication_figures.py",
+                "filePath": "$TMPDIR/create_nanochat_publication_figures.py",
+                "old_string": "",
+                "new_string": "Parse recorded base and SFT metrics and render four SVG figures."
+            }),
+        ),
+        "opencode" => (
+            "read",
+            "bash",
+            "bash",
+            json!({ "filePath": "cpu-apple-silicon-pipeline-results.md" }),
+            json!({ "command": "printf '%s\n' '# deterministic SVG renderer' > $TMPDIR/create_nanochat_publication_figures.py" }),
+        ),
+        _ => (
+            "bash",
+            "bash",
+            "edit",
+            json!({ "command": "sed -n '1,220p' cpu-apple-silicon-pipeline-results.md" }),
+            json!({ "changes": [{
+                "path": "$TMPDIR/create_nanochat_publication_figures.py",
+                "kind": "add"
+            }] }),
+        ),
+    };
+    let mut parts = vec![WirePart::text(
+        "figure-intro",
+        "I’ll treat the recorded logs as the source of truth, keep base and SFT validation separate, and produce only the four quantitative SVGs requested. I’m first checking the report, complete per-step logs, and exact benchmark labels, then I’ll build the plots with one consistent Helvetica Neue academic style and visually inspect the rendered output.",
+    )];
+    if harness == "opencode" {
+        parts.push(tool_part(
+            "figure-todos",
+            "todowrite",
+            json!({ "todos": [
+                { "content": "Parse base and SFT logs", "status": "completed", "priority": "high" },
+                { "content": "Generate four SVG-only figures", "status": "completed", "priority": "high" },
+                { "content": "Inspect and validate final artifacts", "status": "completed", "priority": "high" }
+            ]}),
+            None,
+            Some("Track figure generation"),
+        ));
+    }
+    parts.push(tool_part(
+        "figure-read-report",
+        read_tool,
+        read_input,
+        Some("Recorded phases: 5,000 base steps, 1,499 SFT loss rows, base and SFT validation checkpoints, Apple-Silicon throughput, and four CORE benchmarks."),
+        Some("Inspect the recorded experiment"),
+    ));
+    parts.push(tool_part(
+        "figure-write-script",
+        edit_tool,
+        edit_input,
+        Some("Created a deterministic Matplotlib renderer with Helvetica Neue, SVG text, colorblind-safe blue/orange/green, thin neutral grids, and no raster output."),
+        Some("Build the publication figure renderer"),
+    ));
+    parts.push(tool_part(
+        "figure-parse-logs",
+        shell_tool,
+        json!({ "command": "orx logs demo_nanochat_run_v1 --bytes 2000000 | python $TMPDIR/create_nanochat_publication_figures.py --summarize" }),
+        Some("base loss rows: 5000\nsft loss rows: 1499\nbase validation: 3.195800 → 1.165758\nsft validation: 1.0174 → 0.7389\nbase median throughput: 10466 tok/s\nsft median throughput: 10551 tok/s\nCORE rows: 4"),
+        Some("Parse complete training logs"),
+    ));
+    parts.push(WirePart::text(
+        "figure-data-summary",
+        "The logs have the full resolution needed for publication plots: 5,000 base loss points and 1,499 SFT loss points, plus every validation checkpoint. Median throughput is 10,466 tok/s for base training and 10,551 tok/s for SFT. CORE labels and values are preserved exactly: Wikidata QA 0.0000, OpenBookQA 0.2500, Winogrande 0.5625 (centered 0.1250), and Operators 0.0000.",
+    ));
+    parts.push(tool_part(
+        "figure-render",
+        shell_tool,
+        json!({ "command": "MPLBACKEND=Agg python $TMPDIR/create_nanochat_publication_figures.py" }),
+        Some("wrote nanochat-base-training-curves.svg\nwrote nanochat-sft-training-curves.svg\nwrote nanochat-training-throughput.svg\nwrote nanochat-core-evaluation.svg"),
+        Some("Render four SVG figures"),
+    ));
+    parts.push(WirePart::text(
+        "figure-rendered",
+        "All four figures are rendered. Base and SFT each pair the complete raw loss trace with the requested rolling mean and a separate validation-BPB panel; throughput uses normalized training progress so the unequal phase lengths remain comparable; CORE uses exact labeled values rather than decorative callouts.",
+    ));
+    parts.push(tool_part(
+        "figure-inspect",
+        shell_tool,
+        json!({ "command": "python $TMPDIR/create_nanochat_publication_figures.py --inspect nanochat-*.svg" }),
+        Some("Visually inspected all four figures at full size. Axes, legends, annotations, and line weights are clear; no clipping or overlap detected."),
+        Some("Inspect rendered figures"),
+    ));
+    parts.push(tool_part(
+        "figure-validate",
+        shell_tool,
+        json!({ "command": "python $TMPDIR/create_nanochat_publication_figures.py --validate nanochat-*.svg --font 'Helvetica Neue'" }),
+        Some("4 valid SVG documents\nall figures reference Helvetica Neue\nall metric labels verified\n0 PNG artifacts"),
+        Some("Validate final artifacts"),
+    ));
+    let artifact_link = |name: &str| format!("[{name}](artifacts/{name})");
+    parts.push(WirePart::text(
+        "figure-final",
+        format!(
+            "Completed the requested SVG-only figure set.\n\n- **Base training:** loss falls from about 10.40 to 3.75 over 5,000 steps; validation BPB improves from 3.1958 to 1.1658, with post-training evaluation at 1.1193.\n- **SFT:** loss finishes near 2.03; validation BPB briefly rises from 1.0174 to 1.0580 at step 200, then falls steadily to 0.7389.\n- **Throughput:** median 10,466 tok/s for base and 10,551 tok/s for SFT on Apple Silicon.\n- **CORE:** Winogrande leads at 0.5625 accuracy (0.1250 centered); OpenBookQA is 0.2500; Wikidata QA and Operators are 0.0000.\n\nFiles:\n\n- {}\n- {}\n- {}\n- {}",
+            artifact_link("nanochat-base-training-curves.svg"),
+            artifact_link("nanochat-sft-training-curves.svg"),
+            artifact_link("nanochat-training-throughput.svg"),
+            artifact_link("nanochat-core-evaluation.svg"),
+        ),
+    ));
+    parts
+}
+
+fn literature_assistant_parts(harness: &str) -> Vec<WirePart> {
+    let (read_tool, shell_tool, write_tool) = match harness {
+        "claude-code" => ("Read", "Bash", "Edit"),
+        "opencode" => ("read", "bash", "bash"),
+        _ => ("bash", "bash", "edit"),
+    };
+    let read_input = |path: &str| match harness {
+        "claude-code" => json!({ "file_path": path, "filePath": path }),
+        "opencode" => json!({ "filePath": path }),
+        _ => json!({ "command": format!("sed -n '1,280p' {path}") }),
+    };
+    let mut parts = vec![WirePart::text(
+        "literature-intro",
+        "I’m using the literature-search workflow first, then I’ll inspect the nanochat experiment history so the recommendation is grounded in both scaling literature and the actual recorded runs.",
+    )];
+    if harness == "opencode" {
+        parts.push(tool_part(
+            "literature-todos",
+            "todowrite",
+            json!({ "todos": [
+                { "content": "Inspect the recorded nanochat evidence", "status": "completed", "priority": "high" },
+                { "content": "Review scaling and alignment literature", "status": "completed", "priority": "high" },
+                { "content": "Recommend one controlled next experiment", "status": "completed", "priority": "high" }
+            ]}),
+            None,
+            Some("Track the bottleneck diagnosis"),
+        ));
+    }
+    for (id, path, title) in [
+        (
+            "literature-skill",
+            ".agents/skills/orx-lit/SKILL.md",
+            "Load literature search workflow",
+        ),
+        (
+            "evidence-skill",
+            ".agents/skills/orx-evidence/SKILL.md",
+            "Load evidence workflow",
+        ),
+        (
+            "experiment-tree-skill",
+            ".agents/skills/orx-experiment-tree/SKILL.md",
+            "Load experiment comparison workflow",
+        ),
+    ] {
+        parts.push(tool_part(
+            id,
+            read_tool,
+            read_input(path),
+            Some("Workflow loaded."),
+            Some(title),
+        ));
+    }
+    parts.push(WirePart::text(
+        "literature-comparability",
+        "The next-experiment recommendation depends on keeping the comparison identifiable, so I’ll separate the project’s measured evidence from the broader literature and change only one factor in the proposed follow-up.",
+    ));
+    for (id, command, output, title) in [
+        (
+            "inspect-project",
+            "git branch -a && git status --short --branch && orx projects",
+            "nanochat\nbaseline branch: main\nexperiment: CPU Apple-Silicon end-to-end baseline",
+            "Inspect nanochat project history",
+        ),
+        (
+            "inspect-run",
+            "orx runs demo_nanochat_v1 && orx project view demo_nanochat_v1",
+            "1 successful run\ncommand: bash runs/runcpu.sh\nmodel: depth 6, 73.5M parameters\ntraining: 81.92M tokens",
+            "Inspect completed runs",
+        ),
+        (
+            "inspect-base-log",
+            "orx logs demo_nanochat_run_v1 --bytes 1000000 | rg 'Validation bpb|CORE|step 05000'",
+            "Step 04000 | Validation bpb: 1.187774\nStep 04500 | Validation bpb: 1.1743\nStep 05000 | Validation bpb: 1.165758\nCORE: Wikidata 0.0000, OpenBookQA 0.2500, Winogrande 0.5625 (centered 0.1250), Operators 0.0000",
+            "Read base-training evidence",
+        ),
+        (
+            "inspect-sft-log",
+            "orx logs demo_nanochat_run_v1 --bytes 1000000 | rg 'SFT|Validation bpb|Paris'",
+            "SFT validation bpb: 1.0174 → 0.7389\nfinal checkpoint: model_001499.pt\nfixed prompt answer: Paris, followed by repetitive continuation",
+            "Read SFT and generation evidence",
+        ),
+    ] {
+        parts.push(tool_part(
+            id,
+            shell_tool,
+            json!({ "command": command }),
+            Some(output),
+            Some(title),
+        ));
+    }
+    parts.push(WirePart::text(
+        "literature-project-evidence",
+        "The project evidence already points toward undertraining: base validation BPB was still improving at the final checkpoint, while SFT fit its held-out token distribution much better without producing robust free-running behavior. I’m checking scaling, small-model data quality, and alignment literature before ranking the causes.",
+    ));
+    for (index, query) in [
+        "TinyStories small language models coherent text 10 million parameters",
+        "Training Compute-Optimal Large Language Models Hoffmann tokens per parameter",
+        "scaling laws downstream task performance small language models pretraining tokens",
+        "language model supervised fine tuning repetition overfitting low validation loss generation degeneration",
+        "instruction tuning small pretrained language models capabilities cannot create knowledge",
+        "Textbooks Are All You Need phi-1 data quality small language model",
+        "Scaling laws neural language models downstream performance model size data Kaplan",
+        "LIMA Less Is More for Alignment fine tuning knowledge learned during pretraining",
+    ]
+    .iter()
+    .enumerate()
+    {
+        parts.push(tool_part(
+            &format!("literature-search-{index}"),
+            shell_tool,
+            json!({ "command": format!("orx lit \"{query}\" --limit 8") }),
+            Some("Relevant papers and passages retrieved."),
+            Some("Search the literature"),
+        ));
+    }
+    for (id, paper, output) in [
+        (
+            "paper-tinystories",
+            "2305.07759",
+            "TinyStories: small models can generate coherently on a deliberately constrained, high-quality distribution.",
+        ),
+        (
+            "paper-kaplan",
+            "2001.08361",
+            "Scaling Laws for Neural Language Models: performance follows predictable model/data/compute trends.",
+        ),
+        (
+            "paper-phi",
+            "2306.11644",
+            "Textbooks Are All You Need: curated educational data substantially improves small-model sample efficiency.",
+        ),
+        (
+            "paper-lima",
+            "2305.11206",
+            "LIMA: most knowledge is learned during pretraining; SFT largely teaches response format and alignment.",
+        ),
+        (
+            "paper-chinchilla",
+            "2203.15556",
+            "Chinchilla: compute-optimal training scales model parameters and training tokens together; the canonical point is about 20 tokens per parameter.",
+        ),
+    ] {
+        parts.push(tool_part(
+            id,
+            shell_tool,
+            json!({ "command": format!("orx paper {paper}") }),
+            Some(output),
+            Some("Read primary paper"),
+        ));
+    }
+    parts.push(tool_part(
+        "inspect-scaling-code",
+        read_tool,
+        read_input("scripts/base_train.py"),
+        Some("nanochat default target_param_data_ratio = 12\nscaling parameters = transformer matrices + lm_head = 23,199,960"),
+        Some("Inspect nanochat scaling convention"),
+    ));
+    parts.push(tool_part(
+        "calculate-ablation",
+        shell_tool,
+        json!({ "command": "python -c 'print(23199960 * 12, (23199960 * 12) // 16384)'" }),
+        Some("278396928 tokens\n16992 steps\ncurrent ratio: 81920000 / 23199960 = 3.53"),
+        Some("Calculate the controlled token ablation"),
+    ));
+    parts.push(WirePart::text(
+        "literature-convergence",
+        "The evidence is converging: the base model’s validation curve was still improving at the final token, and its effective token/parameter ratio was 3.53 versus nanochat’s own default target of 12. I’m recording the literature-backed diagnosis as a durable project note before giving the concise recommendation.",
+    ));
+    let report_path = "artifacts/nanochat-bottleneck-diagnosis.md";
+    let write_input = match harness {
+        "claude-code" => json!({
+            "file_path": report_path,
+            "filePath": report_path,
+            "old_string": "",
+            "new_string": BOTTLENECK_REPORT,
+        }),
+        "opencode" => json!({
+            "command": "mkdir -p artifacts && cp $TMPDIR/nanochat-bottleneck-diagnosis.md artifacts/nanochat-bottleneck-diagnosis.md",
+        }),
+        _ => json!({
+            "changes": [{ "path": report_path, "kind": "add" }],
+        }),
+    };
+    parts.push(tool_part(
+        "write-literature-report",
+        write_tool,
+        write_input,
+        Some("Saved nanochat-bottleneck-diagnosis.md."),
+        Some("Save the literature diagnosis"),
+    ));
+    parts.push(tool_part(
+        "verify-literature-report",
+        shell_tool,
+        json!({ "command": "wc -l artifacts/nanochat-bottleneck-diagnosis.md" }),
+        Some("38 artifacts/nanochat-bottleneck-diagnosis.md"),
+        Some("Verify the durable report"),
+    ));
+    parts.push(WirePart::text(
+        "literature-final",
+        format!(
+            "The main bottleneck is insufficient pretraining. Model size sets the eventual ceiling; the SFT recipe likely worsens repetition but cannot manufacture knowledge the base model never learned.\n\nWhy:\n\n- The model saw only 81.9M tokens. Under nanochat’s own scaling convention, that is 3.53 tokens per scaling parameter, versus its default target of 12.\n- Base validation BPB was still improving at the endpoint: 1.1878 at step 4,000 → 1.1743 at 4,500 → 1.1658 at 5,000. The model had not converged.\n- [Chinchilla](https://arxiv.org/abs/2203.15556) establishes that substantially scaling training tokens is generally preferable to leaving a model undertrained. Its canonical ~20-token ratio is not directly comparable because nanochat counts parameters differently, but the direction is unambiguous.\n- [LIMA](https://arxiv.org/abs/2305.11206) supports the view that SFT mostly exposes capabilities acquired during pretraining. It also reports that validation perplexity can continue improving after generation quality peaks—matching your falling SFT loss but poor free-running behavior.\n- [TinyStories](https://arxiv.org/abs/2305.07759) shows that 73.5M parameters are sufficient for coherent generation on a constrained, high-quality distribution. Thus size alone does not explain the repetition. Conversely, broad MMLU/GSM8K performance at this size will remain limited.\n- [Textbooks Are All You Need](https://arxiv.org/abs/2306.11644) makes pretraining-data quality an important subsequent axis, but your run is too undertrained to diagnose quality cleanly yet.\n\nRun this next:\n\n- Train the identical d6 model from scratch with the same data and recipe, changing only the pretraining horizon to `--target-param-data-ratio=12`.\n- That gives 278,396,928 tokens or 16,992 steps—3.4× the current exposure.\n- Evaluate checkpoints at 5,000, ~11,000, and 16,992 steps using fixed prompts, base BPB, CORE, and a repetition metric.\n- Apply the identical 1,500-step SFT recipe only to the final checkpoint and compare ChatCORE, MMLU, GSM8K, and generation.\n\nDo not change SFT simultaneously; that would obscure whether additional pretraining solved the problem. If repetition remains after the longer-pretrained base improves, the following round should test SFT early stopping/lower learning rate using generation and ChatCORE—not validation loss—as the selection criterion.\n\nI saved the full diagnosis as [{}]({}) in the project’s Artifacts tab.",
+            "nanochat-bottleneck-diagnosis.md",
+            report_path,
+        ),
     ));
     parts
 }
@@ -751,6 +1351,14 @@ mod tests {
             let encoded = serde_json::to_string(&parts).unwrap();
             let decoded: Vec<WirePart> = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded.len(), parts.len());
+            assert!(parts.len() > 70, "{harness} transcript was compressed");
+            assert_eq!(
+                parts
+                    .iter()
+                    .filter(|part| part.id.starts_with("base-progress-"))
+                    .count(),
+                BASE_VALIDATION.len()
+            );
             let names: Vec<&str> = parts
                 .iter()
                 .filter_map(|part| part.tool.as_deref())
@@ -794,6 +1402,42 @@ mod tests {
     }
 
     #[test]
+    fn supplementary_transcripts_use_portable_native_parts() {
+        for harness in ["claude-code", "codex", "opencode"] {
+            for parts in [
+                figure_assistant_parts(harness),
+                literature_assistant_parts(harness),
+            ] {
+                let encoded = serde_json::to_string(&parts).unwrap();
+                assert!(!encoded.contains("](/"));
+                assert!(!encoded.contains("parse-nanochat-metrics"));
+                assert!(!encoded.contains("inspect-svg"));
+                assert!(!encoded.contains("validate-svg-artifacts"));
+                if harness == "claude-code" {
+                    for part in parts
+                        .iter()
+                        .filter(|part| matches!(part.tool.as_deref(), Some("Read") | Some("Edit")))
+                    {
+                        let input = part.state.as_ref().unwrap().input.as_ref().unwrap();
+                        assert!(input.get("file_path").is_some());
+                        assert!(input.get("filePath").is_some());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_demo_session_recovers_from_the_experiment_commit() {
+        for session_id in [SESSION_ID, FIGURE_SESSION_ID, LITERATURE_SESSION_ID] {
+            assert_eq!(
+                session_start_ref(OWNER, REPO, session_id),
+                Some(EXPERIMENT_SHA)
+            );
+        }
+    }
+
+    #[test]
     fn repository_and_snapshot_seed_are_idempotent() {
         let root = std::env::temp_dir().join(format!("orx-demo-test-{}", uuid::Uuid::new_v4()));
         let data = root.join("data");
@@ -820,6 +1464,10 @@ mod tests {
         assert_eq!(second.selection.harness, "codex");
         assert_eq!(store.list_local_projects().unwrap().len(), 1);
         assert_eq!(
+            store.get_local_project(PROJECT_ID).unwrap().unwrap().name,
+            "nanochat (demo)"
+        );
+        assert_eq!(
             store.list_experiments_by_project(PROJECT_ID).unwrap().len(),
             1
         );
@@ -829,7 +1477,7 @@ mod tests {
                 .list_chat_sessions_by_project(PROJECT_ID)
                 .unwrap()
                 .len(),
-            1
+            3
         );
         let run = store.get_run(RUN_ID).unwrap().unwrap();
         assert_eq!(run.status, "done");
@@ -846,6 +1494,40 @@ mod tests {
         let assistant: Vec<WirePart> = serde_json::from_str(&messages[1].parts_json).unwrap();
         assert!(!assistant.is_empty());
         assert!(!messages[1].parts_json.contains("/Users/"));
+        let figure_messages = store.list_chat_messages(FIGURE_SESSION_ID).unwrap();
+        assert_eq!(figure_messages.len(), 2);
+        let figure_assistant: Vec<WirePart> =
+            serde_json::from_str(&figure_messages[1].parts_json).unwrap();
+        assert_eq!(
+            figure_assistant
+                .iter()
+                .filter_map(|part| part.text.as_deref())
+                .filter(|text| text.contains("artifacts/nanochat-"))
+                .count(),
+            1
+        );
+        assert!(!figure_messages[1]
+            .parts_json
+            .contains(data.to_string_lossy().as_ref()));
+        assert_eq!(
+            figure_messages[0]
+                .parts_json
+                .matches(FIGURE_USER_PROMPT)
+                .count(),
+            1
+        );
+        let literature_messages = store.list_chat_messages(LITERATURE_SESSION_ID).unwrap();
+        assert_eq!(literature_messages.len(), 2);
+        assert!(literature_messages[0]
+            .parts_json
+            .contains("My 73.5M-parameter nanochat model"));
+        assert!(literature_messages[1]
+            .parts_json
+            .contains("The main bottleneck is insufficient pretraining"));
+        assert!(!literature_messages[1].parts_json.contains("/Users/"));
+        assert!(!literature_messages[1]
+            .parts_json
+            .contains(data.to_string_lossy().as_ref()));
         assert!(repo.join(".git").is_dir());
         let bare = data.join("demo-repos/nanochat.git");
         assert!(bare.join("HEAD").is_file());
@@ -874,9 +1556,22 @@ mod tests {
             std::fs::read_dir(data.join("files/nanochat"))
                 .unwrap()
                 .count(),
-            1
+            6
         );
-        assert!(data.join(format!("run-logs/{RUN_ID}.log")).is_file());
+        for name in FigureAssets::iter() {
+            assert!(data.join("files/nanochat").join(name.as_ref()).is_file());
+        }
+        assert!(data
+            .join("files/nanochat/nanochat-bottleneck-diagnosis.md")
+            .is_file());
+        let log = std::fs::read_to_string(data.join(format!("run-logs/{RUN_ID}.log"))).unwrap();
+        assert!(log.lines().count() > 7_000);
+        assert!(log.contains("Finished training: 32503 merges completed"));
+        assert!(log.contains("Step 05000 | Validation bpb: 1.165758"));
+        assert!(log.contains("Step 01499 | Validation bpb: 0.7389"));
+        assert!(log.contains("The capital of France is Paris"));
+        assert!(!log.contains("/Users/"));
+        assert!(!log.contains("Traceback"));
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -932,10 +1627,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("orx-demo-test-{}", uuid::Uuid::new_v4()));
         let data = root.join("data");
         let repo = root.join("cache/repos").join(OWNER).join(REPO);
-        let worktree = root
-            .join("cache/worktrees")
-            .join(PROJECT_ID)
-            .join(SESSION_ID);
+        let worktrees = root.join("cache/worktrees").join(PROJECT_ID);
         let store = Store::open_at(data.clone()).unwrap();
         seed_at(
             &store,
@@ -949,24 +1641,35 @@ mod tests {
             },
         )
         .unwrap();
-        std::fs::remove_dir_all(&worktree).unwrap();
+        std::fs::remove_dir_all(&worktrees).unwrap();
         std::fs::remove_dir_all(&repo).unwrap();
 
-        crate::local::git::restore_local_clone(
+        crate::local::git::restore_local_repository(
             &repo,
             &data.join("demo-repos/nanochat.git"),
             "main",
         )
         .unwrap();
-        crate::local::git::ensure_session_worktree_in(
-            &repo, &worktree, OWNER, REPO, "main", SESSION_ID,
-        )
-        .unwrap();
-
+        assert_eq!(git(&repo, &["branch", "--show-current"]).unwrap(), "main");
         assert_eq!(
-            git(&worktree, &["rev-parse", "HEAD"]).unwrap(),
+            git(&repo, &["rev-parse", "refs/heads/main"]).unwrap(),
+            BASELINE_SHA
+        );
+        assert_eq!(
+            git(&repo, &["rev-parse", &format!("refs/heads/{BRANCH}")]).unwrap(),
             EXPERIMENT_SHA
         );
+        for session_id in [SESSION_ID, FIGURE_SESSION_ID, LITERATURE_SESSION_ID] {
+            let worktree = worktrees.join(session_id);
+            crate::local::git::ensure_session_worktree_in(
+                &repo, &worktree, OWNER, REPO, "main", session_id,
+            )
+            .unwrap();
+            assert_eq!(
+                git(&worktree, &["rev-parse", "HEAD"]).unwrap(),
+                EXPERIMENT_SHA
+            );
+        }
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -505,18 +505,19 @@ impl Store {
         project: &LocalProject,
         experiment: &crate::local::model::LocalExperiment,
         run: &StoredRun,
-        session: &StoredChatSession,
+        sessions: &[StoredChatSession],
         messages: &[StoredChatMessage],
     ) -> Result<bool> {
         let tx = self.begin()?;
         let inserted = tx.execute(
-            &format!("INSERT OR IGNORE INTO local_projects ({PROJECT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"),
+            &format!("INSERT OR IGNORE INTO local_projects ({PROJECT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
             params![
                 project.id,
                 project.name,
                 project.slug,
                 project.github_owner,
                 project.github_repo,
+                project.github_sync_enabled,
                 project.baseline_branch,
                 project.repo_path,
                 project.run_command,
@@ -568,29 +569,31 @@ impl Store {
                 run.chat_session_id,
             ],
         )?;
-        tx.execute(
-            "INSERT INTO chat_sessions (id, project_id, harness, native_session_id, title,
-                                        title_source, model, permission_mode, reasoning_level,
-                                        archived, context_usage_json, bootstrap_context,
-                                        created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![
-                session.id,
-                session.project_id,
-                session.harness,
-                session.native_session_id,
-                session.title,
-                session.title_source,
-                session.model,
-                session.permission_mode,
-                session.reasoning_level,
-                session.archived,
-                session.context_usage_json,
-                session.bootstrap_context,
-                session.created_at,
-                session.updated_at,
-            ],
-        )?;
+        for session in sessions {
+            tx.execute(
+                "INSERT INTO chat_sessions (id, project_id, harness, native_session_id, title,
+                                            title_source, model, permission_mode, reasoning_level,
+                                            archived, context_usage_json, bootstrap_context,
+                                            created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    session.id,
+                    session.project_id,
+                    session.harness,
+                    session.native_session_id,
+                    session.title,
+                    session.title_source,
+                    session.model,
+                    session.permission_mode,
+                    session.reasoning_level,
+                    session.archived,
+                    session.context_usage_json,
+                    session.bootstrap_context,
+                    session.created_at,
+                    session.updated_at,
+                ],
+            )?;
+        }
         for message in messages {
             tx.execute(
                 "INSERT INTO chat_messages (id, session_id, role, parts_json, created_at)

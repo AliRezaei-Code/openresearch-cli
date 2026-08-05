@@ -6,7 +6,7 @@
 
 import { Code, FileText, RotateCw } from "lucide-react";
 import { useEffect, useState } from "react";
-import { getArtifactFileText, getProjectFile, type ProjectFile } from "../api";
+import { artifactUrl, getArtifactFileText, getProjectFile, type ProjectFile } from "../api";
 import { CodeView } from "./CodeView";
 import { ArtifactMarkdown } from "./ArtifactsTab";
 import { Md } from "./Md";
@@ -41,6 +41,7 @@ export function FileViewer({
   const isArtifacts = source === "artifacts";
   // Markdown renders by default; the header toggle shows the raw source.
   const isMarkdown = /\.(md|mdx|markdown)$/i.test(path);
+  const isImage = /\.(png|svg)$/i.test(path);
   const artifactsFolder = path.split("/").slice(0, -1).join("/");
   const [showSource, setShowSource] = useState(false);
   const data = loaded?.file ?? null;
@@ -146,6 +147,15 @@ export function FileViewer({
           <div className="file-view-note">Loading…</div>
         ) : data.notFound ? (
           <div className="file-view-note">{notFoundCopy(data)}</div>
+        ) : isImage && artifactsMode ? (
+          <a
+            className="fpreview-image"
+            href={artifactUrl(projectId, path)}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <img src={artifactUrl(projectId, path)} alt={path.split("/").pop() ?? path} />
+          </a>
         ) : binary ? (
           <div className="file-view-note">Binary file — no inline preview.</div>
         ) : (
