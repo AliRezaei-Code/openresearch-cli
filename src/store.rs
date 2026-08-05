@@ -191,6 +191,7 @@ impl Store {
                 slug            TEXT NOT NULL UNIQUE,
                 github_owner    TEXT NOT NULL,
                 github_repo     TEXT NOT NULL,
+                github_sync_enabled INTEGER NOT NULL DEFAULT 1,
                 baseline_branch TEXT NOT NULL DEFAULT 'main',
                 repo_path       TEXT NOT NULL,
                 run_command     TEXT,
@@ -259,6 +260,7 @@ impl Store {
             "ALTER TABLE chat_sessions ADD COLUMN context_usage_json TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN title_source TEXT",
             "ALTER TABLE local_projects ADD COLUMN paper_id TEXT",
+            "ALTER TABLE local_projects ADD COLUMN github_sync_enabled INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE local_experiments ADD COLUMN chat_session_id TEXT",
         ] {
             let _ = conn.execute(ddl, []);
@@ -496,10 +498,11 @@ impl Store {
 
     pub fn create_local_project(&self, p: &LocalProject) -> Result<()> {
         self.conn.execute(
-            &format!("INSERT INTO local_projects ({PROJECT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"),
+            &format!("INSERT INTO local_projects ({PROJECT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
             params![
                 p.id, p.name, p.slug, p.github_owner, p.github_repo,
-                p.baseline_branch, p.repo_path, p.run_command, p.paper_id, p.created_at, p.updated_at,
+                p.github_sync_enabled, p.baseline_branch, p.repo_path, p.run_command, p.paper_id,
+                p.created_at, p.updated_at,
             ],
         )?;
         Ok(())
@@ -577,8 +580,8 @@ impl Store {
     pub fn update_local_project(&self, p: &LocalProject) -> Result<()> {
         self.conn.execute(
             "UPDATE local_projects SET name = ?2, slug = ?3, github_owner = ?4, github_repo = ?5,
-                    baseline_branch = ?6, repo_path = ?7, run_command = ?8, paper_id = ?9,
-                    updated_at = ?10
+                    github_sync_enabled = ?6, baseline_branch = ?7, repo_path = ?8,
+                    run_command = ?9, paper_id = ?10, updated_at = ?11
              WHERE id = ?1",
             params![
                 p.id,
@@ -586,6 +589,7 @@ impl Store {
                 p.slug,
                 p.github_owner,
                 p.github_repo,
+                p.github_sync_enabled,
                 p.baseline_branch,
                 p.repo_path,
                 p.run_command,
@@ -962,8 +966,8 @@ const SELECT_RUN: &str = "SELECT id, experiment_id, project_id, status, backend_
                                  commit_sha, result_markdown, cancel_requested,
                                  chat_session_id FROM runs";
 
-const PROJECT_COLS: &str = "id, name, slug, github_owner, github_repo, baseline_branch, \
-                            repo_path, run_command, paper_id, created_at, updated_at";
+const PROJECT_COLS: &str = "id, name, slug, github_owner, github_repo, github_sync_enabled, \
+                            baseline_branch, repo_path, run_command, paper_id, created_at, updated_at";
 
 const EXPERIMENT_COLS: &str = "id, project_id, parent_experiment_id, slug, branch_name, \
                                title, description, run_command, agent_status, created_at, \

@@ -1995,7 +1995,7 @@ export function ChatPanel({
         {SETTINGS_NAV.map((item) => (
           <button
             key={item.id}
-            className={`rail-nav-item ${mainView === item.id ? "active" : ""}`}
+            className={`rail-nav-item ${mainView !== "chat" && mainView !== "artifacts" && item.activeTabs.includes(mainView) ? "active" : ""}`}
             data-onboarding={item.id === "compute" ? "nav-compute" : undefined}
             onClick={() => onSelectMainView(item.id)}
           >

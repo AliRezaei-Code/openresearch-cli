@@ -88,6 +88,22 @@ const patch = <T>(url: string, body: unknown) =>
 export const listProjects = () =>
   get<{ projects: Project[] }>("/api/projects").then((r) => r.projects);
 
+export interface ProjectPathStatus {
+  gitVersion: string | null;
+  resolvedPath: string | null;
+  exists: boolean | null;
+  directory: boolean | null;
+  initialized: boolean | null;
+}
+
+export const getProjectPathStatus = (path = "") => {
+  const query = path ? `?path=${encodeURIComponent(path)}` : "";
+  return get<ProjectPathStatus>(`/api/project-path/status${query}`);
+};
+
+export const pickProjectFolder = () =>
+  post<{ path: string | null }>("/api/project-path/pick").then((result) => result.path);
+
 export interface NewProject {
   name: string;
   path: string;
@@ -98,8 +114,13 @@ export interface NewProject {
   initializeGit?: boolean;
 }
 
+export interface CreateProjectResult {
+  project: Project;
+  githubPublicationError: string | null;
+}
+
 export const createProject = (body: NewProject) =>
-  post<{ project: Project }>("/api/projects", body).then((r) => r.project);
+  post<CreateProjectResult>("/api/projects", body);
 
 export interface PaperHit {
   paperId: string;
@@ -654,6 +675,25 @@ export const getProfile = () => get<Profile>("/api/settings/profile");
 
 export const setProfile = (body: Profile) => post<Profile>("/api/settings/profile", body);
 
+export interface ProjectDefaultsSettings {
+  githubForNewProjects: boolean;
+  githubDefaultPromptSeen: boolean;
+  githubAuthenticated: boolean;
+  githubTokenSource: "env" | "stored" | "gh" | null;
+}
+
+export const getProjectDefaults = () =>
+  get<ProjectDefaultsSettings>("/api/settings/projects");
+
+export const setProjectDefaults = (
+  githubForNewProjects: boolean,
+  githubDefaultPromptSeen?: boolean,
+) =>
+  post<ProjectDefaultsSettings>("/api/settings/projects", {
+    githubForNewProjects,
+    ...(githubDefaultPromptSeen === undefined ? {} : { githubDefaultPromptSeen }),
+  });
+
 export interface ProjectGitStatus {
   path: string;
   gitVersion: string | null;
@@ -687,6 +727,9 @@ export const initializeProjectGit = (projectId: string) =>
 
 export const enableProjectGithub = (projectId: string) =>
   post<{ project: Project; git: ProjectGitStatus }>(`/api/projects/${projectId}/github`);
+
+export const disableProjectGithub = (projectId: string) =>
+  post<{ project: Project; git: ProjectGitStatus }>(`/api/projects/${projectId}/github/disable`);
 
 export const pushProjectGithub = (projectId: string) =>
   post<{ project: Project; git: ProjectGitStatus }>(`/api/projects/${projectId}/github/push`);

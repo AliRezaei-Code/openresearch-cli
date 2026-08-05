@@ -373,8 +373,8 @@ export function TreeView({
             parentSlug: node.exp.parentExperimentId
               ? (slugById.get(node.exp.parentExperimentId) ?? null)
               : null,
-            githubOwner: project.githubOwner,
-            githubRepo: project.githubRepo,
+            githubOwner: project.githubEnabled ? project.githubOwner : "",
+            githubRepo: project.githubEnabled ? project.githubRepo : "",
             onOpenView,
             onOpenCode,
           },
@@ -421,6 +421,7 @@ export function TreeView({
     onOpenCode,
     project.githubOwner,
     project.githubRepo,
+    project.githubEnabled,
     agentSessionId,
     onShowProjectScope,
   ]);

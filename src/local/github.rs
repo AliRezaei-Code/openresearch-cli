@@ -8,9 +8,20 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use super::git::resolve_github_token;
-use crate::error::{anyhow, Result};
+use crate::error::{anyhow, Error, Result};
 
 const UA: &str = concat!("orx/", env!("CARGO_PKG_VERSION"));
+
+#[derive(Debug)]
+struct RepositoryNameExists;
+
+impl std::fmt::Display for RepositoryNameExists {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("repository name already exists")
+    }
+}
+
+impl std::error::Error for RepositoryNameExists {}
 
 /// Create a blank private repo with an auto-init commit so the clone/branch
 /// flow works immediately. An organization target is optional; without one,
@@ -25,7 +36,13 @@ pub async fn create_repo(
 /// Create an empty private repository for a local project. The local history
 /// remains authoritative and becomes the remote's first history on push.
 pub async fn create_project_repo(repo: &str) -> Result<(String, String, String)> {
-    create_repo_api(repo, false, None).await
+    match create_repo_api(repo, false, None).await {
+        Err(error) if error.downcast_ref::<RepositoryNameExists>().is_some() => {
+            let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
+            create_repo_api(&format!("{repo}-{suffix}"), false, None).await
+        }
+        result => result,
+    }
 }
 
 /// GET an api.github.com URL with the resolved token. `None` when there's no
@@ -50,6 +67,7 @@ async fn authed_get(url: &str) -> Option<reqwest::Response> {
 /// What the New project form needs about a repo, from one API call.
 pub struct RepoMeta {
     pub can_push: bool,
+    pub archived: bool,
     /// The repo's own default branch — the honest baseline when the user
     /// doesn't pick one (`create_project` would otherwise assume "main").
     pub default_branch: Option<String>,
@@ -92,6 +110,10 @@ pub async fn repo_meta(owner: &str, repo: &str) -> Option<RepoMeta> {
             Some(RepoMeta {
                 can_push: body
                     .pointer("/permissions/push")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                archived: body
+                    .get("archived")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
                 default_branch: body
@@ -181,6 +203,11 @@ async fn create_repo_api(
             .pointer("/errors/0/message")
             .and_then(Value::as_str)
             .unwrap_or("invalid repository name");
+        let code = body.pointer("/errors/0/code").and_then(Value::as_str);
+        if code == Some("already_exists") || detail.to_ascii_lowercase().contains("already exists")
+        {
+            return Err(Error::new(RepositoryNameExists));
+        }
         return Err(anyhow!("Could not create '{repo}': {detail}."));
     }
     if !status.is_success() {

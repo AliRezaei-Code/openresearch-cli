@@ -1852,6 +1852,7 @@ impl TurnCtx {
                 slug: "test".into(),
                 github_owner: "owner".into(),
                 github_repo: "repo".into(),
+                github_sync_enabled: true,
                 baseline_branch: "main".into(),
                 repo_path: "/tmp/test-repo".into(),
                 run_command: None,

@@ -221,10 +221,14 @@ pub fn ensure_session_skills(
 ) -> Result<()> {
     let base = worktree.join(skills_dir_rel);
     for skill in skills(SkillSet::Local) {
+        let dir = base.join(skill.name);
         if !available_in_session(skill, github_enabled) {
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir)
+                    .map_err(|e| anyhow!("Could not remove {}: {}", dir.display(), e))?;
+            }
             continue;
         }
-        let dir = base.join(skill.name);
         std::fs::create_dir_all(&dir)
             .map_err(|e| anyhow!("Could not create {}: {}", dir.display(), e))?;
         let path = dir.join("SKILL.md");
@@ -440,6 +444,8 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let rel = ".agents/skills";
+        ensure_session_skills(&tmp, rel, true).unwrap();
+        assert!(tmp.join(rel).join("orx-compute-k8s").exists());
         ensure_session_skills(&tmp, rel, false).unwrap();
         let git = std::fs::read_to_string(tmp.join(rel).join("orx-git/SKILL.md")).unwrap();
         assert!(git.contains("This project is local-only"));

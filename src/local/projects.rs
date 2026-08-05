@@ -33,7 +33,7 @@ fn unique_project_slug(store: &Store, base: &str) -> Result<String> {
     }
 }
 
-fn expand_path(path: &str) -> Result<PathBuf> {
+pub(crate) fn expand_path(path: &str) -> Result<PathBuf> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return Err(crate::error::anyhow!("project path is required"));
@@ -141,6 +141,7 @@ pub fn create_project(
         slug,
         github_owner,
         github_repo,
+        github_sync_enabled: false,
         baseline_branch,
         repo_path: repo_path.to_string_lossy().to_string(),
         run_command: run_command.filter(|c| !c.trim().is_empty()),
@@ -226,20 +227,24 @@ mod tests {
     }
 
     #[test]
-    fn rejects_dirty_and_detached_repositories() {
+    fn accepts_dirty_but_rejects_detached_repositories() {
         let root = root();
         let dirty = root.join("dirty");
         initialized(&dirty);
         std::fs::write(dirty.join("README.md"), "changed\n").unwrap();
         let store = Store::open_at(root.join("data")).unwrap();
-        let error = create_project(
+        let project = create_project(
             &store,
             "Dirty",
             dirty.to_str().unwrap(),
             CreateProjectOptions::default(),
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("uncommitted changes"));
+        .unwrap();
+        assert_eq!(
+            Path::new(&project.repo_path),
+            std::fs::canonicalize(&dirty).unwrap()
+        );
+        assert!(!git::is_clean(&dirty).unwrap());
 
         let detached = root.join("detached");
         initialized(&detached);
@@ -304,6 +309,8 @@ mod tests {
         )
         .unwrap();
         assert!(!project.github_enabled());
+        assert_eq!(project.github_owner, "example");
+        assert_eq!(project.github_repo, "research");
         std::fs::remove_dir_all(root).unwrap();
     }
 

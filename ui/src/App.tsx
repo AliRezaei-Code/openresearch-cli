@@ -260,6 +260,10 @@ export default function App() {
   // What the middle pane shows: the agent chat, project artifacts, or
   // one settings section (picked from the rail nav — no separate pages).
   const [mainView, setMainView] = useState<"chat" | "artifacts" | SettingsTab>("chat");
+  const [githubPublicationError, setGithubPublicationError] = useState<{
+    projectId: string;
+    message: string;
+  } | null>(null);
   const [onboarded, setOnboarded] = useState(() => {
     try {
       return localStorage.getItem(ONBOARDED_KEY) === "1";
@@ -594,10 +598,14 @@ export default function App() {
     window.addEventListener("pointercancel", stop);
   };
 
-  const onProjectCreated = (project: Project) => {
+  const onProjectCreated = (project: Project, publicationError: string | null) => {
     setProjects((cur) => (cur ? upsert(cur, project) : [project]));
     setProjectId(project.id);
     setHomeOpen(false);
+    if (publicationError) {
+      setGithubPublicationError({ projectId: project.id, message: publicationError });
+      setMainView("git");
+    }
   };
 
   const onProjectDeleted = (id: string) => {
@@ -673,6 +681,8 @@ export default function App() {
     <RailHeader
       projectName={projects.find((p) => p.id === projectId)?.name ?? ""}
       onHome={() => setHomeOpen(true)}
+      onRepository={() => setMainView("git")}
+      repositoryActive={mainView === "git"}
       onCollapse={() => setRailOpen(false)}
     />
   );
@@ -731,9 +741,15 @@ export default function App() {
               <SettingsView
                 tab={mainView}
                 project={activeProject}
-                onProjectUpdate={(project) =>
-                  setProjects((current) => (current ? upsert(current, project) : [project]))
+                githubPublicationError={
+                  githubPublicationError && githubPublicationError.projectId === activeProject?.id
+                    ? githubPublicationError.message
+                    : null
                 }
+                onProjectUpdate={(project) => {
+                  setProjects((current) => (current ? upsert(current, project) : [project]));
+                  if (project.githubEnabled) setGithubPublicationError(null);
+                }}
                 onSelectTab={setMainView}
               />
             ) : null}

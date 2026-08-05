@@ -306,7 +306,6 @@ impl ControlPlane for LocalPlane {
             match args.backend.as_deref() {
                 None => {
                     args.backend = Some("local".to_string());
-                    args.flavor = None;
                 }
                 Some("local") => {}
                 Some(_) => {
@@ -317,6 +316,9 @@ impl ControlPlane for LocalPlane {
             }
         } else {
             crate::local::apply_compute_default(&mut args.backend, &mut args.flavor);
+            if args.backend.is_none() {
+                args.backend = Some("local".to_string());
+            }
         }
         if args.manifest.is_some() && args.backend.as_deref() != Some("k8s") {
             return Err(anyhow!("--manifest only applies with --backend k8s."));
@@ -551,15 +553,13 @@ impl ControlPlane for LocalPlane {
         println!();
         println!("To edit it, check out the branch in the project's local clone:");
         println!("  cd {}", project.repo_path);
-        println!(
-            "  git fetch origin && git checkout {}",
-            experiment.branch_name
-        );
+        println!("  git checkout {}", experiment.branch_name);
         println!("  # …edit, then…");
-        println!(
-            "  git commit -am \"<msg>\" && git push -u origin {}",
-            experiment.branch_name
-        );
+        if project.github_enabled() {
+            println!("  git commit -am \"<msg>\" && git push");
+        } else {
+            println!("  git commit -am \"<msg>\"");
+        }
         Ok(())
     }
 

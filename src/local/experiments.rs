@@ -144,6 +144,7 @@ mod tests {
             slug: "demo".into(),
             github_owner: "o".into(),
             github_repo: "r".into(),
+            github_sync_enabled: true,
             baseline_branch: base.into(),
             repo_path: "/tmp/r".into(),
             run_command: None,

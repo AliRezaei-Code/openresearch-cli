@@ -14,7 +14,7 @@ export function ProjectsHome({
 }: {
   projects: Project[];
   onOpen: (id: string) => void;
-  onCreated: (project: Project) => void;
+  onCreated: (project: Project, githubPublicationError: string | null) => void;
   onDeleted: (id: string) => void;
   /** Open the New project modal on mount — onboarding ends on "Create your
    * first project", so landing behind an empty page would ask for that click
@@ -34,9 +34,10 @@ export function ProjectsHome({
   }, []);
 
   async function onDelete(p: Project) {
+    const hasGithubRepository = Boolean(p.githubUrl || (p.githubOwner && p.githubRepo));
     const ok = window.confirm(
       `Delete project "${p.name}"?\n\nIts experiments, runs and chats are removed from orx. ` +
-        `The local folder (${p.path})${p.githubEnabled ? " and its GitHub repository" : ""} are kept.`,
+        `The local folder (${p.path})${hasGithubRepository ? " and its GitHub repository" : ""} are kept.`,
     );
     if (!ok) return;
     setDeleting(p.id);
@@ -66,7 +67,14 @@ export function ProjectsHome({
           {projects.length === 0 ? (
             <div className="changes-note">No projects yet — create one to get started.</div>
           ) : (
-            [...projects].sort((a, b) => b.updatedAt - a.updatedAt).map((p) => (
+            [...projects].sort((a, b) => b.updatedAt - a.updatedAt).map((p) => {
+              const hasGithubRepository = Boolean(p.githubUrl || (p.githubOwner && p.githubRepo));
+              const githubState = p.githubEnabled
+                ? "GitHub syncing on"
+                : hasGithubRepository
+                  ? "GitHub syncing off"
+                  : "local only";
+              return (
               <div
                 key={p.id}
                 className="project-card"
@@ -79,7 +87,7 @@ export function ProjectsHome({
               >
                 <span className="name">{p.name}</span>
                 <span className="repo mono">
-                  {p.path} · {p.baselineBranch}{p.githubEnabled ? " · GitHub enabled" : " · local only"}
+                  {p.path} · {p.baselineBranch} · {githubState}
                 </span>
                 {p.paperId && <span className="paper mono">arXiv {p.paperId}</span>}
                 <span className="time">created {timeAgo(p.createdAt)}</span>
@@ -95,7 +103,8 @@ export function ProjectsHome({
                   <Trash2 size={14} />
                 </button>
               </div>
-            ))
+              );
+            })
           )}
         </div>
       </div>
@@ -106,9 +115,9 @@ export function ProjectsHome({
             <h2>New project</h2>
             <NewProjectForm
               onCancel={() => setModalOpen(false)}
-              onCreated={(p) => {
+              onCreated={(project, githubPublicationError) => {
                 setModalOpen(false);
-                onCreated(p);
+                onCreated(project, githubPublicationError);
               }}
             />
           </div>

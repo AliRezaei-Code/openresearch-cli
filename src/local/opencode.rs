@@ -112,10 +112,16 @@ const SYSTEM_PROMPT: &str = include_str!("../../SYSTEM_PROMPT.md");
 fn playbook_md(project: &LocalProject) -> String {
     let id = &project.id;
     let name = &project.name;
-    let publication_line = project.github_url().map_or_else(
-        || "- GitHub: not enabled — this project is local-only".to_string(),
-        |url| format!("- GitHub repository: {url}"),
-    );
+    let publication_line = if project.github_enabled() {
+        format!(
+            "- GitHub repository: {}",
+            project
+                .github_url()
+                .expect("enabled project has publication metadata")
+        )
+    } else {
+        "- GitHub: not enabled — this project is local-only".to_string()
+    };
     let experiment_publish_clause = if project.github_enabled() {
         "created locally and pushed to GitHub"
     } else {
@@ -150,10 +156,20 @@ fn playbook_md(project: &LocalProject) -> String {
     // resolution in `exp run` stays authoritative either way: the agent is
     // told to OMIT `--backend`, never to echo the default back, so even a
     // stale prompt launches on the current default.
+    let configured_compute_default = crate::config::compute_default();
     let compute_default = if project.github_enabled() {
-        crate::config::compute_default()
+        Some(
+            configured_compute_default
+                .clone()
+                .unwrap_or_else(|| ("local".to_string(), None)),
+        )
     } else {
         Some(("local".to_string(), None))
+    };
+    let compute_default_source = if configured_compute_default.is_some() {
+        "the user's configured default"
+    } else {
+        "the local fallback"
     };
     let compute_bullet = if !project.github_enabled() {
         "- Compute: **local only** — run recorded commits on this machine. External backends remain unavailable until the user enables GitHub in the Git tab."
@@ -165,8 +181,8 @@ fn playbook_md(project: &LocalProject) -> String {
                 .as_ref()
                 .map_or(String::new(), |f| format!(" (`--flavor {f}`)"));
             format!(
-                "- Compute: default target **{b}**{flavor_part} — the user set it in \
-                 Settings → Compute; omit `--backend` on `orx exp run` to launch there. \
+                "- Compute: default target **{b}**{flavor_part} — {compute_default_source}; omit `--backend` \
+                 on `orx exp run` to launch there. \
                  Use another backend only when the user names one (see \"Compute backends\")"
             )
         }
@@ -202,12 +218,12 @@ fn playbook_md(project: &LocalProject) -> String {
                     "Omit it to use the default.".to_string()
                 };
                 let mut s = format!(
-                "`orx exp run` launches on the user's configured default — **{b}{flavor_part}** \
+                    "`orx exp run` launches on {compute_default_source} — **{b}{flavor_part}** \
                  — when you omit `--backend`. {omit_hint} \
                  Deviate only when the user names another backend for the task or this \
                  conversation — a connected token for some other backend is NOT a signal to \
                  switch."
-            );
+                );
                 if b == "ssh" {
                     s.push_str(" (`--host <alias>` is still required on every launch.)");
                 }
@@ -663,6 +679,7 @@ mod tests {
             slug: "test-project".into(),
             github_owner: "acme".into(),
             github_repo: "widget".into(),
+            github_sync_enabled: true,
             baseline_branch: "main".into(),
             repo_path: "/tmp/nonexistent".into(),
             run_command: None,

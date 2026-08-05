@@ -47,7 +47,7 @@ pub async fn run(args: crate::ProjectsArgs) -> Result<()> {
                 "paperId": p.paper_id,
                 "path": p.repo_path,
                 "baselineBranch": p.baseline_branch,
-                "repo": p.github_enabled().then(|| format!("{}/{}", p.github_owner, p.github_repo)),
+                "repo": p.has_github_repository().then(|| format!("{}/{}", p.github_owner, p.github_repo)),
                 "githubEnabled": p.github_enabled(),
                 "githubUrl": p.github_url(),
                 "archived": false,

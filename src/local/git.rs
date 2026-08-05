@@ -36,7 +36,7 @@ pub fn session_worktree_path(project_id: &str, session_id: &str) -> PathBuf {
     worktrees_root(project_id).join(session_id)
 }
 
-fn legacy_session_worktree_path(owner: &str, repo: &str, session_id: &str) -> PathBuf {
+fn legacy_worktrees_root(owner: &str, repo: &str) -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".cache")
@@ -44,7 +44,46 @@ fn legacy_session_worktree_path(owner: &str, repo: &str, session_id: &str) -> Pa
         .join("worktrees")
         .join(owner)
         .join(repo)
-        .join(session_id)
+}
+
+fn legacy_session_worktree_path(owner: &str, repo: &str, session_id: &str) -> PathBuf {
+    legacy_worktrees_root(owner, repo).join(session_id)
+}
+
+pub fn migrate_legacy_project_worktrees(
+    project: &crate::local::model::LocalProject,
+    session_ids: &[String],
+) -> Result<()> {
+    if !project.has_github_repository() {
+        return Ok(());
+    }
+    let legacy_root = legacy_worktrees_root(&project.github_owner, &project.github_repo);
+    if !legacy_root.is_dir() {
+        return Ok(());
+    }
+    let current_root = worktrees_root(&project.id);
+    std::fs::create_dir_all(&current_root)?;
+    for session_id in session_ids {
+        let source = legacy_root.join(session_id);
+        if !source.is_dir() {
+            continue;
+        }
+        let target = current_root.join(session_id);
+        if target.exists() {
+            continue;
+        }
+        let source = source
+            .to_str()
+            .ok_or_else(|| anyhow!("Legacy worktree path is not valid UTF-8."))?;
+        let target = target
+            .to_str()
+            .ok_or_else(|| anyhow!("Project worktree path is not valid UTF-8."))?;
+        git(
+            Some(Path::new(&project.repo_path)),
+            &["worktree", "move", source, target],
+        )?;
+    }
+    Ok(())
 }
 
 pub fn existing_session_worktree_path(
@@ -52,7 +91,7 @@ pub fn existing_session_worktree_path(
     session_id: &str,
 ) -> PathBuf {
     let current = session_worktree_path(&project.id, session_id);
-    if current.exists() || !project.github_enabled() {
+    if current.exists() || !project.has_github_repository() {
         return current;
     }
     let legacy =
@@ -146,12 +185,21 @@ pub fn clone_public(url: &str, path: &Path) -> Result<()> {
         .create_new(true)
         .open(&empty_config)?;
     let output = Command::new("git")
+        .current_dir(std::env::temp_dir())
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "")
+        .env("SSH_ASKPASS", "")
+        .env("SSH_ASKPASS_REQUIRE", "never")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", &empty_config)
         .env_remove("GIT_CONFIG_COUNT")
         .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .env("GIT_SSH_COMMAND", "false")
         .args([
             "-c",
@@ -228,11 +276,6 @@ pub fn validate_project_repository(path: &Path) -> Result<()> {
     git(Some(path), &["rev-parse", "--verify", "HEAD"]).map_err(|_| {
         anyhow!("The repository has no commits. Create an initial commit before continuing.")
     })?;
-    if !is_clean(path)? {
-        return Err(anyhow!(
-            "The repository has uncommitted changes. Commit or stash them before creating the project."
-        ));
-    }
     Ok(())
 }
 
@@ -276,9 +319,11 @@ fn sanitize_remote_url(url: &str) -> String {
 }
 
 pub fn github_publication(path: &Path) -> Option<(String, String)> {
-    let url = git(Some(path), &["remote", "get-url", GITHUB_REMOTE]).ok()?;
-    let (owner, repo) = parse_github_url(&url)?;
-    remote_matches_publication(path, GITHUB_REMOTE, &owner, &repo).then_some((owner, repo))
+    [GITHUB_REMOTE, "origin"].into_iter().find_map(|remote| {
+        let url = git(Some(path), &["remote", "get-url", remote]).ok()?;
+        let (owner, repo) = parse_github_url(&url)?;
+        remote_matches_publication(path, remote, &owner, &repo).then_some((owner, repo))
+    })
 }
 
 fn parse_github_url(url: &str) -> Option<(String, String)> {
@@ -748,12 +793,23 @@ pub fn add_github_remote(repo_path: &Path, owner: &str, repo: &str) -> Result<()
             )?;
             return Ok(());
         }
-        return Err(anyhow!(
-            "The 'github' remote already points somewhere else. Rename it, then retry GitHub enablement."
-        ));
-    }
-    if remote_matches_publication(repo_path, "origin", owner, repo) {
-        return Ok(());
+        let remotes = git(Some(repo_path), &["remote"])?;
+        let mut suffix = 1;
+        let backup = loop {
+            let candidate = if suffix == 1 {
+                "upstream".to_string()
+            } else {
+                format!("upstream-{suffix}")
+            };
+            if !remotes.lines().any(|remote| remote == candidate) {
+                break candidate;
+            }
+            suffix += 1;
+        };
+        git(
+            Some(repo_path),
+            &["remote", "rename", GITHUB_REMOTE, &backup],
+        )?;
     }
     git(Some(repo_path), &["remote", "add", GITHUB_REMOTE, &url])?;
     Ok(())
