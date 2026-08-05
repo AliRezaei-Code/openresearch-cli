@@ -248,8 +248,8 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
             </div>
             <h2 className="onb-title">Tell us about your research</h2>
             <p className="onb-sub">
-              A sentence or two about what you work on helps orx tailor its research — and link any
-              alphaXiv papers it should know. All optional; you can skip and add this later.
+              A sentence or two about what you work on helps orx tailor its research. All optional;
+              you can skip and add this later.
             </p>
             <div className="onb-cards">
               <div className="onb-card">
