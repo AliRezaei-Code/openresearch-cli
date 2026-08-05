@@ -16,16 +16,16 @@ pub struct Skill {
     pub no_args: &'static str,
 }
 
-const LIT_REVIEW_TEMPLATE: &str = r#"Perform a multi-hop literature review using alphaXiv.
+const LIT_REVIEW_TEMPLATE: &str = r#"Perform a multi-hop literature review across alphaXiv, OpenAlex, and bioRxiv.
 
 Topic: {args}
 
 Use the `orx` CLI (already installed; public endpoints, no login needed):
-- `orx lit "<query>"` — full-text search across papers; returns ids, titles, abstracts, and page-anchored snippets (`--json` for machine-readable output).
-- `orx paper <id>` — a paper's structured overview report (~10 KB); `--full` for the raw extracted text when the report lacks a detail.
+- `orx lit "<query>" [--source alphaxiv|openalex|biorxiv]` — full-text search; `--source` picks the corpus (default alphaxiv for CS/ML; openalex for cross-discipline + citation counts; biorxiv for biology preprints). Returns ids, titles, abstracts (`--json` for machine-readable output).
+- `orx paper <id>` — for an alphaXiv id, its structured overview report (~10 KB), `--full` for raw text; for a DOI or OpenAlex `W…` id, title/authors/date/citations + abstract. Source auto-detected from the id.
 
 Method — iterate; do not stop after one search:
-1. Hop 1: run `orx lit` with 2-3 distinct phrasings of the topic. Skim titles/abstracts/snippets and pick the 3-5 most relevant papers.
+1. Hop 1: run `orx lit` with 2-3 distinct phrasings of the topic. For biomed or cross-field topics, also query `--source openalex` (and `--source biorxiv` for biology) so you don't miss non-arXiv work. Skim titles/abstracts/snippets and pick the 3-5 most relevant papers.
 2. Read them: `orx paper <id>` for each pick.
 3. Next hop: from those reports, extract cited papers, author names, benchmark/method names, and field terminology you did not start with. Turn these into new `orx lit` queries and search again.
 4. Repeat until a hop surfaces nothing relevantly new (typically 2-4 hops). Track which papers you have already seen so you don't re-read them.
@@ -270,7 +270,7 @@ for this project.
 pub const CATALOG: &[Skill] = &[
     Skill {
         name: "lit-review",
-        description: "Multi-hop literature review via alphaXiv search",
+        description: "Multi-hop literature review across alphaXiv, OpenAlex, and bioRxiv",
         arg_hint: "[topic]",
         template: LIT_REVIEW_TEMPLATE,
         no_args: "(none given — ask the user what topic to review before searching)",

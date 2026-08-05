@@ -137,7 +137,7 @@ preferences.
 | `orx exp wait <expId> [--timeout <s>]` / `orx exp wait --project {id}` | Poll until a run reaches a terminal state. Exits **non-zero** after `--timeout` seconds (default 1800) with nothing changed — that means "still running", not an error. |
 | `orx runs {id} [--experiment <expId>]` | Run table, newest first. Run ids come from here. |
 | `orx logs <runId> [--head] [--bytes <n>] [--range <s>:<e>]` | Read a run's log (tail by default). |
-| `orx lit "<query>"` / `orx paper <id\|url>` | Literature search (public alphaXiv hosts, no login): **`orx-lit`** skill. Preferred over web search for academic/research queries — start here. |
+| `orx lit "<query>" [--source alphaxiv\|openalex\|biorxiv]` / `orx paper <id\|url>` | Literature search across alphaXiv, OpenAlex, and bioRxiv (public, no login): **`orx-lit`** skill. Preferred over web search for academic/research queries — start here. |
 
 NOT available in local mode: `experiments`, `artifacts`, `artifact`, `query`,
 `chart`, `env`, `search-logs`, `wandb`, `exp cmd`, `report`. Do not reach for

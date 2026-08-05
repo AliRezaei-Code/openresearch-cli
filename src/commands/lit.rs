@@ -1,15 +1,26 @@
-//! The `lit` command — full-text literature search over alphaXiv.
+//! The `lit` command — full-text literature search over alphaXiv, OpenAlex, or
+//! bioRxiv (`--source`, default alphaxiv).
 //!
-//! Public endpoint, no token required. Prints a compact, agent-readable list of
-//! hits (id, title, date, votes, truncated abstract) by default, or raw JSON with
-//! `--json`. Pull a hit's report next with `orx paper <id>`.
+//! Public endpoints, no token required. Prints a compact, agent-readable list of
+//! hits (id, title, date, metric, truncated abstract) by default, or raw JSON
+//! with `--json`. Pull a hit next with `orx paper <id>`. bioRxiv has no search
+//! API, so `--source biorxiv` searches OpenAlex filtered to bioRxiv's corpus.
 
-use crate::client::search_papers;
+use crate::client::{search_openalex, search_papers, LitHit, BIORXIV_SOURCE_ID};
 use crate::error::Result;
+use crate::LitSource;
 
 pub async fn run(args: crate::LitArgs) -> Result<()> {
     let limit = args.limit.unwrap_or(5);
-    let hits = search_papers(&args.query, limit).await?;
+    let hits: Vec<LitHit> = match args.source {
+        LitSource::Alphaxiv => search_papers(&args.query, limit)
+            .await?
+            .into_iter()
+            .map(LitHit::from)
+            .collect(),
+        LitSource::Openalex => search_openalex(&args.query, limit, None).await?,
+        LitSource::Biorxiv => search_openalex(&args.query, limit, Some(BIORXIV_SOURCE_ID)).await?,
+    };
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&hits)?);
@@ -27,16 +38,27 @@ pub async fn run(args: crate::LitArgs) -> Result<()> {
             .as_deref()
             .and_then(|d| d.split('T').next())
             .unwrap_or("—");
-        println!("{}  {}", h.paper_id, h.title);
-        println!("            {} · {} votes", date, h.votes);
+        println!("{}  {}", h.id, h.title);
+        println!("            {} · {}", date, metric(h));
         let abstract_ = collapse_ws(&h.abstract_);
         if !abstract_.is_empty() {
             println!("            {}", truncate_chars(&abstract_, 300));
         }
         println!();
     }
-    eprintln!("Fetch a report with: orx paper <paperId>");
+    eprintln!("Fetch a report with: orx paper <id>");
     Ok(())
+}
+
+/// The per-source relevance/impact metric shown under each hit.
+fn metric(h: &LitHit) -> String {
+    if let Some(v) = h.votes {
+        format!("{} votes", v)
+    } else if let Some(c) = h.citations {
+        format!("{} citations", c)
+    } else {
+        "—".to_string()
+    }
 }
 
 /// Collapse runs of whitespace (incl. newlines) into single spaces and trim.

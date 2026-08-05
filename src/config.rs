@@ -34,6 +34,25 @@ pub fn alphaxiv_web_url() -> String {
     std::env::var("ALPHAXIV_WEB_URL").unwrap_or_else(|_| "https://www.alphaxiv.org".to_string())
 }
 
+/// Base URL for the OpenAlex REST API (scholarly works search). Public, no
+/// token. Backs `orx lit --source openalex|biorxiv`. Override with `OPENALEX_API_URL`.
+pub fn openalex_api_url() -> String {
+    std::env::var("OPENALEX_API_URL").unwrap_or_else(|_| "https://api.openalex.org".to_string())
+}
+
+/// Base URL for the bioRxiv API (per-DOI preprint details). Public, no token.
+/// Backs `orx paper <biorxiv-doi>`. Override with `BIORXIV_API_URL`.
+pub fn biorxiv_api_url() -> String {
+    std::env::var("BIORXIV_API_URL").unwrap_or_else(|_| "https://api.biorxiv.org".to_string())
+}
+
+/// Contact address sent to OpenAlex as `mailto=` to enter its faster "polite
+/// pool". OpenAlex asks API users to identify themselves this way. Override with
+/// `OPENALEX_MAILTO`.
+pub fn openalex_mailto() -> String {
+    std::env::var("OPENALEX_MAILTO").unwrap_or_else(|_| "orx@alphaxiv.org".to_string())
+}
+
 /// Stored credentials: the API base URL and the bearer token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Credentials {
