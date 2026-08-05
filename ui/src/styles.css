@@ -3995,6 +3995,15 @@ a.files-pill:hover {
   font-size: var(--fs-md);
   font-weight: var(--fw-semibold);
 }
+.lit-sources-card {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.lit-source-row {
+  border-top: none;
+  padding-top: 0;
+}
 .project-default-row p,
 .project-default-connect p {
   margin: 3px 0 0;

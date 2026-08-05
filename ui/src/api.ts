@@ -693,6 +693,19 @@ export const getProfile = () => get<Profile>("/api/settings/profile");
 
 export const setProfile = (body: Profile) => post<Profile>("/api/settings/profile", body);
 
+/** Which literature sources `orx lit`/`orx paper` may use (settings.json). */
+export interface LitSourcesSettings {
+  alphaxiv: boolean;
+  openalex: boolean;
+  biorxiv: boolean;
+}
+
+export const getLitSources = () =>
+  get<LitSourcesSettings>("/api/settings/lit-sources");
+
+export const setLitSources = (body: LitSourcesSettings) =>
+  post<LitSourcesSettings>("/api/settings/lit-sources", body);
+
 export interface ProjectDefaultsSettings {
   githubForNewProjects: boolean;
   githubDefaultPromptSeen: boolean;

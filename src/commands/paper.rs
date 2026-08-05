@@ -22,11 +22,24 @@ use crate::LitSource;
 
 pub async fn run(args: crate::PaperArgs) -> Result<()> {
     let source = args.source.unwrap_or_else(|| detect_source(&args.id));
+    ensure_source_enabled(source, &crate::config::disabled_lit_sources())?;
     match source {
         LitSource::Alphaxiv => run_alphaxiv(&args).await,
         LitSource::Openalex => run_openalex(&args.id, args.full).await,
         LitSource::Biorxiv => run_biorxiv(&args.id, args.full).await,
     }
+}
+
+/// A disabled source (Settings → Literature sources) refuses to fetch too, so a
+/// source turned off is off everywhere — the same gate `orx lit` applies.
+fn ensure_source_enabled(source: LitSource, disabled: &[String]) -> Result<()> {
+    if disabled.iter().any(|d| d == source.as_str()) {
+        return Err(anyhow!(
+            "{} is disabled in Settings → Literature sources. Re-enable it to fetch this paper.",
+            source.display_name()
+        ));
+    }
+    Ok(())
 }
 
 async fn run_alphaxiv(args: &crate::PaperArgs) -> Result<()> {
@@ -252,8 +265,16 @@ pub(crate) fn parse_paper_id(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{biorxiv_doi, detect_source, extract_doi, parse_paper_id};
+    use super::{biorxiv_doi, detect_source, ensure_source_enabled, extract_doi, parse_paper_id};
     use crate::LitSource;
+
+    #[test]
+    fn enforces_disabled_sources() {
+        assert!(ensure_source_enabled(LitSource::Biorxiv, &[]).is_ok());
+        let disabled = vec!["biorxiv".to_string()];
+        assert!(ensure_source_enabled(LitSource::Biorxiv, &disabled).is_err());
+        assert!(ensure_source_enabled(LitSource::Alphaxiv, &disabled).is_ok());
+    }
 
     #[test]
     fn parses_all_forms() {

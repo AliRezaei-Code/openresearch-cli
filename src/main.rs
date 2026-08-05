@@ -758,6 +758,32 @@ pub enum LitSource {
     Biorxiv,
 }
 
+impl LitSource {
+    /// Lowercase wire name used to enforce against the Settings disable-set.
+    /// Matches the `--source` flag values (clap `rename_all = "lower"`) and the
+    /// `LitHit.source` JSON labels.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LitSource::Alphaxiv => "alphaxiv",
+            LitSource::Openalex => "openalex",
+            LitSource::Biorxiv => "biorxiv",
+        }
+    }
+
+    /// Human-facing name for error/UI text.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            LitSource::Alphaxiv => "alphaXiv",
+            LitSource::Openalex => "OpenAlex",
+            LitSource::Biorxiv => "bioRxiv",
+        }
+    }
+
+    /// All sources, in preference order (used to pick a default when `--source`
+    /// is omitted).
+    pub const ALL: [LitSource; 3] = [LitSource::Alphaxiv, LitSource::Openalex, LitSource::Biorxiv];
+}
+
 #[derive(Args, Debug)]
 pub struct LitArgs {
     /// Full-text search query.
@@ -765,9 +791,10 @@ pub struct LitArgs {
     /// Max results (default 5).
     #[arg(long)]
     pub limit: Option<u32>,
-    /// Corpus to search (default alphaxiv).
-    #[arg(long, value_enum, default_value_t = LitSource::Alphaxiv)]
-    pub source: LitSource,
+    /// Corpus to search. Omitted = the first source enabled in Settings
+    /// (alphaxiv unless it's disabled).
+    #[arg(long, value_enum)]
+    pub source: Option<LitSource>,
     /// Emit raw JSON instead of the formatted list.
     #[arg(long)]
     pub json: bool,

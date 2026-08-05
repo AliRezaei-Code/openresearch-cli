@@ -20,6 +20,8 @@ import {
   getEnvVars,
   getProjectGitStatus,
   getProjectDefaults,
+  getLitSources,
+  setLitSources,
   getHarnesses,
   getHfSettings,
   getK8sSettings,
@@ -57,6 +59,7 @@ import {
   type EnvVar,
   type Project,
   type ProjectDefaultsSettings,
+  type LitSourcesSettings,
   type ProjectGitStatus,
   type Harness,
   type HarnessId,
@@ -1804,6 +1807,84 @@ function EnvVarsSection() {
 
 // --- project defaults ----------------------------------------------------------
 
+const LIT_SOURCE_ROWS: { key: keyof LitSourcesSettings; name: string }[] = [
+  { key: "alphaxiv", name: "alphaXiv" },
+  { key: "openalex", name: "OpenAlex" },
+  { key: "biorxiv", name: "bioRxiv" },
+];
+
+function LiteratureSourcesTab() {
+  const [settings, setSettings] = useState<LitSourcesSettings | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = () => {
+    setError(null);
+    void getLitSources()
+      .then(setSettings)
+      .catch((err) => setError(err instanceof Error ? err.message : String(err)));
+  };
+  useEffect(load, []);
+
+  const toggle = (key: keyof LitSourcesSettings) => {
+    if (!settings || saving) return;
+    setSaving(true);
+    setError(null);
+    void setLitSources({ ...settings, [key]: !settings[key] })
+      .then(setSettings)
+      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+      .finally(() => setSaving(false));
+  };
+
+  const noneEnabled =
+    settings !== null && !settings.alphaxiv && !settings.openalex && !settings.biorxiv;
+
+  return (
+    <>
+      <h2>Literature sources</h2>
+      <p className="settings-sub">
+        Which corpora <code>orx lit</code> and <code>orx paper</code> may use.
+      </p>
+      {!settings ? (
+        error ? (
+          <div className="error">{error}</div>
+        ) : (
+          <div className="settings-loading">
+            <span className="spinner" /> Loading…
+          </div>
+        )
+      ) : (
+        <div className="settings-card lit-sources-card">
+          {LIT_SOURCE_ROWS.map((row) => (
+            <div className="project-default-row lit-source-row" key={row.key}>
+              <div>
+                <div className="project-default-title">{row.name}</div>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={settings[row.key]}
+                aria-label={`Enable ${row.name}`}
+                className={`settings-switch ${settings[row.key] ? "on" : ""}`}
+                disabled={saving}
+                onClick={() => toggle(row.key)}
+              >
+                <span />
+              </button>
+            </div>
+          ))}
+          {noneEnabled && (
+            <p className="settings-note">
+              All sources are off — literature search is disabled until you re-enable one.
+            </p>
+          )}
+          {error && <div className="error">{error}</div>}
+        </div>
+      )}
+    </>
+  );
+}
+
 function ProjectDefaultsTab() {
   const [settings, setSettings] = useState<ProjectDefaultsSettings | null>(null);
   const [saving, setSaving] = useState(false);
@@ -2532,6 +2613,9 @@ export function SettingsView({
             </section>
             <section className="settings-stack-section">
               <HarnessesTab />
+            </section>
+            <section className="settings-stack-section">
+              <LiteratureSourcesTab />
             </section>
             <section className="settings-stack-section">
               <StorageTab />

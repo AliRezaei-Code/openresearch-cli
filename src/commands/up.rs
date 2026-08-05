@@ -346,6 +346,10 @@ fn router(state: AppState) -> Router {
         .route("/api/settings/compute/default", post(set_compute_default))
         .route("/api/settings/local", get(local_machine_settings))
         .route("/api/settings/openresearch", get(openresearch_settings))
+        .route(
+            "/api/settings/lit-sources",
+            get(lit_sources_settings).post(set_lit_sources_settings),
+        )
         .route("/api/harnesses", get(list_harnesses))
         .route("/api/skills", get(list_skills))
         .route(
@@ -2506,6 +2510,50 @@ async fn set_profile_settings(Json(req): Json<SetProfileReq>) -> ApiResult {
     })
     .await
     .map_err(|e| ApiError::from(anyhow!("profile task failed: {e}")))?
+}
+
+/// The lit-source toggles as booleans (enabled = not in the disabled set).
+fn lit_sources_json() -> Value {
+    let disabled = crate::config::disabled_lit_sources();
+    let enabled = |name: &str| !disabled.iter().any(|d| d == name);
+    json!({
+        "alphaxiv": enabled(crate::LitSource::Alphaxiv.as_str()),
+        "openalex": enabled(crate::LitSource::Openalex.as_str()),
+        "biorxiv": enabled(crate::LitSource::Biorxiv.as_str()),
+    })
+}
+
+async fn lit_sources_settings() -> ApiResult {
+    tokio::task::spawn_blocking(|| Ok(Json(lit_sources_json())))
+        .await
+        .map_err(|e| ApiError::from(anyhow!("lit-sources task failed: {e}")))?
+}
+
+#[derive(Deserialize)]
+struct SetLitSourcesReq {
+    alphaxiv: bool,
+    openalex: bool,
+    biorxiv: bool,
+}
+
+async fn set_lit_sources_settings(Json(req): Json<SetLitSourcesReq>) -> ApiResult {
+    tokio::task::spawn_blocking(move || {
+        let mut disabled = Vec::new();
+        for (enabled, source) in [
+            (req.alphaxiv, crate::LitSource::Alphaxiv),
+            (req.openalex, crate::LitSource::Openalex),
+            (req.biorxiv, crate::LitSource::Biorxiv),
+        ] {
+            if !enabled {
+                disabled.push(source.as_str().to_string());
+            }
+        }
+        crate::telemetry::set_disabled_lit_sources(disabled)
+            .map_err(|e| ApiError::from(anyhow!("could not save literature sources: {e}")))?;
+        Ok(Json(lit_sources_json()))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("lit-sources task failed: {e}")))?
 }
 
 /// Record the consent decision (agree/reject) for the analytics choice — fired
