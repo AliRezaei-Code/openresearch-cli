@@ -309,6 +309,10 @@ fn router(state: AppState) -> Router {
             "/api/settings/telemetry/consent",
             post(record_telemetry_consent),
         )
+        .route(
+            "/api/settings/profile",
+            get(profile_settings).post(set_profile_settings),
+        )
         .route("/api/settings/ssh", get(ssh_settings))
         .route("/api/settings/ssh/preflight", post(ssh_preflight))
         .route(
@@ -2200,6 +2204,36 @@ async fn set_telemetry_settings(Json(req): Json<SetTelemetryReq>) -> ApiResult {
     })
     .await
     .map_err(|e| ApiError::from(anyhow!("telemetry task failed: {e}")))?
+}
+
+fn profile_settings_json() -> Value {
+    let (background, papers) = crate::telemetry::load_profile();
+    json!({ "background": background, "papers": papers })
+}
+
+async fn profile_settings() -> ApiResult {
+    tokio::task::spawn_blocking(|| Ok(Json(profile_settings_json())))
+        .await
+        .map_err(|e| ApiError::from(anyhow!("profile task failed: {e}")))?
+}
+
+#[derive(Deserialize)]
+struct SetProfileReq {
+    #[serde(default)]
+    background: Option<String>,
+    #[serde(default)]
+    papers: Vec<crate::telemetry::ProfilePaper>,
+}
+
+async fn set_profile_settings(Json(req): Json<SetProfileReq>) -> ApiResult {
+    tokio::task::spawn_blocking(move || {
+        let background = req.background.map(|b| b.trim().to_string());
+        crate::telemetry::set_profile(background, req.papers)
+            .map_err(|e| ApiError::from(anyhow!("could not save profile: {e}")))?;
+        Ok(Json(profile_settings_json()))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("profile task failed: {e}")))?
 }
 
 /// Record the consent decision (agree/reject) for the analytics choice — fired

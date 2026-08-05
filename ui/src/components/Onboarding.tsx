@@ -1,13 +1,18 @@
-import { ArrowLeft, ArrowRight, Check, RefreshCw } from "lucide-react";
+import { ArrowLeft, ArrowRight, Check, RefreshCw, X } from "lucide-react";
 import { Wordmark } from "./Wordmark";
 import { useEffect, useRef, useState } from "react";
 import {
   getHarnesses,
+  getProfile,
   getTelemetry,
   harnessModelLabel,
   recordTelemetryConsent,
+  searchPapers,
+  setProfile,
   setTelemetry,
   type Harness,
+  type LinkedPaper,
+  type PaperHit,
   type TelemetrySettings,
 } from "../api";
 import { renderNote } from "./agentNote";
@@ -15,16 +20,22 @@ import { onHarnessAuth } from "../events";
 
 const RETRY_COPY = "Couldn't reach orx. Check it's still running, then re-check.";
 
-/** First-run walkthrough: detected coding agents, then analytics consent.
+/** First-run walkthrough: coding agents, research profile, then analytics consent.
  * The data-dir choice deliberately lives in Settings → Storage instead:
  * the default suits almost everyone, and Settings can also *move* existing
  * data, which this flow never could. */
 export function Onboarding({ onDone }: { onDone: () => void }) {
-  const [step, setStep] = useState<0 | 1>(0);
+  const [step, setStep] = useState<0 | 1 | 2>(0);
   const [harnesses, setHarnesses] = useState<Harness[] | null>(null);
   const [telemetry, setTelemetryState] = useState<TelemetrySettings | null>(null);
   const [telemetrySaving, setTelemetrySaving] = useState(false);
   const [checking, setChecking] = useState(false);
+  const [background, setBackground] = useState("");
+  const [papers, setPapers] = useState<LinkedPaper[]>([]);
+  const [paperQuery, setPaperQuery] = useState("");
+  const [paperHits, setPaperHits] = useState<PaperHit[]>([]);
+  const [searchingPapers, setSearchingPapers] = useState(false);
+  const paperSeq = useRef(0);
   // Per-probe, not one shared flag: a telemetry failure must not put a
   // connectivity error on a gate it has nothing to do with — or worse, hide
   // the actionable "sign in" hint behind it.
@@ -77,6 +88,48 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
       }),
     [],
   );
+  useEffect(() => {
+    void getProfile()
+      .then((profile) => {
+        setBackground(profile.background ?? "");
+        setPapers(profile.papers);
+      })
+      .catch(() => {});
+  }, []);
+  useEffect(() => {
+    const query = paperQuery.trim();
+    if (query.length < 3) {
+      setPaperHits([]);
+      setSearchingPapers(false);
+      return;
+    }
+    const request = ++paperSeq.current;
+    setSearchingPapers(true);
+    const timer = setTimeout(() => {
+      void searchPapers(query)
+        .then((results) => request === paperSeq.current && setPaperHits(results))
+        .catch(() => request === paperSeq.current && setPaperHits([]))
+        .finally(() => request === paperSeq.current && setSearchingPapers(false));
+    }, 350);
+    return () => clearTimeout(timer);
+  }, [paperQuery]);
+
+  const addPaper = (hit: PaperHit) => {
+    setPapers((current) =>
+      current.some((paper) => paper.paperId === hit.paperId)
+        ? current
+        : [...current, { paperId: hit.paperId, title: cleanPaperTitle(hit.title) }],
+    );
+    setPaperQuery("");
+    setPaperHits([]);
+  };
+  const removePaper = (paperId: string) =>
+    setPapers((current) => current.filter((paper) => paper.paperId !== paperId));
+
+  const saveProfile = () => {
+    void setProfile({ background: background.trim() || null, papers }).catch(() => {});
+    setStep(2);
+  };
 
   // Leaving step 3 → record the final consent decision once (agree or reject),
   // so every user who reaches the analytics step is counted, including those who
@@ -93,7 +146,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
         {step === 0 ? (
           <>
             <div className="onb-eyebrow">
-              <Wordmark /> · Step 1 of 2
+              <Wordmark /> · Step 1 of 3
             </div>
             <h2 className="onb-title">Your coding agents</h2>
             <p className="onb-sub">
@@ -132,10 +185,80 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
               </button>
             </div>
           </>
+        ) : step === 1 ? (
+          <>
+            <div className="onb-eyebrow">
+              <Wordmark /> · Step 2 of 3
+            </div>
+            <h2 className="onb-title">Tell us about your research</h2>
+            <p className="onb-sub">
+              A sentence or two about what you work on helps orx tailor its research. Everything
+              here is optional.
+            </p>
+            <div className="onb-cards">
+              <div className="onb-card">
+                <textarea
+                  className="onb-textarea"
+                  value={background}
+                  onChange={(event) => setBackground(event.target.value)}
+                  rows={4}
+                  placeholder="e.g. I work on sample-efficient RL for LLM post-training, focused on reward-model-free methods."
+                />
+                <div className="onb-paper-search">
+                  <input
+                    value={paperQuery}
+                    onChange={(event) => setPaperQuery(event.target.value)}
+                    placeholder="Search alphaXiv by title to link a paper…"
+                  />
+                  {searchingPapers ? (
+                    <div className="onb-card-meta">Searching alphaXiv…</div>
+                  ) : paperHits.length > 0 ? (
+                    <div className="onb-paper-results">
+                      {paperHits.map((hit) => (
+                        <button key={hit.paperId} type="button" onClick={() => addPaper(hit)}>
+                          <span className="title">{cleanPaperTitle(hit.title)}</span>
+                          <span className="id">{hit.paperId}</span>
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+                {papers.length > 0 && (
+                  <div className="onb-paper-chips">
+                    {papers.map((paper) => (
+                      <span key={paper.paperId} className="onb-paper-chip">
+                        <span className="title">{paper.title || paper.paperId}</span>
+                        <span className="id">{paper.paperId}</span>
+                        <button
+                          type="button"
+                          aria-label={`Remove ${paper.paperId}`}
+                          onClick={() => removePaper(paper.paperId)}
+                        >
+                          <X size={12} />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+            <p className="onb-aside-text" style={{ marginTop: 12 }}>
+              Your background stays on this machine alongside your other OpenResearch data.
+            </p>
+            <div className="onb-actions">
+              <button className="btn ghost" onClick={() => setStep(0)}>
+                <ArrowLeft size={12} /> Back
+              </button>
+              <div style={{ flex: 1 }} />
+              <button className="btn primary" onClick={saveProfile}>
+                Continue <ArrowRight size={13} />
+              </button>
+            </div>
+          </>
         ) : (
           <>
             <div className="onb-eyebrow">
-              <Wordmark /> · Step 2 of 2
+              <Wordmark /> · Step 3 of 3
             </div>
             <h2 className="onb-title">Usage analytics</h2>
             <p className="onb-sub">
@@ -160,7 +283,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
               any time in Settings → Storage.
             </p>
             <div className="onb-actions">
-              <button className="btn ghost" onClick={() => setStep(0)}>
+              <button className="btn ghost" onClick={() => setStep(1)}>
                 <ArrowLeft size={12} /> Back
               </button>
               <div style={{ flex: 1 }} />
@@ -177,6 +300,10 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
       </div>
     </div>
   );
+}
+
+function cleanPaperTitle(title: string): string {
+  return title.replace(/^\[[^\]]*\]\s*/, "").replace(/\s*[-–|]\s*arXiv\s*$/i, "");
 }
 
 /** Agent notes carry the command to run in backticks (`claude auth login`) —

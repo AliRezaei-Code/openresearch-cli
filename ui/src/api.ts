@@ -638,6 +638,22 @@ export const saveGitToken = (token: string) =>
 export const removeGitToken = () =>
   fetch("/api/settings/git/token", { method: "DELETE" }).then((r) => json<GitSettings>(r));
 
+/** A paper linked to the researcher profile during onboarding. */
+export interface LinkedPaper {
+  paperId: string;
+  title: string | null;
+}
+
+/** The local researcher profile captured in onboarding (settings.json). */
+export interface Profile {
+  background: string | null;
+  papers: LinkedPaper[];
+}
+
+export const getProfile = () => get<Profile>("/api/settings/profile");
+
+export const setProfile = (body: Profile) => post<Profile>("/api/settings/profile", body);
+
 export interface ProjectGitStatus {
   path: string;
   gitVersion: string | null;
