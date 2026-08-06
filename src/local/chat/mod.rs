@@ -385,10 +385,14 @@ fn save_images(images: &[ImageAttachment]) -> Result<Vec<SavedAttachment>> {
         let path = dir.join(&file_name);
         std::fs::write(&path, bytes)
             .map_err(|e| anyhow!("Could not write {}: {}", path.display(), e))?;
+        // Original basename, minus control chars so it can't break out of the
+        // <attached-files> block it's injected into; falls back to the safe name.
         let display_name = img
             .name
             .as_deref()
-            .map(|n| n.rsplit(['/', '\\']).next().unwrap_or(n).to_string())
+            .map(|n| n.rsplit(['/', '\\']).next().unwrap_or(n))
+            .map(|n| n.chars().filter(|c| !c.is_control()).collect::<String>())
+            .filter(|n| !n.is_empty())
             .unwrap_or_else(|| safe.clone());
         saved.push(SavedAttachment {
             file_name,

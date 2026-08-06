@@ -1716,7 +1716,8 @@ textarea::placeholder {
   border-radius: var(--radius-sm);
   display: block;
 }
-.attachment-thumb button {
+.attachment-thumb button,
+.attachment-file button {
   position: absolute;
   top: -5px;
   right: -5px;
@@ -1732,7 +1733,8 @@ textarea::placeholder {
   color: var(--text);
   cursor: pointer;
 }
-.attachment-thumb button:hover {
+.attachment-thumb button:hover,
+.attachment-file button:hover {
   background: var(--text);
   color: var(--base);
 }
@@ -1758,30 +1760,10 @@ textarea::placeholder {
   white-space: nowrap;
   font-size: var(--fs-sm);
 }
-.attachment-file button {
-  position: absolute;
-  top: -5px;
-  right: -5px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  padding: 0;
-  border: 1px solid var(--border);
-  border-radius: 50%;
-  background: var(--surface);
-  color: var(--text);
-  cursor: pointer;
-}
-.attachment-file button:hover {
-  background: var(--text);
-  color: var(--base);
-}
 .composer-attach-error {
   padding: 6px 12px 0;
   font-size: var(--fs-sm);
-  color: var(--danger, #dc2626);
+  color: var(--accent-red);
 }
 .composer-attach {
   display: inline-flex;

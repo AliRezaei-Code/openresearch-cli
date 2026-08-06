@@ -1267,7 +1267,7 @@ export function ChatPanel({
   const [draft, setDraft] = useState("");
   // Pasted/dropped/uploaded attachments waiting in the composer, as data URLs.
   const [attachments, setAttachments] = useState<
-    { dataUrl: string; mediaType: string; name?: string }[]
+    { dataUrl: string; mediaType: string; name?: string; size: number }[]
   >([]);
   const [attachError, setAttachError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -1364,20 +1364,31 @@ export function ChatPanel({
   /** Queue files (upload button, clipboard paste, or drag-drop) as composer
    * attachments — images and PDFs, which the harness reads off disk by path. */
   function addFiles(files: File[]) {
-    // Kept under the backend's 64 MB request-body cap, with headroom for the
-    // base64 inflation (~33%) and multiple attachments in one message.
+    // Per-file and total caps keep the base64-inflated (~33%) request body
+    // under the backend's 64 MB limit — a single 30 MB file or a batch summing
+    // to 40 MB both stay clear once encoded.
     const MAX_BYTES = 30 * 1024 * 1024;
+    const TOTAL_BYTES = 40 * 1024 * 1024;
     setAttachError(null);
+    let total = attachments.reduce((n, a) => n + a.size, 0);
     for (const file of files) {
       if (!/^(image\/(png|jpeg|gif|webp)|application\/pdf)$/.test(file.type)) continue;
       if (file.size > MAX_BYTES) {
-        setAttachError(`${file.name} is too large — attachments must be under 30 MB.`);
+        setAttachError(`${file.name} is too large — each attachment must be under 30 MB.`);
         continue;
       }
+      if (total + file.size > TOTAL_BYTES) {
+        setAttachError("Attachments exceed the 40 MB total limit — remove one and try again.");
+        continue;
+      }
+      total += file.size;
       const reader = new FileReader();
       reader.onload = () => {
         const dataUrl = reader.result as string;
-        setAttachments((cur) => [...cur, { dataUrl, mediaType: file.type, name: file.name }]);
+        setAttachments((cur) => [
+          ...cur,
+          { dataUrl, mediaType: file.type, name: file.name, size: file.size },
+        ]);
       };
       reader.readAsDataURL(file);
     }
@@ -2444,7 +2455,11 @@ export function ChatPanel({
               })}
             </div>
           )}
-          {attachError && <div className="composer-attach-error">{attachError}</div>}
+          {attachError && (
+            <div className="composer-attach-error" role="alert">
+              {attachError}
+            </div>
+          )}
           <div className="composer-input">
             {pickedSkill && (
               // Inert like inline text: clicks fall through to the textarea
