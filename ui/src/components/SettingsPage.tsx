@@ -4,10 +4,13 @@ import {
   Cpu,
   ExternalLink,
   Info,
+  Monitor,
+  Moon,
   Plus,
   RefreshCw,
   Settings,
   SquareTerminal,
+  Sun,
   Trash2,
   X,
 } from "lucide-react";
@@ -78,6 +81,7 @@ import {
   harnessModelLabel,
 } from "../api";
 import { onDataDirMove, onHarnessAuth } from "../events";
+import { useThemePreference, type ThemePreference } from "../theme";
 import { GitTokenForm } from "./GitTokenForm";
 import { BackendBadge, BackendLogo } from "./BackendLogos";
 import { ProgressBar } from "./ProgressBar";
@@ -1803,6 +1807,80 @@ function EnvVarsSection() {
   );
 }
 
+// --- appearance ----------------------------------------------------------------
+
+const THEME_OPTIONS: {
+  value: ThemePreference;
+  label: string;
+  icon: typeof Monitor;
+}[] = [
+  { value: "system", label: "System", icon: Monitor },
+  { value: "light", label: "Light", icon: Sun },
+  { value: "dark", label: "Dark", icon: Moon },
+];
+
+function AppearanceTab() {
+  const [preference, setPreference] = useThemePreference();
+
+  // Arrow keys move selection relative to the focused radio, with focus
+  // following the new choice (WAI-ARIA radio pattern).
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    const dir =
+      e.key === "ArrowRight" || e.key === "ArrowDown"
+        ? 1
+        : e.key === "ArrowLeft" || e.key === "ArrowUp"
+          ? -1
+          : 0;
+    if (!dir) return;
+    e.preventDefault();
+    const radios = [
+      ...e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="radio"]'),
+    ];
+    const from = radios.findIndex((r) => r === document.activeElement);
+    const anchor =
+      from === -1 ? THEME_OPTIONS.findIndex((o) => o.value === preference) : from;
+    const next = (anchor + dir + THEME_OPTIONS.length) % THEME_OPTIONS.length;
+    setPreference(THEME_OPTIONS[next].value);
+    radios[next]?.focus();
+  };
+
+  return (
+    <>
+      <h2>Appearance</h2>
+      <p className="settings-sub">How the interface looks on this device.</p>
+      <div className="settings-card">
+        <div className="project-default-row">
+          <div>
+            <div className="project-default-title">Theme</div>
+            <p>System follows your operating system's light or dark setting.</p>
+          </div>
+          <div
+            className="theme-segmented"
+            role="radiogroup"
+            aria-label="Theme"
+            onKeyDown={onKeyDown}
+          >
+            {THEME_OPTIONS.map(({ value, label, icon: Icon }) => (
+              <button
+                key={value}
+                type="button"
+                role="radio"
+                aria-checked={preference === value}
+                tabIndex={preference === value ? 0 : -1}
+                className={`theme-segment ${preference === value ? "on" : ""}`}
+                onClick={() => setPreference(value)}
+              >
+                <Icon size={14} />
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
 // --- project defaults ----------------------------------------------------------
 
 function ProjectDefaultsTab() {
@@ -2528,6 +2606,9 @@ export function SettingsView({
         <>
           <h1>Settings</h1>
           <div className="settings-stack">
+            <section className="settings-stack-section">
+              <AppearanceTab />
+            </section>
             <section className="settings-stack-section">
               <ProjectDefaultsTab />
             </section>
