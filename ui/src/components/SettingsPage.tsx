@@ -82,6 +82,7 @@ import {
 import { onDataDirMove, onHarnessAuth } from "../events";
 import { GitTokenForm } from "./GitTokenForm";
 import { BackendBadge, BackendLogo } from "./BackendLogos";
+import { LitSourceLogo } from "./LitSourceLogo";
 import { ProgressBar } from "./ProgressBar";
 import { StatusBadge } from "./StatusBadge";
 
@@ -1857,7 +1858,8 @@ function LiteratureSourcesTab() {
         <div className="settings-card lit-sources-card">
           {LIT_SOURCE_ROWS.map((row) => (
             <div className="project-default-row lit-source-row" key={row.key}>
-              <div>
+              <div className="lit-source-name">
+                <LitSourceLogo source={row.key} size={18} decorative />
                 <div className="project-default-title">{row.name}</div>
               </div>
               <button

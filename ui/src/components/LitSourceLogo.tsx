@@ -23,13 +23,22 @@ const LIT_SOURCE_SVG: Record<LitSource, string> = {
   biorxiv: biorxivSvg,
 };
 
-export function LitSourceLogo({ source, size = 16 }: { source: LitSource; size?: number }) {
+/** `decorative` when the source name is already shown as adjacent text (Settings
+ * rows); otherwise the logo carries the source name for screen readers. */
+export function LitSourceLogo({
+  source,
+  size = 16,
+  decorative = false,
+}: {
+  source: LitSource;
+  size?: number;
+  decorative?: boolean;
+}) {
   return (
     <span
       className="lit-logo"
       style={{ width: size, height: size }}
-      // Decorative — the source name is always in the adjacent text.
-      aria-hidden="true"
+      {...(decorative ? { "aria-hidden": true } : { role: "img", "aria-label": LIT_SOURCE_NAME[source] })}
       // Static, build-inlined brand SVGs — not user input.
       dangerouslySetInnerHTML={{ __html: LIT_SOURCE_SVG[source] }}
     />

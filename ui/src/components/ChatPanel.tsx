@@ -53,7 +53,7 @@ import {
   type SkillInfo,
 } from "../api";
 import { onChatEvent } from "../events";
-import { LitSourceLogo, LIT_SOURCE_NAME, parseOrxLit, paperUrl } from "./LitSourceLogo";
+import { LitSourceLogo, parseOrxLit, paperUrl } from "./LitSourceLogo";
 import { Md } from "./Md";
 import { PlanStrip } from "./PlanStrip";
 import { SETTINGS_NAV, type SettingsTab } from "./SettingsPage";
@@ -285,15 +285,15 @@ function toolSummary(part: ChatPart): React.ReactNode {
     const cmd = part.state?.input?.command;
     const call = typeof cmd === "string" ? parseOrxLit(cmd) : null;
     if (call) {
-      const name = LIT_SOURCE_NAME[call.source];
+      // The logo already names the source, so the text doesn't repeat it.
       const text =
         call.kind === "lit"
           ? call.query
-            ? `Searching ${name} for “${call.query}”`
-            : `Searching ${name}`
+            ? `Searching for “${call.query}”`
+            : "Searching"
           : call.id
-            ? `Reading ${call.id} on ${name}`
-            : `Reading a paper on ${name}`;
+            ? `Reading ${call.id}`
+            : "Reading a paper";
       // A fetched paper links out to its page on the source (with an external-link
       // affordance so it reads as clickable); the search rows are plain text. The
       // anchor is the click's activation target, so it navigates without toggling

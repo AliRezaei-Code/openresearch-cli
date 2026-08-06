@@ -4061,6 +4061,11 @@ a.files-pill:hover {
   border-top: none;
   padding-top: 0;
 }
+.lit-source-name {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
 .project-default-row p,
 .project-default-connect p {
   margin: 3px 0 0;
