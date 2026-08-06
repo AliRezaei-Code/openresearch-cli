@@ -28,7 +28,7 @@ mod store;
 mod telemetry;
 mod updates;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -132,10 +132,12 @@ enum Command {
     #[command(name = "install-skills")]
     InstallSkills(InstallSkillsArgs),
 
-    /// Search alphaXiv literature by full-text query (no login required).
+    /// Search literature by full-text query across alphaXiv, OpenAlex, or
+    /// bioRxiv (`--source`; no login required).
     Lit(LitArgs),
 
-    /// Fetch a paper's machine-readable report (or `--full` text) from alphaXiv.
+    /// Fetch a paper: alphaXiv report/full-text, or OpenAlex/bioRxiv metadata.
+    /// The source is auto-detected from the id (override with `--source`).
     Paper(PaperArgs),
 
     /// Show the CLI version; `--check` compares it to the latest release.
@@ -744,6 +746,44 @@ pub enum TelemetryCommand {
     },
 }
 
+/// Which corpus `orx lit` searches / `orx paper` reads from.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[value(rename_all = "lower")]
+pub enum LitSource {
+    /// alphaXiv (arXiv corpus: CS, math, physics, stats — the default).
+    Alphaxiv,
+    /// OpenAlex (general scholarly graph across all disciplines).
+    Openalex,
+    /// bioRxiv biology preprints (searched via OpenAlex, fetched via bioRxiv).
+    Biorxiv,
+}
+
+impl LitSource {
+    /// Lowercase wire name used to enforce against the Settings disable-set.
+    /// Matches the `--source` flag values (clap `rename_all = "lower"`) and the
+    /// `LitHit.source` JSON labels.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LitSource::Alphaxiv => "alphaxiv",
+            LitSource::Openalex => "openalex",
+            LitSource::Biorxiv => "biorxiv",
+        }
+    }
+
+    /// Human-facing name for error/UI text.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            LitSource::Alphaxiv => "alphaXiv",
+            LitSource::Openalex => "OpenAlex",
+            LitSource::Biorxiv => "bioRxiv",
+        }
+    }
+
+    /// All sources, in preference order (used to pick a default when `--source`
+    /// is omitted).
+    pub const ALL: [LitSource; 3] = [LitSource::Alphaxiv, LitSource::Openalex, LitSource::Biorxiv];
+}
+
 #[derive(Args, Debug)]
 pub struct LitArgs {
     /// Full-text search query.
@@ -751,6 +791,10 @@ pub struct LitArgs {
     /// Max results (default 5).
     #[arg(long)]
     pub limit: Option<u32>,
+    /// Corpus to search. Omitted = the first source enabled in Settings
+    /// (alphaxiv unless it's disabled).
+    #[arg(long, value_enum)]
+    pub source: Option<LitSource>,
     /// Emit raw JSON instead of the formatted list.
     #[arg(long)]
     pub json: bool,
@@ -779,9 +823,14 @@ pub struct UpdateArgs {
 
 #[derive(Args, Debug)]
 pub struct PaperArgs {
-    /// arXiv id, versioned id (`2401.12345v2`), or an arXiv/alphaXiv URL.
+    /// Paper id: an arXiv id / URL (alphaXiv), a DOI (bioRxiv `10.1101/…` or any
+    /// other), or an OpenAlex `W…` id. The source is auto-detected.
     pub id: String,
-    /// Fetch the full extracted paper text instead of the report.
+    /// Force the source instead of auto-detecting it from the id.
+    #[arg(long, value_enum)]
+    pub source: Option<LitSource>,
+    /// Fetch the full extracted paper text instead of the report (alphaXiv only;
+    /// OpenAlex/bioRxiv have no extracted full text and point you at the PDF).
     #[arg(long)]
     pub full: bool,
 }

@@ -125,6 +125,11 @@ pub(crate) struct Settings {
     /// Whether the one-time post-publication default prompt has been answered.
     #[serde(default)]
     pub github_default_prompt_seen: Option<bool>,
+    /// Literature sources the user turned off (Settings → Literature sources).
+    /// Values are `LitSource::as_str()` names; empty = all sources enabled, so a
+    /// source added later defaults to enabled. Enforced by `orx lit`/`orx paper`.
+    #[serde(default)]
+    pub disabled_lit_sources: Vec<String>,
 }
 
 /// A paper the user linked to their researcher profile.
@@ -203,6 +208,21 @@ pub(crate) fn set_profile(
         s.background = background.filter(|b| !b.is_empty());
         s.linked_papers = papers;
     })
+}
+
+/// Literature sources the user has disabled (their `LitSource::as_str()` names).
+/// Read by `orx lit`/`orx paper`; `crate::config` re-exports this as
+/// `disabled_lit_sources`.
+pub(crate) fn disabled_lit_sources() -> Vec<String> {
+    load_settings()
+        .map(|s| s.disabled_lit_sources)
+        .unwrap_or_default()
+}
+
+/// Persist the disabled-source set, preserving every other settings field (same
+/// `mutate_settings` guarantees as the data dir).
+pub(crate) fn set_disabled_lit_sources(disabled: Vec<String>) -> std::io::Result<()> {
+    mutate_settings(|s| s.disabled_lit_sources = disabled)
 }
 
 pub(crate) fn github_for_new_projects() -> bool {
@@ -988,6 +1008,36 @@ mod tests {
         assert!(papers.is_empty(), "papers cleared");
         let s = load_settings().expect("settings present");
         assert_eq!(s.telemetry_disabled, Some(true), "opt-out still intact");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disabled_lit_sources_roundtrip_preserves_siblings() {
+        // Same single-writer contract: the disabled-source set persists in the
+        // telemetry-owned settings.json, so its write must preserve siblings.
+        let _g = EnvGuard::new(OPT_VARS);
+        let dir = std::env::temp_dir().join(format!("orx-tel-lit-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        assert!(disabled_lit_sources().is_empty(), "default: all enabled");
+
+        set_persisted_disabled(true).unwrap();
+        set_profile(Some("I study RL".into()), vec![]).unwrap();
+        set_disabled_lit_sources(vec!["biorxiv".into(), "openalex".into()]).unwrap();
+
+        assert_eq!(disabled_lit_sources(), vec!["biorxiv", "openalex"]);
+        let s = load_settings().expect("settings present");
+        assert_eq!(s.telemetry_disabled, Some(true), "opt-out survived");
+        assert_eq!(
+            s.background.as_deref(),
+            Some("I study RL"),
+            "profile survived"
+        );
+
+        // Re-enabling all clears the set.
+        set_disabled_lit_sources(vec![]).unwrap();
+        assert!(disabled_lit_sources().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

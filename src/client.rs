@@ -9,6 +9,7 @@
 //! All endpoint fns are `async` and take `&Credentials` as the first argument,
 //! matching how commands call them.
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use reqwest::{Client, Method};
@@ -1547,11 +1548,365 @@ pub async fn fetch_paper_markdown(kind: &str, paper_id: &str) -> Result<Option<S
     Ok(Some(res.text().await?))
 }
 
+// ---------------------------------------------------------------------------
+// Unified literature hit + OpenAlex / bioRxiv sources.
+//
+// `orx lit` searches one source per call and prints a uniform list; `orx paper`
+// fetches one paper. Like the alphaXiv block above, these hit public hosts with
+// no token and keep their own light error semantics. bioRxiv has no search API,
+// so `--source biorxiv` searches OpenAlex filtered to bioRxiv's source and
+// bioRxiv's own API is used only to fetch a preprint by DOI.
+// ---------------------------------------------------------------------------
+
+/// OpenAlex source id for the bioRxiv repository — `--source biorxiv` filters to it.
+pub const BIORXIV_SOURCE_ID: &str = "S4306402567";
+
+/// A single literature search hit, uniform across sources. `orx lit --json`
+/// emits these verbatim, so per-source-only fields (`votes`, `citations`,
+/// `snippets`) are omitted when empty.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LitHit {
+    /// `"alphaxiv" | "openalex" | "biorxiv"` — set by the search fn.
+    pub source: String,
+    /// Self-routing id for `orx paper`: an arXiv id, a DOI, or an OpenAlex `W…` id.
+    pub id: String,
+    pub title: String,
+    #[serde(rename = "abstract", default)]
+    pub abstract_: String,
+    #[serde(default)]
+    pub publication_date: Option<String>,
+    /// alphaXiv community votes; `None` for other sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub votes: Option<i64>,
+    /// Citation count (OpenAlex); `None` for alphaXiv.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub citations: Option<i64>,
+    /// Matched full-text snippets; alphaXiv only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub snippets: Vec<PaperSnippet>,
+}
+
+impl From<PaperHit> for LitHit {
+    fn from(h: PaperHit) -> Self {
+        LitHit {
+            source: "alphaxiv".to_string(),
+            id: h.paper_id,
+            title: h.title,
+            abstract_: h.abstract_,
+            publication_date: h.publication_date,
+            votes: Some(h.votes),
+            citations: None,
+            snippets: h.snippets,
+        }
+    }
+}
+
+/// `https://openalex.org/W123` (or any `.../W123`) → `W123`.
+fn strip_openalex_prefix(id: &str) -> &str {
+    id.rsplit('/').next().unwrap_or(id)
+}
+
+/// `https://doi.org/10.1101/x` / `doi:10.1101/x` → `10.1101/x`.
+fn strip_doi_prefix(doi: &str) -> &str {
+    doi.strip_prefix("https://doi.org/")
+        .or_else(|| doi.strip_prefix("http://doi.org/"))
+        .or_else(|| doi.strip_prefix("doi:"))
+        .unwrap_or(doi)
+}
+
+/// Rebuild abstract text from OpenAlex's `abstract_inverted_index` (token →
+/// positions). Returns `""` when the index is absent (OpenAlex omits abstracts
+/// for some works).
+fn reconstruct_abstract(index: &Option<HashMap<String, Vec<i64>>>) -> String {
+    let Some(index) = index else {
+        return String::new();
+    };
+    let mut positioned: Vec<(i64, &str)> = Vec::new();
+    for (token, positions) in index {
+        for &p in positions {
+            positioned.push((p, token.as_str()));
+        }
+    }
+    positioned.sort_by_key(|(p, _)| *p);
+    positioned
+        .into_iter()
+        .map(|(_, t)| t)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+// OpenAlex serves snake_case JSON, so the Rust field names match the wire
+// directly — no `rename_all` here (unlike the OpenResearch API DTOs above).
+#[derive(Debug, Clone, Deserialize)]
+struct OaAuthor {
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OaAuthorship {
+    #[serde(default)]
+    author: Option<OaAuthor>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OaLocation {
+    #[serde(default)]
+    pdf_url: Option<String>,
+    #[serde(default)]
+    landing_page_url: Option<String>,
+}
+
+/// One OpenAlex work — used both for `/works` search rows (populated per the
+/// `select` list) and for a single-work fetch (all fields present). Unselected
+/// fields simply default.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenAlexWork {
+    // The three fields `paper.rs` reads straight off the struct stay `pub`; the
+    // rest are reached through the accessor methods below.
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    doi: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub publication_date: Option<String>,
+    #[serde(default)]
+    pub cited_by_count: Option<i64>,
+    #[serde(default)]
+    abstract_inverted_index: Option<HashMap<String, Vec<i64>>>,
+    #[serde(default)]
+    authorships: Vec<OaAuthorship>,
+    #[serde(default)]
+    best_oa_location: Option<OaLocation>,
+}
+
+impl OpenAlexWork {
+    /// Abstract text reconstructed from the inverted index (`""` when absent).
+    pub fn abstract_text(&self) -> String {
+        reconstruct_abstract(&self.abstract_inverted_index)
+    }
+
+    /// Author display names, in order.
+    pub fn author_names(&self) -> Vec<String> {
+        self.authorships
+            .iter()
+            .filter_map(|a| a.author.as_ref()?.display_name.clone())
+            .collect()
+    }
+
+    /// Bare DOI (`10.…`) when the work has one.
+    pub fn doi_bare(&self) -> Option<String> {
+        self.doi.as_deref().map(|d| strip_doi_prefix(d).to_string())
+    }
+
+    /// Bare OpenAlex work id (`W…`) when present.
+    pub fn work_id(&self) -> Option<String> {
+        self.id
+            .as_deref()
+            .map(|i| strip_openalex_prefix(i).to_string())
+    }
+
+    /// A readable open-access URL: PDF if OpenAlex has one, else the landing page.
+    pub fn oa_url(&self) -> Option<String> {
+        self.best_oa_location
+            .as_ref()
+            .and_then(|l| l.pdf_url.clone().or_else(|| l.landing_page_url.clone()))
+    }
+
+    /// Best self-routing id for `orx paper`. For bioRxiv-sourced hits always the
+    /// DOI (routes back to the richer bioRxiv fetch); otherwise the DOI when
+    /// present, else the bare OpenAlex work id.
+    fn routing_id(&self, prefer_doi: bool) -> String {
+        let doi = self.doi_bare();
+        if prefer_doi {
+            if let Some(d) = doi {
+                return d;
+            }
+        }
+        doi.or_else(|| self.work_id()).unwrap_or_default()
+    }
+
+    fn into_lit_hit(self, biorxiv: bool) -> LitHit {
+        let id = self.routing_id(biorxiv);
+        let abstract_ = self.abstract_text();
+        LitHit {
+            source: if biorxiv { "biorxiv" } else { "openalex" }.to_string(),
+            id,
+            title: self.title.unwrap_or_default(),
+            abstract_,
+            publication_date: self.publication_date,
+            votes: None,
+            citations: self.cited_by_count,
+            snippets: Vec::new(),
+        }
+    }
+}
+
+/// Fields to request from OpenAlex `/works` search — keeps the payload small.
+const OPENALEX_SELECT: &str =
+    "id,doi,title,publication_date,cited_by_count,abstract_inverted_index";
+
+/// Search OpenAlex works by relevance, capped at `limit`. When `source_filter`
+/// is set (an OpenAlex source id like [`BIORXIV_SOURCE_ID`]), results are
+/// restricted to that venue. Hits come back already mapped to [`LitHit`].
+pub async fn search_openalex(
+    query: &str,
+    limit: u32,
+    source_filter: Option<&str>,
+) -> Result<Vec<LitHit>> {
+    let base = crate::config::openalex_api_url();
+    // OpenAlex rejects per_page outside 1..=200 with a 400.
+    let per_page = limit.clamp(1, 200);
+    let mut url = format!(
+        "{}/works?search={}&per_page={}&mailto={}&select={}",
+        base,
+        urlencoding::encode(query),
+        per_page,
+        urlencoding::encode(&crate::config::openalex_mailto()),
+        OPENALEX_SELECT,
+    );
+    if let Some(sid) = source_filter {
+        url.push_str("&filter=primary_location.source.id:");
+        url.push_str(sid);
+    }
+    let res = http()
+        .get(&url)
+        .header("user-agent", ALPHAXIV_UA)
+        .send()
+        .await
+        .map_err(|e| anyhow!("Could not reach OpenAlex at {}: {}", base, e))?;
+    let status = res.status();
+    if !status.is_success() {
+        let reason = status.canonical_reason().unwrap_or("");
+        return Err(anyhow!(
+            "OpenAlex search failed ({} {})",
+            status.as_u16(),
+            reason
+        ));
+    }
+
+    #[derive(Deserialize)]
+    struct WorksResponse {
+        #[serde(default)]
+        results: Vec<OpenAlexWork>,
+    }
+    let biorxiv = source_filter == Some(BIORXIV_SOURCE_ID);
+    let body = res.json::<WorksResponse>().await?;
+    Ok(body
+        .results
+        .into_iter()
+        .map(|w| w.into_lit_hit(biorxiv))
+        .collect())
+}
+
+/// The `/works/{id}` selector for a work fetched by id or DOI. A DOI (bare,
+/// `doi:`-prefixed, or a `doi.org` URL) becomes OpenAlex's `doi:<doi>` form
+/// (slashes kept literal); anything else is treated as a bare `W…` work id.
+fn openalex_selector(input: &str) -> String {
+    let bare = strip_doi_prefix(input.trim());
+    if bare.starts_with("10.") {
+        return format!("doi:{}", bare);
+    }
+    strip_openalex_prefix(bare).to_string()
+}
+
+/// Fetch a single OpenAlex work by its `W…` id or a DOI. Returns `Ok(None)` on
+/// 404 (unknown id) — a normal "not found" answer.
+pub async fn fetch_openalex_work(id_or_doi: &str) -> Result<Option<OpenAlexWork>> {
+    let base = crate::config::openalex_api_url();
+    let url = format!(
+        "{}/works/{}?mailto={}",
+        base,
+        openalex_selector(id_or_doi),
+        urlencoding::encode(&crate::config::openalex_mailto()),
+    );
+    let res = http()
+        .get(&url)
+        .header("user-agent", ALPHAXIV_UA)
+        .send()
+        .await
+        .map_err(|e| anyhow!("Could not reach OpenAlex at {}: {}", base, e))?;
+    let status = res.status();
+    if status.as_u16() == 404 {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let reason = status.canonical_reason().unwrap_or("");
+        return Err(anyhow!(
+            "OpenAlex lookup failed ({} {})",
+            status.as_u16(),
+            reason
+        ));
+    }
+    Ok(Some(res.json::<OpenAlexWork>().await?))
+}
+
+/// One version row from the bioRxiv details API. `authors` is a single
+/// semicolon-delimited string; `published` is the peer-reviewed DOI or the
+/// literal string `"NA"`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BiorxivDetail {
+    #[serde(default)]
+    pub doi: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub authors: String,
+    #[serde(rename = "abstract", default)]
+    pub abstract_: String,
+    #[serde(default)]
+    pub date: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub published: String,
+}
+
+/// Fetch a bioRxiv preprint's metadata by DOI (`10.1101/…`). The details
+/// endpoint lists every version oldest→newest; this returns the latest, or
+/// `Ok(None)` when bioRxiv knows no such preprint (200 with an empty collection).
+pub async fn fetch_biorxiv(doi: &str) -> Result<Option<BiorxivDetail>> {
+    let base = crate::config::biorxiv_api_url();
+    let url = format!("{}/details/biorxiv/{}/na/json", base, doi.trim());
+    let res = http()
+        .get(&url)
+        .header("user-agent", ALPHAXIV_UA)
+        .send()
+        .await
+        .map_err(|e| anyhow!("Could not reach bioRxiv at {}: {}", base, e))?;
+    let status = res.status();
+    if status.as_u16() == 404 {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let reason = status.canonical_reason().unwrap_or("");
+        return Err(anyhow!(
+            "bioRxiv lookup failed ({} {})",
+            status.as_u16(),
+            reason
+        ));
+    }
+
+    #[derive(Deserialize)]
+    struct DetailsResponse {
+        #[serde(default)]
+        collection: Vec<BiorxivDetail>,
+    }
+    let body = res.json::<DetailsResponse>().await?;
+    Ok(body.collection.into_iter().last())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CreateBaselineExperimentBody, CreateChildBody, CreateSandboxBody, ListCatalog,
-        ListCpuCatalog, RunBody, RunTarget, SandboxEnvelope, SandboxTarget,
+        openalex_selector, reconstruct_abstract, CreateBaselineExperimentBody, CreateChildBody,
+        CreateSandboxBody, ListCatalog, ListCpuCatalog, LitHit, OpenAlexWork, PaperHit, RunBody,
+        RunTarget, SandboxEnvelope, SandboxTarget, BIORXIV_SOURCE_ID,
     };
     use serde_json::json;
 
@@ -1867,5 +2222,162 @@ mod tests {
         })
         .unwrap();
         assert!(baseline_without.get("chatSessionId").is_none());
+    }
+
+    /// The inverted index maps token → positions; reconstruction must restore the
+    /// original word order, and a missing index yields an empty string.
+    #[test]
+    fn reconstructs_openalex_abstract() {
+        let work: OpenAlexWork = serde_json::from_str(
+            r#"{ "abstract_inverted_index": { "Deep": [0], "learning": [1], "works": [2] } }"#,
+        )
+        .expect("should deserialize");
+        assert_eq!(work.abstract_text(), "Deep learning works");
+        assert_eq!(reconstruct_abstract(&None), "");
+    }
+
+    /// A DOI (bare, `doi:`-prefixed, or a `doi.org` URL) becomes the `doi:` form
+    /// with slashes kept literal; anything else resolves to a bare `W…` work id.
+    #[test]
+    fn openalex_selector_routes_doi_vs_work_id() {
+        assert_eq!(
+            openalex_selector("10.1038/nature14539"),
+            "doi:10.1038/nature14539"
+        );
+        assert_eq!(openalex_selector("doi:10.1038/x"), "doi:10.1038/x");
+        assert_eq!(
+            openalex_selector("https://doi.org/10.1101/2020.09.09.20191205"),
+            "doi:10.1101/2020.09.09.20191205"
+        );
+        assert_eq!(openalex_selector("W2919115771"), "W2919115771");
+        assert_eq!(
+            openalex_selector("https://openalex.org/W2919115771"),
+            "W2919115771"
+        );
+    }
+
+    /// An OpenAlex `/works` row (id + doi as URLs, citations, inverted-index
+    /// abstract, plus unselected extra fields) maps to a `LitHit`: DOI preferred
+    /// as the routing id, `citations` set, `votes`/`snippets` empty.
+    #[test]
+    fn maps_openalex_work_to_lit_hit() {
+        let work: OpenAlexWork = serde_json::from_str(
+            r#"{
+                "id": "https://openalex.org/W2919115771",
+                "doi": "https://doi.org/10.1038/nature14539",
+                "title": "Deep learning",
+                "publication_date": "2015-05-26",
+                "cited_by_count": 82932,
+                "abstract_inverted_index": { "A": [0], "review.": [1] },
+                "authorships": [{ "author": { "display_name": "Yann LeCun" } }],
+                "some_unknown_field": true
+            }"#,
+        )
+        .expect("should deserialize");
+
+        assert_eq!(work.author_names(), vec!["Yann LeCun".to_string()]);
+        assert_eq!(work.work_id().as_deref(), Some("W2919115771"));
+
+        let hit = work.into_lit_hit(false);
+        assert_eq!(hit.source, "openalex");
+        assert_eq!(hit.id, "10.1038/nature14539");
+        assert_eq!(hit.title, "Deep learning");
+        assert_eq!(hit.abstract_, "A review.");
+        assert_eq!(hit.citations, Some(82932));
+        assert_eq!(hit.votes, None);
+        assert!(hit.snippets.is_empty());
+    }
+
+    /// A bioRxiv-filtered OpenAlex hit routes through its `10.1101/…` DOI (so
+    /// `orx paper` hits the richer bioRxiv fetch) and is labeled `biorxiv`.
+    #[test]
+    fn maps_biorxiv_filtered_hit_by_doi() {
+        assert_eq!(BIORXIV_SOURCE_ID, "S4306402567");
+        let work: OpenAlexWork = serde_json::from_str(
+            r#"{
+                "id": "https://openalex.org/W123",
+                "doi": "https://doi.org/10.1101/2020.09.09.20191205",
+                "title": "A preprint",
+                "cited_by_count": 3
+            }"#,
+        )
+        .expect("should deserialize");
+        let hit = work.into_lit_hit(true);
+        assert_eq!(hit.source, "biorxiv");
+        assert_eq!(hit.id, "10.1101/2020.09.09.20191205");
+        assert_eq!(hit.citations, Some(3));
+    }
+
+    /// An alphaXiv `PaperHit` maps to `LitHit` keeping `votes` and `snippets`;
+    /// the JSON stays uniform, omitting the `None`/empty per-source fields.
+    #[test]
+    fn maps_paper_hit_and_serializes_uniform_json() {
+        let ph: PaperHit = serde_json::from_str(
+            r#"{
+                "paperId": "2401.12345",
+                "title": "A paper",
+                "abstract": "Body.",
+                "publicationDate": "2024-01-01T00:00:00Z",
+                "votes": 7,
+                "snippets": [{ "pageNumber": 2, "snippet": "hit" }]
+            }"#,
+        )
+        .expect("should deserialize");
+
+        let hit = LitHit::from(ph);
+        assert_eq!(hit.source, "alphaxiv");
+        assert_eq!(hit.id, "2401.12345");
+        assert_eq!(hit.votes, Some(7));
+        assert_eq!(hit.snippets.len(), 1);
+
+        let value = serde_json::to_value(&hit).unwrap();
+        assert_eq!(value.get("source"), Some(&json!("alphaxiv")));
+        assert_eq!(value.get("votes"), Some(&json!(7)));
+        // Per-source-only fields are omitted when empty.
+        assert!(value.get("citations").is_none());
+
+        let openalex = LitHit {
+            source: "openalex".to_string(),
+            id: "10.1/x".to_string(),
+            title: "T".to_string(),
+            abstract_: String::new(),
+            publication_date: None,
+            votes: None,
+            citations: Some(5),
+            snippets: Vec::new(),
+        };
+        let value = serde_json::to_value(&openalex).unwrap();
+        assert_eq!(value.get("citations"), Some(&json!(5)));
+        assert!(value.get("votes").is_none());
+        assert!(value.get("snippets").is_none());
+    }
+
+    /// The bioRxiv details API wraps versions in a `collection`; we take the last
+    /// (latest) and tolerate the extra top-level `messages` block.
+    #[test]
+    fn parses_biorxiv_latest_version() {
+        #[derive(serde::Deserialize)]
+        struct DetailsResponse {
+            #[serde(default)]
+            collection: Vec<super::BiorxivDetail>,
+        }
+        let body: DetailsResponse = serde_json::from_str(
+            r#"{
+                "messages": [{ "status": "ok" }],
+                "collection": [
+                    { "doi": "10.1101/2020.09.09.20191205", "title": "T", "version": "1",
+                      "authors": "A; B", "abstract": "old", "date": "2020-09-09",
+                      "category": "cell_biology", "published": "NA" },
+                    { "doi": "10.1101/2020.09.09.20191205", "title": "T", "version": "2",
+                      "authors": "A; B", "abstract": "new", "date": "2020-09-15",
+                      "category": "cell_biology", "published": "10.1000/j.x" }
+                ]
+            }"#,
+        )
+        .expect("should deserialize");
+        let latest = body.collection.into_iter().last().expect("has a version");
+        assert_eq!(latest.version, "2");
+        assert_eq!(latest.abstract_, "new");
+        assert_eq!(latest.published, "10.1000/j.x");
     }
 }

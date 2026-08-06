@@ -90,7 +90,7 @@ Run `orx --help` (or `orx <command> --help`) for full usage. The highlights:
 | Experiments | `experiments`, `create-experiment`, `exp status/cmd/run/cancel` |
 | Runs & evidence | `runs`, `logs`, `search-logs`, `artifacts`, `artifact`, `wandb`, `query`, `chart`, `report` |
 | Compute | `compute`, `instance create` |
-| Literature | `lit`, `paper` (alphaXiv full-text search — no login required) |
+| Literature | `lit`, `paper` (full-text search across alphaXiv, OpenAlex, bioRxiv — no login required) |
 | Agent integration | `install-skills`, `skill` |
 | Maintenance | `version`, `update`, `telemetry` |
 
