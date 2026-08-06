@@ -389,7 +389,7 @@ impl ControlPlane for LocalPlane {
             return Err(anyhow!("No run in flight for this experiment."));
         }
         for r in &in_flight {
-            store.set_cancel_requested(&r.id, true)?;
+            crate::commands::exp::request_local_run_cancel(store, &r.id)?;
             println!("\u{2713} Cancel requested for run {}.", r.id);
         }
         Ok(())

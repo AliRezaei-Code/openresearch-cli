@@ -439,6 +439,14 @@ impl Store {
         Ok(n as usize)
     }
 
+    pub fn list_active_runs(&self) -> Result<Vec<StoredRun>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SELECT_RUN} WHERE status IN ('starting', 'running') ORDER BY created_at DESC"
+        ))?;
+        let rows = stmt.query_map([], row_to_run)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn list_runs_by_project(&self, project_id: &str) -> Result<Vec<StoredRun>> {
         let mut stmt = self.conn.prepare(&format!(
             "{SELECT_RUN} WHERE project_id = ?1 ORDER BY created_at DESC"
@@ -1373,6 +1381,33 @@ mod tests {
             None
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn active_run_listing_excludes_terminal_history() {
+        let dir = std::env::temp_dir().join(format!("orx-store-active-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store
+            .upsert_run(&run_fixture("run_starting", "starting", None))
+            .unwrap();
+        store
+            .upsert_run(&run_fixture("run_running", "running", None))
+            .unwrap();
+        store
+            .upsert_run(&run_fixture("run_done", "done", None))
+            .unwrap();
+
+        let mut ids: Vec<_> = store
+            .list_active_runs()
+            .unwrap()
+            .into_iter()
+            .map(|run| run.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["run_running", "run_starting"]);
+
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

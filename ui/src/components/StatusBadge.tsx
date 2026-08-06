@@ -12,6 +12,7 @@ export const STATUS_STYLES: Record<string, StatusStyle> = {
   failed: { className: "st-failed", live: false },
   running: { className: "st-running", live: true },
   starting: { className: "st-starting", live: true },
+  cancelling: { className: "st-cancelling", live: true },
   cancelled: { className: "st-cancelled", live: false },
   editing: { className: "st-editing", live: true },
   idle: { className: "st-idle", live: false },

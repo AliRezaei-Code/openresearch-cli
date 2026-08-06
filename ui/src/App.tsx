@@ -38,7 +38,7 @@ import { DetailDrawer, type ExperimentView } from "./components/DetailDrawer";
 import { FileViewer } from "./components/FileViewer";
 import { RailHeader } from "./components/Header";
 import { Onboarding } from "./components/Onboarding";
-import { ProjectsHome } from "./components/ProjectsHome";
+import { NewProjectDialog, ProjectsHome } from "./components/ProjectsHome";
 import { RunsTable } from "./components/RunsTable";
 import { Md } from "./components/Md";
 import { SettingsView, type SettingsTab } from "./components/SettingsPage";
@@ -243,10 +243,10 @@ const PANEL_WIDTH_KEY = "orx:panel-width";
 /** Floating panel sizing: keep both the panel and the chat column usable. */
 const PANEL_MIN_WIDTH = 360;
 const PANEL_MARGIN = 10;
-// Space the rest of the layout needs beside the panel: the ~232px rail, the
+// Space the rest of the layout needs beside the panel: the 272px rail, the
 // chat column's minimum, and the gutters/margins between the three columns
 // (app-body padding 14×2, rail inner margin 14, right-pane inner margin 14).
-const RAIL_WIDTH = 232;
+const RAIL_WIDTH = 272;
 const CHAT_MIN_SPACE = 380;
 const LAYOUT_CHROME = RAIL_WIDTH + 14 * 4;
 // Once a drag pushes the panel past its usable max by this much, it snaps to
@@ -324,6 +324,7 @@ export default function App() {
   // The agents rail is a floating panel too: fixed-width, collapsible.
   const [railOpen, setRailOpen] = useState(true);
   const [homeOpen, setHomeOpen] = useState(false);
+  const [newProjectOpen, setNewProjectOpen] = useState(false);
   // What the middle pane shows: the agent chat, project artifacts, or
   // one settings section (picked from the rail nav — no separate pages).
   const [mainView, setMainView] = useState<"chat" | "artifacts" | SettingsTab>("chat");
@@ -970,8 +971,8 @@ export default function App() {
     <RailHeader
       projectName={projects.find((p) => p.id === projectId)?.name ?? ""}
       onHome={() => setHomeOpen(true)}
+      onNewProject={() => setNewProjectOpen(true)}
       onRepository={() => setMainView("git")}
-      repositoryActive={mainView === "git"}
       onCollapse={() => setRailOpen(false)}
     />
   );
@@ -993,6 +994,7 @@ export default function App() {
         {projectId && (
           <ChatPanel
             projectId={projectId}
+            projectName={activeProject?.name ?? ""}
             paperId={projects.find((p) => p.id === projectId)?.paperId}
             railHeader={railHeader}
             railOpen={railOpen}
@@ -1239,7 +1241,7 @@ export default function App() {
                           "changes",
                         );
                     }}
-                    onCancel={(runId) => void cancelRun(runId).catch(() => {})}
+                    onCancel={cancelRun}
                   />
                 )}
               </div>
@@ -1352,6 +1354,15 @@ export default function App() {
         </aside>
         )}
       </div>
+      )}
+      {newProjectOpen && (
+        <NewProjectDialog
+          onClose={() => setNewProjectOpen(false)}
+          onCreated={(project, publicationError) => {
+            setNewProjectOpen(false);
+            onProjectCreated(project, publicationError);
+          }}
+        />
       )}
       {tourOpen && !homeOpen && projectId && <Tour onClose={closeTour} />}
     </div>

@@ -1,11 +1,14 @@
 import {
   ArrowUpRight,
+  BookOpen,
+  ChartSpline,
   Check,
   ChevronRight,
   CornerDownLeft,
   FlaskConical,
   FolderGit2,
   FolderOpen,
+  GitBranch,
   HelpCircle,
   MoreHorizontal,
   PanelLeft,
@@ -24,7 +27,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { Wordmark } from "./Wordmark";
+import { BrandMark } from "./Wordmark";
 import {
   chatAttachmentUrl,
   createChatSession,
@@ -172,34 +175,6 @@ function reducer(state: ChatState, action: Action): ChatState {
 }
 
 // --- rendering ---------------------------------------------------------------
-
-/** Which detected agent the first message will run on — keeps autodetection
- * legible at the moment the user first types. */
-function EmptyStateAgentHint({
-  harnesses,
-  selection,
-}: {
-  harnesses: Harness[];
-  selection: ModelSelection | null;
-}) {
-  if (harnesses.length === 0) return null; // still detecting
-  const h = selection ? harnesses.find((x) => x.id === selection.harness) : undefined;
-  if (!h) {
-    return (
-      <p className="chat-empty-hint">
-        No coding agent detected on this machine — install Claude Code, Codex or opencode and
-        sign in, then re-open the model picker below.
-      </p>
-    );
-  }
-  return (
-    <p className="chat-empty-hint">
-      Chatting with {h.name}
-      {h.account ? ` as ${h.account}` : ""} — detected automatically, switch in the model picker
-      below.
-    </p>
-  );
-}
 
 function toolStatusClass(status: string | undefined): string {
   if (status === "error") return "tool-status error";
@@ -1197,6 +1172,7 @@ function SessionRow({
 
 export function ChatPanel({
   projectId,
+  projectName,
   paperId,
   railHeader,
   railOpen,
@@ -1214,6 +1190,7 @@ export function ChatPanel({
   children,
 }: {
   projectId: string;
+  projectName: string;
   /** arXiv id the project starts from — surfaces a /reproduce-paper shortcut. */
   paperId?: string | null;
   /** Back-to-projects + project name block rendered at the top of the rail. */
@@ -2044,23 +2021,35 @@ export function ChatPanel({
   );
 
   const visibleSessions = sessions.filter((s) => matchesFilter(sessionFilter, s.archived));
+  const newTaskShortcut = /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘N" : "Ctrl+N";
+  const startNewTask = useCallback(() => {
+    setSessionFilter("active");
+    setActiveId(null);
+    onSelectMainView("chat");
+  }, [onSelectMainView]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.repeat ||
+        event.key.toLowerCase() !== "n" ||
+        (!event.metaKey && !event.ctrlKey) ||
+        event.altKey ||
+        event.shiftKey
+      )
+        return;
+      event.preventDefault();
+      startNewTask();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [startNewTask]);
 
   const rail = (
     <aside className="session-rail floating-panel">
       {railHeader}
-      {/* Top nav: new session + the settings sections (shown in the middle pane). */}
+      {/* Project-level sections shown in the middle pane. */}
       <nav className="rail-nav">
-        <button
-          className="rail-nav-item"
-          data-onboarding="new-session"
-          onClick={() => {
-            setActiveId(null);
-            onSelectMainView("chat");
-          }}
-        >
-          <Plus size={15} />
-          New session
-        </button>
         <button
           className={`rail-nav-item ${mainView === "artifacts" ? "active" : ""}`}
           data-onboarding="nav-artifacts"
@@ -2081,13 +2070,25 @@ export function ChatPanel({
           </button>
         ))}
       </nav>
-      <div className="rail-body">
-        <div className="rail-section-head">
-          <div className="rail-section-label">
-            {SESSION_FILTERS.find((f) => f.id === sessionFilter)?.railLabel ?? "Recents"}
-          </div>
+      <div className="rail-section-head">
+        <div className="rail-section-label">
+          {SESSION_FILTERS.find((f) => f.id === sessionFilter)?.railLabel ?? "Recents"}
+        </div>
+        <div className="rail-section-actions">
+          <button
+            className="rail-section-new tip-up"
+            data-onboarding="new-session"
+            data-tip={newTaskShortcut}
+            aria-keyshortcuts="Meta+N Control+N"
+            onClick={startNewTask}
+          >
+            <Plus size={13} />
+            Task
+          </button>
           <SessionFilterMenu value={sessionFilter} onChange={setSessionFilter} />
         </div>
+      </div>
+      <div className="rail-body">
         {visibleSessions.map((s) => (
           <SessionRow
             key={s.id}
@@ -2217,37 +2218,74 @@ export function ChatPanel({
         </div>
       ) : !threadMounted ? (
         <div className="chat-empty">
-          <h2>
-            <Wordmark />
-          </h2>
-          <p>
-            Ask the agent to explore your codebase, create and run your baseline experiment, and
-            branch variants off it.
-          </p>
-          <EmptyStateAgentHint
-            harnesses={harnesses}
-            selection={selection ?? defaultSelection(harnesses)}
-          />
-          {paperId && (
+          <div className="chat-empty-mark">
+            <BrandMark />
+          </div>
+          <h2>What should we research?</h2>
+          <div className="chat-empty-project">
+            <FolderOpen size={19} />
+            <span>{projectName}</span>
+          </div>
+          <div className="chat-empty-starters">
             <button
               type="button"
-              className="chat-suggest mono"
-              title="Prefills the composer — add the compute to run on, then send"
+              className="chat-empty-starter blue"
+              onClick={() => {
+                setPickedSkill(null);
+                setDraft("Explore this codebase and explain its architecture, key components, and open research questions.");
+                composerRef.current?.focus();
+              }}
+            >
+              <BookOpen size={16} />
+              <span>Explore this codebase</span>
+            </button>
+            <button
+              type="button"
+              className="chat-empty-starter purple"
               onClick={() => {
                 const skill = skills.find((s) => s.name === "reproduce-paper");
-                if (skill) {
+                if (paperId && skill) {
                   setPickedSkill(skill);
                   setDraft(`${paperId} on `);
                 } else {
-                  // Skills fetch failed — plain text still expands server-side.
-                  setDraft(`/reproduce-paper ${paperId} on `);
+                  setPickedSkill(null);
+                  setDraft(
+                    paperId
+                      ? `/reproduce-paper ${paperId} on `
+                      : "Find and summarize the research most relevant to this project.",
+                  );
                 }
                 composerRef.current?.focus();
               }}
             >
-              /reproduce-paper {paperId} on [describe your compute setup]
+              <GitBranch size={16} />
+              <span>{paperId ? "Reproduce the linked paper" : "Review relevant literature"}</span>
             </button>
-          )}
+            <button
+              type="button"
+              className="chat-empty-starter green"
+              onClick={() => {
+                setPickedSkill(null);
+                setDraft("Set up and run an experiment for this project, including a baseline and meaningful variants.");
+                composerRef.current?.focus();
+              }}
+            >
+              <FlaskConical size={16} />
+              <span>Run an experiment</span>
+            </button>
+            <button
+              type="button"
+              className="chat-empty-starter orange"
+              onClick={() => {
+                setPickedSkill(null);
+                setDraft("Analyze the latest experiment results and recommend the most useful next iteration.");
+                composerRef.current?.focus();
+              }}
+            >
+              <ChartSpline size={16} />
+              <span>Analyze results</span>
+            </button>
+          </div>
         </div>
       ) : (
         <div

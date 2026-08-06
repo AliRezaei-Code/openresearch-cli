@@ -182,11 +182,16 @@ pub fn cancel_job(dir: &Path) -> Result<()> {
         .map(|s| s.success())
         .unwrap_or(false);
     if !group {
-        let _ = std::process::Command::new("kill")
+        let process = std::process::Command::new("kill")
             .args(["-TERM", &pid])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status();
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !process {
+            return Err(anyhow!("Could not terminate local process group {pid}"));
+        }
     }
     Ok(())
 }

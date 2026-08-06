@@ -45,6 +45,7 @@ export interface Experiment {
 }
 
 export type RunStatus = "starting" | "running" | "done" | "failed" | "cancelled";
+export type RunDisplayStatus = RunStatus | "cancelling";
 
 export interface Run {
   id: string;
@@ -59,6 +60,12 @@ export interface Run {
   updatedAt: number;
   endedAt?: number | null;
   exitCode?: number | null;
+  cancelRequested: boolean;
+}
+
+export function runDisplayStatus(run: Pick<Run, "status" | "cancelRequested">): RunDisplayStatus {
+  const live = run.status === "running" || run.status === "starting";
+  return live && run.cancelRequested ? "cancelling" : run.status;
 }
 
 async function json<T>(res: Response): Promise<T> {
@@ -210,7 +217,8 @@ export interface Instance extends Run {
 export const listInstances = () =>
   get<{ instances: Instance[] }>("/api/instances").then((r) => r.instances);
 
-export const cancelRun = (runId: string) => post<{ ok: boolean }>(`/api/runs/${runId}/cancel`);
+export const cancelRun = (runId: string) =>
+  post<{ ok: boolean }>(`/api/runs/${runId}/cancel`).then(() => undefined);
 
 export interface LogChunk {
   dataBase64: string;
