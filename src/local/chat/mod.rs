@@ -356,11 +356,25 @@ fn safe_attachment_name(original: Option<&str>, ext: &str) -> String {
         .unwrap_or("");
     let cleaned: String = base
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
-    let mut safe = cleaned.trim_matches('-').chars().take(60).collect::<String>();
+    let mut safe = cleaned
+        .trim_matches('-')
+        .chars()
+        .take(60)
+        .collect::<String>();
     if safe.is_empty() {
-        safe = if ext == "pdf" { "document".into() } else { "image".into() };
+        safe = if ext == "pdf" {
+            "document".into()
+        } else {
+            "image".into()
+        };
     }
     format!("{safe}.{ext}")
 }
