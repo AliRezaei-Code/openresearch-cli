@@ -1,42 +1,114 @@
 import { Plus, Trash2 } from "lucide-react";
 import { Wordmark } from "./Wordmark";
-import { useEffect, useState } from "react";
+import { GitHubMark } from "./BackendLogos";
+import { useEffect, useRef, useState } from "react";
 import { deleteProject, timeAgo, type Project } from "../api";
 import { NewProjectForm } from "./NewProjectForm";
+
+export function NewProjectDialog({
+  onClose,
+  onCreated,
+}: {
+  onClose: () => void;
+  onCreated: (project: Project, githubPublicationError: string | null) => void;
+}) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const focusable = () =>
+      [...dialog.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+      )];
+    (focusable()[0] ?? dialog).focus();
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        onCloseRef.current();
+        return;
+      }
+      if (
+        event.key.toLowerCase() === "n" &&
+        (event.metaKey || event.ctrlKey) &&
+        !event.altKey &&
+        !event.shiftKey
+      ) {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const controls = focusable();
+      if (controls.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = controls[0];
+      const last = controls[controls.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener("keydown", handleKeyDown, true);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown, true);
+      previousFocus?.focus();
+    };
+  }, []);
+
+  return (
+    <div
+      className="modal-backdrop"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div
+        ref={dialogRef}
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="new-project-dialog-title"
+        tabIndex={-1}
+      >
+        <h2 id="new-project-dialog-title">New project</h2>
+        <NewProjectForm onCancel={onClose} onCreated={onCreated} />
+      </div>
+    </div>
+  );
+}
 
 export function ProjectsHome({
   projects,
   onOpen,
   onCreated,
   onDeleted,
-  openNewProject = false,
-  onNewProjectOpened,
 }: {
   projects: Project[];
   onOpen: (id: string) => void;
-  onCreated: (project: Project) => void;
+  onCreated: (project: Project, githubPublicationError: string | null) => void;
   onDeleted: (id: string) => void;
-  /** Open the New project modal on mount — onboarding ends on "Create your
-   * first project", so landing behind an empty page would ask for that click
-   * twice. Only the post-onboarding hand-off sets this. */
-  openNewProject?: boolean;
-  /** Clear the hand-off flag, so a later remount doesn't re-open the modal. */
-  onNewProjectOpened?: () => void;
 }) {
-  const [modalOpen, setModalOpen] = useState(openNewProject);
+  const [modalOpen, setModalOpen] = useState(false);
   const [deleting, setDeleting] = useState<string | null>(null);
 
-  // Consume the hand-off once: the flag lives in App, and leaving it set would
-  // re-open the modal on any later remount of this page.
-  useEffect(() => {
-    if (openNewProject) onNewProjectOpened?.();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   async function onDelete(p: Project) {
+    const hasGithubRepository = Boolean(p.githubUrl || (p.githubOwner && p.githubRepo));
     const ok = window.confirm(
       `Delete project "${p.name}"?\n\nIts experiments, runs and chats are removed from orx. ` +
-        `The GitHub repo (${p.githubOwner}/${p.githubRepo}) is kept.`,
+        `The local folder (${p.path})${hasGithubRepository ? " and its GitHub repository" : ""} are kept.`,
     );
     if (!ok) return;
     setDeleting(p.id);
@@ -66,26 +138,51 @@ export function ProjectsHome({
           {projects.length === 0 ? (
             <div className="changes-note">No projects yet — create one to get started.</div>
           ) : (
-            [...projects].sort((a, b) => b.updatedAt - a.updatedAt).map((p) => (
+            [...projects].sort((a, b) => b.updatedAt - a.updatedAt).map((p) => {
+              const hasGithubRepository = Boolean(p.githubUrl || (p.githubOwner && p.githubRepo));
+              const githubUrl =
+                p.githubUrl ??
+                (p.githubOwner && p.githubRepo
+                  ? `https://github.com/${p.githubOwner}/${p.githubRepo}`
+                  : null);
+              const githubState = p.githubEnabled
+                ? "GitHub syncing on"
+                : hasGithubRepository
+                  ? "GitHub syncing off"
+                  : "local only";
+              return (
               <div
                 key={p.id}
                 className="project-card"
-                role="button"
-                tabIndex={0}
-                onClick={() => onOpen(p.id)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") onOpen(p.id);
-                }}
               >
+                <button
+                  className="project-card-open"
+                  aria-label={`Open ${p.name}`}
+                  onClick={() => onOpen(p.id)}
+                />
                 <span className="name">{p.name}</span>
-                <span className="repo mono">
-                  {p.githubOwner}/{p.githubRepo} · {p.baselineBranch}
+                <span className="project-card-sync mono">
+                  {githubState}
+                  {p.githubEnabled && githubUrl && (
+                    <a
+                      href={githubUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      data-tip="Open repository on GitHub"
+                      aria-label={`Open ${p.name} on GitHub`}
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      <GitHubMark size={14} />
+                    </a>
+                  )}
                 </span>
                 {p.paperId && <span className="paper mono">arXiv {p.paperId}</span>}
                 <span className="time">created {timeAgo(p.createdAt)}</span>
                 <button
                   className="project-delete"
-                  title={`Delete ${p.name}`}
+                  data-tip={`Delete ${p.name}`}
+                  data-tip-align="end"
+                  aria-label={`Delete ${p.name}`}
                   disabled={deleting === p.id}
                   onClick={(e) => {
                     e.stopPropagation();
@@ -95,24 +192,20 @@ export function ProjectsHome({
                   <Trash2 size={14} />
                 </button>
               </div>
-            ))
+              );
+            })
           )}
         </div>
       </div>
 
       {modalOpen && (
-        <div className="modal-backdrop" onClick={() => setModalOpen(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h2>New project</h2>
-            <NewProjectForm
-              onCancel={() => setModalOpen(false)}
-              onCreated={(p) => {
-                setModalOpen(false);
-                onCreated(p);
-              }}
-            />
-          </div>
-        </div>
+        <NewProjectDialog
+          onClose={() => setModalOpen(false)}
+          onCreated={(project, githubPublicationError) => {
+            setModalOpen(false);
+            onCreated(project, githubPublicationError);
+          }}
+        />
       )}
     </div>
   );

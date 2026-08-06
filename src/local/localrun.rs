@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::commands::exp::{hf_clone_script, spawn_detached_supervise};
+use crate::commands::exp::{local_clone_script, spawn_detached_supervise};
 use crate::error::{anyhow, Result};
 use crate::jobs::{localbox, BackendDescriptor};
 use crate::local::git;
@@ -88,42 +88,24 @@ pub async fn submit_local_run(args: &crate::ExpRunArgs) -> Result<StoredRun> {
         }
     }
 
-    // Same clone contract as every backend: the run clones from GitHub, so
-    // the branch tip must exist there.
     let commit_sha = {
-        let (owner, repo, baseline, branch) = (
-            project.github_owner.clone(),
-            project.github_repo.clone(),
-            project.baseline_branch.clone(),
-            exp.branch_name.clone(),
-        );
+        let repo_path = project.repo_path.clone();
+        let branch = exp.branch_name.clone();
         tokio::task::spawn_blocking(move || -> Result<String> {
-            let repo_path = git::ensure_clone(&owner, &repo, &baseline)?;
-            if !git::branch_on_remote(&repo_path, &branch)? {
-                git::push_branch(&repo_path, &branch)?;
-            }
-            git::branch_head_sha(&repo_path, &branch)
+            git::local_head_sha(std::path::Path::new(&repo_path), &branch)
         })
         .await
         .map_err(|e| anyhow!("git task failed: {e}"))??
     };
 
     let run_id = uuid::Uuid::new_v4().to_string();
-    let script = hf_clone_script(
-        &exp.branch_name,
-        &project.github_owner,
-        &project.github_repo,
-        &run_command,
-    );
+    let script = local_clone_script(&project.repo_path, &commit_sha, &run_command);
 
     // The run's env: everything the user synced (API keys), plus the tokens
     // the clone script expects. Exported inside run.sh (written owner-only).
     let mut env: HashMap<String, String> = crate::config::list_synced_env().into_iter().collect();
     if let Ok(hf_token) = crate::jobs::huggingface::resolve_token() {
         env.entry("HF_TOKEN".to_string()).or_insert(hf_token);
-    }
-    if let Some(gh) = git::resolve_github_token() {
-        env.insert("GITHUB_TOKEN".to_string(), gh);
     }
 
     let dir = localbox::run_job(&localbox::LocalJobSpec {

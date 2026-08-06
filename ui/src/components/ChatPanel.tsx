@@ -1,10 +1,13 @@
 import {
+  BookOpen,
+  ChartSpline,
   Check,
   ChevronRight,
   CornerDownLeft,
   FlaskConical,
   FolderGit2,
   FolderOpen,
+  GitBranch,
   HelpCircle,
   MoreHorizontal,
   PanelLeft,
@@ -23,11 +26,15 @@ import {
   useRef,
   useState,
 } from "react";
-import { Wordmark } from "./Wordmark";
+import { BrandMark } from "./Wordmark";
 import {
   chatAttachmentUrl,
   createChatSession,
   deleteChatSession,
+  DEMO_FIGURE_SESSION_ID,
+  DEMO_LITERATURE_SESSION_ID,
+  DEMO_MAIN_SESSION_ID,
+  DEMO_PROJECT_ID,
   getChatMessages,
   getSkills,
   interruptChat,
@@ -62,17 +69,8 @@ import {
 } from "./ModelPicker";
 import { ContextMeter } from "./ContextMeter";
 import { renderNote } from "./agentNote";
-
-const SELECTION_STORAGE_KEY = "orx:agent-selection";
-
-function loadSelection(): ModelSelection | null {
-  try {
-    const raw = localStorage.getItem(SELECTION_STORAGE_KEY);
-    return raw ? (JSON.parse(raw) as ModelSelection) : null;
-  } catch {
-    return null;
-  }
-}
+import { loadAgentSelection, saveAgentSelection } from "../agentSelection";
+import { loadReadDemoSessions, markDemoSessionRead } from "../demoSessionState";
 
 // --- chat state --------------------------------------------------------------
 
@@ -174,34 +172,6 @@ function reducer(state: ChatState, action: Action): ChatState {
 }
 
 // --- rendering ---------------------------------------------------------------
-
-/** Which detected agent the first message will run on — keeps autodetection
- * legible at the moment the user first types. */
-function EmptyStateAgentHint({
-  harnesses,
-  selection,
-}: {
-  harnesses: Harness[];
-  selection: ModelSelection | null;
-}) {
-  if (harnesses.length === 0) return null; // still detecting
-  const h = selection ? harnesses.find((x) => x.id === selection.harness) : undefined;
-  if (!h) {
-    return (
-      <p className="chat-empty-hint">
-        No coding agent detected on this machine — install Claude Code, Codex or opencode and
-        sign in, then re-open the model picker below.
-      </p>
-    );
-  }
-  return (
-    <p className="chat-empty-hint">
-      Chatting with {h.name}
-      {h.account ? ` as ${h.account}` : ""} — detected automatically, switch in the model picker
-      below.
-    </p>
-  );
-}
 
 function toolStatusClass(status: string | undefined): string {
   if (status === "error") return "tool-status error";
@@ -980,6 +950,7 @@ function TitleReveal({ title, animate }: { title: string; animate: boolean }) {
 function SessionRow({
   session,
   active,
+  unread,
   busy,
   waiting,
   revealTitle,
@@ -990,6 +961,7 @@ function SessionRow({
 }: {
   session: ChatSession;
   active: boolean;
+  unread: boolean;
   busy: boolean;
   /** Turn held on an unanswered card: steady dot, not the working pulse. */
   waiting: boolean;
@@ -1034,7 +1006,7 @@ function SessionRow({
       ref={ref}
       role="button"
       tabIndex={0}
-      className={`session-row ${active ? "active" : ""} ${open ? "menu-open" : ""} ${
+      className={`session-row ${active ? "active" : ""} ${unread ? "unread" : ""} ${open ? "menu-open" : ""} ${
         editing ? "editing" : ""
       }`}
       title={`${HARNESS_LABELS[session.harness]}${session.model ? ` · ${session.model}` : ""}`}
@@ -1061,7 +1033,11 @@ function SessionRow({
       }}
     >
       <span className="session-dot">
-        {busy && <span className={`busy-dot ${waiting ? "waiting" : ""}`} />}
+        {busy ? (
+          <span className={`busy-dot ${waiting ? "waiting" : ""}`} />
+        ) : (
+          unread && <span className="unread-dot" />
+        )}
       </span>
       {editing ? (
         <input
@@ -1146,6 +1122,7 @@ function SessionRow({
 
 export function ChatPanel({
   projectId,
+  projectName,
   paperId,
   railHeader,
   railOpen,
@@ -1163,6 +1140,7 @@ export function ChatPanel({
   children,
 }: {
   projectId: string;
+  projectName: string;
   /** arXiv id the project starts from — surfaces a /reproduce-paper shortcut. */
   paperId?: string | null;
   /** Back-to-projects + project name block rendered at the top of the rail. */
@@ -1197,6 +1175,7 @@ export function ChatPanel({
 }) {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [unreadSessionIds, setUnreadSessionIds] = useState<ReadonlySet<string>>(new Set());
   const [sessionFilter, setSessionFilter] = useState<SessionFilter>("active");
   const [draft, setDraft] = useState("");
   // Pasted/dropped images waiting in the composer, as data URLs.
@@ -1206,7 +1185,7 @@ export function ChatPanel({
     busySessions: new Set<string>(),
   });
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
-  const [selection, setSelection] = useState<ModelSelection | null>(loadSelection);
+  const [selection, setSelection] = useState<ModelSelection | null>(loadAgentSelection);
   // Unsent composer tweaks (model/mode/reasoning) for the *open* session — the
   // session's harness is fixed, so these override only its mutable settings and
   // are applied (and persisted server-side) on the next send. Cleared when the
@@ -1371,7 +1350,7 @@ export function ChatPanel({
     if (!composerSelection) return;
     const merged = { ...composerSelection, ...next };
     setSelection(merged);
-    localStorage.setItem(SELECTION_STORAGE_KEY, JSON.stringify(merged));
+    saveAgentSelection(merged);
     if (openSession) setSessionOverride((cur) => ({ ...cur, ...next }));
   };
   const setPermissionMode = (id: string) => selectModel({ permissionMode: id });
@@ -1433,6 +1412,16 @@ export function ChatPanel({
     // against the new project's list — tombstoning the entire old project.
     sessionsRef.current = [];
     setActiveId(null);
+    const readDemoSessions = loadReadDemoSessions();
+    setUnreadSessionIds(
+      projectId === DEMO_PROJECT_ID
+        ? new Set(
+            [DEMO_FIGURE_SESSION_ID, DEMO_LITERATURE_SESSION_ID].filter(
+              (sessionId) => !readDemoSessions.has(sessionId),
+            ),
+          )
+        : new Set(),
+    );
     setDraft("");
     setPickedSkill(null);
     setAttachments([]);
@@ -1442,7 +1431,16 @@ export function ChatPanel({
     seenTitles.current = new Map();
     void syncSessionList().then((list) => {
       // Prefer the newest non-archived session; archived ones stay hidden.
-      if (list) setActiveId((cur) => cur ?? list.find((s) => !s.archived)?.id ?? null);
+      if (list)
+        setActiveId(
+          (cur) =>
+            cur ??
+            (projectId === DEMO_PROJECT_ID
+              ? list.find((session) => session.id === DEMO_MAIN_SESSION_ID)?.id
+              : undefined) ??
+            list.find((session) => !session.archived)?.id ??
+            null,
+        );
     });
   }, [projectId, syncSessionList]);
 
@@ -1877,6 +1875,12 @@ export function ChatPanel({
     deletedIds.current.add(sessionId);
     setSessions((cur) => cur.filter((s) => s.id !== sessionId));
     setActiveId((cur) => (cur === sessionId ? null : cur));
+    setUnreadSessionIds((current) => {
+      if (!current.has(sessionId)) return current;
+      const next = new Set(current);
+      next.delete(sessionId);
+      return next;
+    });
     loadedSessions.current.delete(sessionId);
     seenTitles.current.delete(sessionId);
     dispatch({ type: "forget", sessionId });
@@ -1967,23 +1971,35 @@ export function ChatPanel({
   );
 
   const visibleSessions = sessions.filter((s) => matchesFilter(sessionFilter, s.archived));
+  const newTaskShortcut = /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘N" : "Ctrl+N";
+  const startNewTask = useCallback(() => {
+    setSessionFilter("active");
+    setActiveId(null);
+    onSelectMainView("chat");
+  }, [onSelectMainView]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.repeat ||
+        event.key.toLowerCase() !== "n" ||
+        (!event.metaKey && !event.ctrlKey) ||
+        event.altKey ||
+        event.shiftKey
+      )
+        return;
+      event.preventDefault();
+      startNewTask();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [startNewTask]);
 
   const rail = (
     <aside className="session-rail floating-panel">
       {railHeader}
-      {/* Top nav: new session + the settings sections (shown in the middle pane). */}
+      {/* Project-level sections shown in the middle pane. */}
       <nav className="rail-nav">
-        <button
-          className="rail-nav-item"
-          data-onboarding="new-session"
-          onClick={() => {
-            setActiveId(null);
-            onSelectMainView("chat");
-          }}
-        >
-          <Plus size={15} />
-          New session
-        </button>
         <button
           className={`rail-nav-item ${mainView === "artifacts" ? "active" : ""}`}
           data-onboarding="nav-artifacts"
@@ -1995,7 +2011,7 @@ export function ChatPanel({
         {SETTINGS_NAV.map((item) => (
           <button
             key={item.id}
-            className={`rail-nav-item ${mainView === item.id ? "active" : ""}`}
+            className={`rail-nav-item ${mainView !== "chat" && mainView !== "artifacts" && item.activeTabs.includes(mainView) ? "active" : ""}`}
             data-onboarding={item.id === "compute" ? "nav-compute" : undefined}
             onClick={() => onSelectMainView(item.id)}
           >
@@ -2004,23 +2020,43 @@ export function ChatPanel({
           </button>
         ))}
       </nav>
-      <div className="rail-body">
-        <div className="rail-section-head">
-          <div className="rail-section-label">
-            {SESSION_FILTERS.find((f) => f.id === sessionFilter)?.railLabel ?? "Recents"}
-          </div>
+      <div className="rail-section-head">
+        <div className="rail-section-label">
+          {SESSION_FILTERS.find((f) => f.id === sessionFilter)?.railLabel ?? "Recents"}
+        </div>
+        <div className="rail-section-actions">
+          <button
+            className="rail-section-new tip-up"
+            data-onboarding="new-session"
+            data-tip={newTaskShortcut}
+            aria-keyshortcuts="Meta+N Control+N"
+            onClick={startNewTask}
+          >
+            <Plus size={13} />
+            Task
+          </button>
           <SessionFilterMenu value={sessionFilter} onChange={setSessionFilter} />
         </div>
+      </div>
+      <div className="rail-body">
         {visibleSessions.map((s) => (
           <SessionRow
             key={s.id}
             session={s}
             active={s.id === activeId && mainView === "chat"}
+            unread={unreadSessionIds.has(s.id)}
             busy={state.busySessions.has(s.id)}
             waiting={waitingSessions.has(s.id)}
             revealTitle={titleReveals.get(s.id)}
             onOpen={() => {
               setActiveId(s.id);
+              if (projectId === DEMO_PROJECT_ID) markDemoSessionRead(s.id);
+              setUnreadSessionIds((current) => {
+                if (!current.has(s.id)) return current;
+                const next = new Set(current);
+                next.delete(s.id);
+                return next;
+              });
               onSelectMainView("chat");
             }}
             onRename={(title) => rename(s, title)}
@@ -2132,37 +2168,74 @@ export function ChatPanel({
         </div>
       ) : !threadMounted ? (
         <div className="chat-empty">
-          <h2>
-            <Wordmark />
-          </h2>
-          <p>
-            Ask the agent to explore your codebase, create and run your baseline experiment, and
-            branch variants off it.
-          </p>
-          <EmptyStateAgentHint
-            harnesses={harnesses}
-            selection={selection ?? defaultSelection(harnesses)}
-          />
-          {paperId && (
+          <div className="chat-empty-mark">
+            <BrandMark />
+          </div>
+          <h2>What should we research?</h2>
+          <div className="chat-empty-project">
+            <FolderOpen size={19} />
+            <span>{projectName}</span>
+          </div>
+          <div className="chat-empty-starters">
             <button
               type="button"
-              className="chat-suggest mono"
-              title="Prefills the composer — add the compute to run on, then send"
+              className="chat-empty-starter blue"
+              onClick={() => {
+                setPickedSkill(null);
+                setDraft("Explore this codebase and explain its architecture, key components, and open research questions.");
+                composerRef.current?.focus();
+              }}
+            >
+              <BookOpen size={16} />
+              <span>Explore this codebase</span>
+            </button>
+            <button
+              type="button"
+              className="chat-empty-starter purple"
               onClick={() => {
                 const skill = skills.find((s) => s.name === "reproduce-paper");
-                if (skill) {
+                if (paperId && skill) {
                   setPickedSkill(skill);
                   setDraft(`${paperId} on `);
                 } else {
-                  // Skills fetch failed — plain text still expands server-side.
-                  setDraft(`/reproduce-paper ${paperId} on `);
+                  setPickedSkill(null);
+                  setDraft(
+                    paperId
+                      ? `/reproduce-paper ${paperId} on `
+                      : "Find and summarize the research most relevant to this project.",
+                  );
                 }
                 composerRef.current?.focus();
               }}
             >
-              /reproduce-paper {paperId} on [describe your compute setup]
+              <GitBranch size={16} />
+              <span>{paperId ? "Reproduce the linked paper" : "Review relevant literature"}</span>
             </button>
-          )}
+            <button
+              type="button"
+              className="chat-empty-starter green"
+              onClick={() => {
+                setPickedSkill(null);
+                setDraft("Set up and run an experiment for this project, including a baseline and meaningful variants.");
+                composerRef.current?.focus();
+              }}
+            >
+              <FlaskConical size={16} />
+              <span>Run an experiment</span>
+            </button>
+            <button
+              type="button"
+              className="chat-empty-starter orange"
+              onClick={() => {
+                setPickedSkill(null);
+                setDraft("Analyze the latest experiment results and recommend the most useful next iteration.");
+                composerRef.current?.focus();
+              }}
+            >
+              <ChartSpline size={16} />
+              <span>Analyze results</span>
+            </button>
+          </div>
         </div>
       ) : (
         <div

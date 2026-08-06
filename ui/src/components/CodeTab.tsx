@@ -116,7 +116,7 @@ export function CodeTab({
           <GitBranch size={12} />
           <span className="wt-branch-name">{branch}</span>
         </span>
-        <a
+        {project.githubEnabled && <a
           className="icon-btn"
           href={githubBranchUrl(project.githubOwner, project.githubRepo, branch)}
           target="_blank"
@@ -124,7 +124,7 @@ export function CodeTab({
           title={`Open ${branch} on GitHub`}
         >
           <GitHubMark size={13} />
-        </a>
+        </a>}
         <span style={{ flex: 1 }} />
         <button
           className="icon-btn"

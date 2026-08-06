@@ -102,21 +102,11 @@ pub async fn submit_local_hf(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     // via ensure_clone so branch_head_sha matches what the job will check out.
     // Git shells out (network, can stall) — keep it off the async workers.
     let commit_sha = {
-        let (owner, repo, baseline, branch) = (
-            project.github_owner.clone(),
-            project.github_repo.clone(),
-            project.baseline_branch.clone(),
-            exp.branch_name.clone(),
-        );
-        tokio::task::spawn_blocking(move || -> Result<String> {
-            let repo_path = git::ensure_clone(&owner, &repo, &baseline)?;
-            if !git::branch_on_remote(&repo_path, &branch)? {
-                git::push_branch(&repo_path, &branch)?;
-            }
-            git::branch_head_sha(&repo_path, &branch)
-        })
-        .await
-        .map_err(|e| anyhow!("git task failed: {e}"))??
+        let project = project.clone();
+        let branch = exp.branch_name.clone();
+        tokio::task::spawn_blocking(move || git::publish_branch_commit(&project, &branch))
+            .await
+            .map_err(|e| anyhow!("git task failed: {e}"))??
     };
 
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -125,7 +115,7 @@ pub async fn submit_local_hf(args: &crate::ExpRunArgs) -> Result<StoredRun> {
         .clone()
         .unwrap_or_else(|| default_hf_image(&flavor));
     let script = hf_clone_script(
-        &exp.branch_name,
+        &commit_sha,
         &project.github_owner,
         &project.github_repo,
         &run_command,

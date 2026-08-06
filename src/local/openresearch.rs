@@ -177,21 +177,11 @@ pub async fn submit_local_openresearch(args: &crate::ExpRunArgs) -> Result<Store
     // The box clones from GitHub, so the branch tip must exist there — push
     // BEFORE provisioning so a git failure never bills a box.
     let commit_sha = {
-        let (owner, repo, baseline, branch) = (
-            project.github_owner.clone(),
-            project.github_repo.clone(),
-            project.baseline_branch.clone(),
-            exp.branch_name.clone(),
-        );
-        tokio::task::spawn_blocking(move || -> Result<String> {
-            let repo_path = git::ensure_clone(&owner, &repo, &baseline)?;
-            if !git::branch_on_remote(&repo_path, &branch)? {
-                git::push_branch(&repo_path, &branch)?;
-            }
-            git::branch_head_sha(&repo_path, &branch)
-        })
-        .await
-        .map_err(|e| anyhow!("git task failed: {e}"))??
+        let project = project.clone();
+        let branch = exp.branch_name.clone();
+        tokio::task::spawn_blocking(move || git::publish_branch_commit(&project, &branch))
+            .await
+            .map_err(|e| anyhow!("git task failed: {e}"))??
     };
 
     let sandbox = create_sandbox(

@@ -147,8 +147,8 @@ export function ExperimentOverview({
           <h2>Git</h2>
           <div className="experiment-overview-meta experiment-overview-git-meta">
             <BranchPill
-              owner={project.githubOwner}
-              repo={project.githubRepo}
+              owner={project.githubEnabled ? project.githubOwner : ""}
+              repo={project.githubEnabled ? project.githubRepo : ""}
               branch={experiment.branchName}
             />
             {parentExperiment && (

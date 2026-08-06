@@ -416,15 +416,43 @@ fn is_initial_chat_message(transcript_text: Option<&str>, has_messages: bool) ->
     transcript_text.is_none() && !has_messages
 }
 
+fn with_bootstrap_context(
+    native_session_id: Option<&str>,
+    bootstrap_context: Option<&str>,
+    text: String,
+) -> String {
+    match (native_session_id, bootstrap_context) {
+        (None, Some(context)) => {
+            format!("{context}\n\n<current-user-message>\n{text}\n</current-user-message>")
+        }
+        _ => text,
+    }
+}
+
 #[cfg(test)]
 mod initial_message_tests {
-    use super::is_initial_chat_message;
+    use super::{is_initial_chat_message, with_bootstrap_context};
 
     #[test]
     fn only_the_first_ordinary_message_starts_a_chat_session() {
         assert!(is_initial_chat_message(None, false));
         assert!(!is_initial_chat_message(None, true));
         assert!(!is_initial_chat_message(Some("resume"), false));
+    }
+
+    #[test]
+    fn bootstrap_context_is_injected_only_before_a_native_session_exists() {
+        let seeded = with_bootstrap_context(None, Some("prior demo"), "continue".into());
+        assert!(seeded.contains("prior demo"));
+        assert!(seeded.contains("<current-user-message>\ncontinue"));
+        assert_eq!(
+            with_bootstrap_context(Some("native"), Some("prior demo"), "continue".into()),
+            "continue"
+        );
+        assert_eq!(
+            with_bootstrap_context(None, None, "continue".into()),
+            "continue"
+        );
     }
 }
 
@@ -1117,7 +1145,13 @@ impl ChatHost {
 
         // Slash-skills: the transcript keeps the `/name` the user typed; the
         // harness gets the expanded prompt.
-        let mut turn_text = crate::local::skills::expand(&text).unwrap_or(text);
+        let turn_text =
+            crate::local::skills::expand(&text, project.github_enabled()).unwrap_or(text);
+        let mut turn_text = with_bootstrap_context(
+            session.native_session_id.as_deref(),
+            session.bootstrap_context.as_deref(),
+            turn_text,
+        );
         // Harnesses take plain text; pasted images ride as on-disk paths every
         // CLI can open with its own image-viewing tool.
         if !saved_images.is_empty() {
@@ -1562,10 +1596,10 @@ impl ChatHost {
 /// Remove a deleted session's worktree in the background — git + rm are
 /// blocking and best-effort, and must never hold up the delete response.
 pub fn cleanup_session_worktree(project: &LocalProject, session_id: &str) {
-    let (owner, repo) = (project.github_owner.clone(), project.github_repo.clone());
+    let project = project.clone();
     let session_id = session_id.to_string();
     tokio::task::spawn_blocking(move || {
-        crate::local::git::remove_session_worktree(&owner, &repo, &session_id);
+        crate::local::git::remove_session_worktree(&project, &session_id);
     });
 }
 
@@ -1851,6 +1885,7 @@ impl TurnCtx {
                 slug: "test".into(),
                 github_owner: "owner".into(),
                 github_repo: "repo".into(),
+                github_sync_enabled: true,
                 baseline_branch: "main".into(),
                 repo_path: "/tmp/test-repo".into(),
                 run_command: None,
@@ -2500,6 +2535,7 @@ mod bridge_tests {
             reasoning_level: None,
             archived: false,
             context_usage_json: None,
+            bootstrap_context: None,
             created_at: 1,
             updated_at: 1,
         }
@@ -2564,6 +2600,7 @@ mod notify_target_tests {
                 reasoning_level: None,
                 archived: false,
                 context_usage_json: None,
+                bootstrap_context: None,
                 created_at: 1,
                 updated_at,
             })

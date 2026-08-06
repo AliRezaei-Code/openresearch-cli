@@ -293,6 +293,7 @@ function PreviewPane({
           <button
             className={`icon-btn ${showSource ? "active" : ""}`}
             data-tip={showSource ? "Rendered view" : "View source"}
+            data-tip-align="end"
             aria-label={showSource ? "Rendered view" : "View source"}
             onClick={() => setShowSource((s) => !s)}
           >
@@ -305,6 +306,7 @@ function PreviewPane({
           target="_blank"
           rel="noopener noreferrer"
           data-tip="Open raw in new tab"
+          data-tip-align="end"
           aria-label="Open raw in new tab"
         >
           <ExternalLink size={13} />
@@ -312,6 +314,7 @@ function PreviewPane({
         <button
           className="icon-btn"
           data-tip="Delete artifact"
+          data-tip-align="end"
           aria-label="Delete artifact"
           onClick={() => {
             if (window.confirm(`Delete "${entry.path}" from the artifacts directory?`))
@@ -368,6 +371,7 @@ function TreeRows({
                 <button
                   className="icon-btn ft-row-delete"
                   data-tip="Delete folder"
+                  data-tip-align="end"
                   aria-label={`Delete folder ${e.name}`}
                   onClick={(ev) => {
                     ev.stopPropagation();
@@ -435,6 +439,7 @@ function DirFooter({ dir, onOpenStorage }: { dir: string; onOpenStorage: () => v
       <button
         className="icon-btn tip-up"
         data-tip="Storage settings"
+        data-tip-align="end"
         aria-label="Storage settings"
         onClick={onOpenStorage}
       >

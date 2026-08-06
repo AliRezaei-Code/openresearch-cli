@@ -1,5 +1,5 @@
 //! Local mode (`orx up`) — projects/experiments live in the local SQLite
-//! store, experiment branches on the user's own GitHub repo, runs on HF Jobs.
+//! store, experiment branches live in local Git, and runs default to this machine.
 //! Nothing under this module ever calls `client.rs` / the OpenResearch api —
 //! except `openresearch`, whose *compute* is a platform box by definition
 //! (the run rows still live only in the local store).
@@ -14,6 +14,7 @@ pub mod chat;
 pub mod claude;
 pub mod codex;
 pub mod datadir;
+pub mod demo;
 pub mod experiments;
 pub mod files;
 pub mod git;

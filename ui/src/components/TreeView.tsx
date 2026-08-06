@@ -253,7 +253,7 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
           Code
         </button>
         {/* Icon-only: labeled actions + the link overflow the card's fixed width. */}
-        <a
+        {githubOwner && githubRepo && <a
           className="node-action node-action-ext"
           title={`Open ${exp.branchName} on GitHub`}
           aria-label={`Open ${exp.branchName} on GitHub`}
@@ -263,7 +263,7 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
           onClick={(e) => e.stopPropagation()}
         >
           <GitHubMark size={13} />
-        </a>
+        </a>}
       </div>
       <Handle type="source" position={Position.Bottom} />
       {/* Node and card share one leave handler — React's enter/leave pairing
@@ -384,8 +384,8 @@ export function TreeView({
             parentSlug: node.exp.parentExperimentId
               ? (slugById.get(node.exp.parentExperimentId) ?? null)
               : null,
-            githubOwner: project.githubOwner,
-            githubRepo: project.githubRepo,
+            githubOwner: project.githubEnabled ? project.githubOwner : "",
+            githubRepo: project.githubEnabled ? project.githubRepo : "",
             onOpenView,
             onOpenCode,
           },
@@ -432,6 +432,7 @@ export function TreeView({
     onOpenCode,
     project.githubOwner,
     project.githubRepo,
+    project.githubEnabled,
     agentSessionId,
     onShowProjectScope,
   ]);

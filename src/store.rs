@@ -191,6 +191,7 @@ impl Store {
                 slug            TEXT NOT NULL UNIQUE,
                 github_owner    TEXT NOT NULL,
                 github_repo     TEXT NOT NULL,
+                github_sync_enabled INTEGER NOT NULL DEFAULT 1,
                 baseline_branch TEXT NOT NULL DEFAULT 'main',
                 repo_path       TEXT NOT NULL,
                 run_command     TEXT,
@@ -226,6 +227,7 @@ impl Store {
                 reasoning_level   TEXT,
                 archived          INTEGER NOT NULL DEFAULT 0,
                 context_usage_json TEXT,
+                bootstrap_context TEXT,
                 created_at        INTEGER NOT NULL,
                 updated_at        INTEGER NOT NULL
             );
@@ -257,8 +259,10 @@ impl Store {
             "ALTER TABLE chat_sessions ADD COLUMN reasoning_level TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE chat_sessions ADD COLUMN context_usage_json TEXT",
+            "ALTER TABLE chat_sessions ADD COLUMN bootstrap_context TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN title_source TEXT",
             "ALTER TABLE local_projects ADD COLUMN paper_id TEXT",
+            "ALTER TABLE local_projects ADD COLUMN github_sync_enabled INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE local_experiments ADD COLUMN chat_session_id TEXT",
         ] {
             let _ = conn.execute(ddl, []);
@@ -502,12 +506,126 @@ impl Store {
 
     // --- local projects (orx up) ---
 
+    /// Atomically install a fully-materialized demo project. The project id is
+    /// the idempotency key: a completed prior seed is left byte-for-byte intact.
+    pub fn create_demo_snapshot(
+        &self,
+        project: &LocalProject,
+        experiment: &crate::local::model::LocalExperiment,
+        run: &StoredRun,
+        sessions: &[StoredChatSession],
+        messages: &[StoredChatMessage],
+    ) -> Result<bool> {
+        let tx = self.begin()?;
+        let inserted = tx.execute(
+            &format!("INSERT OR IGNORE INTO local_projects ({PROJECT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
+            params![
+                project.id,
+                project.name,
+                project.slug,
+                project.github_owner,
+                project.github_repo,
+                project.github_sync_enabled,
+                project.baseline_branch,
+                project.repo_path,
+                project.run_command,
+                project.paper_id,
+                project.created_at,
+                project.updated_at,
+            ],
+        )?;
+        if inserted == 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
+            &format!("INSERT INTO local_experiments ({EXPERIMENT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
+            params![
+                experiment.id,
+                experiment.project_id,
+                experiment.parent_experiment_id,
+                experiment.slug,
+                experiment.branch_name,
+                experiment.title,
+                experiment.description,
+                experiment.run_command,
+                experiment.agent_status,
+                experiment.created_at,
+                experiment.updated_at,
+                experiment.chat_session_id,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO runs (id, experiment_id, project_id, status, backend_json, command,
+                               created_at, updated_at, ended_at, exit_code, commit_sha,
+                               result_markdown, cancel_requested, chat_session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                run.id,
+                run.experiment_id,
+                run.project_id,
+                run.status,
+                run.backend_json,
+                run.command,
+                run.created_at,
+                run.updated_at,
+                run.ended_at,
+                run.exit_code,
+                run.commit_sha,
+                run.result_markdown,
+                run.cancel_requested,
+                run.chat_session_id,
+            ],
+        )?;
+        for session in sessions {
+            tx.execute(
+                "INSERT INTO chat_sessions (id, project_id, harness, native_session_id, title,
+                                            title_source, model, permission_mode, reasoning_level,
+                                            archived, context_usage_json, bootstrap_context,
+                                            created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    session.id,
+                    session.project_id,
+                    session.harness,
+                    session.native_session_id,
+                    session.title,
+                    session.title_source,
+                    session.model,
+                    session.permission_mode,
+                    session.reasoning_level,
+                    session.archived,
+                    session.context_usage_json,
+                    session.bootstrap_context,
+                    session.created_at,
+                    session.updated_at,
+                ],
+            )?;
+        }
+        for message in messages {
+            tx.execute(
+                "INSERT INTO chat_messages (id, session_id, role, parts_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    message.id,
+                    message.session_id,
+                    message.role,
+                    message.parts_json,
+                    message.created_at,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn create_local_project(&self, p: &LocalProject) -> Result<()> {
         self.conn.execute(
-            &format!("INSERT INTO local_projects ({PROJECT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"),
+            &format!("INSERT INTO local_projects ({PROJECT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
             params![
                 p.id, p.name, p.slug, p.github_owner, p.github_repo,
-                p.baseline_branch, p.repo_path, p.run_command, p.paper_id, p.created_at, p.updated_at,
+                p.github_sync_enabled, p.baseline_branch, p.repo_path, p.run_command, p.paper_id,
+                p.created_at, p.updated_at,
             ],
         )?;
         Ok(())
@@ -585,8 +703,8 @@ impl Store {
     pub fn update_local_project(&self, p: &LocalProject) -> Result<()> {
         self.conn.execute(
             "UPDATE local_projects SET name = ?2, slug = ?3, github_owner = ?4, github_repo = ?5,
-                    baseline_branch = ?6, repo_path = ?7, run_command = ?8, paper_id = ?9,
-                    updated_at = ?10
+                    github_sync_enabled = ?6, baseline_branch = ?7, repo_path = ?8,
+                    run_command = ?9, paper_id = ?10, updated_at = ?11
              WHERE id = ?1",
             params![
                 p.id,
@@ -594,6 +712,7 @@ impl Store {
                 p.slug,
                 p.github_owner,
                 p.github_repo,
+                p.github_sync_enabled,
                 p.baseline_branch,
                 p.repo_path,
                 p.run_command,
@@ -660,8 +779,9 @@ impl Store {
     pub fn create_chat_session(&self, s: &StoredChatSession) -> Result<()> {
         self.conn.execute(
             "INSERT INTO chat_sessions (id, project_id, harness, native_session_id, title, title_source, model,
-                                        permission_mode, reasoning_level, archived, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                                        permission_mode, reasoning_level, archived, bootstrap_context,
+                                        created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 s.id,
                 s.project_id,
@@ -673,6 +793,7 @@ impl Store {
                 s.permission_mode,
                 s.reasoning_level,
                 s.archived,
+                s.bootstrap_context,
                 s.created_at,
                 s.updated_at,
             ],
@@ -925,6 +1046,9 @@ pub struct StoredChatSession {
     pub archived: bool,
     /// Serialized `ContextUsage` for the latest turn; None until first reported.
     pub context_usage_json: Option<String>,
+    /// Hidden context prepended only when a seeded transcript starts its first
+    /// real native harness session. Never serialized to the UI.
+    pub bootstrap_context: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -943,7 +1067,7 @@ pub struct StoredChatMessage {
 
 const CHAT_SESSION_COLS: &str = "id, project_id, harness, native_session_id, title, model, \
      permission_mode, reasoning_level, archived, context_usage_json, created_at, updated_at, \
-     title_source";
+     title_source, bootstrap_context";
 
 fn row_to_chat_session(
     row: &rusqlite::Row<'_>,
@@ -962,6 +1086,7 @@ fn row_to_chat_session(
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
         title_source: row.get(12)?,
+        bootstrap_context: row.get(13)?,
     })
 }
 
@@ -970,8 +1095,8 @@ const SELECT_RUN: &str = "SELECT id, experiment_id, project_id, status, backend_
                                  commit_sha, result_markdown, cancel_requested,
                                  chat_session_id FROM runs";
 
-const PROJECT_COLS: &str = "id, name, slug, github_owner, github_repo, baseline_branch, \
-                            repo_path, run_command, paper_id, created_at, updated_at";
+const PROJECT_COLS: &str = "id, name, slug, github_owner, github_repo, github_sync_enabled, \
+                            baseline_branch, repo_path, run_command, paper_id, created_at, updated_at";
 
 const EXPERIMENT_COLS: &str = "id, project_id, parent_experiment_id, slug, branch_name, \
                                title, description, run_command, agent_status, created_at, \
@@ -1081,6 +1206,7 @@ mod tests {
             reasoning_level: None,
             archived: false,
             context_usage_json: None,
+            bootstrap_context: None,
             created_at: 1,
             updated_at: 1,
         }

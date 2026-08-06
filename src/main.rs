@@ -16,6 +16,7 @@ mod client;
 mod commands;
 mod config;
 mod error;
+mod folder_picker;
 mod jobs;
 // Local mode (`orx up`): builds out across stages; not all of it is wired yet.
 #[allow(dead_code)]

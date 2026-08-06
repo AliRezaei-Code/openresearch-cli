@@ -1001,7 +1001,10 @@ async fn run_openresearch(
             return Ok(());
         };
         let script = crate::commands::exp::hf_clone_script(
-            &exp.branch_name,
+            stored
+                .commit_sha
+                .as_deref()
+                .ok_or_else(|| anyhow!("Remote run is missing its recorded commit SHA."))?,
             &project.github_owner,
             &project.github_repo,
             &stored.command,

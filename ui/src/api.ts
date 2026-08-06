@@ -1,5 +1,10 @@
 // Typed client for the orx up local HTTP API (/api/*). All wire JSON is camelCase.
 
+export const DEMO_PROJECT_ID = "demo_nanochat_v1";
+export const DEMO_MAIN_SESSION_ID = "chat_demo_nanochat_v1";
+export const DEMO_FIGURE_SESSION_ID = "chat_demo_nanochat_figures_v1";
+export const DEMO_LITERATURE_SESSION_ID = "chat_demo_nanochat_literature_v1";
+
 export interface Project {
   id: string;
   name: string;
@@ -8,6 +13,9 @@ export interface Project {
   githubRepo: string;
   baselineBranch: string;
   repoPath: string;
+  path: string;
+  githubEnabled: boolean;
+  githubUrl?: string | null;
   /** Absolute path of the project's artifacts directory, non-canonical to
    *  match paths agents inline into chat. */
   artifactsDir: string;
@@ -92,24 +100,52 @@ const patch = <T>(url: string, body: unknown) =>
 export const listProjects = () =>
   get<{ projects: Project[] }>("/api/projects").then((r) => r.projects);
 
+export interface OnboardingSelection {
+  harness: HarnessId;
+  model: string | null;
+  permissionMode: string | null;
+  reasoningLevel: string | null;
+}
+
+export const completeOnboarding = (selection: OnboardingSelection, profile: Profile) =>
+  post<{ project: Project; selection: OnboardingSelection }>(
+    "/api/onboarding/complete",
+    { ...selection, ...profile },
+  );
+
+export interface ProjectPathStatus {
+  gitVersion: string | null;
+  resolvedPath: string | null;
+  exists: boolean | null;
+  directory: boolean | null;
+  initialized: boolean | null;
+}
+
+export const getProjectPathStatus = (path = "") => {
+  const query = path ? `?path=${encodeURIComponent(path)}` : "";
+  return get<ProjectPathStatus>(`/api/project-path/status${query}`);
+};
+
+export const pickProjectFolder = () =>
+  post<{ path: string | null }>("/api/project-path/pick").then((result) => result.path);
+
 export interface NewProject {
   name: string;
-  githubOwner?: string;
-  githubRepo?: string;
-  githubOrganization?: string;
-  baselineBranch?: string;
+  path: string;
   runCommand?: string;
-  /** arXiv id the project starts from (versionless). */
   paperId?: string;
-  /** Create a blank private repo on the user's GitHub account instead. */
-  createRepo?: boolean;
-  /** Fork-by-copy the repo into a fresh `<repo>-<hash>` repo on the user's
-   * account. Applied automatically when they lack push access. */
-  forkRepo?: boolean;
+  cloneUrl?: string;
+  createFolder?: boolean;
+  initializeGit?: boolean;
+}
+
+export interface CreateProjectResult {
+  project: Project;
+  githubPublicationError: string | null;
 }
 
 export const createProject = (body: NewProject) =>
-  post<{ project: Project }>("/api/projects", body).then((r) => r.project);
+  post<CreateProjectResult>("/api/projects", body);
 
 export interface PaperHit {
   paperId: string;
@@ -523,21 +559,29 @@ export interface ComputeTargetSummary {
    */
   unverified?: boolean;
   summary: string;
+  enabled: boolean;
+  disabledReason?: string | null;
 }
 
 export interface ComputeSettings {
   defaultBackend: ComputeTargetId | null;
   defaultFlavor: string | null;
   targets: ComputeTargetSummary[];
+  configuredDefaultBackend?: ComputeTargetId | null;
+  configuredDefaultFlavor?: string | null;
 }
 
-export const getComputeSettings = () => get<ComputeSettings>("/api/settings/compute");
+export const getComputeSettings = (projectId?: string) =>
+  get<ComputeSettings>(
+    `/api/settings/compute${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ""}`,
+  );
 
 /** Set (or clear, with backend: null) the default compute target. Responds
  * with the full compute payload so the caller reconciles in one shot. */
 export const setComputeDefault = (body: {
   backend: ComputeTargetId | null;
   flavor?: string | null;
+  projectId?: string;
 }) => post<ComputeSettings>("/api/settings/compute/default", body);
 
 export interface LocalGpu {
@@ -640,6 +684,81 @@ export const saveGitToken = (token: string) =>
 
 export const removeGitToken = () =>
   fetch("/api/settings/git/token", { method: "DELETE" }).then((r) => json<GitSettings>(r));
+
+/** A paper linked to the researcher profile during onboarding. */
+export interface LinkedPaper {
+  paperId: string;
+  title: string | null;
+}
+
+/** The local researcher profile captured in onboarding (settings.json). */
+export interface Profile {
+  background: string | null;
+  papers: LinkedPaper[];
+}
+
+export const getProfile = () => get<Profile>("/api/settings/profile");
+
+export const setProfile = (body: Profile) => post<Profile>("/api/settings/profile", body);
+
+export interface ProjectDefaultsSettings {
+  githubForNewProjects: boolean;
+  githubDefaultPromptSeen: boolean;
+  githubAuthenticated: boolean;
+  githubTokenSource: "env" | "stored" | "gh" | null;
+}
+
+export const getProjectDefaults = () =>
+  get<ProjectDefaultsSettings>("/api/settings/projects");
+
+export const setProjectDefaults = (
+  githubForNewProjects: boolean,
+  githubDefaultPromptSeen?: boolean,
+) =>
+  post<ProjectDefaultsSettings>("/api/settings/projects", {
+    githubForNewProjects,
+    ...(githubDefaultPromptSeen === undefined ? {} : { githubDefaultPromptSeen }),
+  });
+
+export interface ProjectGitStatus {
+  path: string;
+  gitVersion: string | null;
+  initialized: boolean;
+  baselineBranch: string;
+  currentBranch: string | null;
+  clean: boolean | null;
+  remotes: { name: string; url: string }[];
+  identity: {
+    name: string | null;
+    email: string | null;
+    nameSource: "local" | "global" | null;
+    emailSource: "local" | "global" | null;
+  };
+  github: {
+    authenticated: boolean;
+    tokenSource: "env" | "stored" | "gh" | null;
+    enabled: boolean;
+    owner: string;
+    repo: string;
+    url: string | null;
+    syncStatus: string | null;
+  };
+}
+
+export const getProjectGitStatus = (projectId: string) =>
+  get<ProjectGitStatus>(`/api/projects/${projectId}/git`);
+
+export const initializeProjectGit = (projectId: string) =>
+  post<ProjectGitStatus>(`/api/projects/${projectId}/git/init`);
+
+export const enableProjectGithub = (projectId: string) =>
+  post<{ project: Project; git: ProjectGitStatus }>(`/api/projects/${projectId}/github`);
+
+export const disableProjectGithub = (projectId: string) =>
+  post<{ project: Project; git: ProjectGitStatus }>(`/api/projects/${projectId}/github/disable`);
+
+export const pushProjectGithub = (projectId: string) =>
+  post<{ project: Project; git: ProjectGitStatus }>(`/api/projects/${projectId}/github/push`);
 
 export interface TelemetrySettings {
   /** Whether anonymous usage analytics is currently on. */

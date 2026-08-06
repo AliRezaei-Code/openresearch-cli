@@ -74,8 +74,12 @@ fn flush_window() -> Duration {
 /// Machine-local CLI settings. Lives at `$XDG_CONFIG_HOME/openresearch/
 /// settings.json` (the config dir, NOT the R2-snapshotted data dir) so the
 /// anonymous install id stays per-install rather than travelling with an agent
-/// box's data snapshot. Modeled on `K8sSettings`. Unknown fields on older files
-/// parse fine and are dropped on the next save.
+/// box's data snapshot. Beyond telemetry, this is the one file for user-level
+/// config: the data-dir/compute defaults and the onboarding researcher profile
+/// (`background`/`linked_papers`) — the latter user free-text that, like
+/// everything here, stays on local disk and is never sent in any event.
+/// Modeled on `K8sSettings`. Unknown fields on older files parse fine and are
+/// dropped on the next save.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Settings {
@@ -107,6 +111,29 @@ pub(crate) struct Settings {
     /// applied when a launch resolves to that same backend without a flavor.
     #[serde(default)]
     pub default_flavor: Option<String>,
+    /// Free-text researcher background captured in onboarding (Settings →
+    /// profile). Optional; absent/empty = never provided.
+    #[serde(default)]
+    pub background: Option<String>,
+    /// alphaXiv/arXiv papers the user linked to their profile in onboarding.
+    #[serde(default)]
+    pub linked_papers: Vec<ProfilePaper>,
+    /// Automatically create and push a private GitHub repository after a new
+    /// local project is registered. Existing projects are never changed.
+    #[serde(default)]
+    pub github_for_new_projects: Option<bool>,
+    /// Whether the one-time post-publication default prompt has been answered.
+    #[serde(default)]
+    pub github_default_prompt_seen: Option<bool>,
+}
+
+/// A paper the user linked to their researcher profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProfilePaper {
+    pub paper_id: String,
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 /// The persisted data-dir choice, if any (non-empty). Read by `store::data_dir()`
@@ -153,6 +180,49 @@ pub(crate) fn set_compute_default(
             None
         };
     })
+}
+
+/// The persisted researcher profile: the background blurb (non-empty) and the
+/// linked papers. Read by the profile settings endpoint.
+pub(crate) fn load_profile() -> (Option<String>, Vec<ProfilePaper>) {
+    let s = load_settings().unwrap_or_default();
+    // Trim on read too, so a hand-edited whitespace-only blurb reads as absent.
+    (
+        s.background.filter(|b| !b.trim().is_empty()),
+        s.linked_papers,
+    )
+}
+
+/// Set the researcher profile, preserving every other settings field (same
+/// `mutate_settings` guarantees as the data dir).
+pub(crate) fn set_profile(
+    background: Option<String>,
+    papers: Vec<ProfilePaper>,
+) -> std::io::Result<()> {
+    mutate_settings(|s| {
+        s.background = background.filter(|b| !b.is_empty());
+        s.linked_papers = papers;
+    })
+}
+
+pub(crate) fn github_for_new_projects() -> bool {
+    load_settings()
+        .and_then(|settings| settings.github_for_new_projects)
+        .unwrap_or(false)
+}
+
+pub(crate) fn set_github_for_new_projects(enabled: bool) -> std::io::Result<()> {
+    mutate_settings(|settings| settings.github_for_new_projects = Some(enabled))
+}
+
+pub(crate) fn github_default_prompt_seen() -> bool {
+    load_settings()
+        .and_then(|settings| settings.github_default_prompt_seen)
+        .unwrap_or(false)
+}
+
+pub(crate) fn set_github_default_prompt_seen(seen: bool) -> std::io::Result<()> {
+    mutate_settings(|settings| settings.github_default_prompt_seen = Some(seen))
 }
 
 fn settings_path() -> PathBuf {
@@ -876,6 +946,53 @@ mod tests {
     }
 
     #[test]
+    fn profile_fields_dont_clobber_siblings() {
+        // Same single-writer contract: the onboarding profile persists in the
+        // telemetry-owned settings.json, so a profile write must preserve
+        // install_id/telemetry_disabled and vice-versa.
+        let _g = EnvGuard::new(OPT_VARS);
+        let dir = std::env::temp_dir().join(format!("orx-tel-profile-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        set_persisted_disabled(true).unwrap();
+        let id = install_id().expect("install id");
+        set_profile(
+            Some("I study RL".into()),
+            vec![ProfilePaper {
+                paper_id: "1706.03762".into(),
+                title: Some("Attention Is All You Need".into()),
+            }],
+        )
+        .unwrap();
+
+        let (background, papers) = load_profile();
+        assert_eq!(background.as_deref(), Some("I study RL"));
+        assert_eq!(papers.len(), 1);
+        assert_eq!(papers[0].paper_id, "1706.03762");
+        let s = load_settings().expect("settings present");
+        assert_eq!(
+            s.telemetry_disabled,
+            Some(true),
+            "opt-out survived profile write"
+        );
+        assert_eq!(
+            s.install_id.as_deref(),
+            Some(id.as_str()),
+            "install id survived"
+        );
+
+        // A whitespace-only background clears to None; papers can be emptied.
+        set_profile(Some("   ".into()), vec![]).unwrap();
+        let (background, papers) = load_profile();
+        assert!(background.is_none(), "whitespace background cleared");
+        assert!(papers.is_empty(), "papers cleared");
+        let s = load_settings().expect("settings present");
+        assert_eq!(s.telemetry_disabled, Some(true), "opt-out still intact");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn compute_default_roundtrip_preserves_siblings() {
         // Same single-writer contract as data_dir: the Compute settings persist
         // in the telemetry-owned settings.json, so a default-target write must
@@ -922,6 +1039,27 @@ mod tests {
             Some("abc")
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn github_project_default_roundtrip_preserves_siblings() {
+        let _g = EnvGuard::new(OPT_VARS);
+        let dir = std::env::temp_dir().join(format!("orx-tel-github-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        set_persisted_disabled(true).unwrap();
+        set_compute_default(Some("modal".into()), Some("a10g".into())).unwrap();
+        assert!(!github_for_new_projects());
+
+        set_github_for_new_projects(true).unwrap();
+        assert!(github_for_new_projects());
+        let settings = load_settings().expect("settings present");
+        assert_eq!(settings.telemetry_disabled, Some(true));
+        assert_eq!(settings.default_backend.as_deref(), Some("modal"));
+
+        set_github_for_new_projects(false).unwrap();
+        assert!(!github_for_new_projects());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
