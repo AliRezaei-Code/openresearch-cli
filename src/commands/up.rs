@@ -16,7 +16,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, StatusCode, Uri};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
@@ -381,6 +381,10 @@ fn router(state: AppState) -> Router {
         .route("/api/chat/attachments/{name}", get(chat_attachment))
         .route("/api/agent/status", get(agent_status))
         .fallback(spa)
+        // Chat attachments (PDFs, images) ride as base64 in the send-message
+        // JSON body; the 2 MB axum default rejects any real paper. Cap it well
+        // above the client-side per-file limit so a full message still fits.
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
 }
 
@@ -3524,9 +3528,9 @@ async fn send_chat_message(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// Raw bytes of a pasted-image attachment, by bare file name.
+/// Raw bytes of a chat attachment (image or PDF), by bare file name.
 async fn chat_attachment(Path(name): Path<String>) -> std::result::Result<Response, ApiError> {
-    // Names are server-minted (img_<uuid>.<ext>); anything else is rejected.
+    // Names are server-minted (att-<uuid>__<name>.<ext>); anything else is rejected.
     if !name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
