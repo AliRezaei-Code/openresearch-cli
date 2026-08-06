@@ -1,6 +1,7 @@
 /* OpenResearch design system, mirrored from openresearch.sh www/src/styles.css.
-   Light theme by default, dark via prefers-color-scheme. Quiet idiom:
-   hairline borders, soft radii, flat surfaces that tint on hover. */
+   Light theme by default, dark via [data-theme="dark"] on <html> (resolved
+   before first paint by the inline script in index.html; see theme.ts). Quiet
+   idiom: hairline borders, soft radii, flat surfaces that tint on hover. */
 
 :root {
   --base: #ffffff;
@@ -94,38 +95,38 @@
   color-scheme: light;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --base: #0e0c0c;
-    --canvas: #141110;
-    --panel: #221f1e;
-    --surface: #1d1b1a;
-    --surface-bright: #130f0f;
-    --highlight: #393433;
-    --text: #e6e1e0;
-    --subtext: #a68e8b;
-    --muted: #737373;
-    --primary: #ffb3ad;
-    --primary-subtle: #33191b;
-    --secondary: #3e7fcf;
-    --error: #ffb951;
-    --border: #525252;
-    --border-variant: #404040;
+:root[data-theme="dark"] {
+  /* Theme is JS-resolved via <html data-theme>; do not add
+     @media (prefers-color-scheme) rules — override tokens here instead. */
+  --base: #0e0c0c;
+  --canvas: #141110;
+  --panel: #221f1e;
+  --surface: #1d1b1a;
+  --surface-bright: #130f0f;
+  --highlight: #393433;
+  --text: #e6e1e0;
+  --subtext: #a68e8b;
+  --muted: #737373;
+  --primary: #ffb3ad;
+  --primary-subtle: #33191b;
+  --secondary: #3e7fcf;
+  --error: #ffb951;
+  --border: #525252;
+  --border-variant: #404040;
 
-    --accent-amber: #e67e22;
+  --accent-amber: #e67e22;
 
-    --accent-green-subtle: #1c2b18;
-    --accent-amber-subtle: #33260f;
-    --accent-teal-subtle: #12332d;
-    --accent-red-subtle: #331418;
-    --accent-blue-subtle: #10233a;
-    --accent-purple-subtle: #251933;
+  --accent-green-subtle: #1c2b18;
+  --accent-amber-subtle: #33260f;
+  --accent-teal-subtle: #12332d;
+  --accent-red-subtle: #331418;
+  --accent-blue-subtle: #10233a;
+  --accent-purple-subtle: #251933;
 
-    --dots-muted: #2a2523;
-    --dots-strong: #555555;
+  --dots-muted: #2a2523;
+  --dots-strong: #555555;
 
-    color-scheme: dark;
-  }
+  color-scheme: dark;
 }
 
 * {
@@ -4260,7 +4261,7 @@ a.files-pill:hover {
 :is(.md, .openresearch-diff, .file-view) .token.variable { color: #e45649; }
 :is(.md, .openresearch-diff, .file-view) .token.parameter { color: #383a42; }
 
-@media (prefers-color-scheme: dark) {
+:root[data-theme="dark"] {
   :is(.md, .openresearch-diff, .file-view) .token.comment,
   :is(.md, .openresearch-diff, .file-view) .token.prolog,
   :is(.md, .openresearch-diff, .file-view) .token.cdata { font-style: italic; color: #7f848e; }
@@ -4390,6 +4391,10 @@ a.files-pill:hover {
   padding-top: 14px;
   border-top: 1px solid var(--border-variant);
 }
+.settings-card > .project-default-row:first-child {
+  padding-top: 0;
+  border-top: none;
+}
 .project-default-title {
   font-size: var(--fs-md);
   font-weight: var(--fw-semibold);
@@ -4447,6 +4452,38 @@ a.files-pill:hover {
   cursor: default;
 }
 .settings-switch:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 2px;
+}
+.theme-segmented {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+.theme-segment {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: var(--radius-sm);
+  color: var(--subtext);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.theme-segment:hover:not(.on) {
+  color: var(--text);
+  background: var(--highlight);
+}
+.theme-segment.on {
+  color: var(--base);
+  background: var(--primary);
+}
+.theme-segment:focus-visible {
   outline: 2px solid var(--text);
   outline-offset: 2px;
 }
