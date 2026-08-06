@@ -1,6 +1,8 @@
 import {
   ChartSpline,
+  Check,
   FileCode,
+  Filter,
   FlaskConical,
   FolderGit2,
   FolderTree,
@@ -39,8 +41,9 @@ import { FileViewer } from "./components/FileViewer";
 import { RailHeader } from "./components/Header";
 import { Onboarding } from "./components/Onboarding";
 import { NewProjectDialog, ProjectsHome } from "./components/ProjectsHome";
-import { RunsTable } from "./components/RunsTable";
+import { ExperimentsTable } from "./components/ExperimentsTable";
 import { Md } from "./components/Md";
+import { usePopover } from "./components/ModelPicker";
 import { SettingsView, type SettingsTab } from "./components/SettingsPage";
 import { Tour, TOUR_DONE_KEY } from "./components/Tour";
 import { clearReadDemoSessions } from "./demoSessionState";
@@ -137,7 +140,6 @@ interface RightPaneSessionState {
   filesView: WorktreeView;
   filesToggled: ReadonlySet<string>;
   selectedRunId: string | null;
-  view: "tree" | "table";
   scope: "agent" | "project";
   panelOpen: boolean;
   panelMax: boolean;
@@ -156,7 +158,6 @@ function initialRightPaneSessionState(sessionId?: string): RightPaneSessionState
     filesView: "files",
     filesToggled: new Set(),
     selectedRunId: null,
-    view: "tree",
     scope: "project",
     panelOpen: true,
     panelMax: false,
@@ -239,6 +240,17 @@ function parseFilePath(
 
 const ONBOARDED_KEY = "orx:onboarded";
 const PANEL_WIDTH_KEY = "orx:panel-width";
+const EXPERIMENTS_VIEW_KEY = "orx:experiments-view";
+
+type ExperimentsView = "tree" | "table";
+
+function initialExperimentsView(): ExperimentsView {
+  try {
+    return localStorage.getItem(EXPERIMENTS_VIEW_KEY) === "tree" ? "tree" : "table";
+  } catch {
+    return "table";
+  }
+}
 
 /** Floating panel sizing: keep both the panel and the chat column usable. */
 const PANEL_MIN_WIDTH = 360;
@@ -283,26 +295,33 @@ export default function App() {
   const [experiments, setExperiments] = useState<Experiment[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
   const [artifacts, setArtifacts] = useState<ProjectArtifacts | null>(null);
-  const [view, setView] = useState<"tree" | "table">("tree");
+  const [view, setView] = useState<ExperimentsView>(initialExperimentsView);
   // Experiments pane scope: "agent" narrows to the open chat session's work.
-  // Falls back to "project" whenever there's no session to scope to. The
-  // toggle only renders when every experiment carries attribution — any
-  // unattributed node (legacy, or created before chatSessionId existed) means
-  // Agent scope would misrepresent the tree, so those projects keep today's UI.
+  // Falls back to "project" whenever there is no usable experiment attribution.
   const [scope, setScope] = useState<"agent" | "project">("project");
+  const scopeTriggerRef = useRef<HTMLButtonElement>(null);
+  const { open: scopeMenuOpen, setOpen: setScopeMenuOpen, ref: scopeMenuRef } =
+    usePopover(scopeTriggerRef);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const allExperimentsAttributed =
-    experiments.length > 0 && experiments.every((e) => e.chatSessionId);
+  const allExperimentsAttributed = experiments.every((experiment) => experiment.chatSessionId);
   const effectiveScope = activeSessionId && allExperimentsAttributed ? scope : "project";
-  // Agent scope means "this session's experiments" in both panes: runs are
-  // scoped by their experiment's owner, not by which session launched them.
+  const scopedExperiments = useMemo(() => {
+    if (effectiveScope !== "agent") return experiments;
+    return experiments.filter((experiment) => experiment.chatSessionId === activeSessionId);
+  }, [experiments, effectiveScope, activeSessionId]);
+  // Runs are scoped by their experiment's owner, not by which session launched them.
   const scopedRuns = useMemo(() => {
     if (effectiveScope !== "agent") return runs;
-    const mine = new Set(
-      experiments.filter((e) => e.chatSessionId === activeSessionId).map((e) => e.id),
-    );
+    const mine = new Set(scopedExperiments.map((experiment) => experiment.id));
     return runs.filter((r) => mine.has(r.experimentId));
-  }, [runs, experiments, effectiveScope, activeSessionId]);
+  }, [runs, scopedExperiments, effectiveScope]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(EXPERIMENTS_VIEW_KEY, view);
+    } catch {
+      // The preference remains sticky for this app session when storage is unavailable.
+    }
+  }, [view]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   // Right-panel tab strip: closable home and working tabs. The same experiment
   // can keep both its overview and terminal open.
@@ -347,7 +366,6 @@ export default function App() {
     filesView,
     filesToggled,
     selectedRunId,
-    view,
     scope,
     panelOpen,
     panelMax,
@@ -373,7 +391,6 @@ export default function App() {
     setFilesView(nextState.filesView);
     setFilesToggled(nextState.filesToggled);
     setSelectedRunId(nextState.selectedRunId);
-    setView(nextState.view);
     setScope(nextState.scope);
     setPanelOpen(nextState.panelOpen);
     setPanelMax(nextState.panelMax);
@@ -499,7 +516,7 @@ export default function App() {
     setRightTab("experiments");
     setExperimentsTabOpen(true);
     setFilesTabOpen(false);
-    // Scoping is an explicit per-project choice — don't let Agent scope
+    // Scoping is an explicit per-project choice — don't let Current task scope
     // re-bind to whichever session ChatPanel auto-selects in the next project.
     setScope("project");
     listExperiments(projectId).then(setExperiments).catch(() => {});
@@ -1166,42 +1183,74 @@ export default function App() {
           {rightTab === "experiments" ? (
             <div className="tab-body">
               <div className={`pane-toolbar${view === "table" ? " table-view" : ""}`}>
-                {allExperimentsAttributed && (
-                  <div className="seg">
+                <span style={{ flex: 1 }} />
+                <div className="experiments-toolbar-controls">
+                  <div className="option-picker" ref={scopeMenuRef}>
                     <button
-                      className={effectiveScope === "agent" ? "active" : ""}
-                      disabled={!activeSessionId}
-                      title={
-                        activeSessionId
-                          ? undefined
-                          : "Open a chat session to filter to its experiments"
-                      }
-                      onClick={() => setScope("agent")}
+                      ref={scopeTriggerRef}
+                      className={`icon-btn experiment-scope-trigger${effectiveScope === "agent" ? " active" : ""}`}
+                      title={`Experiment filter: ${effectiveScope === "agent" ? "Current task" : "Entire project"}`}
+                      aria-label="Filter experiments"
+                      aria-expanded={scopeMenuOpen}
+                      onClick={() => setScopeMenuOpen((open) => !open)}
                     >
-                      Agent
+                      <Filter size={16} strokeWidth={2.5} />
+                    </button>
+                    {scopeMenuOpen && (
+                      <div className="option-menu drop-down align-right experiment-scope-menu">
+                        <button
+                          className="model-item"
+                          aria-pressed={effectiveScope === "agent"}
+                          disabled={!activeSessionId || !allExperimentsAttributed}
+                          title={
+                            !activeSessionId
+                              ? "Open a task to filter to its experiments"
+                              : !allExperimentsAttributed
+                                ? "Current task filtering is unavailable for unattributed experiments"
+                                : undefined
+                          }
+                          onClick={() => {
+                            setScope("agent");
+                            setScopeMenuOpen(false);
+                          }}
+                        >
+                          <span>Current task</span>
+                          {effectiveScope === "agent" && <Check size={13} />}
+                        </button>
+                        <button
+                          className="model-item"
+                          aria-pressed={effectiveScope === "project"}
+                          onClick={() => {
+                            setScope("project");
+                            setScopeMenuOpen(false);
+                          }}
+                        >
+                          <span>Entire project</span>
+                          {effectiveScope === "project" && <Check size={13} />}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                  <div
+                    className="seg experiments-view-toggle"
+                    role="group"
+                    aria-label="Experiment view"
+                  >
+                    <button
+                      className={view === "table" ? "active" : ""}
+                      aria-pressed={view === "table"}
+                      onClick={() => setView("table")}
+                    >
+                      Table
                     </button>
                     <button
-                      className={effectiveScope === "project" ? "active" : ""}
-                      onClick={() => setScope("project")}
+                      className={view === "tree" ? "active" : ""}
+                      aria-pressed={view === "tree"}
+                      onClick={() => setView("tree")}
                     >
-                      Project
+                      Tree
                     </button>
                   </div>
-                )}
-                <span style={{ flex: 1 }} />
-                <div className="seg">
-                  <button
-                    className={view === "tree" ? "active" : ""}
-                    onClick={() => setView("tree")}
-                  >
-                    Tree
-                  </button>
-                  <button
-                    className={view === "table" ? "active" : ""}
-                    onClick={() => setView("table")}
-                  >
-                    Table
-                  </button>
                 </div>
               </div>
               <div className="pane-content">
@@ -1218,19 +1267,20 @@ export default function App() {
                     />
                   )
                 ) : (
-                  <RunsTable
+                  <ExperimentsTable
                     runs={scopedRuns}
                     emptyHint={
-                      // Unlike the tree's empty state, suppressed when Project
-                      // scope would be just as empty.
-                      effectiveScope === "agent" && runs.length > 0
-                        ? "No runs from this agent's experiments yet. Switch to Project to see all runs."
+                      effectiveScope === "agent" && experiments.length > 0
+                        ? "No experiments from the current task yet. Switch to Entire project to see all experiments."
                         : undefined
                     }
-                    experiments={experiments}
-                    onOpen={(run) => {
-                      setSelectedRunId(run.id);
-                      openExperimentTab(run.experimentId, "overview");
+                    experiments={scopedExperiments}
+                    onOpen={(experiment) => {
+                      openExperimentTab(experiment.id, "overview");
+                    }}
+                    onOpenLogs={(experimentId, runId) => {
+                      setSelectedRunId(runId);
+                      openExperimentTab(experimentId, "terminal");
                     }}
                     onOpenChanges={(experimentId) => {
                       const experiment = experiments.find((item) => item.id === experimentId);
@@ -1240,6 +1290,11 @@ export default function App() {
                           experiment.branchName,
                           "changes",
                         );
+                    }}
+                    onOpenCode={(experimentId) => {
+                      const experiment = experiments.find((item) => item.id === experimentId);
+                      if (experiment)
+                        openCodeTabForExperiment(experiment.id, experiment.branchName, "files");
                     }}
                     onCancel={cancelRun}
                   />

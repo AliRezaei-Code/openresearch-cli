@@ -973,6 +973,34 @@ textarea::placeholder {
   cursor: default;
 }
 
+.experiments-toolbar-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.experiments-view-toggle {
+  padding: 2px;
+}
+.experiments-view-toggle button {
+  padding: 2px 8px;
+  font-size: var(--fs-sm);
+}
+.experiment-scope-trigger {
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-sm);
+}
+.experiment-scope-menu .model-item {
+  white-space: nowrap;
+}
+.experiment-scope-menu .model-item:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+.experiment-scope-menu .model-item:disabled:hover {
+  background: transparent;
+}
+
 /* ---- chat ---- */
 
 /* Borderless header that fades into the chat: the thread scrolls under a
@@ -2038,8 +2066,8 @@ textarea::placeholder {
   padding: 3px 5px;
 }
 
-/* Agent scope: dashed "…" pill standing in for a region of the tree created
- * by other agents. Clicking it switches the pane back to Project scope. */
+/* Current task scope: dashed "…" pill standing in for other tasks' experiments.
+ * Clicking it switches the pane back to Entire project scope. */
 .react-flow__node.react-flow__node-elided.selectable {
   cursor: pointer;
 }
@@ -2270,16 +2298,181 @@ textarea::placeholder {
   display: none !important;
 }
 
-/* ---- runs table ---- */
+/* ---- experiments table ---- */
 
-/* Runs table fills the panel directly, with quiet row separators. */
-.runs-table-wrap {
+.experiments-table-wrap {
   position: absolute;
   inset: 0;
   overflow: auto;
   background: var(--base);
+  container-type: inline-size;
 }
-.runs-table-error {
+.experiments-table {
+  width: 100%;
+  font-size: var(--fs-md);
+  background: var(--base);
+}
+.experiment-table-group {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "name meta"
+    "actions actions";
+  column-gap: 32px;
+  align-items: center;
+  padding: 20px 24px;
+  row-gap: 7px;
+  border-bottom: 1px solid color-mix(in oklab, var(--text) 7%, transparent);
+  background: var(--base);
+  cursor: pointer;
+}
+.experiment-table-group:hover {
+  background: var(--canvas);
+}
+.experiment-table-name {
+  grid-area: name;
+  align-self: start;
+  min-width: 0;
+}
+.experiment-table-subtitle {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.experiment-table-title {
+  display: block;
+  width: 100%;
+  overflow: hidden;
+  color: var(--text);
+  font-weight: var(--fw-semibold);
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.experiment-table-subtitle {
+  gap: 6px;
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--subtext);
+  font-size: var(--fs-sm);
+}
+.experiment-table-subtitle > svg {
+  flex-shrink: 0;
+}
+.experiment-table-subtitle code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.experiment-table-status,
+.experiment-run-summary {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.experiment-table-meta {
+  grid-area: meta;
+  align-self: start;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 18px;
+  white-space: nowrap;
+}
+.experiment-run-summary {
+  gap: 8px;
+  color: var(--subtext);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+}
+.experiment-table-latest {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--subtext);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  white-space: nowrap;
+}
+.experiment-table-actions {
+  grid-area: actions;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  margin-top: 12px;
+}
+.experiment-table-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--base);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  line-height: 1;
+}
+.experiment-table-action:hover:not(:disabled) {
+  background: var(--surface);
+  border-color: var(--border-strong);
+}
+.experiment-table-action:disabled {
+  color: var(--muted);
+  cursor: default;
+  opacity: 0.5;
+}
+.experiment-table-action.danger {
+  border-color: color-mix(in oklab, var(--accent-red) 42%, var(--border));
+  background: color-mix(in oklab, var(--accent-red) 6%, var(--base));
+  color: var(--accent-red);
+}
+.experiment-table-action.danger:hover:not(:disabled) {
+  border-color: var(--accent-red);
+  background: color-mix(in oklab, var(--accent-red) 10%, var(--base));
+}
+.experiment-table-group:last-child {
+  border-bottom: none;
+}
+
+@container (max-width: 560px) {
+  .experiment-table-group {
+    grid-template-columns: minmax(0, 1fr) auto;
+    column-gap: 14px;
+    row-gap: 9px;
+  }
+  .experiment-table-meta {
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 6px;
+  }
+  .experiment-table-action.danger {
+    margin-left: auto;
+  }
+}
+
+@container (max-width: 360px) {
+  .experiment-table-group {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "name"
+      "meta"
+      "actions";
+  }
+  .experiment-table-meta {
+    flex-direction: row;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    gap: 12px;
+  }
+}
+
+.experiments-table-error {
   padding: 8px 12px;
   color: var(--accent-red);
   font-size: var(--fs-sm);
@@ -2336,8 +2529,8 @@ textarea::placeholder {
   font-weight: var(--fw-medium);
   color: var(--text);
 }
-/* Normal-flow wrapper: the shared .runs-table-wrap is position:absolute (it
-   fills the experiments panel); in the settings pane the table sits in flow and
+/* Normal-flow wrapper: .experiments-table-wrap is position:absolute; in the
+   settings pane the table sits in flow and
    just needs horizontal-scroll safety on narrow viewports. */
 .instances-table-wrap {
   overflow-x: auto;
@@ -5489,7 +5682,7 @@ a.files-pill:hover {
 }
 
 /* Code browser tab — project-clone / branch file tree in flow layout (NOT
-   .runs-table-wrap, which is position:absolute and would jump to (0,0)). */
+   .experiments-table-wrap, which is position:absolute and would jump to (0,0)). */
 .code-tab {
   display: flex;
   flex-direction: column;
