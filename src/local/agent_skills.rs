@@ -126,7 +126,7 @@ const S_CREATE: AgentSkill = AgentSkill {
 };
 const S_REPORTS_LOCAL: AgentSkill = AgentSkill {
     name: "orx-reports",
-    description: "Write durable research outputs into the local project's artifacts directory so they appear in the dashboard's Artifacts tab. Use when a line of work concludes, when the user asks for a write-up, summary, comparison, figures, or exported data, or before ending a long task — findings not written down are lost.",
+    description: "Write durable research outputs into the local project's artifacts directory. Use when a line of work concludes, when the user asks for a write-up, summary, comparison, figures, or exported data, or before ending a long task — findings not written down are lost.",
     content: REPORTS_LOCAL,
 };
 const S_REPORTS_CLOUD: AgentSkill = AgentSkill {
@@ -456,5 +456,27 @@ mod tests {
         assert!(!compute.contains("git push"));
         assert!(!tmp.join(rel).join("orx-compute-k8s").exists());
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn bundled_skills_avoid_openresearch_ui_navigation() {
+        for set in [SkillSet::Local, SkillSet::Full] {
+            for skill in skills(set) {
+                for content in [
+                    skill.content,
+                    session_content(skill, true),
+                    session_content(skill, false),
+                ] {
+                    crate::local::assert_agent_guidance_is_ui_agnostic(skill.name, content);
+                }
+                for description in [
+                    skill.description,
+                    session_description(skill, true),
+                    session_description(skill, false),
+                ] {
+                    crate::local::assert_agent_guidance_is_ui_agnostic(skill.name, description);
+                }
+            }
+        }
     }
 }

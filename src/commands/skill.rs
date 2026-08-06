@@ -44,7 +44,7 @@ pub async fn run(args: crate::SkillArgs) -> Result<()> {
             if let Some(github_enabled) = publication {
                 if !agent_skills::available_in_session(skill, github_enabled) {
                     return Err(anyhow!(
-                        "{} requires GitHub. Enable it for this project in the Git tab first.",
+                        "{} requires GitHub. Enable GitHub syncing for this project first.",
                         skill.name
                     ));
                 }
@@ -59,7 +59,7 @@ pub async fn run(args: crate::SkillArgs) -> Result<()> {
         }
         if publication == Some(false) {
             return Err(anyhow!(
-                "Only bundled local-safe skills are available while this project is local-only. Enable GitHub in the Git tab before loading remote references."
+                "Only bundled local-safe skills are available while this project is local-only. Enable GitHub syncing for this project before loading remote references."
             ));
         }
         // Otherwise fetch the canonical doc from the API (same docs the assistant
@@ -74,7 +74,7 @@ pub async fn run(args: crate::SkillArgs) -> Result<()> {
     // list API-fetchable deep references (best effort — skip if unreachable).
     if publication == Some(false) {
         println!(
-            "OpenResearch local-only skills. Commit experiment branches locally and run them on this machine. GitHub and external compute remain unavailable until the user enables GitHub in the Git tab."
+            "OpenResearch local-only skills. Commit experiment branches locally and run them on this machine. GitHub and external compute remain unavailable until the user enables GitHub syncing for this project."
         );
     } else {
         println!("{}", SKILL_MD);
@@ -112,4 +112,12 @@ pub async fn run(args: crate::SkillArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn bundled_overview_avoids_openresearch_ui_navigation() {
+        crate::local::assert_agent_guidance_is_ui_agnostic("orx skill overview", super::SKILL_MD);
+    }
 }

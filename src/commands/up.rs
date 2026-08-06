@@ -1800,7 +1800,7 @@ fn spawn_agent_preflight() {
         eprintln!("orx up: agents: {}", line.join(" · "));
         if !harnesses.iter().any(|h| h.agent_ready) {
             eprintln!(
-                "orx up: warning: no coding agent detected — install Claude Code, Codex or opencode and sign in to chat in the dashboard."
+                "orx up: warning: no coding agent detected — install Claude Code, Codex or OpenCode and sign in to at least one of them."
             );
         }
     });

@@ -589,7 +589,7 @@ fn plan_auto_policy(tool_name: &str, tool_input: &Value) -> Option<PermissionDec
         }),
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => Some(PermissionDecision::deny(
             "File edits are blocked in plan mode. Present your plan with the \
-             ExitPlanMode tool; the user approves it from the plan card.",
+             ExitPlanMode tool so the user can approve it before implementation.",
         )),
         _ => None,
     }

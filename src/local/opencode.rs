@@ -147,7 +147,7 @@ fn playbook_md(project: &LocalProject) -> String {
              from; `orx paper {p}` fetches its report\n"
         )
     });
-    // The default compute target (Settings → Compute) is read fresh on every
+    // The default compute target is read fresh on every
     // playbook rewrite, but how soon a rewrite reaches a live agent varies:
     // claude reads it at child spawn, so a rewrite reaches the agent on the next
     // respawn (config change / interrupt / crash), not every turn; codex only on
@@ -172,7 +172,7 @@ fn playbook_md(project: &LocalProject) -> String {
         "the local fallback"
     };
     let compute_bullet = if !project.github_enabled() {
-        "- Compute: **local only** — run recorded commits on this machine. External backends remain unavailable until the user enables GitHub in the Git tab."
+        "- Compute: **local only** — run recorded commits on this machine. External backends remain unavailable until the user enables GitHub syncing for this project."
             .to_string()
     } else {
         match &compute_default {
@@ -254,7 +254,7 @@ fn playbook_md(project: &LocalProject) -> String {
         "local runs, tree shaping, local git recipes, log analysis, and artifact naming"
     };
     let launch_step = if !project.github_enabled() {
-        "3. **Launch locally**: `orx exp run <expId> --backend local`. External backends are unavailable until the user enables GitHub in the Git tab."
+        "3. **Launch locally**: `orx exp run <expId> --backend local`. External backends are unavailable until the user enables GitHub syncing for this project."
     } else if compute_default.is_some() {
         "3. **Launch**: `orx exp run <expId>` — omitting `--backend` uses the default\n   \
          target (flags the default still needs are listed under \"Compute backends\") —\n   \
@@ -779,5 +779,16 @@ mod tests {
         assert!(md.contains("`orx exp run <expId> --backend local`"));
         assert!(!md.contains("orx-compute-k8s"));
         assert!(!md.contains("--backend <hf|modal"));
+    }
+
+    #[test]
+    fn playbook_avoids_ui_navigation() {
+        let mut local_only = sample_project();
+        local_only.github_owner.clear();
+        local_only.github_repo.clear();
+
+        for md in [sample_playbook(), playbook_md(&local_only)] {
+            crate::local::assert_agent_guidance_is_ui_agnostic("playbook", &md);
+        }
     }
 }

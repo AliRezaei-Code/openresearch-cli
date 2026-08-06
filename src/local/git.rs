@@ -745,7 +745,7 @@ fn publication_remote(repo_path: &Path, owner: &str, repo: &str) -> Result<Strin
         }
     }
     Err(anyhow!(
-        "This project has no remote matching github.com/{owner}/{repo}. Retry GitHub enablement from the Git tab."
+        "This project has no remote matching github.com/{owner}/{repo}. Retry enabling GitHub syncing for this project."
     ))
 }
 
@@ -1056,7 +1056,7 @@ pub fn publish_branch_commit(
 ) -> Result<String> {
     if !project.github_enabled() {
         return Err(anyhow!(
-            "Remote compute requires this project's GitHub repository. Enable GitHub from the Git tab, then retry."
+            "Remote compute requires this project's GitHub repository. Enable GitHub syncing for this project, then retry."
         ));
     }
     let repo_path = Path::new(&project.repo_path);
@@ -1086,7 +1086,7 @@ pub fn publish_branch_commit(
         .any(|line| line == format!("{commit_sha}\t{reference}"))
     {
         return Err(anyhow!(
-            "The recorded commit cannot be cloned through the HTTPS credentials used by remote jobs. Connect a GitHub token with access to {}/{} in the Git tab.",
+            "The recorded commit cannot be cloned through the HTTPS credentials used by remote jobs. Connect a GitHub token with access to {}/{}.",
             project.github_owner,
             project.github_repo
         ));

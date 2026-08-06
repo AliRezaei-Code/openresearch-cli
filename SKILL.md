@@ -12,8 +12,7 @@ tree, runs, logs, artifacts, evidence database) and **write actions**
 `orx` does not serve: every experiment is a git branch on the project's GitHub
 repo, and the **local clone in `~/.cache/openresearch/repos/<owner>/<repo>` is
 the standard way to read, diff, and edit it** (see the `orx-git` module). Use
-`orx` when you need to inspect or drive project state from a shell instead of the
-web UI.
+`orx` when you need to inspect or drive project state from a shell.
 
 This overview is deliberately short: it carries the cardinal rules and a command
 quick-reference, then points at focused **modules** for everything else. Load a

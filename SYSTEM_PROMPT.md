@@ -26,7 +26,7 @@ same clone, sharing its branches and remotes.
 - Baseline branch: `{baseline}`
 {paper_line}{compute_bullet}
 - Artifacts directory: `{artifacts}` — durable project outputs such as reports,
-  figures, images, CSVs, and PDFs appear in the dashboard's Artifacts tab
+  figures, images, CSVs, and PDFs are stored as project artifacts
 
 ## Start here
 
@@ -114,7 +114,7 @@ preferences.
 5. **Launch all compute via `orx exp run` — never `hf jobs`, `modal`, `kubectl`, raw `ssh`, or a training command in your own shell.** Your worktree is the edit
    box (git, code edits, `orx` orchestration, lightweight checks); anything that
    trains, evaluates, or produces results goes through `orx exp run`. Direct
-   jobs are unsupervised, invisible to the dashboard, run whatever happens to
+   jobs are unsupervised, untracked by OpenResearch, run whatever happens to
    be in your checkout instead of the branch tip, and block your turn.
 6. **Never merge or rebase a branch once its node is frozen.** That history is
    the code its measurement came from — leave it as it ran. To bring in changes
@@ -186,17 +186,17 @@ monitors — any process you background dies when your turn ends, so "I'll keep
 watching the run" is not something you can do. While a run you launched is in
 flight, the wait loop above IS your job: stay in it, and end your turn only
 once you've read the result and acted on it. (If your turn does end early,
-the dashboard injects an `[orx]` message when a run completes — treat it as
+OpenResearch injects an `[orx]` message when a run completes — treat it as
 the wake-up to reconcile and continue the loop.)
 
 ## Referencing files
 
-When you point the reader at a repo source file in chat, wrap it so they can
-open it in the dashboard's file viewer: `<file path="relative/path.py" />`, or
-with a line target `<file path="relative/path.py" lines="20-40" />`. Use
-repo-relative paths (from the worktree root), not absolute paths. Reach for this
-whenever you'd otherwise write a bare file path or a markdown link to a file —
-the file you edited, the entrypoint you're describing, the config you changed.
+When you point the reader at a repo source file in chat, wrap it so OpenResearch
+can link it to the project: `<file path="relative/path.py" />`, or with a line
+target `<file path="relative/path.py" lines="20-40" />`. Use repo-relative paths
+(from the worktree root), not absolute paths. Reach for this whenever you'd
+otherwise write a bare file path or a markdown link to a file — the file you
+edited, the entrypoint you're describing, the config you changed.
 
 ## Compute backends
 
@@ -206,10 +206,10 @@ the file you edited, the entrypoint you're describing, the config you changed.
 
 ## Asking the user
 
-Interactive prompt tools surface as cards in the chat UI — they do not hang.
 If your harness provides a question tool (e.g. AskUserQuestion), use it for
-decisions with concrete options; otherwise ask in normal text and **end your
-turn**, and the user replies in their next message.
+decisions with concrete options; it returns control to the user rather than
+hanging the session. Otherwise ask in normal text and **end your turn**, and the
+user replies in their next message.
 
 Repair is capped: after **two** consecutive runs answering nothing on the
 same node, stop and ask the user about their setup — different errors still
@@ -218,6 +218,5 @@ diagnosis and carry on with other nodes rather than ending the session
 (**`orx-experiment-tree`**: the repair cap).
 
 **Plan mode:** always present your finished plan by calling the ExitPlanMode
-tool — never as plain chat text. The plan card is how the user approves the
-plan and unlocks execution; a plan left in chat text strands the session in
-plan mode.
+tool — never as plain chat text. That tool is the approval boundary that unlocks
+execution; a plan left in chat text strands the session in plan mode.

@@ -59,21 +59,22 @@ Rules and notes:
 
 ## The default compute target (local projects)
 
-The user may set a **default compute target** in the `orx up` dashboard
-(Settings → Compute → Make default); it is machine-wide and applies to every
-local project. When one is set, `orx exp run <expId>` with no `--backend`
-launches there, with the saved default flavor — omitting the flag is how you
-use it (flavor-required backends still need `--flavor` if no default flavor
-is saved). When none is set, local launches require an explicit `--backend`; the
-compute choice is the user's, so ask. Server projects are unaffected: managed
-compute (`--gpu`/`--cpu`/`--sandbox`) stays their default.
+A local-only project always launches on this machine with the `local` backend.
+After GitHub syncing is enabled, local projects can also use remote backends;
+the user may configure a **default compute target** that is machine-wide and
+shared by those projects. When one is set, `orx exp run <expId>` with no
+`--backend` launches there with the saved default flavor — omitting the flag is
+how you use it (flavor-required backends still need `--flavor` if no default
+flavor is saved). When none is set, ask the user to choose an explicit backend.
+Server projects are unaffected: managed compute (`--gpu`/`--cpu`/`--sandbox`)
+stays their default.
 
 ## Running on Hugging Face Jobs — `--backend hf`
 
 **Managed compute (`--gpu`/`--cpu`/`--sandbox`) is the default. Use
 `--backend hf` ONLY when the user explicitly asks for Hugging Face Jobs**
 (e.g. "run this on HF", "use my huggingface account"), it is the configured
-default target (orx up Settings → Compute), or the project context says to
+default target, or the project context says to
 prefer it. A connected HF token by itself is NOT a signal to switch — it just
 means the option exists. When in doubt, launch on managed compute.
 
@@ -106,8 +107,8 @@ Rules and notes:
   flavors, `python:3.12` on cpu flavors). Pick an image with your deps baked
   in when pip-install time dominates the run.
 - Everything downstream is identical: the run appears in the tree, `orx exp
-  wait` / `orx runs` / `orx logs` work unchanged, and cancel from the web or
-  `orx exp cancel` reaches the job within a few seconds. A detached
+  wait` / `orx runs` / `orx logs` work unchanged, and cancellation through
+  OpenResearch or `orx exp cancel` reaches the job within a few seconds. A detached
   `orx supervise` process mirrors status and logs; don't kill it.
 
 ## Running on Modal — `--backend modal`
@@ -145,7 +146,7 @@ Rules and notes:
   flavors, `python:3.12` on cpu). Pick one with your deps baked in when
   pip-install time dominates.
 - Everything downstream is identical (`orx exp wait` / `orx runs` / `orx logs`,
-  cancel from web or `orx exp cancel`). A detached `orx supervise` mirrors
+  cancellation through OpenResearch or `orx exp cancel`). A detached `orx supervise` mirrors
   status and logs; don't kill it.
 
 ## Running on your Kubernetes cluster — `--backend k8s`
@@ -169,8 +170,8 @@ orx exp run <expId> --backend ssh --host my-gpu-box     # ~/.ssh/config alias
 
 Rules and notes:
 - **`--host` is the ssh host alias** (from `~/.ssh/config`) — a machine, not a
-  hardware shape, so there is no `--flavor` here. See `orx up` Settings →
-  Compute → SSH (each host has a "Test" button that checks reachability + git).
+  hardware shape, so there is no `--flavor` here. Use one of the user's
+  configured aliases; OpenResearch validates reachability and git separately.
 - Auth is your ssh keys/agent — orx never reads a key, it just shells out to
   `ssh <alias>`. The host needs `git` and `bash`; it clones the experiment
   branch's GitHub tip (private repos via the `GITHUB_TOKEN` passed in the run's
@@ -178,7 +179,7 @@ Rules and notes:
 - No `--image` (the host's environment is used as-is) and no `--timeout` (the
   process runs until it exits or you cancel).
 - The run lives under `~/.orx/runs/<runId>/` on the host (`run.sh`, `log`,
-  `pid`, `exit_code`). Cancel from the web or `orx exp cancel` kills the remote
+  `pid`, `exit_code`). Cancellation through OpenResearch or `orx exp cancel` kills the remote
   process group. Everything downstream (`orx exp wait` / `runs` / `logs`) is
   identical; a detached `orx supervise` polls it over ssh — don't kill it.
 
@@ -197,7 +198,7 @@ orx exp run <expId> --backend slurm                    # CPU-only, settings defa
 
 Rules and notes:
 - **`--host` is the login node's `~/.ssh/config` alias**; omit it to use the
-  default from the slurm settings (`orx up` Settings → Compute → Slurm).
+  configured Slurm default.
 - **`--flavor` is a GRES GPU request** (`h100:2` = two H100s) — omit it for a
   CPU-only job. There is no `--image`; the job runs in the cluster's own
   environment (modules, conda, whatever the login profile provides).
@@ -223,7 +224,7 @@ orx exp run <expId> --backend ray --flavor cpu:2,mem:8GiB
 ```
 
 Rules and notes:
-- **Address** comes from Settings → Compute → Ray, else
+- **Address** comes from the user's saved Ray configuration, else
   `ASTROAI_RAY_JOBS_ADDRESS` / `RAY_DASHBOARD_URL`, else
   `http://127.0.0.1:8265` (a local Ray head).
 - **`--flavor` is optional** entrypoint resource hints: `cpu[:N]`, `gpu[:N]`,
@@ -281,18 +282,17 @@ Rules and notes:
 - Same clone contract as every backend: the run clones the experiment
   branch's GitHub tip into its own run dir (never your checkout) and runs the
   fixed command — commit and push first. Never run training directly in your
-  shell instead: that would be unsupervised and invisible to the dashboard.
+  shell instead: that would be unsupervised and untracked by OpenResearch.
 - The run lives under `<orx data dir>/local-runs/<runId>/` (`run.sh`, `log`,
-  `pid`, `exit_code`). Cancel from the web or `orx exp cancel` TERMs the
+  `pid`, `exit_code`). Cancellation through OpenResearch or `orx exp cancel` TERMs the
   process group. Everything downstream (`orx exp wait` / `orx runs` / `orx logs`) is
   identical; a detached `orx supervise` watches it — don't kill it.
 
 ## Spinning up a standalone instance — `orx instance create`
 
 Provision a persistent instance in an **organization**, not tied to any
-experiment — the CLI equivalent of the dashboard's org "Spin up" panel. Use this
-for ad-hoc/manual compute (you SSH in yourself); experiment runs use `orx exp run`
-instead.
+experiment. Use this for ad-hoc/manual compute (you SSH in yourself); experiment
+runs use `orx exp run` instead.
 
 ```sh
 orx instance create <orgId> --gpu H100_SXM --count 1 [--disk 100]   # GPU box (cheapest provider)

@@ -7,7 +7,7 @@ description: "Run an experiment on your own Kubernetes cluster (`orx exp run --b
 cluster** ("run this on k8s", "use our cluster") or it is the configured
 default target. Local projects (`orx up`) only for now. Auth comes from the
 local kubeconfig — orx never stores cluster credentials; the context/namespace
-live in `orx up` Settings → Compute.
+come from the user's configured Kubernetes profile.
 
 **There are no flavors: the run's shape is a Kubernetes manifest you commit
 on the experiment branch** (default `.orx/k8s.yaml`, or `--manifest <path>`).

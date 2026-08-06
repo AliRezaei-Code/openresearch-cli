@@ -72,8 +72,8 @@ orx paper 2401.12345v2 --full                             # alphaXiv full extrac
 - Override hosts with `ALPHAXIV_API_URL`/`ALPHAXIV_WEB_URL` (alphaXiv),
   `OPENALEX_API_URL`, or `BIORXIV_API_URL` if you ever need to point elsewhere;
   `OPENALEX_MAILTO` sets the contact OpenAlex's polite pool wants.
-- **Sources can be turned off** in the dashboard's Settings → Literature sources.
-  A disabled source makes `orx lit --source <it>` / `orx paper <its id>` exit
+- **Sources can be turned off** by the user. A disabled source makes `orx lit
+  --source <it>` / `orx paper <its id>` exit
   non-zero with a hint; bare `orx lit` uses the first enabled source. Getting that
   error means the user disabled it — respect the choice, don't work around it.
 

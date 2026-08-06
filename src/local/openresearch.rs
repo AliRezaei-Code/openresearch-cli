@@ -88,7 +88,7 @@ pub async fn submit_local_openresearch(args: &crate::ExpRunArgs) -> Result<Store
             match orgs.len() {
                 0 => {
                     return Err(anyhow!(
-                        "You belong to no org — create one in the dashboard."
+                        "You belong to no organization — create an OpenResearch organization first."
                     ))
                 }
                 1 => orgs[0].id.clone(),
@@ -150,9 +150,8 @@ pub async fn submit_local_openresearch(args: &crate::ExpRunArgs) -> Result<Store
         .ok_or_else(|| {
             anyhow!(
                 "No run command set for this experiment or its project. Set the project \
-                 default with `orx project edit {} --run-command '<cmd>'`, pass \
-                 `--run-command '<cmd>'` to `orx create-experiment`, or set it in the \
-                 dashboard — then relaunch.",
+                 default with `orx project edit {} --run-command '<cmd>'`, or pass \
+                 `--run-command '<cmd>'` to `orx create-experiment` — then relaunch.",
                 project.id
             )
         })?;
@@ -241,7 +240,7 @@ pub async fn submit_local_openresearch(args: &crate::ExpRunArgs) -> Result<Store
         if let Err(td) = openresearch::teardown(&creds, &sandbox.id).await {
             eprintln!(
                 "warning: box {} could not be torn down ({td}) — delete it with \
-                 `orx instance delete {}` or from the dashboard.",
+                 `orx instance delete {}` or through OpenResearch.",
                 sandbox.id, sandbox.id
             );
         }

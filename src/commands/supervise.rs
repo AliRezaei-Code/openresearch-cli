@@ -926,7 +926,7 @@ async fn run_openresearch(
                 &format!(
                     "The supervisor found no OpenResearch credentials (`orx login`), so it \
                      could not manage box {sandbox_id} — the box may still be running; \
-                     delete it from the dashboard."
+                     delete it through OpenResearch."
                 ),
             )?;
             return Err(anyhow!("no credentials for the openresearch backend"));
@@ -1091,8 +1091,8 @@ async fn teardown_box(store: &Store, creds: &Credentials, sandbox_id: &str, run_
                 .unwrap_or_default();
             let hint = format!(
                 "\n\n> **Warning**: box {sandbox_id} could not be torn down ({err}) — it is \
-                 still billing. Delete it with `orx instance delete {sandbox_id}` or from the \
-                 dashboard."
+                 still billing. Delete it with `orx instance delete {sandbox_id}` or through \
+                 OpenResearch."
             );
             let _ = store.set_result_markdown(run_id, &format!("{existing}{hint}"));
         }

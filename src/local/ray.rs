@@ -45,8 +45,8 @@ pub async fn submit_local_ray(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     }
     if args.host.is_some() {
         return Err(anyhow!(
-            "--host only applies with --backend ssh/slurm. Set the Ray Jobs URL in \
-             Settings → Compute → Ray (or ASTROAI_RAY_JOBS_ADDRESS / RAY_DASHBOARD_URL)."
+            "--host only applies with --backend ssh/slurm. Save the Ray Jobs URL in \
+             OpenResearch or set ASTROAI_RAY_JOBS_ADDRESS / RAY_DASHBOARD_URL."
         ));
     }
     if args.manifest.is_some() {
@@ -78,9 +78,8 @@ pub async fn submit_local_ray(args: &crate::ExpRunArgs) -> Result<StoredRun> {
         .ok_or_else(|| {
             anyhow!(
                 "No run command set for this experiment or its project. Set the project \
-                 default with `orx project edit {} --run-command '<cmd>'`, pass \
-                 `--run-command '<cmd>'` to `orx create-experiment`, or set it in the \
-                 dashboard — then relaunch.",
+                 default with `orx project edit {} --run-command '<cmd>'`, or pass \
+                 `--run-command '<cmd>'` to `orx create-experiment` — then relaunch.",
                 project.id
             )
         })?;
@@ -105,7 +104,7 @@ pub async fn submit_local_ray(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     ray::preflight(&address).await.map_err(|e| {
         anyhow!(
             "{e}\n\
-             Set the Jobs URL in Settings → Compute → Ray, or export \
+             Save the Jobs URL in OpenResearch, or export \
              ASTROAI_RAY_JOBS_ADDRESS / RAY_DASHBOARD_URL."
         )
     })?;

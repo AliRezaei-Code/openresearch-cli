@@ -53,8 +53,8 @@ pub async fn submit_local_ssh(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     }
     let host = args.host.clone().ok_or_else(|| {
         anyhow!(
-            "--backend ssh requires --host <alias>: an ~/.ssh/config alias to run on \
-             (see `orx up` Settings → Compute → SSH). The host needs git and bash."
+            "--backend ssh requires --host <alias> from the user's ~/.ssh/config. \
+             The host needs git and bash."
         )
     })?;
 
@@ -74,9 +74,8 @@ pub async fn submit_local_ssh(args: &crate::ExpRunArgs) -> Result<StoredRun> {
         .ok_or_else(|| {
             anyhow!(
                 "No run command set for this experiment or its project. Set the project \
-                 default with `orx project edit {} --run-command '<cmd>'`, pass \
-                 `--run-command '<cmd>'` to `orx create-experiment`, or set it in the \
-                 dashboard — then relaunch.",
+                 default with `orx project edit {} --run-command '<cmd>'`, or pass \
+                 `--run-command '<cmd>'` to `orx create-experiment` — then relaunch.",
                 project.id
             )
         })?;

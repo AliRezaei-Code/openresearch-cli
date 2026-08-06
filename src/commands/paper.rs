@@ -30,12 +30,12 @@ pub async fn run(args: crate::PaperArgs) -> Result<()> {
     }
 }
 
-/// A disabled source (Settings → Literature sources) refuses to fetch too, so a
+/// A source disabled by the user refuses to fetch too, so a
 /// source turned off is off everywhere — the same gate `orx lit` applies.
 fn ensure_source_enabled(source: LitSource, disabled: &[String]) -> Result<()> {
     if disabled.iter().any(|d| d == source.as_str()) {
         return Err(anyhow!(
-            "{} is disabled in Settings → Literature sources. Re-enable it to fetch this paper.",
+            "{} is disabled by your OpenResearch literature-source configuration. Re-enable it to fetch this paper.",
             source.display_name()
         ));
     }
