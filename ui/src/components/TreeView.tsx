@@ -11,7 +11,14 @@ import {
 import { Ellipsis, FolderTree, GitBranch, Terminal } from "lucide-react";
 import { GitHubMark } from "./BackendLogos";
 import { memo, useMemo, useRef } from "react";
-import { githubBranchUrl, timeAgo, type Experiment, type Project, type Run } from "../api";
+import {
+  githubBranchUrl,
+  runDisplayStatus,
+  timeAgo,
+  type Experiment,
+  type Project,
+  type Run,
+} from "../api";
 import type { ExperimentView } from "./DetailDrawer";
 import type { CodeView } from "./CodeTab";
 import { ExpHoverCard, dismissTreeHoverCards, useHoverIntent } from "./ExpHoverCard";
@@ -151,14 +158,14 @@ function subtreeWidth(node: DisplayNode): number {
 function runSquareClass(status: string): string {
   if (status === "done") return "pass";
   if (status === "failed") return "fail";
-  if (status === "running" || status === "starting") return "live";
+  if (status === "running" || status === "starting" || status === "cancelling") return "live";
   return "other";
 }
 
 const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
   const { exp, latestRun, runs, isBaseline, parentSlug, githubOwner, githubRepo, onOpenView, onOpenCode } = data;
-  const status = latestRun?.status;
-  const live = status === "running" || status === "starting";
+  const status = latestRun ? runDisplayStatus(latestRun) : undefined;
+  const live = status === "running" || status === "starting" || status === "cancelling";
   const kind = isBaseline ? "Baseline" : live ? "Running" : "Experiment";
   const squares = runs.slice(-MAX_SQUARES);
 
@@ -203,7 +210,11 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
           {squares.length > 0 ? (
             <span className="run-squares">
               {squares.map((run) => (
-                <span key={run.id} className={`run-sq ${runSquareClass(run.status)}`} title={run.status} />
+                <span
+                  key={run.id}
+                  className={`run-sq ${runSquareClass(runDisplayStatus(run))}`}
+                  title={runDisplayStatus(run)}
+                />
               ))}
             </span>
           ) : (

@@ -611,6 +611,7 @@ textarea::placeholder {
 .st-starting .dot {
   color: var(--accent-amber);
 }
+.st-cancelling .dot,
 .st-cancelled .dot {
   color: var(--accent-orange);
 }
@@ -2215,6 +2216,12 @@ textarea::placeholder {
   inset: 0;
   overflow: auto;
   background: var(--base);
+}
+.runs-table-error {
+  padding: 8px 12px;
+  color: var(--accent-red);
+  font-size: var(--fs-sm);
+  border-bottom: 1px solid var(--border);
 }
 .runs-table {
   width: 100%;

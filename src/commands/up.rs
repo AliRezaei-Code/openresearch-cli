@@ -41,7 +41,16 @@ pub async fn run(args: UpArgs) -> Result<()> {
         .await
         .map_err(|e| anyhow!("Could not bind 127.0.0.1:{}: {}", port, e))?;
     // Open early so the schema exists before any request or agent spawn.
-    Store::open()?;
+    {
+        let store = Store::open()?;
+        for run in store.list_active_runs()? {
+            if store.get_local_experiment(&run.experiment_id)?.is_some() {
+                if let Err(err) = crate::commands::exp::spawn_detached_supervise(&run.id) {
+                    eprintln!("could not recover supervisor for run {}: {err}", run.id);
+                }
+            }
+        }
+    }
 
     // Harnesses spawn lazily on the first message to one of their sessions;
     // no eager agent bring-up. (--no-agent is now a no-op kept for compat.)
@@ -401,7 +410,7 @@ type ApiResult = std::result::Result<Json<Value>, ApiError>;
 // --- wire types -----------------------------------------------------------
 
 /// The Run entity the API serves: StoredRun with `backend_json` parsed into an
-/// object and internal fields (cancel intent) dropped.
+/// object and cancellation intent exposed for pending UI state.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiRun {
@@ -423,6 +432,7 @@ struct ApiRun {
     ended_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     exit_code: Option<i64>,
+    cancel_requested: bool,
 }
 
 impl From<&StoredRun> for ApiRun {
@@ -440,6 +450,7 @@ impl From<&StoredRun> for ApiRun {
             updated_at: run.updated_at,
             ended_at: run.ended_at,
             exit_code: run.exit_code,
+            cancel_requested: run.cancel_requested,
         }
     }
 }
@@ -1070,8 +1081,18 @@ async fn delete_project(State(state): State<AppState>, Path(id): Path<String>) -
         .filter(|r| !is_terminal(&r.status))
         .collect();
     if !in_flight.is_empty() {
+        let mut failures = Vec::new();
         for run in &in_flight {
-            let _ = store.set_cancel_requested(&run.id, true);
+            if let Err(err) = crate::commands::exp::request_local_run_cancel(&store, &run.id) {
+                failures.push(format!("{}: {err}", run.id));
+            }
+        }
+        if !failures.is_empty() {
+            let requested = in_flight.len() - failures.len();
+            return Err(bad_request(format!(
+                "{requested} run(s) cancellation requested; cancellation failed for {}",
+                failures.join(", ")
+            )));
         }
         return Err(bad_request(format!(
             "{} run(s) still in flight — cancellation requested; retry once they stop",
@@ -1161,7 +1182,7 @@ async fn cancel_run(Path(id): Path<String>) -> ApiResult {
     if is_terminal(&run.status) {
         return Err(bad_request(format!("run already {}", run.status)));
     }
-    store.set_cancel_requested(&run.id, true)?;
+    crate::commands::exp::request_local_run_cancel(&store, &run.id)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -3833,6 +3854,29 @@ async fn spa(uri: Uri) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_run_exposes_cancel_intent() {
+        let run = StoredRun {
+            id: "run-1".into(),
+            experiment_id: "experiment-1".into(),
+            project_id: "project-1".into(),
+            status: "running".into(),
+            backend_json: "{}".into(),
+            command: String::new(),
+            created_at: 1,
+            updated_at: 2,
+            ended_at: None,
+            exit_code: None,
+            commit_sha: None,
+            result_markdown: None,
+            cancel_requested: true,
+            chat_session_id: None,
+        };
+
+        let value = serde_json::to_value(ApiRun::from(&run)).unwrap();
+        assert_eq!(value["cancelRequested"], true);
+    }
 
     #[test]
     fn project_json_exposes_artifacts_dir_with_legacy_alias() {

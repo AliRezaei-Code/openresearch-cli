@@ -9,6 +9,7 @@ import {
 import { useEffect, useState } from "react";
 import {
   fmtDuration,
+  runDisplayStatus,
   timeAgo,
   type Experiment,
   type Project,
@@ -71,7 +72,7 @@ export function ExperimentOverview({
             <h1>{experiment.title || experiment.slug}</h1>
             <div className="experiment-overview-slug">{experiment.slug}</div>
           </div>
-          <StatusBadge status={latestRun?.status ?? "idle"} />
+          <StatusBadge status={latestRun ? runDisplayStatus(latestRun) : "idle"} />
         </header>
 
         <div className="experiment-overview-actions">
@@ -106,7 +107,7 @@ export function ExperimentOverview({
           {latestRun && (
             <>
               <div className="experiment-overview-meta">
-                <StatusBadge status={latestRun.status} />
+                <StatusBadge status={runDisplayStatus(latestRun)} />
                 <BackendBadge backend={latestRun.backend} />
                 <span title="Started">
                   <CalendarDays size={13} />
@@ -171,7 +172,7 @@ export function ExperimentOverview({
               {runs.map((run, index) => (
                 <button key={run.id} onClick={() => onOpenLogs(run.id)}>
                   <span className="experiment-run-number">Run {runs.length - index}</span>
-                  <StatusBadge status={run.status} />
+                  <StatusBadge status={runDisplayStatus(run)} />
                   <span>{timeAgo(run.createdAt)}</span>
                   <span>{runDuration(run, now)}</span>
                   <Terminal size={13} />
