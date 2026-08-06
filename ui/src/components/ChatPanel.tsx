@@ -52,6 +52,7 @@ import {
   type SkillInfo,
 } from "../api";
 import { onChatEvent } from "../events";
+import { LitSourceLogo, LIT_SOURCE_NAME, parseOrxLit } from "./LitSourceLogo";
 import { Md } from "./Md";
 import { PlanStrip } from "./PlanStrip";
 import { SETTINGS_NAV, type SettingsTab } from "./SettingsPage";
@@ -275,6 +276,34 @@ function toolLine(part: ChatPart): string {
   }
 }
 
+/** Richer summary for the tool row: `orx lit`/`orx paper` Bash calls render as a
+ * real search (source logo + natural language) instead of raw shell output.
+ * Everything else falls back to the plain `toolLine` string. */
+function toolSummary(part: ChatPart): React.ReactNode {
+  if (part.tool === "Bash" || part.tool === "bash") {
+    const cmd = part.state?.input?.command;
+    const call = typeof cmd === "string" ? parseOrxLit(cmd) : null;
+    if (call) {
+      const name = LIT_SOURCE_NAME[call.source];
+      const text =
+        call.kind === "lit"
+          ? call.query
+            ? `Searching ${name} for “${call.query}”`
+            : `Searching ${name}`
+          : call.id
+            ? `Reading ${call.id} on ${name}`
+            : `Reading a paper on ${name}`;
+      return (
+        <span className="tool-lit">
+          <LitSourceLogo source={call.source} />
+          <span className="tool-lit-text">{text}</span>
+        </span>
+      );
+    }
+  }
+  return toolLine(part);
+}
+
 /** Readable one-liner for a Codex sub-agent spawn/activity row, from the
  * collab item fields the backend put in `state.input`. */
 function subagentLine(input: Record<string, unknown>): string {
@@ -316,7 +345,7 @@ function ToolRow({ part, onOpenFile }: { part: ChatPart; onOpenFile?: (path: str
     <details className="tool-row" open={false}>
       <summary>
         <span className={toolStatusClass(state?.status)} />
-        <span className="tool-line">{toolLine(part)}</span>
+        <span className="tool-line">{toolSummary(part)}</span>
         {filePath && onOpenFile && (
           <button
             className="tool-open file-link"
