@@ -1225,6 +1225,11 @@ textarea::placeholder {
   padding-left: 10px;
   border-left: 1px solid var(--border-variant);
 }
+/* Grouped rows sit under the group's own status dot + indent rule, so the
+   per-row dot is redundant noise — the summary line carries the state. */
+.tool-group-rows .tool-status {
+  display: none;
+}
 /* A sub-agent spawn row: one clickable line that opens the transcript in the
    right panel (never expands inline). Sized like the transcript body text. */
 .subagent-row {
