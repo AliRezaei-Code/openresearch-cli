@@ -59,14 +59,15 @@ Rules and notes:
 
 ## The default compute target (local projects)
 
-The user may configure a **default compute target** for local projects; it is
-machine-wide and applies to every local project. When one is set, `orx exp run
-<expId>` with no `--backend`
-launches there, with the saved default flavor — omitting the flag is how you
-use it (flavor-required backends still need `--flavor` if no default flavor
-is saved). When none is set, local launches require an explicit `--backend`; the
-compute choice is the user's, so ask. Server projects are unaffected: managed
-compute (`--gpu`/`--cpu`/`--sandbox`) stays their default.
+A local-only project always launches on this machine with the `local` backend.
+After GitHub syncing is enabled, local projects can also use remote backends;
+the user may configure a **default compute target** that is machine-wide and
+shared by those projects. When one is set, `orx exp run <expId>` with no
+`--backend` launches there with the saved default flavor — omitting the flag is
+how you use it (flavor-required backends still need `--flavor` if no default
+flavor is saved). When none is set, ask the user to choose an explicit backend.
+Server projects are unaffected: managed compute (`--gpu`/`--cpu`/`--sandbox`)
+stays their default.
 
 ## Running on Hugging Face Jobs — `--backend hf`
 
