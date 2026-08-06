@@ -61,6 +61,35 @@ function detectPaperSource(id: string): LitSource {
   return "alphaxiv";
 }
 
+/** Bare DOI (`10.<registrant>/<suffix>`) out of an id or URL, or null. Strips a
+ * trailing bioRxiv content-URL suffix (`v2`, `v2.full`, `v2.full.pdf`) so the DOI
+ * resolves on doi.org. */
+function doiFrom(id: string): string | null {
+  const s = id.trim().replace(/^https?:\/\/doi\.org\//i, "").replace(/^doi:/i, "");
+  const m = s.match(/10\.\d+\/[^\s?#]+/);
+  if (!m) return null;
+  return m[0].replace(/[.,)]+$/, "").replace(/v\d+(\.[a-z][a-z-]*)*$/i, "");
+}
+
+/** The public page to open for a fetched paper, on its own source: alphaXiv for
+ * arXiv ids, the resolving DOI (→ bioRxiv) for bioRxiv, and the DOI or the
+ * OpenAlex work page for OpenAlex. */
+export function paperUrl(source: LitSource, id: string): string {
+  const s = id.trim();
+  if (source === "alphaxiv") {
+    const last = s.split(/[?#]/)[0].split("/").pop() || s;
+    const arxivId = last.replace(/\.(pdf|md)$/i, "");
+    return `https://www.alphaxiv.org/abs/${encodeURIComponent(arxivId)}`;
+  }
+  const doi = doiFrom(s);
+  if (doi) return `https://doi.org/${doi}`;
+  if (source === "openalex") {
+    const wid = s.split("/").pop() || s;
+    return `https://openalex.org/${encodeURIComponent(wid)}`;
+  }
+  return `https://doi.org/${s}`;
+}
+
 /** Tokenize the args after `orx lit`/`orx paper`, respecting quotes and
  * stopping at a shell operator (`|`, `;`, `>`, `&`). */
 function tokenizeArgs(s: string): string[] {

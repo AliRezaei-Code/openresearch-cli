@@ -1,4 +1,5 @@
 import {
+  ArrowUpRight,
   Check,
   ChevronRight,
   CornerDownLeft,
@@ -52,7 +53,7 @@ import {
   type SkillInfo,
 } from "../api";
 import { onChatEvent } from "../events";
-import { LitSourceLogo, LIT_SOURCE_NAME, parseOrxLit } from "./LitSourceLogo";
+import { LitSourceLogo, LIT_SOURCE_NAME, parseOrxLit, paperUrl } from "./LitSourceLogo";
 import { Md } from "./Md";
 import { PlanStrip } from "./PlanStrip";
 import { SETTINGS_NAV, type SettingsTab } from "./SettingsPage";
@@ -293,10 +294,29 @@ function toolSummary(part: ChatPart): React.ReactNode {
           : call.id
             ? `Reading ${call.id} on ${name}`
             : `Reading a paper on ${name}`;
+      // A fetched paper links out to its page on the source (with an external-link
+      // affordance so it reads as clickable); the search rows are plain text. The
+      // anchor is the click's activation target, so it navigates without toggling
+      // the row open — stopPropagation just guards against any future row handler.
+      const body =
+        call.kind === "paper" && call.id ? (
+          <a
+            className="tool-lit-link"
+            href={paperUrl(call.source, call.id)}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <span className="tool-lit-text">{text}</span>
+            <ArrowUpRight className="tool-lit-ext" size={13} aria-hidden="true" />
+          </a>
+        ) : (
+          <span className="tool-lit-text">{text}</span>
+        );
       return (
         <span className="tool-lit">
           <LitSourceLogo source={call.source} />
-          <span className="tool-lit-text">{text}</span>
+          {body}
         </span>
       );
     }

@@ -1315,6 +1315,29 @@ textarea::placeholder {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* A fetched paper links out to its source page. The trailing arrow is a resting
+   affordance (the row is also expandable), and the whole link goes primary on hover. */
+.tool-lit-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  color: inherit;
+  text-decoration: none;
+}
+.tool-lit-link:hover {
+  color: var(--primary);
+}
+.tool-lit-link:hover .tool-lit-text {
+  text-decoration: underline;
+}
+.tool-lit-ext {
+  flex: 0 0 auto;
+  opacity: 0.5;
+}
+.tool-lit-link:hover .tool-lit-ext {
+  opacity: 1;
+}
 /* Favicon-style tile so black marks stay visible in dark mode and the three
    differently-shaped logos read uniformly. */
 .lit-logo {
