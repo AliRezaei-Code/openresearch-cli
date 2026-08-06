@@ -125,6 +125,7 @@ export function FileViewer({
           <button
             className={`icon-btn ${showSource ? "active" : ""}`}
             data-tip={showSource ? "Rendered view" : "View source"}
+            data-tip-align="end"
             aria-label={showSource ? "Rendered view" : "View source"}
             onClick={() => setShowSource((s) => !s)}
           >
@@ -134,6 +135,7 @@ export function FileViewer({
         <button
           className="icon-btn"
           data-tip="Reload file"
+          data-tip-align="end"
           aria-label="Reload file"
           onClick={() => setNonce((n) => n + 1)}
         >

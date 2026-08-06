@@ -298,6 +298,23 @@ textarea::placeholder {
   border-color: var(--text);
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
 }
+.project-card-open {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+}
+.project-card-open:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 2px;
+}
+.project-card > :not(.project-card-open, .project-delete) {
+  position: relative;
+  z-index: 1;
+  pointer-events: none;
+}
+.project-card-sync a {
+  pointer-events: auto;
+}
 .project-delete {
   position: absolute;
   top: 10px;
@@ -308,7 +325,7 @@ textarea::placeholder {
   color: var(--muted);
   line-height: 0;
 }
-.project-card:hover .project-delete {
+.project-card:is(:hover, :focus-within) .project-delete {
   display: block;
 }
 .project-delete:hover {
@@ -319,7 +336,18 @@ textarea::placeholder {
   font-weight: var(--fw-semibold);
   font-size: var(--fs-base);
 }
-.project-card .repo {
+.project-card-sync {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  gap: 7px;
+  color: var(--text);
+}
+.project-card-sync a {
+  display: inline-flex;
+  color: var(--subtext);
+}
+.project-card-sync a:hover {
   color: var(--text);
 }
 .project-card .paper {
@@ -337,33 +365,87 @@ textarea::placeholder {
   display: flex;
   align-items: center;
   gap: 4px;
-  height: 48px;
-  /* 12px left text inset + ~14px icon right edge — keep in step with
-     .rail-nav below. */
-  padding: 0 8px 0 12px;
+  height: 64px;
+  padding: 8px;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
-/* Back arrow + current project name; truncates, arrow stays visible. */
+/* Current-project switcher; truncates while its chevron stays visible. */
+.rail-brand .project-switcher {
+  position: relative;
+  flex: 1;
+  align-self: stretch;
+  min-width: 0;
+}
+.rail-brand .project-back {
+  flex-shrink: 0;
+}
 .rail-brand .brand {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
-  flex: 1;
+  width: 100%;
+  height: 100%;
   min-width: 0;
   font-weight: var(--fw-semibold);
   font-size: var(--fs-base);
   color: var(--text);
-  padding: 4px 6px 4px 0;
+  padding: 4px 6px;
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
 }
-.rail-brand .brand:hover {
-  color: var(--subtext);
+.rail-brand .brand:hover,
+.rail-brand .brand.open {
+  background: var(--surface);
+  border-color: var(--border);
 }
 .rail-brand .brand svg {
   flex-shrink: 0;
 }
+.rail-brand .brand-project-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  line-height: 1.15;
+  text-align: left;
+}
+.rail-brand .brand-project-label {
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+  font-weight: var(--fw-medium);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
 .rail-brand .brand .brand-project {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-2xl);
+}
+.rail-brand .project-chevron {
+  color: var(--muted);
+  opacity: 0;
+  transition: transform 120ms ease;
+}
+.rail-brand .brand:hover .project-chevron,
+.rail-brand .brand.open .project-chevron {
+  opacity: 1;
+}
+.rail-brand .brand.open .project-chevron {
+  transform: rotate(180deg);
+}
+.rail-brand .project-menu {
+  left: 0;
+  width: 210px;
+  z-index: 70;
+}
+.project-menu-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -384,7 +466,7 @@ textarea::placeholder {
   background: var(--surface);
 }
 
-/* CSS-only tooltip for icon-only controls: `data-tip` holds the label.
+/* CSS-only tooltip: `data-tip` holds the label.
    Inverted bubble (text-on-base swap) so it reads in both themes. Default
    below the control; `.tip-up` flips above (for footer rows). */
 [data-tip] {
@@ -394,7 +476,8 @@ textarea::placeholder {
   content: attr(data-tip);
   position: absolute;
   top: calc(100% + 6px);
-  right: -4px;
+  left: 50%;
+  transform: translateX(-50%);
   background: var(--text);
   color: var(--base);
   font-size: var(--fs-xs);
@@ -406,12 +489,20 @@ textarea::placeholder {
   opacity: 0;
   visibility: hidden;
   pointer-events: none;
-  transition: opacity 0.1s ease 0.3s, visibility 0s linear 0.4s;
   z-index: 60;
 }
-[data-tip]:hover::after {
+[data-tip]:is(:hover, :focus-visible)::after {
   opacity: 1;
   visibility: visible;
+}
+[data-tip-align="start"]::after {
+  left: 0;
+  transform: none;
+}
+[data-tip-align="end"]::after {
+  right: 0;
+  left: auto;
+  transform: none;
 }
 .tip-up[data-tip]::after {
   top: auto;
@@ -546,7 +637,7 @@ textarea::placeholder {
 
 /* Floating agents rail: fixed-width, collapsible (not resizable). */
 .session-rail {
-  width: 256px;
+  width: 272px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
@@ -556,7 +647,7 @@ textarea::placeholder {
   background: var(--base);
   min-height: 0;
 }
-/* Rail nav: new session + settings sections, above the Recents list. */
+/* Project sections above the Recents list. */
 .rail-nav {
   display: flex;
   flex-direction: column;
@@ -583,7 +674,7 @@ textarea::placeholder {
 }
 
 .rail-section-label {
-  padding: 10px 10px 6px;
+  padding: 0;
   font-size: var(--fs-md);
   font-weight: var(--fw-medium);
   color: var(--subtext);
@@ -593,11 +684,31 @@ textarea::placeholder {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-shrink: 0;
+  padding: 14px 10px 6px 18px;
+}
+.rail-section-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.rail-section-new {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 6px;
+  border-radius: var(--radius-sm);
+  color: var(--subtext);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+}
+.rail-section-new:hover {
+  color: var(--text);
+  background: var(--surface);
 }
 .rail-filter {
   position: relative;
   display: inline-flex;
-  margin-right: 2px;
 }
 /* A non-default filter keeps the button lit via the shared .icon-btn.active. */
 .rail-filter-btn {
@@ -1074,43 +1185,82 @@ textarea::placeholder {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 12px;
+  container-type: inline-size;
   color: var(--text);
-  padding: 20px;
+  padding: 32px;
   text-align: center;
+}
+.chat-empty-mark {
+  width: 42px;
+  height: 42px;
+  margin-bottom: 22px;
+}
+.chat-empty-mark svg {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 .chat-empty h2 {
   margin: 0;
   font-size: var(--fs-5xl);
-  font-weight: var(--fw-display);
-  letter-spacing: -0.02em;
+  font-weight: var(--fw-medium);
+  letter-spacing: -0.015em;
   color: var(--text);
 }
-.chat-empty .chat-empty-hint {
-  font-size: var(--fs-md);
-  color: var(--muted);
-  max-width: 340px;
-  text-align: center;
-}
-.chat-empty p {
-  margin: 0;
-  font-size: var(--fs-base);
-  max-width: 320px;
-}
-/* one-click /reproduce-paper prefill for paper-born projects */
-.chat-empty .chat-suggest {
-  font-family: var(--mono);
-  font-size: var(--fs-md);
-  color: var(--text);
-  background: var(--surface);
+.chat-empty-project {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 12px;
+  padding: 6px 12px;
   border: 1px solid var(--border);
   border-radius: var(--radius-full);
-  padding: 6px 14px;
-  cursor: pointer;
-  transition: border-color 120ms ease;
+  color: var(--subtext);
+  background: var(--surface);
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-semibold);
 }
-.chat-empty .chat-suggest:hover {
-  border-color: var(--text);
+.chat-empty-starters {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  width: min(100%, 620px);
+  margin-top: 76px;
+}
+.chat-empty-starter {
+  min-height: 112px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  color: var(--text);
+  background: var(--base);
+  box-shadow: 0 1px 3px color-mix(in oklab, var(--text) 5%, transparent);
+  text-align: left;
+  font-size: var(--fs-md);
+  font-weight: var(--fw-medium);
+  line-height: 1.35;
+  transition: border-color 120ms ease, background 120ms ease, transform 120ms ease;
+}
+.chat-empty-starter:hover {
+  border-color: var(--muted);
+  background: var(--surface);
+  transform: translateY(-1px);
+}
+.chat-empty-starter.blue svg { color: var(--accent-blue); }
+.chat-empty-starter.purple svg { color: var(--accent-purple); }
+.chat-empty-starter.green svg { color: var(--accent-green); }
+.chat-empty-starter.orange svg { color: var(--accent-orange); }
+
+@container (min-width: 500px) {
+  .chat-empty-starters {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    width: min(100%, 720px);
+  }
 }
 
 /* Shown while an existing session's transcript is fetched, so switching
@@ -1424,12 +1574,12 @@ textarea::placeholder {
   padding: 10px 12px 4px;
   font-size: var(--fs-base);
   /* Auto-grow with the draft (Firefox doesn't ship field-sizing yet and
-     falls back to the fixed two-row box). min-height keeps the two-row
-     resting look — field-sizing ignores rows — and max-height caps the
+     falls back to the fixed-height box). min-height keeps the intended
+     resting height — field-sizing ignores rows — and max-height caps the
      growth, past which the textarea scrolls internally. Also matches the
      plan strip's revise textarea, which grows the same way. */
   field-sizing: content;
-  min-height: 52px;
+  min-height: 72px;
   max-height: 180px;
 }
 /* pasted images waiting to be sent */
