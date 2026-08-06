@@ -995,8 +995,10 @@ export interface ChatPrompt {
 
 export interface ChatPart {
   id: string;
-  type: string; // text | reasoning | tool | prompt
+  type: string; // text | reasoning | tool | prompt | image
   text?: string;
+  /** Original file name for an `image` (attachment) part, when known. */
+  name?: string;
   tool?: string;
   state?: ChatToolState;
   prompt?: ChatPrompt;
@@ -1082,10 +1084,12 @@ export const getChatMessages = (sessionId: string) =>
     (r) => r.messages,
   );
 
-/** Pasted image riding a chat message. */
+/** A pasted image or uploaded file riding a chat message. */
 export interface ChatImageAttachment {
   mediaType: string;
   dataBase64: string;
+  /** Original file name (uploads/drops); pasted images carry none. */
+  name?: string;
 }
 
 /** Image parts store a server-minted file name; this is where it's served. */

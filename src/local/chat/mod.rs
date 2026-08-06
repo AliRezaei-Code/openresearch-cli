@@ -295,12 +295,25 @@ impl WirePart {
 
 // --- image attachments ---------------------------------------------------------
 
-/// Pasted image riding the send-message request.
+/// A pasted image or uploaded file riding the send-message request.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageAttachment {
     pub media_type: String,
     pub data_base64: String,
+    /// Original file name (uploads/drops); pasted images carry none.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// An attachment written to disk, ready to hand the harness by path.
+pub struct SavedAttachment {
+    /// Server-minted file name, served via /api/chat/attachments.
+    pub file_name: String,
+    pub path: std::path::PathBuf,
+    /// Human-readable name shown in the transcript and told to the agent.
+    pub display_name: String,
+    pub is_pdf: bool,
 }
 
 pub fn attachments_dir() -> Result<std::path::PathBuf> {
@@ -316,6 +329,7 @@ fn image_ext(media_type: &str) -> Option<&'static str> {
         "image/jpeg" => Some("jpg"),
         "image/gif" => Some("gif"),
         "image/webp" => Some("webp"),
+        "application/pdf" => Some("pdf"),
         _ => None,
     }
 }
@@ -326,12 +340,35 @@ pub fn attachment_content_type(name: &str) -> &'static str {
         Some("jpg") => "image/jpeg",
         Some("gif") => "image/gif",
         Some("webp") => "image/webp",
+        Some("pdf") => "application/pdf",
         _ => "application/octet-stream",
     }
 }
 
-/// Decode pasted images to the attachments dir; returns (file name, abs path).
-fn save_images(images: &[ImageAttachment]) -> Result<Vec<(String, std::path::PathBuf)>> {
+/// Sanitize an original file name into the `<name>.<ext>` form embedded in the
+/// server-minted attachment file name — ASCII alnum / `-` / `_` only (the set
+/// the attachment route allows), canonical extension, no dots in the stem so
+/// the result can never contain a `..` traversal sequence.
+fn safe_attachment_name(original: Option<&str>, ext: &str) -> String {
+    let base = original
+        .map(|n| n.rsplit(['/', '\\']).next().unwrap_or(n))
+        .and_then(|b| b.rsplit_once('.').map(|(stem, _)| stem).or(Some(b)))
+        .unwrap_or("");
+    let cleaned: String = base
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let mut safe = cleaned.trim_matches('-').chars().take(60).collect::<String>();
+    if safe.is_empty() {
+        safe = if ext == "pdf" { "document".into() } else { "image".into() };
+    }
+    format!("{safe}.{ext}")
+}
+
+/// Decode pasted/uploaded attachments to the attachments dir. The original file
+/// name (when present) is preserved after a `__` marker so the transcript and the
+/// agent see a meaningful name; the uuid prefix keeps names collision-free.
+fn save_images(images: &[ImageAttachment]) -> Result<Vec<SavedAttachment>> {
     if images.is_empty() {
         return Ok(Vec::new());
     }
@@ -339,15 +376,26 @@ fn save_images(images: &[ImageAttachment]) -> Result<Vec<(String, std::path::Pat
     let mut saved = Vec::new();
     for img in images {
         let ext = image_ext(&img.media_type)
-            .ok_or_else(|| anyhow!("unsupported image type: {}", img.media_type))?;
+            .ok_or_else(|| anyhow!("unsupported attachment type: {}", img.media_type))?;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(img.data_base64.as_bytes())
-            .map_err(|e| anyhow!("bad image data: {e}"))?;
-        let name = format!("img_{}.{ext}", uuid::Uuid::new_v4());
-        let path = dir.join(&name);
+            .map_err(|e| anyhow!("bad attachment data: {e}"))?;
+        let safe = safe_attachment_name(img.name.as_deref(), ext);
+        let file_name = format!("att-{}__{safe}", uuid::Uuid::new_v4());
+        let path = dir.join(&file_name);
         std::fs::write(&path, bytes)
             .map_err(|e| anyhow!("Could not write {}: {}", path.display(), e))?;
-        saved.push((name, path));
+        let display_name = img
+            .name
+            .as_deref()
+            .map(|n| n.rsplit(['/', '\\']).next().unwrap_or(n).to_string())
+            .unwrap_or_else(|| safe.clone());
+        saved.push(SavedAttachment {
+            file_name,
+            path,
+            display_name,
+            is_pdf: ext == "pdf",
+        });
     }
     Ok(saved)
 }
@@ -1094,7 +1142,13 @@ impl ChatHost {
                 title.push('…');
             }
             if title.is_empty() && !saved_images.is_empty() {
-                title = "Image".into();
+                // Name an attachment-only message after the first PDF (the
+                // "upload my paper" flow), falling back to a generic label.
+                title = saved_images
+                    .iter()
+                    .find(|a| a.is_pdf)
+                    .map(|a| a.display_name.chars().take(64).collect())
+                    .unwrap_or_else(|| "Image".into());
             }
             if !title.is_empty() {
                 store.set_chat_session_title(&session.id, &title, "fallback")?;
@@ -1106,8 +1160,8 @@ impl ChatHost {
         if !display_text.is_empty() {
             parts.push(WirePart::text("p0", display_text.to_string()));
         }
-        for (i, (name, _)) in saved_images.iter().enumerate() {
-            parts.push(WirePart::image(format!("img{i}"), name.clone()));
+        for (i, att) in saved_images.iter().enumerate() {
+            parts.push(WirePart::image(format!("img{i}"), att.file_name.clone()));
         }
         // A resume whose transcript text is empty (e.g. a note-less plan
         // approval) records no user message: the resolved card already tells
@@ -1152,16 +1206,17 @@ impl ChatHost {
             session.bootstrap_context.as_deref(),
             turn_text,
         );
-        // Harnesses take plain text; pasted images ride as on-disk paths every
-        // CLI can open with its own image-viewing tool.
+        // Harnesses take plain text; attachments ride as on-disk paths every
+        // CLI can open with its own file-reading tool (Read handles PDFs and
+        // images alike).
         if !saved_images.is_empty() {
             let list: String = saved_images
                 .iter()
-                .map(|(_, path)| format!("- {}\n", path.display()))
+                .map(|att| format!("- {} — {}\n", att.display_name, att.path.display()))
                 .collect();
             turn_text.push_str(&format!(
-                "\n\n<attached-images>\nThe user attached {} image(s) to this message, saved at:\n{list}\
-                 View them with your image-reading tool (Read / view_image) before responding.\n</attached-images>",
+                "\n\n<attached-files>\nThe user attached {} file(s) to this message, saved on disk at:\n{list}\
+                 Open each with your file-reading tool (Read) before responding — it can read PDFs and images.\n</attached-files>",
                 saved_images.len()
             ));
         }

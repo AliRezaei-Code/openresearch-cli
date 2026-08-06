@@ -1335,6 +1335,31 @@ textarea::placeholder {
   border-radius: var(--radius-xs);
   display: block;
 }
+.msg-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.msg-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 240px;
+  padding: 6px 10px;
+  border: 1px solid var(--border-variant);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  text-decoration: none;
+}
+.msg-file:hover {
+  border-color: var(--text);
+}
+.msg-file span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .msg-assistant {
   font-size: var(--fs-lg);
@@ -1710,6 +1735,70 @@ textarea::placeholder {
 .attachment-thumb button:hover {
   background: var(--text);
   color: var(--base);
+}
+.attachment-file {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 220px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  background: var(--surface);
+}
+.attachment-file svg {
+  flex-shrink: 0;
+  color: var(--muted);
+}
+.attachment-file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-sm);
+}
+.attachment-file button {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+.attachment-file button:hover {
+  background: var(--text);
+  color: var(--base);
+}
+.composer-attach-error {
+  padding: 6px 12px 0;
+  font-size: var(--fs-sm);
+  color: var(--danger, #dc2626);
+}
+.composer-attach {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--radius-md);
+  color: var(--muted);
+  cursor: pointer;
+  transition:
+    background 100ms ease,
+    color 100ms ease;
+}
+.composer-attach:hover {
+  background: var(--surface);
+  color: var(--text);
 }
 .composer-actions {
   display: flex;

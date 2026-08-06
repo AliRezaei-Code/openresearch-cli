@@ -5,6 +5,7 @@ import {
   Check,
   ChevronRight,
   CornerDownLeft,
+  FileText,
   FlaskConical,
   FolderGit2,
   FolderOpen,
@@ -12,6 +13,7 @@ import {
   HelpCircle,
   MoreHorizontal,
   PanelLeft,
+  Paperclip,
   Plus,
   SlidersHorizontal,
   Users,
@@ -86,7 +88,12 @@ type Action =
   | { type: "reset" }
   | { type: "seed"; sessionId: string; messages: ChatMessage[]; onlyIfAbsent?: boolean }
   | { type: "upsertMessage"; sessionId: string; message: ChatMessage }
-  | { type: "optimisticUser"; sessionId: string; text: string; imageUrls: string[] }
+  | {
+      type: "optimisticUser";
+      sessionId: string;
+      text: string;
+      attachments: { url: string; mediaType: string; name?: string }[];
+    }
   | { type: "busy"; sessionId: string; busy: boolean }
   // `known` scopes the reseed: flags for sessions outside it (other projects —
   // busy events aren't project-filtered) are carried forward, not wiped.
@@ -136,8 +143,8 @@ function reducer(state: ChatState, action: Action): ChatState {
         ? [{ id: "p0", type: "text", text: action.text }]
         : [];
       // Data URLs stand in until the server's copy arrives with file names.
-      action.imageUrls.forEach((url, i) =>
-        parts.push({ id: `img${i}`, type: "image", text: url }),
+      action.attachments.forEach((a, i) =>
+        parts.push({ id: `img${i}`, type: "image", text: a.url, name: a.name }),
       );
       const msg: ChatMessage = {
         id: `${LOCAL_PREFIX}${Date.now()}`,
@@ -652,6 +659,24 @@ function messageHasVisibleContent(m: ChatMessage): boolean {
  * in ChatPanel). `Transcript` below adds a second boundary for the other hot
  * path — composer keystrokes re-render ChatPanel itself, and the transcript
  * memo stops those from touching the rows at all. */
+/** Resolve an `image` (attachment) part into what the transcript renders: a
+ * source URL, whether it's a PDF (file chip vs inline image), and a name. */
+function attachmentPartView(p: ChatPart): { src: string; isPdf: boolean; name: string } {
+  const raw = p.text ?? "";
+  const src = raw.startsWith("data:") ? raw : chatAttachmentUrl(raw);
+  // Server file names embed the original after a `__` marker; optimistic parts
+  // carry the real name on the part instead (no server file yet).
+  const derived = raw.startsWith("data:")
+    ? ""
+    : raw.includes("__")
+      ? raw.slice(raw.indexOf("__") + 2)
+      : raw;
+  const name = p.name || derived || "attachment";
+  const isPdf =
+    raw.startsWith("data:application/pdf") || /\.pdf$/i.test(name) || /\.pdf$/i.test(raw);
+  return { src, isPdf, name };
+}
+
 const Message = memo(function Message({
   message,
   onOpenFile,
@@ -680,9 +705,11 @@ const Message = memo(function Message({
     const slash = text.match(/^\/(\S+)([\s\S]*)$/);
     const command = slash ? skills?.find((s) => s.name === slash[1]) : undefined;
     // Optimistic parts carry a data URL; server parts carry a file name.
-    const images = message.parts
+    const attachments = message.parts
       .filter((p) => p.type === "image" && p.text)
-      .map((p) => (p.text!.startsWith("data:") ? p.text! : chatAttachmentUrl(p.text!)));
+      .map(attachmentPartView);
+    const images = attachments.filter((a) => !a.isPdf);
+    const files = attachments.filter((a) => a.isPdf);
     return (
       <div className="msg-user">
         {command ? (
@@ -695,9 +722,19 @@ const Message = memo(function Message({
         )}
         {images.length > 0 && (
           <div className="msg-images">
-            {images.map((src, i) => (
-              <a key={i} href={src} target="_blank" rel="noreferrer">
-                <img src={src} alt="attachment" />
+            {images.map((a, i) => (
+              <a key={i} href={a.src} target="_blank" rel="noreferrer">
+                <img src={a.src} alt="attachment" />
+              </a>
+            ))}
+          </div>
+        )}
+        {files.length > 0 && (
+          <div className="msg-files">
+            {files.map((a, i) => (
+              <a key={i} className="msg-file" href={a.src} target="_blank" rel="noreferrer">
+                <FileText size={15} />
+                <span>{a.name}</span>
               </a>
             ))}
           </div>
@@ -1228,8 +1265,12 @@ export function ChatPanel({
   const [unreadSessionIds, setUnreadSessionIds] = useState<ReadonlySet<string>>(new Set());
   const [sessionFilter, setSessionFilter] = useState<SessionFilter>("active");
   const [draft, setDraft] = useState("");
-  // Pasted/dropped images waiting in the composer, as data URLs.
-  const [attachments, setAttachments] = useState<{ dataUrl: string; mediaType: string }[]>([]);
+  // Pasted/dropped/uploaded attachments waiting in the composer, as data URLs.
+  const [attachments, setAttachments] = useState<
+    { dataUrl: string; mediaType: string; name?: string }[]
+  >([]);
+  const [attachError, setAttachError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [state, dispatch] = useReducer(reducer, {
     messagesBySession: {},
     busySessions: new Set<string>(),
@@ -1320,14 +1361,23 @@ export function ChatPanel({
     composerRef.current?.focus();
   }
 
-  /** Queue image files (clipboard paste or drag-drop) as composer attachments. */
-  function addImageFiles(files: File[]) {
+  /** Queue files (upload button, clipboard paste, or drag-drop) as composer
+   * attachments — images and PDFs, which the harness reads off disk by path. */
+  function addFiles(files: File[]) {
+    // Kept under the backend's 64 MB request-body cap, with headroom for the
+    // base64 inflation (~33%) and multiple attachments in one message.
+    const MAX_BYTES = 30 * 1024 * 1024;
+    setAttachError(null);
     for (const file of files) {
-      if (!/^image\/(png|jpeg|gif|webp)$/.test(file.type)) continue;
+      if (!/^(image\/(png|jpeg|gif|webp)|application\/pdf)$/.test(file.type)) continue;
+      if (file.size > MAX_BYTES) {
+        setAttachError(`${file.name} is too large — attachments must be under 30 MB.`);
+        continue;
+      }
       const reader = new FileReader();
       reader.onload = () => {
         const dataUrl = reader.result as string;
-        setAttachments((cur) => [...cur, { dataUrl, mediaType: file.type }]);
+        setAttachments((cur) => [...cur, { dataUrl, mediaType: file.type, name: file.name }]);
       };
       reader.readAsDataURL(file);
     }
@@ -1335,12 +1385,16 @@ export function ChatPanel({
 
   function onComposerPaste(e: React.ClipboardEvent) {
     const files = Array.from(e.clipboardData.items)
-      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      .filter(
+        (item) =>
+          item.kind === "file" &&
+          (item.type.startsWith("image/") || item.type === "application/pdf"),
+      )
       .map((item) => item.getAsFile())
       .filter((f): f is File => f !== null);
     if (files.length > 0) {
       e.preventDefault();
-      addImageFiles(files);
+      addFiles(files);
     }
   }
 
@@ -1794,6 +1848,7 @@ export function ChatPanel({
     setDraft("");
     setPickedSkill(null);
     setAttachments([]);
+    setAttachError(null);
     let sid = activeId;
     try {
       if (!sid) {
@@ -1811,7 +1866,7 @@ export function ChatPanel({
         type: "optimisticUser",
         sessionId: sid,
         text,
-        imageUrls: pending.map((a) => a.dataUrl),
+        attachments: pending.map((a) => ({ url: a.dataUrl, mediaType: a.mediaType, name: a.name })),
       });
       dispatch({ type: "busy", sessionId: sid, busy: true });
       stickToBottom.current = true;
@@ -1833,6 +1888,7 @@ export function ChatPanel({
       const images: ChatImageAttachment[] = pending.map((a) => ({
         mediaType: a.mediaType,
         dataBase64: a.dataUrl.slice(a.dataUrl.indexOf(",") + 1),
+        name: a.name,
       }));
       await sendChatMessage(sid, text, turnOpts, images.length ? images : undefined);
     } catch (err) {
@@ -2366,20 +2422,29 @@ export function ChatPanel({
           )}
           {attachments.length > 0 && (
             <div className="composer-attachments">
-              {attachments.map((a, i) => (
-                <div key={i} className="attachment-thumb">
-                  <img src={a.dataUrl} alt="pasted" />
-                  <button
-                    title="Remove image"
-                    aria-label="Remove image"
-                    onClick={() => setAttachments((cur) => cur.filter((_, j) => j !== i))}
-                  >
-                    <X size={11} />
-                  </button>
-                </div>
-              ))}
+              {attachments.map((a, i) => {
+                const remove = () =>
+                  setAttachments((cur) => cur.filter((_, j) => j !== i));
+                return a.mediaType === "application/pdf" ? (
+                  <div key={i} className="attachment-file" title={a.name}>
+                    <FileText size={22} />
+                    <span className="attachment-file-name">{a.name ?? "document.pdf"}</span>
+                    <button title="Remove file" aria-label="Remove file" onClick={remove}>
+                      <X size={11} />
+                    </button>
+                  </div>
+                ) : (
+                  <div key={i} className="attachment-thumb">
+                    <img src={a.dataUrl} alt="pasted" />
+                    <button title="Remove image" aria-label="Remove image" onClick={remove}>
+                      <X size={11} />
+                    </button>
+                  </div>
+                );
+              })}
             </div>
           )}
+          {attachError && <div className="composer-attach-error">{attachError}</div>}
           <div className="composer-input">
             {pickedSkill && (
               // Inert like inline text: clicks fall through to the textarea
@@ -2422,7 +2487,7 @@ export function ChatPanel({
               onDrop={(e) => {
                 if (e.dataTransfer.files.length === 0) return;
                 e.preventDefault();
-                addImageFiles(Array.from(e.dataTransfer.files));
+                addFiles(Array.from(e.dataTransfer.files));
               }}
               onChange={(e) => {
                 const v = e.target.value;
@@ -2505,6 +2570,26 @@ export function ChatPanel({
               onSelect={setPermissionMode}
             />
             <LitSourcesPicker />
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="application/pdf,image/png,image/jpeg,image/gif,image/webp"
+              multiple
+              hidden
+              onChange={(e) => {
+                addFiles(Array.from(e.target.files ?? []));
+                e.target.value = ""; // let the same file be re-picked
+              }}
+            />
+            <button
+              type="button"
+              className="composer-attach"
+              title="Attach a PDF or image"
+              aria-label="Attach a PDF or image"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <Paperclip size={16} />
+            </button>
             <div style={{ flex: 1 }} />
             {/* Bottom-right: model, reasoning level, then context meter. The
                 picker reflects the open session (harness locked once it exists);
