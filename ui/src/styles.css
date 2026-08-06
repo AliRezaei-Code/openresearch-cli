@@ -1376,6 +1376,11 @@ textarea::placeholder {
   padding-left: 10px;
   border-left: 1px solid var(--border-variant);
 }
+/* Grouped rows sit under the group's own status dot + indent rule, so the
+   per-row dot is redundant noise — the summary line carries the state. */
+.tool-group-rows .tool-status {
+  display: none;
+}
 /* A sub-agent spawn row: one clickable line that opens the transcript in the
    right panel (never expands inline). Sized like the transcript body text. */
 .subagent-row {
@@ -1449,6 +1454,63 @@ textarea::placeholder {
   white-space: nowrap;
   font-size: var(--fs-md);
   color: var(--subtext);
+}
+/* `orx lit`/`orx paper` rows: source logo inline with the search text. */
+.tool-lit {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+  vertical-align: bottom;
+}
+/* Let the text ellipsize like a plain tool row (the logo stays fixed). */
+.tool-lit-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A fetched paper links out to its source page. The trailing arrow is a resting
+   affordance (the row is also expandable), and the whole link goes primary on hover. */
+.tool-lit-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  color: inherit;
+  text-decoration: none;
+}
+.tool-lit-link:hover {
+  color: var(--primary);
+}
+.tool-lit-link:hover .tool-lit-text {
+  text-decoration: underline;
+}
+.tool-lit-ext {
+  flex: 0 0 auto;
+  opacity: 0.5;
+}
+.tool-lit-link:hover .tool-lit-ext {
+  opacity: 1;
+}
+/* Favicon-style tile so black marks stay visible in dark mode and the three
+   differently-shaped logos read uniformly. */
+.lit-logo {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5px;
+  box-sizing: border-box;
+  background: #fff;
+  border-radius: 3px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.08);
+}
+.lit-logo svg {
+  width: 100%;
+  height: 100%;
+  display: block;
 }
 .tool-open {
   flex-shrink: 0;
@@ -4151,6 +4213,20 @@ a.files-pill:hover {
 .project-default-title {
   font-size: var(--fs-md);
   font-weight: var(--fw-semibold);
+}
+/* Literature-sources popover (composer footer): source logo + name toggle rows. */
+.lit-sources-menu {
+  min-width: 210px;
+}
+.lit-source-item-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+}
+.lit-sources-loading {
+  padding: 6px 8px;
+  color: var(--muted);
+  font-size: var(--fs-sm);
 }
 .project-default-row p,
 .project-default-connect p {

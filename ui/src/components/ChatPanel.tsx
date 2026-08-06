@@ -1,4 +1,5 @@
 import {
+  ArrowUpRight,
   BookOpen,
   ChartSpline,
   Check,
@@ -55,6 +56,8 @@ import {
   type SkillInfo,
 } from "../api";
 import { onChatEvent } from "../events";
+import { LitSourceLogo, parseOrxLit, paperUrl } from "./LitSourceLogo";
+import { LitSourcesPicker } from "./LitSourcesPicker";
 import { Md } from "./Md";
 import { PlanStrip } from "./PlanStrip";
 import { SETTINGS_NAV, type SettingsTab } from "./SettingsPage";
@@ -250,6 +253,53 @@ function toolLine(part: ChatPart): string {
   }
 }
 
+/** Richer summary for the tool row: `orx lit`/`orx paper` Bash calls render as a
+ * real search (source logo + natural language) instead of raw shell output.
+ * Everything else falls back to the plain `toolLine` string. */
+function toolSummary(part: ChatPart): React.ReactNode {
+  if (part.tool === "Bash" || part.tool === "bash") {
+    const cmd = part.state?.input?.command;
+    const call = typeof cmd === "string" ? parseOrxLit(cmd) : null;
+    if (call) {
+      // The logo already names the source, so the text doesn't repeat it.
+      const text =
+        call.kind === "lit"
+          ? call.query
+            ? `Searching for “${call.query}”`
+            : "Searching"
+          : call.id
+            ? `Reading ${call.id}`
+            : "Reading a paper";
+      // A fetched paper links out to its page on the source (with an external-link
+      // affordance so it reads as clickable); the search rows are plain text. The
+      // anchor is the click's activation target, so it navigates without toggling
+      // the row open — stopPropagation just guards against any future row handler.
+      const body =
+        call.kind === "paper" && call.id ? (
+          <a
+            className="tool-lit-link"
+            href={paperUrl(call.source, call.id)}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <span className="tool-lit-text">{text}</span>
+            <ArrowUpRight className="tool-lit-ext" size={13} aria-hidden="true" />
+          </a>
+        ) : (
+          <span className="tool-lit-text">{text}</span>
+        );
+      return (
+        <span className="tool-lit">
+          <LitSourceLogo source={call.source} />
+          {body}
+        </span>
+      );
+    }
+  }
+  return toolLine(part);
+}
+
 /** Readable one-liner for a Codex sub-agent spawn/activity row, from the
  * collab item fields the backend put in `state.input`. */
 function subagentLine(input: Record<string, unknown>): string {
@@ -291,7 +341,7 @@ function ToolRow({ part, onOpenFile }: { part: ChatPart; onOpenFile?: (path: str
     <details className="tool-row" open={false}>
       <summary>
         <span className={toolStatusClass(state?.status)} />
-        <span className="tool-line">{toolLine(part)}</span>
+        <span className="tool-line">{toolSummary(part)}</span>
         {filePath && onOpenFile && (
           <button
             className="tool-open file-link"
@@ -2442,7 +2492,7 @@ export function ChatPanel({
             />
           </div>
           <div className="composer-actions">
-            {/* Bottom-left: permission mode. */}
+            {/* Bottom-left: permission mode + literature sources. */}
             <OptionPicker
               choices={activeHarness?.agentReady ? (opts?.permissionModes ?? []) : []}
               value={composerSelection?.permissionMode ?? null}
@@ -2454,6 +2504,7 @@ export function ChatPanel({
               title="Permission mode for this chat"
               onSelect={setPermissionMode}
             />
+            <LitSourcesPicker />
             <div style={{ flex: 1 }} />
             {/* Bottom-right: model, reasoning level, then context meter. The
                 picker reflects the open session (harness locked once it exists);

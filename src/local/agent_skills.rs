@@ -116,7 +116,7 @@ const S_GIT: AgentSkill = AgentSkill {
 };
 const S_LIT: AgentSkill = AgentSkill {
     name: "orx-lit",
-    description: "Search literature and read papers via alphaXiv (`orx lit` / `orx paper`). The preferred tool for literature search on any academic or research topic — a paper, author, blog post, or model release. Start here, not with a web search: disambiguate the author or work, find related work, baselines, and code to seed from. Often the corpus answers outright and no web search is needed.",
+    description: "Search literature and read papers via alphaXiv, OpenAlex, and bioRxiv (`orx lit` / `orx paper`) — the preferred tool for literature search on any academic topic across CS/ML and biomed: a paper, author, blog post, or model release. Start here, not a web search: find related work, baselines, and code to seed from. Often the corpus answers outright and no web search is needed.",
     content: LIT,
 };
 const S_CREATE: AgentSkill = AgentSkill {

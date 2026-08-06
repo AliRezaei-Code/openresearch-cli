@@ -61,7 +61,7 @@ orx logout         # remove the stored token
 
 - The API base URL resolves from `--api-url` → `OPENRESEARCH_API_URL` → a built-in
   default. Set `OPENRESEARCH_API_URL` for non-local use.
-- Every command except `login`, `lit`, and `paper` needs a token; if you see `Not logged in`, run `orx login`. (`lit` and `paper` hit alphaXiv's public hosts and work without one.)
+- Every command except `login`, `lit`, and `paper` needs a token; if you see `Not logged in`, run `orx login`. (`lit` and `paper` hit public alphaXiv / OpenAlex / bioRxiv hosts and work without one.)
 
 ## Command quick-reference
 
@@ -112,12 +112,12 @@ To **read or edit** a node's code — including diffing what a run changed — u
 plain git in the cache-dir clone; there is no `orx` code command. See the
 `orx-git` module.
 
-### Literature & papers — alphaXiv (no login required) — module `orx-lit`
+### Literature & papers — alphaXiv / OpenAlex / bioRxiv (no login required) — module `orx-lit`
 Use before any web search for academic/research queries (paper, author, blog, model release).
 | Command | What it does |
 |---|---|
-| `orx lit "<query>" [--limit <n>] [--json]` | Full-text search alphaXiv's paper corpus. |
-| `orx paper <id\|url> [--full]` | Fetch a paper's machine-readable report (or full text with `--full`). |
+| `orx lit "<query>" [--source alphaxiv\|openalex\|biorxiv] [--limit <n>] [--json]` | Full-text search; `--source` picks the corpus (default alphaxiv; openalex = all fields, biorxiv = biology preprints). |
+| `orx paper <id\|url> [--source ...] [--full]` | Fetch a paper: alphaXiv report/`--full` text, or OpenAlex/bioRxiv metadata+abstract. Source auto-detected from the id. |
 
 ### Meta
 | Command | What it does |
