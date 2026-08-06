@@ -2255,7 +2255,7 @@ textarea::placeholder {
   grid-template-columns: minmax(0, 1fr) auto;
   grid-template-areas:
     "name meta"
-    "actions meta";
+    "actions actions";
   column-gap: 32px;
   align-items: center;
   padding: 20px 24px;
@@ -2320,8 +2320,8 @@ textarea::placeholder {
 }
 .experiment-run-summary {
   gap: 8px;
-  color: var(--text);
-  font-size: var(--fs-sm);
+  color: var(--subtext);
+  font-size: var(--fs-xs);
   font-weight: var(--fw-medium);
 }
 .experiment-table-latest {
@@ -2329,8 +2329,8 @@ textarea::placeholder {
   align-items: center;
   gap: 6px;
   min-width: 0;
-  color: var(--text);
-  font-size: var(--fs-sm);
+  color: var(--subtext);
+  font-size: var(--fs-xs);
   font-weight: var(--fw-medium);
   white-space: nowrap;
 }
@@ -2366,7 +2366,6 @@ textarea::placeholder {
   opacity: 0.5;
 }
 .experiment-table-action.danger {
-  margin-left: auto;
   border-color: color-mix(in oklab, var(--accent-red) 42%, var(--border));
   background: color-mix(in oklab, var(--accent-red) 6%, var(--base));
   color: var(--accent-red);
@@ -2382,9 +2381,6 @@ textarea::placeholder {
 @container (max-width: 560px) {
   .experiment-table-group {
     grid-template-columns: minmax(0, 1fr) auto;
-    grid-template-areas:
-      "name meta"
-      "actions actions";
     column-gap: 14px;
     row-gap: 9px;
   }
@@ -2392,6 +2388,9 @@ textarea::placeholder {
     flex-direction: column;
     align-items: flex-end;
     gap: 6px;
+  }
+  .experiment-table-action.danger {
+    margin-left: auto;
   }
 }
 
