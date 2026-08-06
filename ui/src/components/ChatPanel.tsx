@@ -54,6 +54,7 @@ import {
 } from "../api";
 import { onChatEvent } from "../events";
 import { LitSourceLogo, parseOrxLit, paperUrl } from "./LitSourceLogo";
+import { LitSourcesPicker } from "./LitSourcesPicker";
 import { Md } from "./Md";
 import { PlanStrip } from "./PlanStrip";
 import { SETTINGS_NAV, type SettingsTab } from "./SettingsPage";
@@ -2453,7 +2454,7 @@ export function ChatPanel({
             />
           </div>
           <div className="composer-actions">
-            {/* Bottom-left: permission mode. */}
+            {/* Bottom-left: permission mode + literature sources. */}
             <OptionPicker
               choices={activeHarness?.agentReady ? (opts?.permissionModes ?? []) : []}
               value={composerSelection?.permissionMode ?? null}
@@ -2465,6 +2466,7 @@ export function ChatPanel({
               title="Permission mode for this chat"
               onSelect={setPermissionMode}
             />
+            <LitSourcesPicker />
             <div style={{ flex: 1 }} />
             {/* Bottom-right: model, reasoning level, then context meter. The
                 picker reflects the open session (harness locked once it exists);

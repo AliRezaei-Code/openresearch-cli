@@ -4052,19 +4052,19 @@ a.files-pill:hover {
   font-size: var(--fs-md);
   font-weight: var(--fw-semibold);
 }
-.lit-sources-card {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
+/* Literature-sources popover (composer footer): source logo + name toggle rows. */
+.lit-sources-menu {
+  min-width: 210px;
 }
-.lit-source-row {
-  border-top: none;
-  padding-top: 0;
-}
-.lit-source-name {
-  display: flex;
+.lit-source-item-label {
+  display: inline-flex;
   align-items: center;
   gap: 9px;
+}
+.lit-sources-loading {
+  padding: 6px 8px;
+  color: var(--muted);
+  font-size: var(--fs-sm);
 }
 .project-default-row p,
 .project-default-connect p {
