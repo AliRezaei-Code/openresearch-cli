@@ -542,8 +542,8 @@ pub async fn preflight() -> Result<()> {
     if !s.token_configured {
         return Err(anyhow!(
             "No Modal token configured. Run `modal token new`, or set MODAL_TOKEN_ID and \
-             MODAL_TOKEN_SECRET (in the environment, `orx up` Settings → Environment, or \
-             `~/.openresearch/env`)."
+             MODAL_TOKEN_SECRET in the process or OpenResearch run environment, or \
+             `~/.openresearch/env`."
         ));
     }
     Ok(())

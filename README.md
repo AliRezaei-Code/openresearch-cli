@@ -56,9 +56,9 @@ JSON/SSE API over a local SQLite store. From there you get:
   snapshot of your code. The root is your baseline; children are variants
   measured against it, so lineage stays explicit.
 - **Runs** — projects and experiments stay local by default and run on this
-  machine from their recorded Git commit. Enable GitHub for a project from the
-  Git tab when you want Modal, Hugging Face Jobs, Kubernetes, Slurm, SSH, Ray,
-  or OpenResearch compute; remote launches push the exact branch first.
+  machine from their recorded Git commit. Enable GitHub syncing for a project
+  when you want Modal, Hugging Face Jobs, Kubernetes, Slurm, SSH, Ray, or
+  OpenResearch compute; remote launches push the exact branch first.
 - **Autoresearch** — describe a goal and let the agent run autonomously toward
   it: proposing, launching, and analyzing experiments.
 

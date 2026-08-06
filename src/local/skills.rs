@@ -44,7 +44,7 @@ Paper: {args}
 
 Setup — verify before anything else:
 1. `hf version` — if missing, install with `curl -LsSf https://hf.co/cli/install.sh | sh` (or `pip install -U "huggingface_hub[cli]"`), then re-check.
-2. `hf auth whoami` — HF_TOKEN is usually already in the environment (synced from the orx up settings). If unauthenticated, ask the user to add their token in the orx up settings (Hugging Face section) or run `hf auth login`. Note the username — the logbook publishes under it.
+2. `hf auth whoami` — `HF_TOKEN` may already be available to OpenResearch runs. If unauthenticated, ask the user to provide it to OpenResearch or run `hf auth login`. Note the username — the logbook publishes under it.
 3. `trackio --version` — if missing, `pip install --upgrade trackio`.
 
 Workflow:
@@ -62,7 +62,7 @@ Paper: {args}
 The challenge workflow requires Hugging Face Jobs and publication, which are
 not available while this project is local-only. Do not launch `hf jobs` or
 bypass the OpenResearch compute gate. Explain that the user must explicitly
-enable GitHub for this project in the Git tab before the challenge workflow can
+enable GitHub syncing for this project before the challenge workflow can
 run. Until then, you may read the paper and outline a local experiment plan,
 but do not provision external compute or publish a logbook.
 "#;
@@ -72,7 +72,7 @@ const REPRODUCE_PAPER_TEMPLATE: &str = r#"Reproduce a research paper claim by cl
 Paper and compute: {args}
 
 Before running anything:
-1. Confirm the compute. The user should name where runs execute — an `~/.ssh/config` host alias (`orx exp run --backend ssh --host <alias>`, configurable in orx up Settings → Compute), another `orx` backend (`hf`, `modal`, `k8s` with a `--flavor`), or the local machine. If unspecified, use the default compute target configured in orx up Settings → Compute when one is set (omit `--backend` to launch there); otherwise ask before launching anything.
+1. Confirm the compute. The user should name where runs execute — a configured `~/.ssh/config` host alias (`orx exp run --backend ssh --host <alias>`), another `orx` backend (`hf` or `modal` with a flavor, `k8s` with a committed manifest), or the local machine. If unspecified, use the configured default compute target when one is set (omit `--backend` to launch there); otherwise ask before launching anything.
 2. Read the paper. If the args name no paper, infer it from the current repository — read the README, docs, and code, and if the repo clearly corresponds to an identifiable paper, reproduce that one; only ask the user if none can be identified. If it's on alphaXiv, `orx paper <id>` gives a structured report (`--full` for raw text); `orx lit "<query>"` can find it. Otherwise ask the user for a PDF or link.
 3. Plan to the user's compute window. When the caller supplies an absolute deadline and available accelerator capacity, treat both as authoritative: keep the available GPUs occupied with scientifically useful parallel variants, seeds, ablations, controls, or profiling runs; refill freed capacity after each completion; and stop early when the target claims are adequately evaluated. Interpret capacity by total GPUs across in-flight runs, not by raw run count. Do not invent or maintain a GPU-hour ledger unless the user explicitly asks for one. For vague small-budget language such as "for a little bit," prefer published-checkpoint evaluation and targeted checks. Larger windows may support broader sweeps, added seeds, fine-tuning, or retraining, but they make training eligible, not mandatory.
 4. Optional tracking: if the user wants metrics logged, prefer Weights & Biases — check `wandb login` / `WANDB_API_KEY` and log each run to a project named after the paper. Don't require it.
@@ -98,7 +98,7 @@ Publish a polished GitHub artifact:
 - Treat the repository README as the public landing page, not as an afterthought. Add a project-specific reproduction section at the very top, before any upstream README content. It must state which paper claim was tested, what was done, the assessment, the paper number versus the observed number, the downscaling/substitutions, the agreed compute, and links to the detailed report or notebook when present.
 - In that top section, add a compact `Experiment log` or provenance table covering the important branches only. Use descriptive links to each branch and include columns for branch/experiment, purpose or change, **exact run command**, assessment/outcome, and compute. Copy the command verbatim from `orx exp status`; do not abbreviate it, replace it with pseudocode, or show only the entrypoint.
 - Account for `main` explicitly. If a formal experiment was ever launched from `main`, include `main` in the table with the exact command and result. If `main` is presentation-only, say `Not run as an experiment (publication surface)` rather than inventing a command.
-- Publish every reader-facing report on `main`, alongside the README and other small presentation artifacts. A report is not considered published if it exists only in the dashboard Artifacts directory, a local artifact directory, an `orx/*` experiment branch, or an internal run log. Copy or recreate the final report under a clear repository path such as `reports/<topic>/report.md` or `artifacts/<topic>/report.md`, then add a descriptive link to it in the README's top reproduction section. If several reports are produced, link every important one and briefly say what each contains.
+- Publish every reader-facing report on `main`, alongside the README and other small presentation artifacts. A report is not considered published if it exists only in the project artifacts directory, an `orx/*` experiment branch, or an internal run log. Copy or recreate the final report under a clear repository path such as `reports/<topic>/report.md` or `artifacts/<topic>/report.md`, then add a descriptive link to it in the README's top reproduction section. If several reports are produced, link every important one and briefly say what each contains.
 - Also publish a self-contained, tutorial-style marimo notebook on `main` that explains the central claim and opens with the already-produced evidence; do not make readers rerun expensive experiments to see the result. Validate it with `marimo check <notebook.py>`, embed small results or fetch them from public URLs instead of assuming repository-relative artifacts exist in Molab, and keep optional interactive work bounded and separate from formal reproduction evidence. If the repository is public—or the user explicitly requested public publication and its history is safe to expose—add and verify `[![Open in molab](https://marimo.io/molab-shield.svg)](https://molab.marimo.io/github/<owner>/<repo>/blob/main/<notebook.py>)` in the README. Otherwise preserve private visibility, omit the unusable Molab link, and include concise local `marimo edit <notebook.py>` and `marimo run <notebook.py>` instructions. Never change repository visibility without explicit authorization.
 - Include failed branches only when they explain the lineage to the successful result. Keep raw experiment and run IDs in `orx exp desc`, not in the README.
 - Keep the README current whenever another important branch is run or its assessment changes. A reader landing on GitHub should be able to understand what was tried and reproduce the command without inspecting the internal experiment database.
@@ -116,7 +116,7 @@ The final deliverable is:
 
 Before running anything:
 1. Inspect the project with `orx projects`, `orx runs <project-id>`, `git branch -a`, and relevant `orx exp desc <experiment-id>` entries so you extend existing work instead of duplicating it.
-2. Confirm the compute if the user did not specify it: the default compute target from orx up Settings → Compute when one is set (omit `--backend` to launch there), or an explicit backend — `hf` or `modal` with a flavor, `k8s` with a committed manifest, or `ssh` with a host alias. Formal reproduction runs must use `orx exp run`; molab's GPU is for the notebook's short teaching experiment, not untracked reproduction runs.
+2. Confirm the compute if the user did not specify it: the configured default compute target when one is set (omit `--backend` to launch there), or an explicit backend — `hf` or `modal` with a flavor, `k8s` with a committed manifest, or `ssh` with a host alias. Formal reproduction runs must use `orx exp run`; molab's GPU is for the notebook's short teaching experiment, not untracked reproduction runs.
 3. Read the paper. If the args name no paper, infer it from the current repository — read the README, docs, and code, and if the repo clearly corresponds to an identifiable paper, use that one; only ask the user if none can be identified. For alphaXiv papers use `orx paper <id>` and use `--full` when the structured report omits an important detail. Use `orx lit "<query>"` to locate related work or public implementations.
 4. Enumerate the main empirical claims, prioritizing the headline table or figure. Unless the user asks for broader coverage, select the single claim that makes the clearest illustrative tutorial.
 5. Inspect repository visibility and history before publication. Molab's GitHub opener requires a public repository. If the repository is private and the user has not already authorized a visibility change, explain this requirement, ask permission to make it public, and stop until the user approves. After approval, scan the complete Git history for credentials or private artifacts, change visibility with `gh`, and continue the workflow; do not make the user perform the change manually.
@@ -200,7 +200,7 @@ Immediately below that overview, add a compact `Experiment log` or provenance ta
 
 Account for `main` explicitly in this top section. If any formal experiment was launched from `main`, list `main` with the exact command and result. If `main` is only the maintained publication surface, state `Not run as an experiment (publication surface)` rather than inventing a command. Keep this table current whenever another important branch is run or its verdict changes.
 
-Publish every reader-facing report on `main`, alongside the README, notebook, and other small presentation artifacts. A report is not considered published if it exists only in the dashboard Artifacts directory, a local artifact directory, an `orx/*` experiment branch, or an internal run log. Copy or recreate each final report under a clear repository path such as `reports/<topic>/report.md` or `artifacts/<topic>/report.md`, and add a descriptive link to every important report in the README's top reproduction section with a short explanation of what it contains.
+Publish every reader-facing report on `main`, alongside the README, notebook, and other small presentation artifacts. A report is not considered published if it exists only in the project artifacts directory, an `orx/*` experiment branch, or an internal run log. Copy or recreate each final report under a clear repository path such as `reports/<topic>/report.md` or `artifacts/<topic>/report.md`, and add a descriptive link to every important report in the README's top reproduction section with a short explanation of what it contains.
 
 After pushing:
 1. Verify the repository is public. If it is still private and permission has not been granted, explain that the molab link cannot work anonymously, ask permission to make the repository public, and stop. Once permission is granted, make it public with `gh` and verify the new visibility before continuing.
@@ -245,7 +245,7 @@ with figures in an adjacent `images/` folder. Open with the strongest result,
 separate paper evidence from observed evidence, and link experiment branches by
 name without assuming hosted URLs. Do not publish, change repository visibility,
 or contact a Git hosting service. If the user later wants hosted artifacts or
-external compute, ask them to enable GitHub from the Git tab first.
+external compute, ask them to enable GitHub syncing for this project first.
 "#;
 
 const PAPER_TO_MARIMO_LOCAL_TEMPLATE: &str = r#"Reproduce a paper's main illustrative claim and create a self-contained local marimo tutorial.
@@ -287,14 +287,14 @@ pub const CATALOG: &[Skill] = &[
         description: "Reproduce a paper claim by claim on compute you specify",
         arg_hint: "[paper] on [compute]",
         template: REPRODUCE_PAPER_TEMPLATE,
-        no_args: "(none given — infer the paper from the current repository: read the README, docs, and code, and if the repo clearly corresponds to an identifiable paper, reproduce that one; only ask the user if no paper can be identified. For compute, use the default target configured in orx up Settings → Compute when one is set, per the rules below; otherwise ask before launching.)",
+        no_args: "(none given — infer the paper from the current repository: read the README, docs, and code, and if the repo clearly corresponds to an identifiable paper, reproduce that one; only ask the user if no paper can be identified. For compute, use the configured default target when one is set, per the rules below; otherwise ask before launching.)",
     },
     Skill {
         name: "paper-to-marimo",
         description: "Reproduce a paper and publish an interactive molab tutorial",
         arg_hint: "[paper] on [compute]",
         template: PAPER_TO_MARIMO_TEMPLATE,
-        no_args: "(none given — infer the paper from the current repository: read the README, docs, and code, and if the repo clearly corresponds to an identifiable paper, use that one; only ask the user if no paper can be identified. For compute, use the default target configured in orx up Settings → Compute when one is set, per the rules below; otherwise ask before launching.)",
+        no_args: "(none given — infer the paper from the current repository: read the README, docs, and code, and if the repo clearly corresponds to an identifiable paper, use that one; only ask the user if no paper can be identified. For compute, use the configured default target when one is set, per the rules below; otherwise ask before launching.)",
     },
 ];
 
@@ -435,5 +435,20 @@ mod tests {
         let icml = super::expand("/icml-repro example", false).unwrap();
         assert!(icml.contains("local-only"));
         assert!(icml.contains("Do not launch `hf jobs`"));
+    }
+
+    #[test]
+    fn expanded_skills_avoid_openresearch_ui_navigation() {
+        for skill in super::CATALOG {
+            for github_enabled in [false, true] {
+                for invocation in [
+                    format!("/{}", skill.name),
+                    format!("/{} example", skill.name),
+                ] {
+                    let prompt = super::expand(&invocation, github_enabled).unwrap();
+                    crate::local::assert_agent_guidance_is_ui_agnostic(skill.name, &prompt);
+                }
+            }
+        }
     }
 }

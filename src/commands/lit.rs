@@ -67,7 +67,7 @@ fn resolve_lit_source(explicit: Option<LitSource>, disabled: &[String]) -> Resul
     if let Some(s) = explicit {
         if is_disabled(s) {
             return Err(anyhow!(
-                "{} is disabled in Settings → Literature sources. Re-enable it or pick another --source.",
+                "{} is disabled by your OpenResearch literature-source configuration. Re-enable it or pick another --source.",
                 s.display_name()
             ));
         }
@@ -77,7 +77,7 @@ fn resolve_lit_source(explicit: Option<LitSource>, disabled: &[String]) -> Resul
         .into_iter()
         .find(|&s| !is_disabled(s))
         .ok_or_else(|| {
-            anyhow!("All literature sources are disabled in Settings → Literature sources.")
+            anyhow!("All literature sources are disabled by your OpenResearch configuration.")
         })
 }
 

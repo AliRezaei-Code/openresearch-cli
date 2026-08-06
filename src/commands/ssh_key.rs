@@ -112,8 +112,7 @@ async fn add_with_creds(creds: &Credentials, path: Option<String>) -> Result<()>
         if err.to_string().contains("Unauthorized") {
             anyhow!(
                 "The server wouldn't register a key with this token.\n  \
-                 • It may predate `orx ssh-key add` — add the key in the dashboard\n    \
-                 under Settings \u{2192} SSH keys instead.\n  \
+                 • It may predate `orx ssh-key add` — add the key to your OpenResearch account instead.\n  \
                  • Or you're on a box: a box's token can't add keys, so run this\n    \
                  on your own computer."
             )

@@ -292,7 +292,7 @@ impl ControlPlane for LocalPlane {
     }
 
     async fn launch(&self, mut args: ExpRunArgs) -> Result<()> {
-        // Fill backend/flavor from the persisted default (Settings → Compute)
+        // Fill backend/flavor from the persisted default
         // BEFORE the flag validations below, so e.g. `--host box1` with a default
         // of `ssh` is a valid launch, and before `backend_label` is captured, so
         // telemetry records the resolved backend.
@@ -310,7 +310,7 @@ impl ControlPlane for LocalPlane {
                 Some("local") => {}
                 Some(_) => {
                     return Err(anyhow!(
-                        "Remote compute requires this project's GitHub repository. Enable GitHub from the Git tab, then retry."
+                        "Remote compute requires this project's GitHub repository. Enable GitHub syncing for this project, then retry."
                     ));
                 }
             }
@@ -352,7 +352,7 @@ impl ControlPlane for LocalPlane {
             )),
             None => Err(anyhow!(
                 "No --backend given and no default compute target is set. \
-                 Set a default in the dashboard (`orx up` → Settings → Compute → Make default), \
+                 Configure a default compute target in OpenResearch, \
                  or pass one per launch: \
                  `--backend hf --flavor <flavor>` (e.g. --flavor a10g-small), \
                  `--backend modal --flavor <flavor>` (e.g. --flavor a10g), \
@@ -500,7 +500,7 @@ impl ControlPlane for LocalPlane {
             Some(parent_id) => Some(store.get_local_experiment(parent_id)?.ok_or_else(|| {
                 anyhow!(
                     "Parent experiment {} not found in the local store. \
-                     See the dashboard, or omit --parent to branch off the project root.",
+                     Choose an existing parent experiment in OpenResearch, or omit --parent to branch off the project root.",
                     parent_id
                 )
             })?),
@@ -574,8 +574,7 @@ impl ControlPlane for LocalPlane {
         Err(anyhow!(
             "`orx report` is cloud-only. Local projects have no upload step: write \
              descriptively named outputs straight into the project's artifacts directory,\n  {}\n\
-             Everything in that directory shows up in the dashboard's Artifacts tab; \
-             folders are optional.",
+             Everything in that directory is available as a project artifact; folders are optional.",
             dir.display()
         ))
     }

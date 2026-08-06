@@ -20,5 +20,5 @@ immediately; use `orx exp wait --project` as a wake-up signal and reconcile
 terminal state with `orx runs` after every wake.
 
 External compute is intentionally unavailable. If the user explicitly wants
-it, ask them to enable GitHub for this project in the dashboard's Git tab;
-do not attempt provider setup or publication on their behalf.
+it, ask them to enable GitHub syncing for this project; do not attempt provider
+setup or publication on their behalf.

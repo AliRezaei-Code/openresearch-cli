@@ -104,6 +104,35 @@ pub const FLAVORED_BACKENDS: &[&str] = &["hf", "modal", "slurm", "ray", "openres
 /// about these when they're the default with no saved flavor.
 pub const FLAVOR_REQUIRED_BACKENDS: &[&str] = &["hf", "modal", "openresearch"];
 
+#[cfg(test)]
+pub(crate) fn assert_agent_guidance_is_ui_agnostic(label: &str, guidance: &str) {
+    let guidance = guidance.to_lowercase();
+    for phrase in [
+        "git tab",
+        "settings →",
+        "orx up settings",
+        "hugging face section",
+        "artifacts tab",
+        "dashboard artifacts",
+        "dashboard's",
+        "dashboard injects",
+        "invisible to the dashboard",
+        "visible in the dashboard",
+        "chat ui",
+        "plan card",
+        "file viewer",
+        "web ui",
+        "\"test\" button",
+        "cancel from web",
+        "cancel from the web",
+    ] {
+        assert!(
+            !guidance.contains(phrase),
+            "{label} contains UI navigation: {phrase}"
+        );
+    }
+}
+
 /// Fill a local-mode launch's backend/flavor from the persisted default
 /// (Settings → Compute) when the caller didn't pass them. Explicit args always
 /// win; see `resolve_compute_default` for the exact precedence.

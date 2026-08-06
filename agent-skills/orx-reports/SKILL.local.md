@@ -1,12 +1,12 @@
 ---
 name: orx-reports
-description: "Write durable research outputs into the local project's artifacts directory so they appear in the dashboard's Artifacts tab. Use when a line of work concludes, when the user asks for a write-up, summary, comparison, figures, or exported data, or before ending a long task — findings not written down are lost."
+description: "Write durable research outputs into the local project's artifacts directory. Use when a line of work concludes, when the user asks for a write-up, summary, comparison, figures, or exported data, or before ending a long task — findings not written down are lost."
 ---
 
 In local mode (`orx up`), outputs are written **directly into the project's
 artifacts directory** — there is no upload step. Reports, figures, images, CSVs,
-PDFs, and other useful outputs appear in the dashboard's Artifacts tab
-immediately. The directory path is shown in your session playbook.
+PDFs, and other useful outputs become project artifacts immediately. The
+directory path is shown in your session playbook.
 
 When a line of work concludes (or the user asks for a write-up), use a descriptive
 filename that explains the output without relying on its directory, for example:

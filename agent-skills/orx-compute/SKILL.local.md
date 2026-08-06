@@ -5,7 +5,7 @@ description: "Launch experiment runs with `orx exp run`: backends (hf, modal, k8
 
 Projects are local-only by default. In that state, commit the experiment and
 use the `local` backend; never push. Remote backends stay unavailable until the
-user explicitly enables GitHub for the project in the Git tab. Once enabled,
+user explicitly enables GitHub syncing for the project. Once enabled,
 `orx exp run` pushes the selected branch before provisioning and aborts the
 launch if that push fails.
 
@@ -13,7 +13,7 @@ In local mode (`orx up`) every run launches with `orx exp run <expId>` onto a
 **backend**: `hf`, `modal`, `k8s`, `ssh`, `slurm`, `ray`, `openresearch`, or `local`.
 There is no managed-SKU compute here (`--gpu`/`--cpu`/`--sandbox` are
 server-project flags) — the backend comes from an explicit `--backend`, or from
-the default target the user saved in Settings → Compute.
+the machine-wide default target configured by the user.
 
 ```sh
 orx exp status <expId>                     # status, branch, run command, latest run
@@ -42,8 +42,8 @@ orx exp cancel <expId>                     # cancel the in-flight run
 
 ## Choosing a backend, and the default target
 
-The user may set a **default compute target** in the dashboard (Settings →
-Compute → Make default); it is machine-wide and applies to every local project.
+The user may configure a **default compute target**; it is machine-wide and
+applies to every local project.
 When one is set, `orx exp run <expId>` with no `--backend` launches there with
 the saved default flavor — omitting the flag is how you use it (flavor-required
 backends still need `--flavor` if no default flavor is saved; ssh always needs
@@ -109,8 +109,8 @@ orx exp run <expId> --backend ssh --host my-gpu-box
 
 - **`--host <alias>` is required on every launch** — a machine, not a hardware
   shape, so there is no `--flavor`, `--image`, or `--timeout` (the process runs
-  until it exits or is cancelled). Hosts are managed in Settings → Compute →
-  SSH (each has a "Test" button checking reachability + git).
+  until it exits or is cancelled). Use one of the user's configured SSH host
+  aliases; OpenResearch validates reachability and git separately.
 - Auth is your own ssh keys/agent — orx never reads a key, it just shells out
   to `ssh <alias>`. The host needs `git` and `bash`; private repos clone via
   the `GITHUB_TOKEN` passed in the run's env. The run lives under
@@ -128,7 +128,7 @@ orx exp run <expId> --backend slurm                    # CPU-only, settings defa
 ```
 
 - **`--host` is the login node's `~/.ssh/config` alias**; omit it to use the
-  default from Settings → Compute → Slurm. **`--flavor` is a GRES GPU request**
+  configured Slurm default. **`--flavor` is a GRES GPU request**
   (`h100:2` = two H100s); omit it for a CPU-only job. There is no `--image`;
   `--timeout` (default `4h`) applies — size it to cover the whole run.
 
@@ -144,7 +144,7 @@ orx exp run <expId> --backend ray --flavor gpu:1
 orx exp run <expId> --backend ray --flavor cpu:2,mem:8GiB
 ```
 
-- **Address** comes from Settings → Compute → Ray, else
+- **Address** comes from the user's saved Ray configuration, else
   `ASTROAI_RAY_JOBS_ADDRESS` / `RAY_DASHBOARD_URL`, else
   `http://127.0.0.1:8265`.
 - **`--flavor` is optional** resource hints for the job entrypoint:
@@ -189,11 +189,11 @@ orx exp run <expId> --backend local
 
 - **No flags** — no `--flavor`, `--host`, `--image`, or `--timeout` (the
   process runs until it exits or is cancelled); the hardware is whatever this
-  machine has. It shares CPU/RAM/GPU with the dashboard and your editing:
+  machine has. It shares CPU/RAM/GPU with OpenResearch and your editing tools:
   prefer it for small or CPU-scale runs and a remote backend for anything
   heavy.
 - Still the full run contract: it clones the branch tip into its own run dir
-  (never your checkout), supervised and visible in the dashboard — never run
+  (never your checkout), supervised and tracked by OpenResearch — never run
   training directly in your shell instead. The run lives under
   `<orx data dir>/local-runs/<runId>/`; cancel TERMs the process group.
 
