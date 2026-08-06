@@ -182,6 +182,16 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
             <p className="onb-sub">
               Choose a coding agent and confirm Git is installed. Both run on this machine.
             </p>
+            {harnesses !== null && !anyAgentReady && (
+              <p className="onb-gate-hint onb-agent-hint">
+                Sign in to at least one agent to continue.
+              </p>
+            )}
+            {harnesses !== null && anyAgentReady && preferredHarness === null && (
+              <p className="onb-gate-hint onb-agent-hint">
+                Choose a coding agent to continue.
+              </p>
+            )}
             <div className="onb-cards">
               {harnesses !== null ? (
                 harnesses.map((h) => (
@@ -203,14 +213,17 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
                   <span className="spinner" /> Detecting Claude Code, Codex, OpenCode…
                 </div>
               )}
-              <LocalGitCard gitVersion={gitVersion} error={gitError} />
             </div>
-            {harnesses !== null && !anyAgentReady && (
-              <p className="onb-gate-hint">Sign in to at least one agent to continue.</p>
-            )}
-            {harnesses !== null && anyAgentReady && preferredHarness === null && (
-              <p className="onb-gate-hint">Choose a coding agent to continue.</p>
-            )}
+            <div className="onb-git-check" role="status" aria-live="polite">
+              <LocalGitCard gitVersion={gitVersion} error={gitError} />
+              {gitError ? (
+                <p className="onb-gate-hint onb-git-hint">{RETRY_COPY}</p>
+              ) : gitVersion === null ? (
+                <p className="onb-gate-hint onb-git-hint">
+                  Git is required for local experiments. Install Git, then re-check.
+                </p>
+              ) : null}
+            </div>
             <div className="onb-actions">
               <button className="btn ghost" onClick={() => load(true, true)} disabled={checking}>
                 <RefreshCw size={12} className={checking ? "spin" : ""} /> Re-check
@@ -457,7 +470,7 @@ function LocalGitCard({
   error: boolean;
 }) {
   return (
-    <div className="onb-card" role="status" aria-live="polite">
+    <div className="onb-card">
       <div className="onb-card-head">
         <span className="onb-card-name">Local Git</span>
         <span
@@ -467,15 +480,9 @@ function LocalGitCard({
           {gitVersion ? "Ready" : error ? "Check failed" : gitVersion === null ? "Not found" : "Checking"}
         </span>
       </div>
-      <div className="onb-card-meta">
-        {gitVersion
-          ? gitVersion
-          : error
-            ? RETRY_COPY
-            : gitVersion === null
-              ? "Git is required for local experiments. Install Git, then re-check."
-              : "Checking Git…"}
-      </div>
+      {(gitVersion || (!error && gitVersion === undefined)) && (
+        <div className="onb-card-meta">{gitVersion ?? "Checking Git…"}</div>
+      )}
     </div>
   );
 }

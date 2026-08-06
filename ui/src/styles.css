@@ -3193,6 +3193,15 @@ textarea::placeholder {
   line-height: 1.5;
   color: var(--text);
 }
+.onb-git-check {
+  margin-top: 28px;
+}
+.onb-agent-hint {
+  margin: 0 0 10px;
+}
+.onb-git-hint {
+  margin-top: 8px;
+}
 .onb-token-form {
   display: flex;
   align-items: center;
