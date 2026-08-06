@@ -3073,13 +3073,6 @@ textarea::placeholder {
   padding: 1px 5px;
   white-space: nowrap;
 }
-.onb-card-row {
-  display: grid;
-  grid-template-columns: 56px 1fr auto;
-  align-items: baseline;
-  gap: 12px;
-  padding: 3px 0;
-}
 .onb-loading {
   display: flex;
   align-items: center;
@@ -3088,32 +3081,12 @@ textarea::placeholder {
   font-size: var(--fs-md);
   padding: 8px 0;
 }
-/* The fix for the row above it: one command, one action. Indented under its
-   status row so it reads as a remedy, not a third peer item. */
-.onb-fix {
-  display: flex;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin: 6px 0 9px;
-}
-/* Nice-to-have that isn't required to proceed (git identity) — set below the
-   requirement and visually quieter so it never reads as a second blocker. */
-.onb-aside {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 7px;
-  margin-top: 12px;
-  padding-top: 10px;
-  border-top: 1px solid var(--border-variant);
-}
 .onb-aside-text {
   font-size: var(--fs-xs);
   color: var(--muted);
   line-height: 1.5;
 }
-/* Step 3 (research background): a free-text blurb plus alphaXiv paper links. */
+/* Step 2 (research background): a free-text blurb plus alphaXiv paper links. */
 .onb-textarea {
   width: 100%;
   resize: vertical;
@@ -3211,72 +3184,6 @@ textarea::placeholder {
   color: var(--text);
   background: var(--panel);
 }
-/* The identity command is long — let it wrap inside the chip rather than
-   overflow the card. */
-.onb-aside .onb-cmd-chip {
-  max-width: 100%;
-}
-.onb-aside .onb-cmd-chip code {
-  font-size: var(--fs-xs);
-  white-space: normal;
-  word-break: break-word;
-}
-/* The call to action. Full-strength text so it's unmissable, but regular
-   weight at body size — semibold would tie it with the `GitHub` row label
-   above and read as a second heading. */
-.onb-fix-label {
-  font-size: var(--fs-md);
-  font-weight: var(--fw-regular);
-  color: var(--text);
-}
-/* Secondary escape hatch (paste a PAT) — deliberately quiet so it doesn't
-   compete with the primary command. */
-.onb-fix-alt {
-  margin-left: auto;
-  padding: 0;
-  border: 0;
-  background: none;
-  color: var(--muted);
-  font-size: var(--fs-xs);
-  text-decoration: underline;
-  cursor: pointer;
-}
-.onb-fix-alt:hover {
-  color: var(--text);
-}
-/* Command + its copy button share one border, so the button reads as part of
-   the command rather than a separate control next to it. */
-.onb-cmd-chip {
-  display: inline-flex;
-  align-items: stretch;
-  /* Hug the command — the card is a flex column, which would stretch it. */
-  align-self: flex-start;
-  max-width: 100%;
-  background: var(--panel);
-  border: 1px solid var(--border-variant);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
-}
-.onb-cmd-chip code {
-  font-family: var(--mono);
-  font-size: var(--fs-sm);
-  padding: 4px 9px;
-}
-.onb-cmd-copy {
-  display: inline-flex;
-  align-items: center;
-  flex-shrink: 0;
-  padding: 0 8px;
-  border: 0;
-  border-left: 1px solid var(--border-variant);
-  background: none;
-  color: var(--muted);
-  cursor: pointer;
-}
-.onb-cmd-copy:hover {
-  background: var(--surface);
-  color: var(--text);
-}
 /* Why Continue is disabled on step 1 — a disabled control with no explanation
    reads as a bug. */
 .onb-gate-hint {
@@ -3285,6 +3192,15 @@ textarea::placeholder {
   font-weight: var(--fw-semibold);
   line-height: 1.5;
   color: var(--text);
+}
+.onb-git-check {
+  margin-top: 28px;
+}
+.onb-agent-hint {
+  margin: 0 0 10px;
+}
+.onb-git-hint {
+  margin-top: 8px;
 }
 .onb-token-form {
   display: flex;
