@@ -59,7 +59,7 @@ interface TreeNode {
 }
 
 /** What the layout actually draws: real experiments plus "…" placeholders
- * standing in for regions owned by other agents (Agent scope only). */
+ * standing in for experiments from other tasks (Current task scope only). */
 type DisplayNode =
   | { kind: "exp"; exp: Experiment; children: DisplayNode[] }
   | { kind: "elided"; id: string; count: number; children: DisplayNode[] };
@@ -297,7 +297,7 @@ const ElidedNode = memo(function ElidedNode({ data }: NodeProps<ElidedFlowNode>)
       className="elided-node"
       role="button"
       tabIndex={0}
-      title="Switch to Project to see all experiments"
+      title="Switch to Entire project to see all experiments"
       onClick={onShowProjectScope}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
@@ -310,7 +310,7 @@ const ElidedNode = memo(function ElidedNode({ data }: NodeProps<ElidedFlowNode>)
       <Ellipsis size={14} />
       <span className="elided-node-label">
         {count} {count === 1 ? "experiment" : "experiments"}
-        <span className="elided-node-sub">other agents</span>
+        <span className="elided-node-sub">other tasks</span>
       </span>
       <Handle type="source" position={Position.Bottom} />
     </div>
@@ -344,10 +344,10 @@ export function TreeView({
   onOpenView: (id: string, view: ExperimentView) => void;
   /** Browse an experiment branch's code in the project-level Code tab. */
   onOpenCode: (experimentId: string, branch: string, view: CodeView) => void;
-  /** Agent scope: show only this chat session's experiments, eliding the rest.
-   * Null = Project scope (the whole forest). */
+  /** Current task scope: show only this chat session's experiments, eliding the rest.
+   * Null = Entire project scope (the whole forest). */
   agentSessionId: string | null;
-  /** Leave Agent scope (clicking an elided "…" pill). */
+  /** Leave Current task scope (clicking an elided "…" pill). */
   onShowProjectScope: () => void;
 }) {
   const { nodes, edges } = useMemo(() => {
@@ -446,13 +446,13 @@ export function TreeView({
     );
   }
 
-  // Only Agent scope can filter a non-empty forest down to nothing.
+  // Only Current task scope can filter a non-empty forest down to nothing.
   if (nodes.length === 0 && agentSessionId) {
     return (
       <div className="empty-state empty-state-cta">
-        <p className="empty-state-title">No experiments from this agent yet</p>
+        <p className="empty-state-title">No experiments from the current task yet</p>
         <p className="empty-state-hint">
-          Ask this agent to create one, or switch to Project to see all experiments.
+          Ask in this task to create one, or switch to Entire project to see all experiments.
         </p>
       </div>
     );

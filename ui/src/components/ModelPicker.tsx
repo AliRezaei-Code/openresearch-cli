@@ -1,5 +1,5 @@
 import { Check, ChevronDown, Lock } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import {
   getHarnesses,
   harnessModelLabel,
@@ -42,7 +42,7 @@ export function defaultSelection(harnesses: Harness[]): ModelSelection | null {
 
 /** Close-on-outside-click + open state shared by the composer dropdowns (and
  * the session-rail menus). */
-export function usePopover() {
+export function usePopover(triggerRef?: RefObject<HTMLButtonElement | null>) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -61,15 +61,16 @@ export function usePopover() {
         e.preventDefault();
         e.stopPropagation();
         setOpen(false);
+        triggerRef?.current?.focus();
       }
     };
-    document.addEventListener("mousedown", onDown);
+    document.addEventListener("mousedown", onDown, true);
     document.addEventListener("keydown", onKey, true);
     return () => {
-      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("mousedown", onDown, true);
       document.removeEventListener("keydown", onKey, true);
     };
-  }, [open]);
+  }, [open, triggerRef]);
   return { open, setOpen, ref };
 }
 
