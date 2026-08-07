@@ -3153,11 +3153,6 @@ textarea::placeholder {
   font-size: var(--fs-md);
   padding: 8px 0;
 }
-.onb-aside-text {
-  font-size: var(--fs-xs);
-  color: var(--muted);
-  line-height: 1.5;
-}
 /* Step 2: research interests, background, and representative papers. */
 .onb-fieldset {
   border: 0;
@@ -3169,10 +3164,6 @@ textarea::placeholder {
   font-size: var(--fs-base);
   font-weight: var(--fw-semibold);
   margin-bottom: 6px;
-}
-.onb-field-label span {
-  color: var(--muted);
-  font-weight: var(--fw-regular);
 }
 .onb-field-hint {
   color: var(--muted);

@@ -304,7 +304,7 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
                   )}
                 </fieldset>
                 <label className="onb-field-label" htmlFor="onb-background">
-                  Research background <span>(optional)</span>
+                  Research background
                 </label>
                 <textarea
                   id="onb-background"
@@ -316,7 +316,7 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
                   placeholder="e.g. I work on sample-efficient RL for LLM post-training, focused on reward-model-free methods."
                 />
                 <label className="onb-field-label" htmlFor="onb-paper-search">
-                  Representative papers <span>(optional)</span>
+                  Representative papers
                 </label>
                 <p className="onb-field-hint">
                   Add papers that represent your research interests, including papers by other
@@ -368,12 +368,6 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
                 )}
               </div>
             </div>
-            <p className="onb-aside-text" style={{ marginTop: 12 }}>
-              Your answers, including text and paper metadata exactly as submitted, are saved on
-              this machine and sent to OpenResearch as product analytics linked to a random
-              installation ID, not your account. Disable analytics any time with{" "}
-              <code>orx telemetry off</code>.
-            </p>
             {!researchProfileValid && (
               <p className="onb-profile-hint">
                 {researchAreas.length === 0
