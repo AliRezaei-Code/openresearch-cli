@@ -1,16 +1,41 @@
+import { useState } from "react";
+import { Check, Copy } from "lucide-react";
+
+/** A backtick command from an `agentNote`, rendered as a code pill with its own
+ * copy button so the user can grab it without retyping. */
+function CommandPill({ cmd }: { cmd: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <span className="cmd-inline">
+      <code className="mono">{cmd}</code>
+      <button
+        type="button"
+        className="cmd-inline-copy"
+        onClick={() => {
+          void navigator.clipboard
+            .writeText(cmd)
+            .then(() => {
+              setCopied(true);
+              setTimeout(() => setCopied(false), 1500);
+            })
+            .catch(() => {});
+        }}
+        aria-label={copied ? "Copied" : `Copy ${cmd}`}
+        title={copied ? "Copied" : "Copy"}
+      >
+        {copied ? <Check size={11} strokeWidth={3} /> : <Copy size={11} />}
+      </button>
+    </span>
+  );
+}
+
 /** Harness `agentNote` strings carry the command to run in backticks
- * (`claude auth login`) — render those spans as code so they read as something
- * to type, not prose. Shared by every surface that shows a note: onboarding,
- * the model picker, and settings. */
+ * (`claude auth login`) — render those spans as copyable code pills so they read
+ * as something to type, not prose. Shared by every surface that shows a note:
+ * onboarding, the model picker, and the chat panel. */
 export function renderNote(note: string | undefined) {
   if (!note) return null;
-  return note.split(/`([^`]+)`/).map((part, i) =>
-    i % 2 === 1 ? (
-      <code key={i} className="mono">
-        {part}
-      </code>
-    ) : (
-      part
-    ),
-  );
+  return note
+    .split(/`([^`]+)`/)
+    .map((part, i) => (i % 2 === 1 ? <CommandPill key={i} cmd={part} /> : part));
 }
