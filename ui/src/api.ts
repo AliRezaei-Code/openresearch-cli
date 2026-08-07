@@ -693,6 +693,8 @@ export interface LinkedPaper {
 
 /** The local researcher profile captured in onboarding (settings.json). */
 export interface Profile {
+  researchAreas: string[];
+  otherArea: string | null;
   background: string | null;
   papers: LinkedPaper[];
 }
@@ -774,7 +776,7 @@ export const pushProjectGithub = (projectId: string) =>
   post<{ project: Project; git: ProjectGitStatus }>(`/api/projects/${projectId}/github/push`);
 
 export interface TelemetrySettings {
-  /** Whether anonymous usage analytics is currently on. */
+  /** Whether usage analytics linked to the random installation ID is on. */
   enabled: boolean;
   /** When off, a short human reason (e.g. "--no-telemetry flag"); null when on. */
   reason: string | null;

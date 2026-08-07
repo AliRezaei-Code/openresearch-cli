@@ -3158,13 +3158,60 @@ textarea::placeholder {
   color: var(--muted);
   line-height: 1.5;
 }
-/* Step 2 (research background): a free-text blurb plus alphaXiv paper links. */
+/* Step 2: research interests, background, and representative papers. */
+.onb-fieldset {
+  border: 0;
+  margin: 0 0 18px;
+  padding: 0;
+}
+.onb-fieldset legend,
+.onb-field-label {
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semibold);
+  margin-bottom: 6px;
+}
+.onb-field-label span {
+  color: var(--muted);
+  font-weight: var(--fw-regular);
+}
+.onb-field-hint {
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  line-height: 1.4;
+  margin: 0 0 8px;
+}
+.onb-area-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.onb-area-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  padding: 9px 10px;
+}
+.onb-area-option:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--primary-subtle);
+}
+.onb-area-option input {
+  margin: 0;
+}
+.onb-other-area {
+  width: 100%;
+  margin-top: 8px;
+}
 .onb-textarea {
   width: 100%;
   resize: vertical;
   min-height: 78px;
   line-height: 1.5;
   font-size: var(--fs-base);
+  margin-bottom: 14px;
 }
 .onb-paper-search {
   display: flex;
@@ -3255,6 +3302,11 @@ textarea::placeholder {
 .onb-paper-chip button:hover {
   color: var(--text);
   background: var(--panel);
+}
+.onb-profile-hint {
+  color: var(--accent-red);
+  font-size: var(--fs-sm);
+  margin: 8px 0 0;
 }
 /* Why Continue is disabled on step 1 — a disabled control with no explanation
    reads as a bug. */

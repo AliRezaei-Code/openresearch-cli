@@ -20,11 +20,12 @@ import { onHarnessAuth } from "../events";
 import { saveAgentSelection, type AgentSelection } from "../agentSelection";
 
 const RETRY_COPY = "Couldn't reach orx. Check it's still running, then re-check.";
+const RESEARCH_AREAS = ["AI/ML", "Biology", "Physics", "Other"];
 
-/** First-run walkthrough: choose a local coding agent, verify Git, optionally
- * add research background, then install and open the demo project. The local
- * tool checks gate setup; the background (a blurb + linked papers) is saved
- * best-effort so it never blocks installation. The data-dir choice lives in
+/** First-run walkthrough: choose a local coding agent, verify Git, add a
+ * research profile, then install and open the demo project. The local tool
+ * checks gate setup; the profile is saved best-effort so it never blocks
+ * installation. The data-dir choice lives in
  * Settings → Storage (which can also *move* existing data); usage analytics is
  * opt-out via the CLI (`orx telemetry off`). */
 export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
@@ -35,9 +36,8 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
   const [finishError, setFinishError] = useState<string | null>(null);
   const [preferredHarness, setPreferredHarness] = useState<HarnessId | null>(null);
   const [checking, setChecking] = useState(false);
-  // Step 2 (optional): a free-text background plus any alphaXiv papers linked
-  // via title search. Prefilled from any saved profile so a replayed
-  // walkthrough doesn't look empty.
+  const [researchAreas, setResearchAreas] = useState<string[]>([]);
+  const [otherArea, setOtherArea] = useState("");
   const [background, setBackground] = useState("");
   const [papers, setPapers] = useState<LinkedPaper[]>([]);
   const [paperQuery, setPaperQuery] = useState("");
@@ -114,6 +114,8 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
   useEffect(() => {
     void getProfile()
       .then((p) => {
+        setResearchAreas(p.researchAreas);
+        setOtherArea(p.otherArea ?? "");
         setBackground(p.background ?? "");
         setPapers(p.papers);
       })
@@ -149,6 +151,14 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
     setPaperHits([]);
   };
   const removePaper = (id: string) => setPapers((cur) => cur.filter((p) => p.paperId !== id));
+  const toggleResearchArea = (area: string) => {
+    setResearchAreas((current) =>
+      current.includes(area) ? current.filter((item) => item !== area) : [...current, area],
+    );
+  };
+
+  const researchProfileValid =
+    researchAreas.length > 0 && (!researchAreas.includes("Other") || otherArea.trim().length > 0);
 
   const finishOnboarding = async () => {
     const harness = harnesses?.find((item) => item.id === preferredHarness && item.agentReady);
@@ -158,7 +168,9 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
     setFinishError(null);
     try {
       const completion = await completeOnboarding(selection, {
-        background: background.trim() || null,
+        researchAreas,
+        otherArea: researchAreas.includes("Other") ? otherArea : null,
+        background: background || null,
         papers,
       });
       saveAgentSelection(completion.selection);
@@ -260,12 +272,42 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
             </div>
             <h2 className="onb-title">Tell us about your research</h2>
             <p className="onb-sub">
-              A sentence or two about what you work on helps orx tailor its research. All optional;
-              you can skip and add this later.
+              This helps us understand who uses orx and improve it for your kind of research.
             </p>
             <div className="onb-cards">
               <div className="onb-card">
+                <fieldset className="onb-fieldset">
+                  <legend>What areas are you interested in?</legend>
+                  <p className="onb-field-hint">Choose one or more.</p>
+                  <div className="onb-area-options">
+                    {RESEARCH_AREAS.map((area) => (
+                      <label key={area} className="onb-area-option">
+                        <input
+                          type="checkbox"
+                          checked={researchAreas.includes(area)}
+                          onChange={() => toggleResearchArea(area)}
+                          disabled={finishing}
+                        />
+                        <span>{area}</span>
+                      </label>
+                    ))}
+                  </div>
+                  {researchAreas.includes("Other") && (
+                    <input
+                      className="onb-other-area"
+                      value={otherArea}
+                      onChange={(event) => setOtherArea(event.target.value)}
+                      disabled={finishing}
+                      placeholder="Tell us your other research area"
+                      aria-label="Other research area"
+                    />
+                  )}
+                </fieldset>
+                <label className="onb-field-label" htmlFor="onb-background">
+                  Research background <span>(optional)</span>
+                </label>
                 <textarea
+                  id="onb-background"
                   className="onb-textarea"
                   value={background}
                   onChange={(e) => setBackground(e.target.value)}
@@ -273,8 +315,16 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
                   rows={4}
                   placeholder="e.g. I work on sample-efficient RL for LLM post-training, focused on reward-model-free methods."
                 />
+                <label className="onb-field-label" htmlFor="onb-paper-search">
+                  Representative papers <span>(optional)</span>
+                </label>
+                <p className="onb-field-hint">
+                  Add papers that represent your research interests, including papers by other
+                  authors.
+                </p>
                 <div className="onb-paper-search">
                   <input
+                    id="onb-paper-search"
                     value={paperQuery}
                     onChange={(e) => setPaperQuery(e.target.value)}
                     disabled={finishing}
@@ -318,12 +368,19 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
                 )}
               </div>
             </div>
-            {/* The data dir moved to Settings → Storage; still disclose where
-                things land so the location isn't a surprise. */}
             <p className="onb-aside-text" style={{ marginTop: 12 }}>
-              Your background stays on this machine, alongside your database, run logs, and
-              artifacts — change where they live any time in Settings → Storage.
+              Your answers, including text and paper metadata exactly as submitted, are saved on
+              this machine and sent to OpenResearch as product analytics linked to a random
+              installation ID, not your account. Disable analytics any time with{" "}
+              <code>orx telemetry off</code>.
             </p>
+            {!researchProfileValid && (
+              <p className="onb-profile-hint">
+                {researchAreas.length === 0
+                  ? "Choose at least one research area to continue."
+                  : "Describe your research area to continue."}
+              </p>
+            )}
             <div className="onb-actions">
               <button className="btn ghost" onClick={() => setStep(0)} disabled={finishing}>
                 <ArrowLeft size={12} /> Back
@@ -332,7 +389,7 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
               <button
                 className="btn primary"
                 onClick={() => void finishOnboarding()}
-                disabled={finishing || preferredHarness === null}
+                disabled={finishing || preferredHarness === null || !researchProfileValid}
               >
                 {finishing ? (
                   <>
