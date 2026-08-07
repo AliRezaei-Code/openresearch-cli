@@ -8,11 +8,14 @@
 //! the workspace or added automatically.
 //!
 //! Guarantees, enforced by this module:
+//! - **Official builds only.** Source builds never send production telemetry or
+//!   generate an install id. The official release workflow embeds the immutable
+//!   production build channel; a runtime override may only disable it.
 //! - **Opt-out.** A `--no-telemetry` flag and a persistent `orx telemetry off`
 //!   (also toggleable from the `orx up` onboarding step). A disabled run sends
-//!   nothing, touches no disk, and generates no install id. (Sole exception:
-//!   *agreeing* to the consent step persists the install id — an opt-in; see
-//!   `record_consent`.)
+//!   nothing, touches no disk, and generates no install id. (In an eligible
+//!   official build, *agreeing* to the consent step persists the install id —
+//!   an opt-in; see `record_consent`.)
 //! - **Never blocks or crashes the CLI.** Sends are fire-and-forget on a
 //!   background task with a bounded flush window (modeled on
 //!   [`crate::updates::UpdateWarning`]); every error is swallowed. A telemetry
@@ -40,6 +43,12 @@ const POSTHOG_KEY: &str = "phc_u2i23xa8CBjcZpQprf6kdDzzR8vb2iTpRT8FmdcREBvX";
 /// every current and future CLI event is `cli_*` by construction; call sites
 /// pass the bare name (`command`, `experiment_started`).
 const EVENT_PREFIX: &str = "cli_";
+
+const BUILD_CHANNEL: &str = env!("ORX_BUILD_CHANNEL");
+
+pub(crate) fn build_channel() -> &'static str {
+    BUILD_CHANNEL
+}
 
 /// US PostHog cloud. Overridable with `ORX_TELEMETRY_HOST` so tests can point
 /// at a throwaway local listener instead of production.
@@ -427,6 +436,8 @@ fn install_id() -> Option<String> {
 
 /// Why telemetry is off, for `orx telemetry status`. `None` = enabled.
 pub(crate) enum DisabledReason {
+    DevelopmentBuild,
+    RuntimeEnvironment,
     Flag,
     Persisted,
     CorruptSettings,
@@ -435,6 +446,8 @@ pub(crate) enum DisabledReason {
 impl DisabledReason {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
+            DisabledReason::DevelopmentBuild => "development build",
+            DisabledReason::RuntimeEnvironment => "disabled by ORX_TELEMETRY_ENV",
             DisabledReason::Flag => "--no-telemetry flag",
             DisabledReason::Persisted => "disabled via `orx telemetry off`",
             DisabledReason::CorruptSettings => "settings file unreadable (failing safe)",
@@ -442,16 +455,35 @@ impl DisabledReason {
     }
 }
 
-/// Resolves whether telemetry is disabled and why. The flag is checked before
-/// the persisted setting so a `--no-telemetry` run never reads disk.
+/// Resolves whether telemetry is disabled and why. Build/runtime eligibility
+/// is checked before flags or settings so source builds never read telemetry
+/// state merely to decide whether they may send.
 /// `cli_flag` is the `--no-telemetry` global flag.
 ///
-/// Opt-out surface is intentionally minimal: the `--no-telemetry` flag and the
-/// persistent `orx telemetry off`. Automated/CI runs are not auto-disabled —
-/// the `ci` property on every event lets those be filtered at query time
-/// instead, which also catches automation the old `CI` env check missed
-/// (agent boxes, Jenkins, ad-hoc scripts).
-pub(crate) fn disabled_reason(cli_flag: bool) -> Option<DisabledReason> {
+/// User preference controls are intentionally minimal: the `--no-telemetry`
+/// flag and persistent `orx telemetry off`. `ORX_TELEMETRY_ENV` is a separate
+/// eligibility downgrade for testing official binaries. Automated/CI runs are
+/// not otherwise auto-disabled — the `ci` property on every event lets those
+/// be filtered at query time instead.
+fn environment_disabled_reason_for(
+    build_channel: &str,
+    runtime_environment: Option<&str>,
+) -> Option<DisabledReason> {
+    if build_channel != "production" {
+        return Some(DisabledReason::DevelopmentBuild);
+    }
+    match runtime_environment.map(str::trim) {
+        None | Some("production") => None,
+        Some(_) => Some(DisabledReason::RuntimeEnvironment),
+    }
+}
+
+fn environment_disabled_reason() -> Option<DisabledReason> {
+    let runtime_environment = std::env::var("ORX_TELEMETRY_ENV").ok();
+    environment_disabled_reason_for(build_channel(), runtime_environment.as_deref())
+}
+
+fn preference_disabled_reason(cli_flag: bool) -> Option<DisabledReason> {
     if cli_flag {
         return Some(DisabledReason::Flag);
     }
@@ -465,6 +497,14 @@ pub(crate) fn disabled_reason(cli_flag: bool) -> Option<DisabledReason> {
         SettingsState::Corrupt => Some(DisabledReason::CorruptSettings),
         _ => None,
     }
+}
+
+pub(crate) fn disabled_reason(cli_flag: bool) -> Option<DisabledReason> {
+    environment_disabled_reason().or_else(|| preference_disabled_reason(cli_flag))
+}
+
+pub(crate) fn effective_disabled_reason() -> Option<DisabledReason> {
+    disabled_reason(flag())
 }
 
 /// Convenience: `true` when events should be sent.
@@ -547,8 +587,9 @@ fn is_ci() -> bool {
 }
 
 /// Builds the PostHog capture payload for an event. Every event carries the
-/// same base context (source, version, os, arch, ci, install_kind) plus
-/// `$process_person_profile: false` so PostHog does not create a person profile.
+/// same base context (source, version, build channel, os, arch, ci, install
+/// kind) plus `$process_person_profile: false` so PostHog does not create a
+/// person profile.
 /// `extra` supplies event-specific properties. Most callers use coarse enums;
 /// the onboarding research-profile event deliberately includes the fields
 /// disclosed in the UI.
@@ -558,6 +599,7 @@ fn build_payload(event: &str, distinct_id: &str, extra: serde_json::Value) -> se
         "$process_person_profile": false,
         "source": "cli",
         "cli_version": crate::updates::current_version().to_string(),
+        "build_channel": build_channel(),
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "ci": is_ci(),
@@ -699,10 +741,11 @@ fn consent_distinct_id(agreed: bool) -> String {
 }
 
 /// Record a telemetry consent decision — `cli_telemetry_consent` with
-/// `{ agreed: bool }`. This is the ONE event that fires UNCONDITIONALLY: it must
-/// land even when the user chose to disable telemetry, otherwise every rejection
-/// would be invisible and the agree/reject ratio would be hopelessly skewed
-/// toward "agree".
+/// `{ agreed: bool }`. Within an eligible official build, this is the ONE event
+/// that ignores the user's telemetry preference: it must land even when the
+/// user chose to disable telemetry, otherwise every rejection would be
+/// invisible and the agree/reject ratio would be hopelessly skewed toward
+/// "agree".
 ///
 /// Identity policy (phantom-free by construction):
 /// - `agreed` → the persistent install id. The user just consented to
@@ -716,6 +759,9 @@ fn consent_distinct_id(agreed: bool) -> String {
 /// the `orx telemetry on/off` command) can fire-and-confirm without hanging.
 /// Errors are swallowed — recording consent must never fail the action.
 pub(crate) async fn record_consent(agreed: bool) {
+    if environment_disabled_reason().is_some() {
+        return;
+    }
     let distinct_id = consent_distinct_id(agreed);
     let payload = build_payload(
         "telemetry_consent",
@@ -859,8 +905,8 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard};
 
-    // Serializes the telemetry tests below, which mutate process-global env
-    // (XDG_CONFIG_HOME, and ORX_TELEMETRY_HOST in one test). IMPORTANT: this lock
+    // Serializes the telemetry tests below, which mutate the process-global
+    // variables in OPT_VARS. IMPORTANT: this lock
     // is telemetry-module-local — it does NOT protect against a test in ANOTHER
     // module reading those same vars concurrently under the default
     // multithreaded test runner. Today no other test reads them at runtime (the
@@ -900,24 +946,36 @@ mod tests {
         }
     }
 
-    const OPT_VARS: &[&str] = &["XDG_CONFIG_HOME", "ORX_TELEMETRY_CONTEXT"];
+    const OPT_VARS: &[&str] = &[
+        "XDG_CONFIG_HOME",
+        "ORX_TELEMETRY_CONTEXT",
+        "ORX_TELEMETRY_ENV",
+        "ORX_TELEMETRY_HOST",
+    ];
 
     #[test]
-    fn opt_out_precedence() {
+    fn environment_policy_is_fail_closed_and_downgrade_only() {
         let _g = EnvGuard::new(OPT_VARS);
-        // Point config dir at a fresh throwaway path so the persisted-setting
-        // branch reads nothing (unique per run to avoid cross-run leftovers).
-        let dir = std::env::temp_dir().join(format!("orx-tel-none-{}", uuid::Uuid::new_v4()));
-        std::env::set_var("XDG_CONFIG_HOME", &dir);
-
-        // Clean state, no flag → enabled. Automated/CI environments are NOT
-        // auto-disabled (that's a query-time filter via the `ci` property).
-        assert!(is_enabled(false));
-
-        // The only per-run opt-out is the --no-telemetry flag.
-        assert!(matches!(disabled_reason(true), Some(DisabledReason::Flag)));
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(
+            environment_disabled_reason_for("development", None),
+            Some(DisabledReason::DevelopmentBuild)
+        ));
+        assert!(matches!(
+            environment_disabled_reason_for("development", Some("production")),
+            Some(DisabledReason::DevelopmentBuild)
+        ));
+        assert!(environment_disabled_reason_for("production", None).is_none());
+        assert!(environment_disabled_reason_for("production", Some("production")).is_none());
+        for value in ["development", "test", "off", "", "unexpected"] {
+            assert!(matches!(
+                environment_disabled_reason_for("production", Some(value)),
+                Some(DisabledReason::RuntimeEnvironment)
+            ));
+        }
+        assert!(matches!(
+            preference_disabled_reason(true),
+            Some(DisabledReason::Flag)
+        ));
     }
 
     #[test]
@@ -926,20 +984,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("orx-tel-persist-{}", uuid::Uuid::new_v4()));
         std::env::set_var("XDG_CONFIG_HOME", &dir);
 
-        // Nothing persisted → enabled.
-        assert!(is_enabled(false));
+        assert!(preference_disabled_reason(false).is_none());
 
         // Persist an opt-out and confirm it disables.
         set_persisted_disabled(true).unwrap();
         assert!(matches!(
-            disabled_reason(false),
+            preference_disabled_reason(false),
             Some(DisabledReason::Persisted)
         ));
 
         // Clearing it re-enables (and doesn't wipe the install id via the lock).
         let _ = install_id();
         set_persisted_disabled(false).unwrap();
-        assert!(is_enabled(false));
+        assert!(preference_disabled_reason(false).is_none());
         assert!(
             load_settings().and_then(|s| s.install_id).is_some(),
             "clearing opt-out must not clobber the install id"
@@ -1221,6 +1278,7 @@ mod tests {
         assert_eq!(props["$process_person_profile"], false);
         assert_eq!(props["source"], "cli");
         assert!(props["cli_version"].is_string());
+        assert_eq!(props["build_channel"], build_channel());
         assert!(props["os"].is_string());
         assert!(props["arch"].is_string());
         assert!(props["ci"].is_boolean());
@@ -1255,10 +1313,21 @@ mod tests {
         let payload = build_payload(
             "command",
             "did",
-            json!({ "source": "EVIL", "ci": "EVIL", "install_kind": "EVIL", "command": "login" }),
+            json!({
+                "source": "EVIL",
+                "build_channel": "EVIL",
+                "ci": "EVIL",
+                "install_kind": "EVIL",
+                "command": "login"
+            }),
         );
         let props = &payload["properties"];
         assert_eq!(props["source"], "cli", "base source must win");
+        assert_eq!(
+            props["build_channel"],
+            build_channel(),
+            "embedded build channel must win"
+        );
         assert!(props["ci"].is_boolean(), "base ci must win");
         assert_eq!(props["install_kind"], "human", "base install_kind must win");
         // Non-colliding extra keys still land.
@@ -1385,6 +1454,7 @@ mod tests {
             vec![
                 "$process_person_profile",
                 "arch",
+                "build_channel",
                 "ci",
                 "cli_version",
                 "install_kind",
@@ -1453,33 +1523,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_consent_sends_even_when_opted_out() {
-        // The consent event is UNCONDITIONAL: a persisted opt-out must not
-        // suppress it (otherwise rejections would be invisible). We can't easily
-        // assert the wire send in-process, but we CAN assert record_consent does
-        // not early-return on the opt-out path and returns promptly against a
-        // dead endpoint — i.e. it neither hangs nor panics while disabled.
+    async fn environment_disabled_consent_never_creates_an_install_id() {
         let _g = EnvGuard::new(OPT_VARS);
         let dir = std::env::temp_dir().join(format!("orx-tel-consent-{}", uuid::Uuid::new_v4()));
         std::env::set_var("XDG_CONFIG_HOME", &dir);
-        std::env::set_var("ORX_TELEMETRY_HOST", "http://127.0.0.1:9");
+        if build_channel() == "production" {
+            std::env::set_var("ORX_TELEMETRY_ENV", "off");
+        }
+        assert!(environment_disabled_reason().is_some());
 
-        // Persist an opt-out; normal telemetry is now disabled.
-        set_persisted_disabled(true).unwrap();
-        assert!(matches!(
-            disabled_reason(false),
-            Some(DisabledReason::Persisted)
-        ));
-
-        // Still returns (bounded by the internal timeout) without panicking, and
-        // does NOT create a persisted install id as a side effect.
         record_consent(false).await;
+        record_consent(true).await;
         assert!(
             load_settings().and_then(|s| s.install_id).is_none(),
-            "consent must not generate a persisted install id"
+            "environment-disabled consent must not generate a persisted install id"
         );
 
-        std::env::remove_var("ORX_TELEMETRY_HOST");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn environment_disabled_all_capture_paths_stay_inert() {
+        let _g = EnvGuard::new(OPT_VARS);
+        let dir = std::env::temp_dir().join(format!("orx-tel-inert-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        if build_channel() == "production" {
+            std::env::set_var("ORX_TELEMETRY_ENV", "off");
+        }
+        assert!(environment_disabled_reason().is_some());
+
+        let session = TelemetrySession::start("up");
+        capture_onboarding_completed();
+        capture_onboarding_research_profile(&ResearchProfile::default());
+        capture_project_created(true);
+        capture_chat_session_started("codex");
+        capture_experiment_started("run", true, Some("local"));
+
+        assert!(pending().lock().unwrap().is_empty());
+        session.finish(true).await;
+        assert!(load_settings().and_then(|s| s.install_id).is_none());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1512,7 +1595,7 @@ mod tests {
 
         // Fail safe: an unreadable file is treated as "disabled", not "enabled".
         assert!(matches!(
-            disabled_reason(false),
+            preference_disabled_reason(false),
             Some(DisabledReason::CorruptSettings)
         ));
 
@@ -1529,15 +1612,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capture_is_non_blocking_and_drains_at_flush() {
+    async fn capture_respects_the_embedded_build_channel() {
         let _g = EnvGuard::new(OPT_VARS);
         let dir = std::env::temp_dir().join(format!("orx-tel-flush-{}", uuid::Uuid::new_v4()));
         std::env::set_var("XDG_CONFIG_HOME", &dir);
         // Dead endpoint: the send will fail fast; we only care about registration
         // and that flush_pending returns (bounded, never hangs).
         std::env::set_var("ORX_TELEMETRY_HOST", "http://127.0.0.1:9");
-        // Start from a clean pending set (this is the only test that uses it,
-        // but guard against ordering just in case).
+        // Start clean in case another capture-path test ran first.
         pending().lock().unwrap().clear();
 
         // Disabled (persisted opt-out) → nothing registered. Using the persisted
@@ -1551,23 +1633,20 @@ mod tests {
         );
         set_persisted_disabled(false).unwrap();
 
-        // Enabled → capture returns immediately (non-blocking) and registers a
-        // handle for the exit-time flush.
+        // With the preference on, capture follows the embedded build channel.
         capture("experiment_started", json!({ "kind": "run" }));
-        assert_eq!(
-            pending().lock().unwrap().len(),
-            1,
-            "enabled capture must register exactly one pending send"
-        );
-
-        // Draining the pending set empties it and returns within bounds.
-        flush_pending().await;
+        if build_channel() == "production" {
+            assert_eq!(pending().lock().unwrap().len(), 1);
+            flush_pending().await;
+        } else {
+            assert!(pending().lock().unwrap().is_empty());
+            assert!(load_settings().and_then(|s| s.install_id).is_none());
+        }
         assert!(
             pending().lock().unwrap().is_empty(),
             "flush_pending must drain the pending set"
         );
 
-        std::env::remove_var("ORX_TELEMETRY_HOST");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

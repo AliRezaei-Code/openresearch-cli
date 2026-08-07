@@ -46,9 +46,7 @@ fn context(value: Option<String>, clear: bool) -> Result<()> {
 }
 
 fn status() -> Result<()> {
-    // `--no-telemetry` is a per-run flag, not persisted state, so status reports
-    // the standing (persisted) setting with flag=false.
-    match telemetry::disabled_reason(false) {
+    match telemetry::effective_disabled_reason() {
         None => {
             println!("Anonymous usage analytics: on");
             println!("  No code, prompts, file contents, or identifiers are ever sent.");
@@ -57,6 +55,7 @@ fn status() -> Result<()> {
             println!("Anonymous usage analytics: off ({})", reason.as_str());
         }
     }
+    println!("  Build channel: {}", telemetry::build_channel());
 
     match telemetry::load_settings().and_then(|s| s.install_id) {
         Some(id) => println!("  Anonymous install id: {id}"),
@@ -66,19 +65,26 @@ fn status() -> Result<()> {
         println!("  Machine context: {context} (events tagged install_kind={context})");
     }
     println!();
-    println!("Turn off with `orx telemetry off`; back on with `orx telemetry on`.");
+    println!("Set your preference with `orx telemetry off` or `orx telemetry on`.");
     Ok(())
 }
 
 async fn set_enabled(enabled: bool) -> Result<()> {
-    // Record the consent decision itself — unconditionally, so an opt-out is
-    // still counted (see telemetry::record_consent).
+    // Eligible official builds record the decision even for an opt-out.
     telemetry::record_consent(enabled).await;
     telemetry::set_persisted_disabled(!enabled)
         .map_err(|e| anyhow!("Could not save telemetry setting: {e}"))?;
     if enabled {
-        println!("\u{2713} Anonymous usage analytics enabled.");
-        println!("  (The --no-telemetry flag still disables it for a single run.)");
+        match telemetry::effective_disabled_reason() {
+            None => {
+                println!("\u{2713} Anonymous usage analytics enabled.");
+                println!("  (The --no-telemetry flag still disables it for a single run.)");
+            }
+            Some(reason) => println!(
+                "\u{2713} Analytics preference enabled, but analytics remain off ({}).",
+                reason.as_str()
+            ),
+        }
     } else {
         println!("\u{2713} Anonymous usage analytics disabled on this machine.");
     }
