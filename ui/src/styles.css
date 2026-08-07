@@ -3088,18 +3088,19 @@ textarea::placeholder {
   color: inherit;
   font: inherit;
   text-align: left;
-  cursor: pointer;
   transition: border-color 120ms ease, box-shadow 120ms ease;
 }
-.onb-agent-choice:not(:disabled):hover {
+/* Only a selectable (ready) card is a button — the unready card is an inert div,
+   so keep the pointer cursor and hover feedback off it. */
+button.onb-agent-choice {
+  cursor: pointer;
+}
+button.onb-agent-choice:hover {
   border-color: var(--muted);
 }
 .onb-agent-choice.selected {
   border-color: var(--accent);
   box-shadow: 0 0 0 1px var(--accent);
-}
-.onb-agent-choice:disabled {
-  cursor: default;
 }
 .onb-card-head {
   display: flex;
@@ -3144,6 +3145,27 @@ textarea::placeholder {
   border-radius: var(--radius-xs);
   padding: 1px 5px;
   white-space: nowrap;
+}
+/* A renderNote() command plus its copy button, kept on one baseline. */
+.cmd-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  vertical-align: baseline;
+}
+.cmd-inline-copy {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+.cmd-inline-copy:hover {
+  background: var(--surface);
+  color: var(--text);
 }
 .onb-loading {
   display: flex;

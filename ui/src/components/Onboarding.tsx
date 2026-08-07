@@ -469,46 +469,52 @@ function AgentCard({
 }) {
   const badge = agentBadge(h);
   const version = h.version?.replace(/\s*\(.*\)$/, "");
+  const head = (
+    <div className="onb-card-head">
+      <span className="onb-card-identity">
+        <AgentLogo harness={h.id} />
+        <span className="onb-card-name">{h.name}</span>
+      </span>
+      <span className={`status-badge ${badge.cls}`}>
+        {h.agentReady ? <Check size={12} strokeWidth={3} /> : <span className="dot" />}
+        {badge.label}
+      </span>
+    </div>
+  );
+  // An unready agent can't be selected — render it as a plain container, not a
+  // disabled button, so the copy button on its `agentNote` command stays live.
+  if (!h.agentReady) {
+    return (
+      <div className="onb-card onb-agent-choice">
+        {head}
+        <div className="onb-card-meta">{renderNote(h.agentNote)}</div>
+      </div>
+    );
+  }
   return (
     <button
       type="button"
       className={`onb-card onb-agent-choice${selected ? " selected" : ""}`}
-      disabled={!h.agentReady}
       aria-pressed={selected}
       onClick={onSelect}
     >
-      <div className="onb-card-head">
-        <span className="onb-card-identity">
-          <AgentLogo harness={h.id} />
-          <span className="onb-card-name">{h.name}</span>
-        </span>
-        <span className={`status-badge ${badge.cls}`}>
-          {h.agentReady ? <Check size={12} strokeWidth={3} /> : <span className="dot" />}
-          {badge.label}
-        </span>
+      {head}
+      <div className="onb-card-detail mono">
+        {h.account ?? "API key"}
+        {h.plan ? ` · ${h.plan}` : ""}
       </div>
-      {h.agentReady ? (
-        <>
-          <div className="onb-card-detail mono">
-            {h.account ?? "API key"}
-            {h.plan ? ` · ${h.plan}` : ""}
-          </div>
-          <div className="onb-card-meta">
-            {[
-              version,
-              h.models.length > 0 &&
-                `${h.models.length} model${h.models.length === 1 ? "" : "s"} — ${h.models
-                  .slice(0, 3)
-                  .map((m) => harnessModelLabel(m))
-                  .join(", ")}${h.models.length > 3 ? ", …" : ""}`,
-            ]
-              .filter(Boolean)
-              .join(" · ")}
-          </div>
-        </>
-      ) : (
-        <div className="onb-card-meta">{renderNote(h.agentNote)}</div>
-      )}
+      <div className="onb-card-meta">
+        {[
+          version,
+          h.models.length > 0 &&
+            `${h.models.length} model${h.models.length === 1 ? "" : "s"} — ${h.models
+              .slice(0, 3)
+              .map((m) => harnessModelLabel(m))
+              .join(", ")}${h.models.length > 3 ? ", …" : ""}`,
+        ]
+          .filter(Boolean)
+          .join(" · ")}
+      </div>
     </button>
   );
 }
