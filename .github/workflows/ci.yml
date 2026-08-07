@@ -36,6 +36,14 @@ jobs:
       - name: Build
         run: cargo build --locked
 
+      - name: Source builds cannot enable production telemetry
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(target/debug/orx --no-telemetry version --build-channel)" = "development"
+          cargo build --release --locked
+          test "$(target/release/orx --no-telemetry version --build-channel)" = "development"
+
       - name: Test
         run: cargo test --locked
 

@@ -802,6 +802,9 @@ pub struct LitArgs {
 
 #[derive(Args, Debug)]
 pub struct VersionArgs {
+    /// Print the embedded telemetry build channel.
+    #[arg(long, hide = true, conflicts_with_all = ["check", "json"])]
+    pub build_channel: bool,
     /// Also check the latest released version on GitHub.
     #[arg(long)]
     pub check: bool,

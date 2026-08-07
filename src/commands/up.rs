@@ -2527,11 +2527,11 @@ async fn set_git_settings(Json(req): Json<SetGitSettingsReq>) -> ApiResult {
 
 // --- telemetry settings -----------------------------------------------------
 
-/// `{ enabled, reason }` — whether anonymous usage analytics is on, and if off,
-/// why (so the UI can explain a `--no-telemetry`-style override vs a persisted
-/// opt-out). `reason` is null when enabled.
+/// `{ enabled, reason }` — the effective analytics state after build/runtime
+/// eligibility, per-run flags, and the persisted preference. `reason` is null
+/// when enabled.
 fn telemetry_settings_json() -> Value {
-    match crate::telemetry::disabled_reason(false) {
+    match crate::telemetry::effective_disabled_reason() {
         None => json!({ "enabled": true, "reason": null }),
         Some(r) => json!({ "enabled": false, "reason": r.as_str() }),
     }
@@ -2658,10 +2658,9 @@ async fn set_lit_sources_settings(Json(req): Json<SetLitSourcesReq>) -> ApiResul
     .map_err(|e| ApiError::from(anyhow!("lit-sources task failed: {e}")))?
 }
 
-/// Record the consent decision (agree/reject) for the analytics choice — fired
-/// once when the user leaves the onboarding step, so every user who sees it is
-/// counted, including those who accept the default. Unconditional by design (see
-/// telemetry::record_consent): it lands even when the choice is "off".
+/// Record the analytics choice once when the user leaves onboarding. In an
+/// eligible official build this ignores the persisted preference so opt-outs
+/// are counted; development and runtime-disabled builds stay inert.
 async fn record_telemetry_consent(Json(req): Json<SetTelemetryReq>) -> ApiResult {
     crate::telemetry::record_consent(req.enabled).await;
     crate::telemetry::capture_onboarding_completed();

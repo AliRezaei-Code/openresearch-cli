@@ -11,6 +11,11 @@ use crate::error::Result;
 use crate::updates;
 
 pub async fn run(args: crate::VersionArgs) -> Result<()> {
+    if args.build_channel {
+        println!("{}", crate::telemetry::build_channel());
+        return Ok(());
+    }
+
     let current = updates::current_version();
 
     if !args.check && !args.json {
