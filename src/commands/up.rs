@@ -477,9 +477,55 @@ struct CompleteOnboardingReq {
     permission_mode: Option<String>,
     reasoning_level: Option<String>,
     #[serde(default)]
+    research_areas: Vec<String>,
+    #[serde(default)]
+    other_area: Option<String>,
+    #[serde(default)]
     background: Option<String>,
     #[serde(default)]
     papers: Vec<crate::telemetry::ProfilePaper>,
+}
+
+const RESEARCH_AREAS: [&str; 4] = ["AI/ML", "Biology", "Physics", "Other"];
+
+fn normalize_research_profile(
+    research_areas: Vec<String>,
+    other_area: Option<String>,
+    background: Option<String>,
+    papers: Vec<crate::telemetry::ProfilePaper>,
+) -> std::result::Result<crate::telemetry::ResearchProfile, ApiError> {
+    if research_areas.is_empty() {
+        return Err(bad_request("choose at least one research area"));
+    }
+    let mut normalized_areas = Vec::with_capacity(research_areas.len());
+    for area in research_areas {
+        let area = area.trim().to_string();
+        if !RESEARCH_AREAS.contains(&area.as_str()) {
+            return Err(bad_request(format!("unknown research area: {area}")));
+        }
+        if normalized_areas.contains(&area) {
+            return Err(bad_request(format!("duplicate research area: {area}")));
+        }
+        normalized_areas.push(area);
+    }
+    let other_area = other_area.filter(|value| !value.trim().is_empty());
+    let includes_other = normalized_areas.iter().any(|area| area == "Other");
+    if includes_other && other_area.is_none() {
+        return Err(bad_request(
+            "describe your research area when choosing Other",
+        ));
+    }
+    if !includes_other && other_area.is_some() {
+        return Err(bad_request(
+            "choose Other before describing another research area",
+        ));
+    }
+    Ok(crate::telemetry::ResearchProfile {
+        research_areas: normalized_areas,
+        other_area,
+        background: background.filter(|value| !value.trim().is_empty()),
+        papers,
+    })
 }
 
 async fn complete_onboarding(
@@ -497,16 +543,22 @@ async fn complete_onboarding(
         permission_mode: nonempty(req.permission_mode),
         reasoning_level: nonempty(req.reasoning_level),
     };
-    let background = req.background.map(|value| value.trim().to_string());
-    let papers = req.papers;
+    let profile = normalize_research_profile(
+        req.research_areas,
+        req.other_area,
+        req.background,
+        req.papers,
+    )?;
+    let profile_for_event = profile.clone();
     let completion = tokio::task::spawn_blocking(move || {
-        let _ = crate::telemetry::set_profile(background, papers);
+        let _ = crate::telemetry::set_profile(profile);
         local::demo::complete_onboarding(selection)
     })
     .await
     .map_err(|e| ApiError::from(anyhow!("demo seed task failed: {e}")))??;
     if completion.newly_created {
         crate::telemetry::capture_onboarding_completed();
+        crate::telemetry::capture_onboarding_research_profile(&profile_for_event);
     }
     Ok(Json(json!({
         "project": project_json(&completion.project),
@@ -2508,8 +2560,7 @@ async fn set_telemetry_settings(Json(req): Json<SetTelemetryReq>) -> ApiResult {
 }
 
 fn profile_settings_json() -> Value {
-    let (background, papers) = crate::telemetry::load_profile();
-    json!({ "background": background, "papers": papers })
+    json!(crate::telemetry::load_profile())
 }
 
 async fn profile_settings() -> ApiResult {
@@ -2519,17 +2570,43 @@ async fn profile_settings() -> ApiResult {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SetProfileReq {
+    #[serde(default)]
+    research_areas: Vec<String>,
+    #[serde(default)]
+    other_area: Option<String>,
     #[serde(default)]
     background: Option<String>,
     #[serde(default)]
     papers: Vec<crate::telemetry::ProfilePaper>,
 }
 
+fn profile_settings_update(
+    req: SetProfileReq,
+    current: crate::telemetry::ResearchProfile,
+) -> std::result::Result<crate::telemetry::ResearchProfile, ApiError> {
+    if req.research_areas.is_empty() {
+        Ok(crate::telemetry::ResearchProfile {
+            research_areas: current.research_areas,
+            other_area: current.other_area,
+            background: req.background.filter(|value| !value.trim().is_empty()),
+            papers: req.papers,
+        })
+    } else {
+        normalize_research_profile(
+            req.research_areas,
+            req.other_area,
+            req.background,
+            req.papers,
+        )
+    }
+}
+
 async fn set_profile_settings(Json(req): Json<SetProfileReq>) -> ApiResult {
+    let profile = profile_settings_update(req, crate::telemetry::load_profile())?;
     tokio::task::spawn_blocking(move || {
-        let background = req.background.map(|b| b.trim().to_string());
-        crate::telemetry::set_profile(background, req.papers)
+        crate::telemetry::set_profile(profile)
             .map_err(|e| ApiError::from(anyhow!("could not save profile: {e}")))?;
         Ok(Json(profile_settings_json()))
     })
@@ -3906,6 +3983,77 @@ async fn spa(uri: Uri) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn expect_profile(
+        result: std::result::Result<crate::telemetry::ResearchProfile, ApiError>,
+    ) -> crate::telemetry::ResearchProfile {
+        match result {
+            Ok(profile) => profile,
+            Err(error) => panic!("unexpected profile error: {}", error.1),
+        }
+    }
+
+    #[test]
+    fn research_profile_requires_an_area_and_other_description() {
+        let missing_area = normalize_research_profile(vec![], None, None, vec![]).unwrap_err();
+        assert_eq!(missing_area.1, "choose at least one research area");
+
+        let missing_other =
+            normalize_research_profile(vec!["Other".into()], Some("   ".into()), None, vec![])
+                .unwrap_err();
+        assert_eq!(
+            missing_other.1,
+            "describe your research area when choosing Other"
+        );
+    }
+
+    #[test]
+    fn research_profile_preserves_disclosed_free_text() {
+        let profile = expect_profile(normalize_research_profile(
+            vec!["AI/ML".into(), "Other".into()],
+            Some("  AI for theorem proving  ".into()),
+            Some("  I study RL.\nSecond line.  ".into()),
+            vec![crate::telemetry::ProfilePaper {
+                paper_id: "1706.03762".into(),
+                title: Some("Attention Is All You Need".into()),
+            }],
+        ));
+
+        assert_eq!(
+            profile.other_area.as_deref(),
+            Some("  AI for theorem proving  ")
+        );
+        assert_eq!(
+            profile.background.as_deref(),
+            Some("  I study RL.\nSecond line.  ")
+        );
+        assert_eq!(
+            profile.papers[0].title.as_deref(),
+            Some("Attention Is All You Need")
+        );
+    }
+
+    #[test]
+    fn legacy_profile_update_preserves_saved_research_areas() {
+        let current = crate::telemetry::ResearchProfile {
+            research_areas: vec!["Physics".into(), "Other".into()],
+            other_area: Some("Quantum information".into()),
+            ..crate::telemetry::ResearchProfile::default()
+        };
+        let updated = expect_profile(profile_settings_update(
+            SetProfileReq {
+                research_areas: vec![],
+                other_area: None,
+                background: Some("Updated background".into()),
+                papers: vec![],
+            },
+            current,
+        ));
+
+        assert_eq!(updated.research_areas, vec!["Physics", "Other"]);
+        assert_eq!(updated.other_area.as_deref(), Some("Quantum information"));
+        assert_eq!(updated.background.as_deref(), Some("Updated background"));
+    }
 
     #[test]
     fn api_run_exposes_cancel_intent() {

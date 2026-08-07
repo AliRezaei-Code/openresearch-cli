@@ -1,9 +1,11 @@
-//! Anonymous, opt-out usage analytics → PostHog.
+//! Opt-out usage analytics → PostHog.
 //!
 //! Why this exists: `orx` shipped with no telemetry, so we had no way to see
 //! installs, DAU/WAU, retention, or which commands people actually use. This
-//! module sends anonymous events (a random per-install UUID as the only
-//! identity — never any PII, prompt text, file paths, ids, or repo contents).
+//! module sends events under a random per-install UUID that is not tied to an
+//! account. The disclosed onboarding research profile is included unfiltered
+//! in its own event; prompts, file paths, and repo contents are never read from
+//! the workspace or added automatically.
 //!
 //! Guarantees, enforced by this module:
 //! - **Opt-out.** A `--no-telemetry` flag and a persistent `orx telemetry off`
@@ -75,9 +77,7 @@ fn flush_window() -> Duration {
 /// settings.json` (the config dir, NOT the R2-snapshotted data dir) so the
 /// anonymous install id stays per-install rather than travelling with an agent
 /// box's data snapshot. Beyond telemetry, this is the one file for user-level
-/// config: the data-dir/compute defaults and the onboarding researcher profile
-/// (`background`/`linked_papers`) — the latter user free-text that, like
-/// everything here, stays on local disk and is never sent in any event.
+/// config: the data-dir/compute defaults and the onboarding researcher profile.
 /// Modeled on `K8sSettings`. Unknown fields on older files parse fine and are
 /// dropped on the next save.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -111,6 +111,12 @@ pub(crate) struct Settings {
     /// applied when a launch resolves to that same backend without a flavor.
     #[serde(default)]
     pub default_flavor: Option<String>,
+    /// Research areas selected in onboarding.
+    #[serde(default)]
+    pub research_areas: Vec<String>,
+    /// Free-text specialization supplied when `Other` is selected.
+    #[serde(default)]
+    pub other_area: Option<String>,
     /// Free-text researcher background captured in onboarding (Settings →
     /// profile). Optional; absent/empty = never provided.
     #[serde(default)]
@@ -139,6 +145,19 @@ pub(crate) struct ProfilePaper {
     pub paper_id: String,
     #[serde(default)]
     pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ResearchProfile {
+    #[serde(default)]
+    pub research_areas: Vec<String>,
+    #[serde(default)]
+    pub other_area: Option<String>,
+    #[serde(default)]
+    pub background: Option<String>,
+    #[serde(default)]
+    pub papers: Vec<ProfilePaper>,
 }
 
 /// The persisted data-dir choice, if any (non-empty). Read by `store::data_dir()`
@@ -187,26 +206,25 @@ pub(crate) fn set_compute_default(
     })
 }
 
-/// The persisted researcher profile: the background blurb (non-empty) and the
-/// linked papers. Read by the profile settings endpoint.
-pub(crate) fn load_profile() -> (Option<String>, Vec<ProfilePaper>) {
+/// The persisted researcher profile. Read by the profile settings endpoint.
+pub(crate) fn load_profile() -> ResearchProfile {
     let s = load_settings().unwrap_or_default();
-    // Trim on read too, so a hand-edited whitespace-only blurb reads as absent.
-    (
-        s.background.filter(|b| !b.trim().is_empty()),
-        s.linked_papers,
-    )
+    ResearchProfile {
+        research_areas: s.research_areas,
+        other_area: s.other_area.filter(|value| !value.trim().is_empty()),
+        background: s.background.filter(|value| !value.trim().is_empty()),
+        papers: s.linked_papers,
+    }
 }
 
 /// Set the researcher profile, preserving every other settings field (same
 /// `mutate_settings` guarantees as the data dir).
-pub(crate) fn set_profile(
-    background: Option<String>,
-    papers: Vec<ProfilePaper>,
-) -> std::io::Result<()> {
+pub(crate) fn set_profile(profile: ResearchProfile) -> std::io::Result<()> {
     mutate_settings(|s| {
-        s.background = background.filter(|b| !b.is_empty());
-        s.linked_papers = papers;
+        s.research_areas = profile.research_areas;
+        s.other_area = profile.other_area.filter(|value| !value.is_empty());
+        s.background = profile.background.filter(|value| !value.is_empty());
+        s.linked_papers = profile.papers;
     })
 }
 
@@ -257,7 +275,7 @@ enum SettingsState {
     /// File doesn't exist — never configured. Safe to create fresh.
     Absent,
     /// Parsed cleanly.
-    Loaded(Settings),
+    Loaded(Box<Settings>),
     /// File exists but didn't parse. Treat as "present but unknown".
     Corrupt,
 }
@@ -266,7 +284,7 @@ fn read_settings_state() -> SettingsState {
     match std::fs::read_to_string(settings_path()) {
         Err(_) => SettingsState::Absent,
         Ok(raw) => match serde_json::from_str::<Settings>(&raw) {
-            Ok(s) => SettingsState::Loaded(s),
+            Ok(s) => SettingsState::Loaded(Box::new(s)),
             Err(_) => SettingsState::Corrupt,
         },
     }
@@ -278,7 +296,7 @@ fn read_settings_state() -> SettingsState {
 /// see `mutate_settings`.)
 pub(crate) fn load_settings() -> Option<Settings> {
     match read_settings_state() {
-        SettingsState::Loaded(s) => Some(s),
+        SettingsState::Loaded(s) => Some(*s),
         _ => None,
     }
 }
@@ -370,7 +388,7 @@ fn mutate_settings<F: FnOnce(&mut Settings)>(f: F) -> std::io::Result<()> {
 
     let mut settings = match read_settings_state() {
         SettingsState::Absent => Settings::default(),
-        SettingsState::Loaded(s) => s,
+        SettingsState::Loaded(s) => *s,
         SettingsState::Corrupt => {
             return Err(std::io::Error::other(
                 "settings.json is unreadable; refusing to overwrite",
@@ -530,12 +548,13 @@ fn is_ci() -> bool {
 
 /// Builds the PostHog capture payload for an event. Every event carries the
 /// same base context (source, version, os, arch, ci, install_kind) plus
-/// `$process_person_profile: false` to keep it anonymous. `extra` supplies
-/// event-specific properties — callers MUST keep these free of PII (coarse
-/// enums only).
+/// `$process_person_profile: false` so PostHog does not create a person profile.
+/// `extra` supplies event-specific properties. Most callers use coarse enums;
+/// the onboarding research-profile event deliberately includes the fields
+/// disclosed in the UI.
 fn build_payload(event: &str, distinct_id: &str, extra: serde_json::Value) -> serde_json::Value {
     let mut props = json!({
-        // Anonymous: don't build a person profile for this distinct_id.
+        // Keep this random installation id out of PostHog person profiles.
         "$process_person_profile": false,
         "source": "cli",
         "cli_version": crate::updates::current_version().to_string(),
@@ -549,8 +568,8 @@ fn build_payload(event: &str, distinct_id: &str, extra: serde_json::Value) -> se
     });
     // Merge event-specific props FIRST so the invariant base context above can
     // never be silently overwritten by a caller's `extra` (defense in depth —
-    // callers are expected to keep `extra` PII-free and disjoint, but a stray
-    // `source`/`ci`/`os` key must not be able to corrupt identity fields).
+    // callers keep keys disjoint, but a stray `source`/`ci`/`os` key must not
+    // be able to corrupt identity fields).
     if let (Some(obj), Some(add)) = (props.as_object_mut(), extra.as_object()) {
         for (k, v) in add {
             obj.entry(k.clone()).or_insert_with(|| v.clone());
@@ -719,6 +738,31 @@ pub(crate) async fn record_consent(agreed: bool) {
 
 pub(crate) fn capture_onboarding_completed() {
     capture("onboarding_completed", json!({}));
+}
+
+pub(crate) fn capture_onboarding_research_profile(profile: &ResearchProfile) {
+    let paper_ids: Vec<_> = profile
+        .papers
+        .iter()
+        .map(|paper| paper.paper_id.as_str())
+        .collect();
+    let paper_titles: Vec<_> = profile
+        .papers
+        .iter()
+        .map(|paper| paper.title.as_deref())
+        .collect();
+    capture(
+        "onboarding_research_profile_submitted",
+        json!({
+            "research_areas": profile.research_areas,
+            "other_area": profile.other_area,
+            "background": profile.background,
+            "papers": profile.papers,
+            "paper_ids": paper_ids,
+            "paper_titles": paper_titles,
+            "paper_count": profile.papers.len(),
+        }),
+    );
 }
 
 pub(crate) fn capture_project_created(local: bool) {
@@ -976,19 +1020,26 @@ mod tests {
 
         set_persisted_disabled(true).unwrap();
         let id = install_id().expect("install id");
-        set_profile(
-            Some("I study RL".into()),
-            vec![ProfilePaper {
+        set_profile(ResearchProfile {
+            research_areas: vec!["AI/ML".into(), "Other".into()],
+            other_area: Some("AI for theorem proving".into()),
+            background: Some("I study RL".into()),
+            papers: vec![ProfilePaper {
                 paper_id: "1706.03762".into(),
                 title: Some("Attention Is All You Need".into()),
             }],
-        )
+        })
         .unwrap();
 
-        let (background, papers) = load_profile();
-        assert_eq!(background.as_deref(), Some("I study RL"));
-        assert_eq!(papers.len(), 1);
-        assert_eq!(papers[0].paper_id, "1706.03762");
+        let profile = load_profile();
+        assert_eq!(profile.research_areas, vec!["AI/ML", "Other"]);
+        assert_eq!(
+            profile.other_area.as_deref(),
+            Some("AI for theorem proving")
+        );
+        assert_eq!(profile.background.as_deref(), Some("I study RL"));
+        assert_eq!(profile.papers.len(), 1);
+        assert_eq!(profile.papers[0].paper_id, "1706.03762");
         let s = load_settings().expect("settings present");
         assert_eq!(
             s.telemetry_disabled,
@@ -1001,11 +1052,25 @@ mod tests {
             "install id survived"
         );
 
-        // A whitespace-only background clears to None; papers can be emptied.
-        set_profile(Some("   ".into()), vec![]).unwrap();
-        let (background, papers) = load_profile();
-        assert!(background.is_none(), "whitespace background cleared");
-        assert!(papers.is_empty(), "papers cleared");
+        // Whitespace-only optional fields clear to None; papers can be emptied.
+        set_profile(ResearchProfile {
+            research_areas: vec!["Physics".into()],
+            other_area: Some("   ".into()),
+            background: Some("   ".into()),
+            papers: vec![],
+        })
+        .unwrap();
+        let profile = load_profile();
+        assert_eq!(profile.research_areas, vec!["Physics"]);
+        assert!(
+            profile.other_area.is_none(),
+            "whitespace other area cleared"
+        );
+        assert!(
+            profile.background.is_none(),
+            "whitespace background cleared"
+        );
+        assert!(profile.papers.is_empty(), "papers cleared");
         let s = load_settings().expect("settings present");
         assert_eq!(s.telemetry_disabled, Some(true), "opt-out still intact");
 
@@ -1023,7 +1088,12 @@ mod tests {
         assert!(disabled_lit_sources().is_empty(), "default: all enabled");
 
         set_persisted_disabled(true).unwrap();
-        set_profile(Some("I study RL".into()), vec![]).unwrap();
+        set_profile(ResearchProfile {
+            research_areas: vec!["AI/ML".into()],
+            background: Some("I study RL".into()),
+            ..ResearchProfile::default()
+        })
+        .unwrap();
         set_disabled_lit_sources(vec!["biorxiv".into(), "openalex".into()]).unwrap();
 
         assert_eq!(disabled_lit_sources(), vec!["biorxiv", "openalex"]);
@@ -1129,7 +1199,7 @@ mod tests {
     }
 
     #[test]
-    fn payload_shape_is_anonymous_and_pii_free() {
+    fn standard_payload_shape_excludes_sensitive_fields() {
         // build_payload reads the machine context (env + settings), so isolate.
         let _g = EnvGuard::new(OPT_VARS);
         let dir = std::env::temp_dir().join(format!("orx-tel-shape-{}", uuid::Uuid::new_v4()));
@@ -1164,8 +1234,8 @@ mod tests {
         // time, not ingestion time).
         assert!(payload["timestamp"].is_string());
 
-        // Guard against PII creep: the whole serialized payload must not contain
-        // obvious identifying keys.
+        // Standard product events must not automatically add obvious
+        // identifying fields.
         let text = serde_json::to_string(&payload).unwrap();
         for banned in ["email", "token", "path", "repo", "prompt", "title", "home"] {
             assert!(
@@ -1274,6 +1344,10 @@ mod tests {
         for (bare, wire) in [
             ("command", "cli_command"),
             ("onboarding_completed", "cli_onboarding_completed"),
+            (
+                "onboarding_research_profile_submitted",
+                "cli_onboarding_research_profile_submitted",
+            ),
             ("project_created", "cli_project_created"),
             ("chat_session_started", "cli_chat_session_started"),
             ("experiment_started", "cli_experiment_started"),
@@ -1318,6 +1392,35 @@ mod tests {
                 "source",
             ]
         );
+
+        let research_profile = build_payload(
+            "onboarding_research_profile_submitted",
+            "did",
+            json!({
+                "research_areas": ["AI/ML", "Other"],
+                "other_area": "AI for theorem proving",
+                "background": "I study RL",
+                "papers": [{"paperId": "1706.03762", "title": "Attention Is All You Need"}],
+                "paper_ids": ["1706.03762"],
+                "paper_titles": ["Attention Is All You Need"],
+                "paper_count": 1,
+            }),
+        );
+        assert_eq!(
+            research_profile["event"],
+            "cli_onboarding_research_profile_submitted"
+        );
+        assert_eq!(research_profile["properties"]["research_areas"][1], "Other");
+        assert_eq!(
+            research_profile["properties"]["other_area"],
+            "AI for theorem proving"
+        );
+        assert_eq!(research_profile["properties"]["background"], "I study RL");
+        assert_eq!(
+            research_profile["properties"]["papers"][0]["title"],
+            "Attention Is All You Need"
+        );
+        assert_eq!(research_profile["properties"]["paper_ids"][0], "1706.03762");
 
         let project = build_payload("project_created", "did", json!({ "local": true }));
         assert_eq!(project["event"], "cli_project_created");
