@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 import {
@@ -8,9 +8,6 @@ import {
   usePopoverPosition,
   useTourBounds,
 } from "./tourGeometry";
-
-/** Set once the tour has been finished or skipped; gates the auto-start. */
-export const TOUR_DONE_KEY = "orx:tour-done";
 
 /** Breathing room between a target's edges and the spotlight cutout. */
 const BOX_PADDING = 8;
@@ -92,10 +89,22 @@ const STEPS: TourStep[] = [
  * the spotlight between steps. Targets are located by `data-onboarding`
  * attributes; a missing target degrades to a full dim with a centered card.
  */
-export function Tour({ onClose }: { onClose: () => void }) {
+export function Tour({ onClose }: { onClose: () => Promise<void> }) {
   const [index, setIndex] = useState(0);
+  const [closing, setClosing] = useState(false);
+  const [closeError, setCloseError] = useState<string | null>(null);
   const step = STEPS[index];
   const bounds = useTourBounds(step.focus ?? []);
+  const requestClose = useCallback(() => {
+    if (closing) return;
+    setClosing(true);
+    setCloseError(null);
+    void onClose()
+      .catch((error) => {
+        setCloseError(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => setClosing(false));
+  }, [closing, onClose]);
 
   // Own Escape in the capture phase so it can never reach ChatPanel's
   // document-level listener, which would interrupt a running agent turn.
@@ -104,11 +113,11 @@ export function Tour({ onClose }: { onClose: () => void }) {
       if (e.key !== "Escape") return;
       e.preventDefault();
       e.stopPropagation();
-      onClose();
+      requestClose();
     }
     document.addEventListener("keydown", onKey, true);
     return () => document.removeEventListener("keydown", onKey, true);
-  }, [onClose]);
+  }, [requestClose]);
 
   const box = bounds
     ? {
@@ -135,8 +144,10 @@ export function Tour({ onClose }: { onClose: () => void }) {
         bounds={bounds}
         index={index}
         onBack={() => setIndex((i) => Math.max(0, i - 1))}
-        onNext={() => (index + 1 >= STEPS.length ? onClose() : setIndex(index + 1))}
-        onClose={onClose}
+        onNext={() => (index + 1 >= STEPS.length ? requestClose() : setIndex(index + 1))}
+        onClose={requestClose}
+        closing={closing}
+        closeError={closeError}
       />
     </div>,
     document.body,
@@ -150,6 +161,8 @@ function TourCard({
   onBack,
   onNext,
   onClose,
+  closing,
+  closeError,
 }: {
   step: TourStep;
   bounds: Bounds;
@@ -157,6 +170,8 @@ function TourCard({
   onBack: () => void;
   onNext: () => void;
   onClose: () => void;
+  closing: boolean;
+  closeError: string | null;
 }) {
   const measure = useMeasure();
   const popover = usePopoverPosition(
@@ -187,11 +202,12 @@ function TourCard({
       {positioned && step.anchor && (
         <Arrow anchor={step.anchor} adjustment={popover.arrowAdjustment} />
       )}
-      <button className="icon-btn tour-close" title="Skip tour" onClick={onClose}>
+      <button className="icon-btn tour-close" title="Skip tour" onClick={onClose} disabled={closing}>
         <X size={15} />
       </button>
       <h3>{step.title}</h3>
       <p>{step.description}</p>
+      {closeError && <div className="error">Couldn't save tour progress. Try again.</div>}
       <div className="tour-footer">
         <div className="tour-footer-side">
           {index > 0 && (
@@ -204,8 +220,8 @@ function TourCard({
           {index + 1} / {STEPS.length}
         </span>
         <div className="tour-footer-side end">
-          <button className="btn primary" onClick={onNext}>
-            {last ? "Done" : "Next"}
+          <button className="btn primary" onClick={onNext} disabled={closing}>
+            {closing ? "Saving…" : last ? "Done" : "Next"}
           </button>
         </div>
       </div>

@@ -37,6 +37,25 @@ pub fn data_dir() -> PathBuf {
     xdg_default_data_dir()
 }
 
+pub(crate) fn open_lifecycle_lock() -> Result<fd_lock::RwLock<std::fs::File>> {
+    // The config dir stays put while the user can move the live data directory.
+    open_lifecycle_lock_at(&crate::config::config_dir().join("orx.lifecycle.lock"))
+}
+
+pub(crate) fn open_lifecycle_lock_at(
+    path: &std::path::Path,
+) -> Result<fd_lock::RwLock<std::fs::File>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
+    Ok(fd_lock::RwLock::new(file))
+}
+
 /// Read an env var as a path, treating unset **and empty** the same (an empty
 /// `export ORX_DATA_DIR=` is a shell footgun that must not resolve to `""`).
 fn env_path(key: &str) -> Option<PathBuf> {
@@ -246,6 +265,15 @@ impl Store {
                 git_found INTEGER NOT NULL,
                 error     TEXT,
                 tested_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ui_state (
+                id                       INTEGER PRIMARY KEY CHECK (id = 1),
+                onboarding_completed     INTEGER NOT NULL DEFAULT 0,
+                tour_completed           INTEGER NOT NULL DEFAULT 0,
+                preferred_harness        TEXT,
+                preferred_model          TEXT,
+                preferred_permission_mode TEXT,
+                preferred_reasoning_level TEXT
             );",
         )?;
         // Best-effort migrations for pre-existing dbs; re-runs fail with
@@ -322,6 +350,26 @@ impl Store {
             [],
         );
 
+        // Seed the singleton for existing databases without replaying first-run
+        // UI. The newest chat session is the best durable approximation of the
+        // browser-only agent preference older builds used.
+        conn.execute(
+            "INSERT OR IGNORE INTO ui_state (
+                 id, onboarding_completed, tour_completed,
+                 preferred_harness, preferred_model,
+                 preferred_permission_mode, preferred_reasoning_level
+             )
+             SELECT 1,
+                    EXISTS(SELECT 1 FROM local_projects),
+                    EXISTS(SELECT 1 FROM local_projects),
+                    harness, model, permission_mode, reasoning_level
+             FROM (SELECT 1) seed
+             LEFT JOIN chat_sessions ON chat_sessions.id = (
+                 SELECT id FROM chat_sessions ORDER BY updated_at DESC LIMIT 1
+             )",
+            [],
+        )?;
+
         // NOTE: `reasoning_level` deliberately has NO migration for issue #123,
         // unlike the permission modes above. Rows written by older builds carry
         // an implicit effort (`high`), but every value the old builds wrote is
@@ -349,6 +397,63 @@ impl Store {
     pub fn checkpoint(&self) -> Result<()> {
         self.conn
             .pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+        Ok(())
+    }
+
+    pub fn ui_state(&self) -> Result<StoredUiState> {
+        Ok(self.conn.query_row(
+            "SELECT onboarding_completed, tour_completed, preferred_harness,
+                    preferred_model, preferred_permission_mode, preferred_reasoning_level
+             FROM ui_state WHERE id = 1",
+            [],
+            |row| {
+                let harness = row.get::<_, Option<String>>(2)?;
+                let model = row.get::<_, Option<String>>(3)?;
+                let permission_mode = row.get::<_, Option<String>>(4)?;
+                let reasoning_level = row.get::<_, Option<String>>(5)?;
+                Ok(StoredUiState {
+                    onboarding_completed: row.get(0)?,
+                    tour_completed: row.get(1)?,
+                    preferred_agent: harness.map(|harness| StoredAgentSelection {
+                        harness,
+                        model,
+                        permission_mode,
+                        reasoning_level,
+                    }),
+                })
+            },
+        )?)
+    }
+
+    pub fn set_onboarding_completed(&self, completed: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE ui_state SET onboarding_completed = ?1 WHERE id = 1",
+            params![completed],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_tour_completed(&self, completed: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE ui_state SET tour_completed = ?1 WHERE id = 1",
+            params![completed],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_preferred_agent(&self, selection: &StoredAgentSelection) -> Result<()> {
+        self.conn.execute(
+            "UPDATE ui_state
+             SET preferred_harness = ?1, preferred_model = ?2,
+                 preferred_permission_mode = ?3, preferred_reasoning_level = ?4
+             WHERE id = 1",
+            params![
+                selection.harness,
+                selection.model,
+                selection.permission_mode,
+                selection.reasoning_level,
+            ],
+        )?;
         Ok(())
     }
 
@@ -1053,6 +1158,23 @@ pub struct StoredChatSession {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredAgentSelection {
+    pub harness: String,
+    pub model: Option<String>,
+    pub permission_mode: Option<String>,
+    pub reasoning_level: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredUiState {
+    pub onboarding_completed: bool,
+    pub tour_completed: bool,
+    pub preferred_agent: Option<StoredAgentSelection>,
+}
+
 /// Normalized transcript entry; `parts_json` is the wire-format parts array
 /// the UI renders (orx is the system of record for transcripts, not the
 /// harness's own storage).
@@ -1137,6 +1259,79 @@ mod tests {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(2048), "2.0 KB");
         assert_eq!(human_bytes(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn ui_state_roundtrips_functional_preferences() {
+        let dir = std::env::temp_dir().join(format!("orx-store-ui-state-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        assert_eq!(
+            store.ui_state().unwrap(),
+            StoredUiState {
+                onboarding_completed: false,
+                tour_completed: false,
+                preferred_agent: None,
+            }
+        );
+
+        let selection = StoredAgentSelection {
+            harness: "codex".into(),
+            model: Some("gpt-5.6".into()),
+            permission_mode: Some("plan".into()),
+            reasoning_level: Some("high".into()),
+        };
+        store.set_onboarding_completed(true).unwrap();
+        store.set_tour_completed(true).unwrap();
+        store.set_preferred_agent(&selection).unwrap();
+
+        assert_eq!(
+            store.ui_state().unwrap(),
+            StoredUiState {
+                onboarding_completed: true,
+                tour_completed: true,
+                preferred_agent: Some(selection),
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ui_state_singleton_seeds_existing_projects_and_latest_session() {
+        let dir =
+            std::env::temp_dir().join(format!("orx-store-ui-migrate-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store
+            .create_local_project(&LocalProject {
+                id: "project".into(),
+                name: "Project".into(),
+                slug: "project".into(),
+                github_owner: String::new(),
+                github_repo: String::new(),
+                github_sync_enabled: false,
+                baseline_branch: "main".into(),
+                repo_path: dir.join("project").to_string_lossy().into_owned(),
+                run_command: None,
+                paper_id: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        let mut older = chat_session_fixture("older");
+        older.harness = "codex".into();
+        store.create_chat_session(&older).unwrap();
+        let mut session = chat_session_fixture("latest");
+        session.harness = "opencode".into();
+        session.model = Some("model".into());
+        session.updated_at = 2;
+        store.create_chat_session(&session).unwrap();
+        store.conn.execute("DELETE FROM ui_state", []).unwrap();
+        drop(store);
+
+        let migrated = Store::open_at(dir.clone()).unwrap().ui_state().unwrap();
+        assert!(migrated.onboarding_completed);
+        assert!(migrated.tour_completed);
+        assert_eq!(migrated.preferred_agent.unwrap().harness, "opencode");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

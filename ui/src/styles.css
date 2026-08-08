@@ -291,13 +291,10 @@ textarea::placeholder {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   cursor: pointer;
-  transition:
-    border-color 120ms ease,
-    box-shadow 120ms ease;
+  transition: box-shadow 120ms ease;
 }
 .project-card:hover {
-  border-color: var(--text);
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
+  box-shadow: 0 3px 12px color-mix(in srgb, var(--text) 8%, transparent);
 }
 .project-card-open {
   position: absolute;
@@ -316,10 +313,11 @@ textarea::placeholder {
 .project-card-sync a {
   pointer-events: auto;
 }
-.project-delete {
+.project-card .project-delete {
   position: absolute;
   top: 10px;
   right: 10px;
+  z-index: 2;
   display: none;
   padding: 5px;
   border-radius: var(--radius-sm);
@@ -3062,6 +3060,9 @@ textarea::placeholder {
   font-size: var(--fs-3xl);
   letter-spacing: -0.01em;
 }
+.onb-profile-title {
+  margin-bottom: 22px;
+}
 .onb-sub {
   color: var(--text);
   font-size: var(--fs-base);
@@ -3389,22 +3390,94 @@ button.onb-agent-choice:hover {
 .form .repo-hint.ok {
   color: var(--accent-teal);
 }
-.form .folder-picker-row {
+.form .folder-picker-control {
   display: flex;
-  align-items: stretch;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  min-width: 0;
+  padding: 8px 10px;
+  overflow: hidden;
+  background: var(--base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  text-align: left;
+  transition:
+    border-color 120ms ease,
+    box-shadow 120ms ease;
+}
+.form .folder-picker-control:hover:not(:disabled) {
+  border-color: var(--muted);
+  box-shadow: 0 2px 8px rgb(0 0 0 / 5%);
+}
+.form .folder-picker-control:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 2px;
+}
+.form .folder-picker-control span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.form .folder-picker-control .placeholder {
+  color: var(--muted);
+}
+.form .folder-picker-icon {
+  flex: none;
+  color: currentColor;
+}
+.form .folder-picker-chevron {
+  flex: none;
+  color: var(--muted);
+}
+.form .folder-picker-control:hover:not(:disabled) .folder-picker-chevron {
+  color: var(--subtext);
+}
+.form .folder-picker-hint {
+  color: var(--subtext);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-regular);
+  line-height: 1.4;
+}
+.form .project-location-field {
+  display: flex;
+  flex-direction: column;
   gap: 8px;
 }
-.form .folder-picker-row input {
-  min-width: 0;
+.form .project-location-label,
+.form .project-field-label {
+  color: var(--text);
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semibold);
+}
+.form .folder-picker-control:disabled {
+  cursor: default;
+  opacity: 0.65;
+}
+.form .paper-destination {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 8px 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--base);
+}
+.form .paper-destination code {
   flex: 1;
-  cursor: pointer;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-regular);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.form .folder-picker-row input:focus {
-  border-color: var(--border);
-}
-.form .folder-picker-row .btn {
+.form .paper-destination .btn {
   flex: none;
-  padding-inline: 14px;
 }
 .form .project-path-notice {
   padding: 9px 11px;
@@ -3483,6 +3556,9 @@ button.onb-agent-choice:hover {
   flex-direction: column;
   gap: 10px;
 }
+.new-project-form {
+  gap: 18px;
+}
 .form label {
   display: flex;
   flex-direction: column;
@@ -3490,6 +3566,9 @@ button.onb-agent-choice:hover {
   font-size: var(--fs-xs);
   color: var(--text);
   font-weight: var(--fw-medium);
+}
+.new-project-form > label {
+  gap: 8px;
 }
 .form .row2 {
   display: grid;
@@ -3501,6 +3580,13 @@ button.onb-agent-choice:hover {
   justify-content: flex-end;
   gap: 10px;
   margin-top: 6px;
+}
+.form .new-project-actions {
+  justify-content: flex-start;
+  margin-top: 10px;
+}
+.form .new-project-actions .primary {
+  margin-left: auto;
 }
 .form .error,
 .settings-card > .error {

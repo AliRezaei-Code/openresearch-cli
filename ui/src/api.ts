@@ -107,6 +107,21 @@ export interface OnboardingSelection {
   reasoningLevel: string | null;
 }
 
+export type AgentSelection = OnboardingSelection;
+
+export interface UiState {
+  onboardingCompleted: boolean;
+  tourCompleted: boolean;
+  preferredAgent: AgentSelection | null;
+}
+
+export const getUiState = () => get<UiState>("/api/settings/ui-state");
+
+export const updateUiState = (body: {
+  tourCompleted?: boolean;
+  preferredAgent?: AgentSelection;
+}) => post<UiState>("/api/settings/ui-state", body);
+
 export const completeOnboarding = (selection: OnboardingSelection, profile: Profile) =>
   post<{ project: Project; selection: OnboardingSelection }>(
     "/api/onboarding/complete",
@@ -118,6 +133,7 @@ export interface ProjectPathStatus {
   resolvedPath: string | null;
   exists: boolean | null;
   directory: boolean | null;
+  empty: boolean | null;
   initialized: boolean | null;
 }
 
