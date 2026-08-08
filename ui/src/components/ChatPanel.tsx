@@ -2089,8 +2089,8 @@ export function ChatPanel({
 
   const visibleSessions = sessions.filter((s) => matchesFilter(sessionFilter, s.archived));
   const newTaskShortcut = /Mac|iPhone|iPad/.test(navigator.platform)
-    ? "⌘⇧Enter"
-    : "Ctrl+Shift+Enter";
+    ? "⌘ ⇧ Enter"
+    : "Ctrl + Shift + Enter";
   const startNewTask = useCallback(() => {
     setSessionFilter("active");
     setActiveId(null);
