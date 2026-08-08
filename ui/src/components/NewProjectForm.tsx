@@ -11,23 +11,13 @@ import {
   type ResolvedPaper,
 } from "../api";
 
-function slugify(text: string): string {
-  return (
-    text
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 48) || "research-project"
-  );
-}
-
 function parsePaperId(input: string): string | null {
   const last = input.trim().split(/[?#]/)[0].split("/").filter(Boolean).pop() ?? "";
   const id = last.replace(/\.(pdf|md)$/i, "");
   return /^\d{4}\.\d{4,5}(v\d+)?$/.test(id) ? id : null;
 }
 
-type Mode = "folder" | "new" | "paper";
+type Mode = "folder" | "paper";
 
 export function NewProjectForm({
   onCreated,
@@ -40,7 +30,6 @@ export function NewProjectForm({
   const [name, setName] = useState("");
   const [nameTouched, setNameTouched] = useState(false);
   const [path, setPath] = useState("");
-  const [pathTouched, setPathTouched] = useState(false);
   const [pathStatus, setPathStatus] = useState<ProjectPathStatus | null>(null);
   const [pathError, setPathError] = useState<string | null>(null);
   const [checkingPath, setCheckingPath] = useState(false);
@@ -53,11 +42,6 @@ export function NewProjectForm({
   const [searching, setSearching] = useState(false);
   const seq = useRef(0);
   const pathSeq = useRef(0);
-
-  useEffect(() => {
-    if (pathTouched || mode === "folder") return;
-    setPath(`~/OpenResearch/${slugify(name)}`);
-  }, [mode, name, pathTouched]);
 
   useEffect(() => {
     const request = ++pathSeq.current;
@@ -100,7 +84,6 @@ export function NewProjectForm({
           .then((resolved) => {
             if (request !== seq.current) return;
             setPaper(resolved);
-            if (!nameTouched) setName(resolved.title?.trim().slice(0, 60) || resolved.paperId);
           })
           .catch((err) => request === seq.current && setError(err instanceof Error ? err.message : String(err)))
           .finally(() => request === seq.current && setSearching(false));
@@ -112,7 +95,7 @@ export function NewProjectForm({
         .finally(() => request === seq.current && setSearching(false));
     }, 350);
     return () => clearTimeout(timer);
-  }, [mode, paper, paperQuery, nameTouched]);
+  }, [mode, paper, paperQuery]);
 
   async function choosePaper(paperId: string) {
     setSearching(true);
@@ -121,7 +104,6 @@ export function NewProjectForm({
       const resolved = await resolvePaper(paperId);
       setPaper(resolved);
       setHits([]);
-      if (!nameTouched) setName(resolved.title?.trim().slice(0, 60) || resolved.paperId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -135,15 +117,18 @@ export function NewProjectForm({
     setPaperQuery("");
     setHits([]);
     setSearching(false);
-    if (!nameTouched) setName("");
   }
 
   function chooseMode(next: Mode) {
     if (next === mode) return;
     setMode(next);
     setError(null);
-    setPathTouched(false);
-    setPath(next === "folder" ? "" : `~/OpenResearch/${slugify(name)}`);
+    setPath("");
+    setName("");
+    setNameTouched(false);
+    setPaper(null);
+    setPaperQuery("");
+    setHits([]);
   }
 
   async function chooseLocalFolder() {
@@ -153,7 +138,6 @@ export function NewProjectForm({
     try {
       const selected = await pickProjectFolder();
       if (!selected) return;
-      setPathTouched(true);
       setPath(selected);
       if (!nameTouched) {
         const folderName = selected.replace(/[\\/]+$/, "").split(/[\\/]/).pop();
@@ -175,7 +159,7 @@ export function NewProjectForm({
       const result = await createProject({
         name: name.trim(),
         path: path.trim(),
-        createFolder: mode !== "folder",
+        createFolder: false,
         initializeGit: true,
         ...(mode === "paper" && paper
           ? { paperId: paper.paperId, cloneUrl: paper.repoUrl ?? undefined }
@@ -191,10 +175,11 @@ export function NewProjectForm({
 
   const gitMissing = pathStatus?.gitVersion === null;
   const invalidLocalFolder =
-    mode === "folder" &&
     Boolean(path.trim()) &&
     pathStatus !== null &&
     (pathStatus.exists === false || pathStatus.directory === false);
+  const nonemptyPaperCloneFolder =
+    mode === "paper" && Boolean(paper?.repoUrl) && pathStatus?.empty === false;
   const canCreate =
     Boolean(name.trim() && path.trim()) &&
     !pending &&
@@ -202,6 +187,7 @@ export function NewProjectForm({
     !pathError &&
     !gitMissing &&
     !invalidLocalFolder &&
+    !nonemptyPaperCloneFolder &&
     (mode !== "paper" || paper !== null);
 
   return (
@@ -212,9 +198,6 @@ export function NewProjectForm({
         </button>
         <button type="button" className={mode === "paper" ? "active" : ""} onClick={() => chooseMode("paper")}>
           From a paper
-        </button>
-        <button type="button" className={mode === "new" ? "active" : ""} onClick={() => chooseMode("new")}>
-          New folder
         </button>
       </div>
 
@@ -254,73 +237,72 @@ export function NewProjectForm({
       {(mode !== "paper" || paper) && (
         <>
           <label>
-            Project name
-            <input
-              value={name}
-              onChange={(event) => {
-                setNameTouched(true);
-                setName(event.target.value);
-              }}
-              placeholder="my-research"
-            />
-          </label>
-          <label>
             Local folder
-            {mode === "folder" ? (
-              <div className="folder-picker-row">
-                <input
-                  value={path}
-                  placeholder="Choose an existing folder"
-                  readOnly
-                  onClick={() => void chooseLocalFolder()}
-                  spellCheck={false}
-                />
-                <button
-                  type="button"
-                  className="btn"
-                  disabled={pickingFolder}
-                  onClick={(event) => {
-                    event.preventDefault();
-                    void chooseLocalFolder();
-                  }}
-                >
-                  {pickingFolder ? "Choosing…" : path ? "Change…" : "Choose…"}
-                </button>
-              </div>
-            ) : (
-              <>
-                <input
-                  value={path}
-                  onChange={(event) => {
-                    setPathTouched(true);
-                    setPath(event.target.value);
-                  }}
-                  placeholder="~/OpenResearch/my-research"
-                  spellCheck={false}
-                />
-                <span className="repo-hint mono">Created locally; GitHub is optional</span>
-              </>
-            )}
+            <div className="folder-picker-row">
+              <input
+                value={path}
+                placeholder="Choose or create a folder"
+                readOnly
+                onClick={() => void chooseLocalFolder()}
+                spellCheck={false}
+              />
+              <button
+                type="button"
+                className="btn"
+                disabled={pickingFolder}
+                onClick={(event) => {
+                  event.preventDefault();
+                  void chooseLocalFolder();
+                }}
+              >
+                {pickingFolder ? "Choosing…" : path ? "Change…" : "Choose…"}
+              </button>
+            </div>
           </label>
+          {path && (
+            <label>
+              Project name
+              <input
+                value={name}
+                onChange={(event) => {
+                  setNameTouched(true);
+                  setName(event.target.value);
+                }}
+                placeholder="my-research"
+                autoFocus
+              />
+            </label>
+          )}
           {gitMissing && (
             <div className="project-path-notice error">
               Git is required for experiments but is not installed. Install Git, then restart OpenResearch.
             </div>
           )}
-          {!gitMissing && mode === "folder" && path.trim() && checkingPath && (
+          {!gitMissing && path.trim() && checkingPath && (
             <span className="repo-hint mono">Checking folder…</span>
           )}
-          {!gitMissing && mode === "folder" && path.trim() && !checkingPath && pathStatus?.exists === false && (
+          {!gitMissing && path.trim() && !checkingPath && pathStatus?.exists === false && (
             <div className="project-path-notice error">Choose an existing folder.</div>
           )}
-          {!gitMissing && mode === "folder" && path.trim() && !checkingPath && pathStatus?.exists && pathStatus.directory === false && (
+          {!gitMissing && path.trim() && !checkingPath && pathStatus?.exists && pathStatus.directory === false && (
             <div className="project-path-notice error">The selected path is not a folder.</div>
           )}
-          {!gitMissing && mode === "folder" && !checkingPath && pathStatus?.directory && pathStatus.initialized === false && (
-            <div className="project-path-notice">
-              This folder is not a Git repository. OpenResearch will initialize Git here.
+          {!gitMissing && !checkingPath && nonemptyPaperCloneFolder && (
+            <div className="project-path-notice error">
+              Choose an empty folder for the paper repository.
             </div>
           )}
+          {!gitMissing &&
+            !checkingPath &&
+            !nonemptyPaperCloneFolder &&
+            pathStatus?.directory &&
+            pathStatus.initialized === false && (
+            <div className="project-path-notice">
+              {mode === "paper" && paper?.repoUrl
+                ? "The paper repository will be cloned into this folder."
+                : "This folder is not a Git repository. OpenResearch will initialize Git here."}
+            </div>
+            )}
           {pathError && <div className="project-path-notice error">{pathError}</div>}
         </>
       )}

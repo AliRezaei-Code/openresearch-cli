@@ -9,6 +9,7 @@ import {
   completeOnboarding,
   reasoningFor,
   searchPapers,
+  type AgentSelection,
   type Harness,
   type HarnessId,
   type LinkedPaper,
@@ -17,7 +18,6 @@ import {
 } from "../api";
 import { renderNote } from "./agentNote";
 import { onHarnessAuth } from "../events";
-import { saveAgentSelection, type AgentSelection } from "../agentSelection";
 
 const RETRY_COPY = "Couldn't reach orx. Check it's still running, then re-check.";
 const RESEARCH_AREAS = ["AI/ML", "Biology", "Physics", "Other"];
@@ -28,7 +28,13 @@ const RESEARCH_AREAS = ["AI/ML", "Biology", "Physics", "Other"];
  * installation. The data-dir choice lives in
  * Settings → Storage (which can also *move* existing data); usage analytics is
  * opt-out via the CLI (`orx telemetry off`). */
-export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
+export function Onboarding({
+  onDone,
+  preferredAgent,
+}: {
+  onDone: (project: Project, selection: AgentSelection) => void;
+  preferredAgent: AgentSelection | null;
+}) {
   const [step, setStep] = useState<0 | 1>(0);
   const [harnesses, setHarnesses] = useState<Harness[] | null>(null);
   const [gitVersion, setGitVersion] = useState<string | null>();
@@ -44,7 +50,6 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
   const [paperHits, setPaperHits] = useState<PaperHit[]>([]);
   const [searchingPapers, setSearchingPapers] = useState(false);
   const paperSeq = useRef(0);
-  const harnessSelectionInvalidated = useRef(false);
   // Per-probe, not one shared flag: a git failure must not put a connectivity
   // error on the harness gate it has nothing to do with — or worse, hide the
   // actionable "sign in" hint behind it.
@@ -90,14 +95,11 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
     if (harnesses === null) return;
     const ready = harnesses.filter((h) => h.agentReady);
     setPreferredHarness((current) => {
-      if (current && !ready.some((h) => h.id === current)) {
-        harnessSelectionInvalidated.current = true;
-        return null;
-      }
-      if (current) return current;
-      return ready.length === 1 && !harnessSelectionInvalidated.current ? ready[0].id : null;
+      if (current && ready.some((h) => h.id === current)) return current;
+      const saved = preferredAgent && ready.find((h) => h.id === preferredAgent.harness);
+      return saved?.id ?? ready[0]?.id ?? null;
     });
-  }, [harnesses]);
+  }, [harnesses, preferredAgent]);
   useEffect(
     () =>
       onHarnessAuth(() => {
@@ -173,8 +175,7 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
         background: background || null,
         papers,
       });
-      saveAgentSelection(completion.selection);
-      onDone(completion.project);
+      onDone(completion.project, completion.selection);
     } catch (error) {
       setFinishError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -190,10 +191,8 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
             <div className="onb-eyebrow">
               <Wordmark /> · Step 1 of 2
             </div>
-            <h2 className="onb-title">Set up your local tools</h2>
-            <p className="onb-sub">
-              Choose a coding agent and confirm Git is installed. Both run on this machine.
-            </p>
+            <h2 className="onb-title">Choose a coding agent</h2>
+            <p className="onb-sub">OpenResearch uses an agent already signed in on this machine.</p>
             {harnesses !== null && !anyAgentReady && (
               <p className="onb-gate-hint onb-agent-hint">
                 Sign in to at least one agent to continue.
@@ -211,10 +210,7 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
                     key={h.id}
                     h={h}
                     selected={preferredHarness === h.id}
-                    onSelect={() => {
-                      harnessSelectionInvalidated.current = false;
-                      setPreferredHarness(h.id);
-                    }}
+                    onSelect={() => setPreferredHarness(h.id)}
                   />
                 ))
               ) : harnessError ? (
@@ -226,20 +222,27 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
                 </div>
               )}
             </div>
-            <div className="onb-git-check" role="status" aria-live="polite">
-              <LocalGitCard gitVersion={gitVersion} error={gitError} />
-              {gitError ? (
-                <p className="onb-gate-hint onb-git-hint">{RETRY_COPY}</p>
-              ) : gitVersion === null ? (
-                <p className="onb-gate-hint onb-git-hint">
-                  Git is required for local experiments. Install Git, then re-check.
-                </p>
-              ) : null}
-            </div>
+            {(gitVersion === null || gitError) && (
+              <div className="onb-git-check" role="status" aria-live="polite">
+                <LocalGitCard gitVersion={gitVersion} error={gitError} />
+                {gitError ? (
+                  <p className="onb-gate-hint onb-git-hint">{RETRY_COPY}</p>
+                ) : (
+                  <p className="onb-gate-hint onb-git-hint">
+                    Git is required for local experiments. Install Git, then re-check.
+                  </p>
+                )}
+              </div>
+            )}
             <div className="onb-actions">
-              <button className="btn ghost" onClick={() => load(true, true)} disabled={checking}>
-                <RefreshCw size={12} className={checking ? "spin" : ""} /> Re-check
-              </button>
+              {(harnessError ||
+                gitError ||
+                gitVersion === null ||
+                (harnesses !== null && !anyAgentReady)) && (
+                <button className="btn ghost" onClick={() => load(true, true)} disabled={checking}>
+                  <RefreshCw size={12} className={checking ? "spin" : ""} /> Re-check
+                </button>
+              )}
               <div style={{ flex: 1 }} />
               <button
                 className="btn primary"
@@ -468,6 +471,7 @@ function AgentCard({
   onSelect: () => void;
 }) {
   const badge = agentBadge(h);
+  const visibleBadge = selected ? { cls: "st-done", label: "Selected" } : badge;
   const version = h.version?.replace(/\s*\(.*\)$/, "");
   const head = (
     <div className="onb-card-head">
@@ -475,9 +479,9 @@ function AgentCard({
         <AgentLogo harness={h.id} />
         <span className="onb-card-name">{h.name}</span>
       </span>
-      <span className={`status-badge ${badge.cls}`}>
+      <span className={`status-badge ${visibleBadge.cls}`}>
         {h.agentReady ? <Check size={12} strokeWidth={3} /> : <span className="dot" />}
-        {badge.label}
+        {visibleBadge.label}
       </span>
     </div>
   );

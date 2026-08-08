@@ -92,7 +92,7 @@ Run `orx --help` (or `orx <command> --help`) for full usage. The highlights:
 | Compute | `compute`, `instance create` |
 | Literature | `lit`, `paper` (full-text search across alphaXiv, OpenAlex, bioRxiv — no login required) |
 | Agent integration | `install-skills`, `skill` |
-| Maintenance | `version`, `update`, `telemetry` |
+| Maintenance | `version`, `update`, `telemetry`, `delete database/cli/all` |
 
 `orx install-skills` drops the OpenResearch skill into your local coding agents
 (Claude Code, Codex, OpenCode, Cursor) so they can drive `orx` themselves —
