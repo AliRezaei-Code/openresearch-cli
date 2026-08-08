@@ -273,10 +273,7 @@ export function Onboarding({
             <div className="onb-eyebrow">
               <Wordmark /> · Step 2 of 2
             </div>
-            <h2 className="onb-title">Tell us about your research</h2>
-            <p className="onb-sub">
-              This helps us understand who uses orx and improve it for your kind of research.
-            </p>
+            <h2 className="onb-title onb-profile-title">Tell us about your research</h2>
             <div className="onb-cards">
               <div className="onb-card">
                 <fieldset className="onb-fieldset">
