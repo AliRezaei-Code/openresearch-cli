@@ -2088,7 +2088,9 @@ export function ChatPanel({
   );
 
   const visibleSessions = sessions.filter((s) => matchesFilter(sessionFilter, s.archived));
-  const newTaskShortcut = /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘N" : "Ctrl+N";
+  const newTaskShortcut = /Mac|iPhone|iPad/.test(navigator.platform)
+    ? "⌘ ⇧ Enter"
+    : "Ctrl + Shift + Enter";
   const startNewTask = useCallback(() => {
     setSessionFilter("active");
     setActiveId(null);
@@ -2099,10 +2101,10 @@ export function ChatPanel({
     const onKeyDown = (event: KeyboardEvent) => {
       if (
         event.repeat ||
-        event.key.toLowerCase() !== "n" ||
+        event.key !== "Enter" ||
         (!event.metaKey && !event.ctrlKey) ||
         event.altKey ||
-        event.shiftKey
+        !event.shiftKey
       )
         return;
       event.preventDefault();
@@ -2146,7 +2148,7 @@ export function ChatPanel({
             className="rail-section-new tip-up"
             data-onboarding="new-session"
             data-tip={newTaskShortcut}
-            aria-keyshortcuts="Meta+N Control+N"
+            aria-keyshortcuts="Meta+Shift+Enter Control+Shift+Enter"
             onClick={startNewTask}
           >
             <Plus size={13} />
