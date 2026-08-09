@@ -74,7 +74,6 @@ import {
 } from "./ModelPicker";
 import { ContextMeter } from "./ContextMeter";
 import { renderNote } from "./agentNote";
-import { loadAgentSelection, saveAgentSelection } from "../agentSelection";
 import { loadReadDemoSessions, markDemoSessionRead } from "../demoSessionState";
 
 // --- chat state --------------------------------------------------------------
@@ -1226,6 +1225,8 @@ export function ChatPanel({
   onOpenWorktree,
   onStartTour,
   onActiveSessionChange,
+  preferredAgent,
+  onPreferredAgentChange,
   children,
 }: {
   projectId: string;
@@ -1261,6 +1262,9 @@ export function ChatPanel({
   onStartTour?: () => void;
   /** The open chat session, surfaced so the shell can scope panes to it. */
   onActiveSessionChange?: (sessionId: string | null) => void;
+  /** Database-backed selection used to seed new chat sessions. */
+  preferredAgent: ModelSelection | null;
+  onPreferredAgentChange: (selection: ModelSelection) => Promise<void>;
   /** Middle-pane content when a settings section is active. */
   children?: React.ReactNode;
 }) {
@@ -1280,7 +1284,8 @@ export function ChatPanel({
     busySessions: new Set<string>(),
   });
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
-  const [selection, setSelection] = useState<ModelSelection | null>(loadAgentSelection);
+  const [selection, setSelection] = useState<ModelSelection | null>(preferredAgent);
+  useEffect(() => setSelection(preferredAgent), [preferredAgent]);
   // Unsent composer tweaks (model/mode/reasoning) for the *open* session — the
   // session's harness is fixed, so these override only its mutable settings and
   // are applied (and persisted server-side) on the next send. Cleared when the
@@ -1436,7 +1441,7 @@ export function ChatPanel({
   // Reconcile the reasoning level against the *currently selected model* here
   // rather than only in the picker's `pick`. Two paths reach the composer with
   // a level nobody chose for this model: a session row stored by an older build
-  // (which always wrote an explicit effort), and a stale localStorage selection.
+  // (which always wrote an explicit effort), and a stale saved preference.
   // Reconciling at the point the composer derives its state covers both, so the
   // displayed value and the value `send` transmits can never be one the model
   // rejects.
@@ -1469,7 +1474,7 @@ export function ChatPanel({
     if (!composerSelection) return;
     const merged = { ...composerSelection, ...next };
     setSelection(merged);
-    saveAgentSelection(merged);
+    void onPreferredAgentChange(merged).catch(() => {});
     if (openSession) setSessionOverride((cur) => ({ ...cur, ...next }));
   };
   const setPermissionMode = (id: string) => selectModel({ permissionMode: id });
@@ -2089,7 +2094,9 @@ export function ChatPanel({
   );
 
   const visibleSessions = sessions.filter((s) => matchesFilter(sessionFilter, s.archived));
-  const newTaskShortcut = /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘N" : "Ctrl+N";
+  const newTaskShortcut = /Mac|iPhone|iPad/.test(navigator.platform)
+    ? "⌘ ⇧ Enter"
+    : "Ctrl + Shift + Enter";
   const startNewTask = useCallback(() => {
     setSessionFilter("active");
     setActiveId(null);
@@ -2100,10 +2107,10 @@ export function ChatPanel({
     const onKeyDown = (event: KeyboardEvent) => {
       if (
         event.repeat ||
-        event.key.toLowerCase() !== "n" ||
+        event.key !== "Enter" ||
         (!event.metaKey && !event.ctrlKey) ||
         event.altKey ||
-        event.shiftKey
+        !event.shiftKey
       )
         return;
       event.preventDefault();
@@ -2147,7 +2154,7 @@ export function ChatPanel({
             className="rail-section-new tip-up"
             data-onboarding="new-session"
             data-tip={newTaskShortcut}
-            aria-keyshortcuts="Meta+N Control+N"
+            aria-keyshortcuts="Meta+Shift+Enter Control+Shift+Enter"
             onClick={startNewTask}
           >
             <Plus size={13} />

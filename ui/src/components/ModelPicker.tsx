@@ -13,7 +13,7 @@ import {
 } from "../api";
 import { renderNote } from "./agentNote";
 import { onHarnessAuth } from "../events";
-import type { AgentSelection } from "../agentSelection";
+import type { AgentSelection } from "../api";
 
 export type ModelSelection = AgentSelection;
 

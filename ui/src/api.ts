@@ -107,6 +107,21 @@ export interface OnboardingSelection {
   reasoningLevel: string | null;
 }
 
+export type AgentSelection = OnboardingSelection;
+
+export interface UiState {
+  onboardingCompleted: boolean;
+  tourCompleted: boolean;
+  preferredAgent: AgentSelection | null;
+}
+
+export const getUiState = () => get<UiState>("/api/settings/ui-state");
+
+export const updateUiState = (body: {
+  tourCompleted?: boolean;
+  preferredAgent?: AgentSelection;
+}) => post<UiState>("/api/settings/ui-state", body);
+
 export const completeOnboarding = (selection: OnboardingSelection, profile: Profile) =>
   post<{ project: Project; selection: OnboardingSelection }>(
     "/api/onboarding/complete",
@@ -118,6 +133,7 @@ export interface ProjectPathStatus {
   resolvedPath: string | null;
   exists: boolean | null;
   directory: boolean | null;
+  empty: boolean | null;
   initialized: boolean | null;
 }
 
@@ -693,6 +709,8 @@ export interface LinkedPaper {
 
 /** The local researcher profile captured in onboarding (settings.json). */
 export interface Profile {
+  researchAreas: string[];
+  otherArea: string | null;
   background: string | null;
   papers: LinkedPaper[];
 }
@@ -774,7 +792,7 @@ export const pushProjectGithub = (projectId: string) =>
   post<{ project: Project; git: ProjectGitStatus }>(`/api/projects/${projectId}/github/push`);
 
 export interface TelemetrySettings {
-  /** Whether anonymous usage analytics is currently on. */
+  /** Whether usage analytics linked to the random installation ID is on. */
   enabled: boolean;
   /** When off, a short human reason (e.g. "--no-telemetry flag"); null when on. */
   reason: string | null;
@@ -785,8 +803,8 @@ export const getTelemetry = () => get<TelemetrySettings>("/api/settings/telemetr
 export const setTelemetry = (enabled: boolean) =>
   post<TelemetrySettings>("/api/settings/telemetry", { enabled });
 
-/** Record the consent decision (agree/reject) once, when the user leaves the
- * onboarding step — fires unconditionally so opt-outs are counted too. */
+/** Record the consent decision once when the user leaves onboarding. Eligible
+ * official builds send this even for opt-outs; development builds stay inert. */
 export const recordTelemetryConsent = (enabled: boolean) =>
   post<{ ok: boolean }>("/api/settings/telemetry/consent", { enabled });
 

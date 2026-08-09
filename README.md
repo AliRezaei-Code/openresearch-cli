@@ -92,7 +92,7 @@ Run `orx --help` (or `orx <command> --help`) for full usage. The highlights:
 | Compute | `compute`, `instance create` |
 | Literature | `lit`, `paper` (full-text search across alphaXiv, OpenAlex, bioRxiv — no login required) |
 | Agent integration | `install-skills`, `skill` |
-| Maintenance | `version`, `update`, `telemetry` |
+| Maintenance | `version`, `update`, `telemetry`, `delete database/cli/all` |
 
 `orx install-skills` drops the OpenResearch skill into your local coding agents
 (Claude Code, Codex, OpenCode, Cursor) so they can drive `orx` themselves —
@@ -140,21 +140,32 @@ Run the tests with `cargo test`.
 
 ## Usage analytics
 
-`orx` sends **anonymous** usage analytics to help prioritize features. It's
-opt-out, and the `orx up` onboarding surfaces the choice on first run.
+`orx` sends usage analytics linked to a random installation ID—not an account—to
+help prioritize features. It's opt-out, and the `orx up` onboarding surfaces the
+choice on first run.
 
 - **Collected:** command name, a random per-install UUID, CLI version, OS/arch,
-  a CI flag, coarse install type, and coarse event labels (e.g. onboarding
-  completed, project created, chat session started, or a run launched on
-  `modal`).
-- **Never collected:** code, prompts, file contents or paths, project or
-  experiment ids/names, repo names, tokens, emails, or account/identity data.
-  The random install UUID is not tied to your account.
+  the official build channel, a CI flag, coarse install type, and coarse event
+  labels (e.g. onboarding completed, project created, chat session started, or
+  a run launched on `modal`). When onboarding is completed, the disclosed
+  research profile is also sent unfiltered: selected research areas, the
+  Other-area description, research background, and representative paper IDs
+  and titles.
+- **Not automatically added:** code, prompts, file contents or paths, project or
+  experiment IDs/names, repo names, tokens, emails, or account identifiers.
+  Anything entered in the onboarding profile is sent exactly as submitted and
+  may contain identifying information. The random install UUID is not tied to
+  your account.
 
 ```sh
 orx telemetry off        # persistent, per-machine
-orx telemetry status     # current state + the anonymous install id
+orx telemetry status     # current state + the random install id
 orx <cmd> --no-telemetry # per-run
 ```
+
+Only official prebuilt release artifacts can send usage analytics. Source,
+worktree, `cargo install --path`, and cargo-dist PR/dry-run builds remain off and
+do not create an installation ID. `ORX_TELEMETRY_ENV=off` additionally disables
+analytics in an official binary; it cannot enable analytics in a source build.
 
 Events are fire-and-forget on a background task and never block a command.

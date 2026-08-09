@@ -9,6 +9,7 @@ import {
   completeOnboarding,
   reasoningFor,
   searchPapers,
+  type AgentSelection,
   type Harness,
   type HarnessId,
   type LinkedPaper,
@@ -17,17 +18,23 @@ import {
 } from "../api";
 import { renderNote } from "./agentNote";
 import { onHarnessAuth } from "../events";
-import { saveAgentSelection, type AgentSelection } from "../agentSelection";
 
 const RETRY_COPY = "Couldn't reach orx. Check it's still running, then re-check.";
+const RESEARCH_AREAS = ["AI/ML", "Biology", "Physics", "Other"];
 
-/** First-run walkthrough: choose a local coding agent, verify Git, optionally
- * add research background, then install and open the demo project. The local
- * tool checks gate setup; the background (a blurb + linked papers) is saved
- * best-effort so it never blocks installation. The data-dir choice lives in
+/** First-run walkthrough: choose a local coding agent, verify Git, add a
+ * research profile, then install and open the demo project. The local tool
+ * checks gate setup; the profile is saved best-effort so it never blocks
+ * installation. The data-dir choice lives in
  * Settings → Storage (which can also *move* existing data); usage analytics is
  * opt-out via the CLI (`orx telemetry off`). */
-export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
+export function Onboarding({
+  onDone,
+  preferredAgent,
+}: {
+  onDone: (project: Project, selection: AgentSelection) => void;
+  preferredAgent: AgentSelection | null;
+}) {
   const [step, setStep] = useState<0 | 1>(0);
   const [harnesses, setHarnesses] = useState<Harness[] | null>(null);
   const [gitVersion, setGitVersion] = useState<string | null>();
@@ -35,16 +42,14 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
   const [finishError, setFinishError] = useState<string | null>(null);
   const [preferredHarness, setPreferredHarness] = useState<HarnessId | null>(null);
   const [checking, setChecking] = useState(false);
-  // Step 2 (optional): a free-text background plus any alphaXiv papers linked
-  // via title search. Prefilled from any saved profile so a replayed
-  // walkthrough doesn't look empty.
+  const [researchAreas, setResearchAreas] = useState<string[]>([]);
+  const [otherArea, setOtherArea] = useState("");
   const [background, setBackground] = useState("");
   const [papers, setPapers] = useState<LinkedPaper[]>([]);
   const [paperQuery, setPaperQuery] = useState("");
   const [paperHits, setPaperHits] = useState<PaperHit[]>([]);
   const [searchingPapers, setSearchingPapers] = useState(false);
   const paperSeq = useRef(0);
-  const harnessSelectionInvalidated = useRef(false);
   // Per-probe, not one shared flag: a git failure must not put a connectivity
   // error on the harness gate it has nothing to do with — or worse, hide the
   // actionable "sign in" hint behind it.
@@ -90,14 +95,11 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
     if (harnesses === null) return;
     const ready = harnesses.filter((h) => h.agentReady);
     setPreferredHarness((current) => {
-      if (current && !ready.some((h) => h.id === current)) {
-        harnessSelectionInvalidated.current = true;
-        return null;
-      }
-      if (current) return current;
-      return ready.length === 1 && !harnessSelectionInvalidated.current ? ready[0].id : null;
+      if (current && ready.some((h) => h.id === current)) return current;
+      const saved = preferredAgent && ready.find((h) => h.id === preferredAgent.harness);
+      return saved?.id ?? ready[0]?.id ?? null;
     });
-  }, [harnesses]);
+  }, [harnesses, preferredAgent]);
   useEffect(
     () =>
       onHarnessAuth(() => {
@@ -114,6 +116,8 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
   useEffect(() => {
     void getProfile()
       .then((p) => {
+        setResearchAreas(p.researchAreas);
+        setOtherArea(p.otherArea ?? "");
         setBackground(p.background ?? "");
         setPapers(p.papers);
       })
@@ -149,6 +153,14 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
     setPaperHits([]);
   };
   const removePaper = (id: string) => setPapers((cur) => cur.filter((p) => p.paperId !== id));
+  const toggleResearchArea = (area: string) => {
+    setResearchAreas((current) =>
+      current.includes(area) ? current.filter((item) => item !== area) : [...current, area],
+    );
+  };
+
+  const researchProfileValid =
+    researchAreas.length > 0 && (!researchAreas.includes("Other") || otherArea.trim().length > 0);
 
   const finishOnboarding = async () => {
     const harness = harnesses?.find((item) => item.id === preferredHarness && item.agentReady);
@@ -158,11 +170,12 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
     setFinishError(null);
     try {
       const completion = await completeOnboarding(selection, {
-        background: background.trim() || null,
+        researchAreas,
+        otherArea: researchAreas.includes("Other") ? otherArea : null,
+        background: background || null,
         papers,
       });
-      saveAgentSelection(completion.selection);
-      onDone(completion.project);
+      onDone(completion.project, completion.selection);
     } catch (error) {
       setFinishError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -178,10 +191,8 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
             <div className="onb-eyebrow">
               <Wordmark /> · Step 1 of 2
             </div>
-            <h2 className="onb-title">Set up your local tools</h2>
-            <p className="onb-sub">
-              Choose a coding agent and confirm Git is installed. Both run on this machine.
-            </p>
+            <h2 className="onb-title">Choose a coding agent</h2>
+            <p className="onb-sub">OpenResearch uses an agent already signed in on this machine.</p>
             {harnesses !== null && !anyAgentReady && (
               <p className="onb-gate-hint onb-agent-hint">
                 Sign in to at least one agent to continue.
@@ -199,10 +210,7 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
                     key={h.id}
                     h={h}
                     selected={preferredHarness === h.id}
-                    onSelect={() => {
-                      harnessSelectionInvalidated.current = false;
-                      setPreferredHarness(h.id);
-                    }}
+                    onSelect={() => setPreferredHarness(h.id)}
                   />
                 ))
               ) : harnessError ? (
@@ -214,20 +222,27 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
                 </div>
               )}
             </div>
-            <div className="onb-git-check" role="status" aria-live="polite">
-              <LocalGitCard gitVersion={gitVersion} error={gitError} />
-              {gitError ? (
-                <p className="onb-gate-hint onb-git-hint">{RETRY_COPY}</p>
-              ) : gitVersion === null ? (
-                <p className="onb-gate-hint onb-git-hint">
-                  Git is required for local experiments. Install Git, then re-check.
-                </p>
-              ) : null}
-            </div>
+            {(gitVersion === null || gitError) && (
+              <div className="onb-git-check" role="status" aria-live="polite">
+                <LocalGitCard gitVersion={gitVersion} error={gitError} />
+                {gitError ? (
+                  <p className="onb-gate-hint onb-git-hint">{RETRY_COPY}</p>
+                ) : (
+                  <p className="onb-gate-hint onb-git-hint">
+                    Git is required for local experiments. Install Git, then re-check.
+                  </p>
+                )}
+              </div>
+            )}
             <div className="onb-actions">
-              <button className="btn ghost" onClick={() => load(true, true)} disabled={checking}>
-                <RefreshCw size={12} className={checking ? "spin" : ""} /> Re-check
-              </button>
+              {(harnessError ||
+                gitError ||
+                gitVersion === null ||
+                (harnesses !== null && !anyAgentReady)) && (
+                <button className="btn ghost" onClick={() => load(true, true)} disabled={checking}>
+                  <RefreshCw size={12} className={checking ? "spin" : ""} /> Re-check
+                </button>
+              )}
               <div style={{ flex: 1 }} />
               <button
                 className="btn primary"
@@ -258,14 +273,41 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
             <div className="onb-eyebrow">
               <Wordmark /> · Step 2 of 2
             </div>
-            <h2 className="onb-title">Tell us about your research</h2>
-            <p className="onb-sub">
-              A sentence or two about what you work on helps orx tailor its research. All optional;
-              you can skip and add this later.
-            </p>
+            <h2 className="onb-title onb-profile-title">Tell us about your research</h2>
             <div className="onb-cards">
               <div className="onb-card">
+                <fieldset className="onb-fieldset">
+                  <legend>What areas are you interested in?</legend>
+                  <p className="onb-field-hint">Choose one or more.</p>
+                  <div className="onb-area-options">
+                    {RESEARCH_AREAS.map((area) => (
+                      <label key={area} className="onb-area-option">
+                        <input
+                          type="checkbox"
+                          checked={researchAreas.includes(area)}
+                          onChange={() => toggleResearchArea(area)}
+                          disabled={finishing}
+                        />
+                        <span>{area}</span>
+                      </label>
+                    ))}
+                  </div>
+                  {researchAreas.includes("Other") && (
+                    <input
+                      className="onb-other-area"
+                      value={otherArea}
+                      onChange={(event) => setOtherArea(event.target.value)}
+                      disabled={finishing}
+                      placeholder="Tell us your other research area"
+                      aria-label="Other research area"
+                    />
+                  )}
+                </fieldset>
+                <label className="onb-field-label" htmlFor="onb-background">
+                  Research background
+                </label>
                 <textarea
+                  id="onb-background"
                   className="onb-textarea"
                   value={background}
                   onChange={(e) => setBackground(e.target.value)}
@@ -273,8 +315,16 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
                   rows={4}
                   placeholder="e.g. I work on sample-efficient RL for LLM post-training, focused on reward-model-free methods."
                 />
+                <label className="onb-field-label" htmlFor="onb-paper-search">
+                  Representative papers
+                </label>
+                <p className="onb-field-hint">
+                  Add papers that represent your research interests, including papers by other
+                  authors.
+                </p>
                 <div className="onb-paper-search">
                   <input
+                    id="onb-paper-search"
                     value={paperQuery}
                     onChange={(e) => setPaperQuery(e.target.value)}
                     disabled={finishing}
@@ -318,12 +368,13 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
                 )}
               </div>
             </div>
-            {/* The data dir moved to Settings → Storage; still disclose where
-                things land so the location isn't a surprise. */}
-            <p className="onb-aside-text" style={{ marginTop: 12 }}>
-              Your background stays on this machine, alongside your database, run logs, and
-              artifacts — change where they live any time in Settings → Storage.
-            </p>
+            {!researchProfileValid && (
+              <p className="onb-profile-hint">
+                {researchAreas.length === 0
+                  ? "Choose at least one research area to continue."
+                  : "Describe your research area to continue."}
+              </p>
+            )}
             <div className="onb-actions">
               <button className="btn ghost" onClick={() => setStep(0)} disabled={finishing}>
                 <ArrowLeft size={12} /> Back
@@ -332,7 +383,7 @@ export function Onboarding({ onDone }: { onDone: (project: Project) => void }) {
               <button
                 className="btn primary"
                 onClick={() => void finishOnboarding()}
-                disabled={finishing || preferredHarness === null}
+                disabled={finishing || preferredHarness === null || !researchProfileValid}
               >
                 {finishing ? (
                   <>
@@ -417,47 +468,54 @@ function AgentCard({
   onSelect: () => void;
 }) {
   const badge = agentBadge(h);
+  const visibleBadge = selected ? { cls: "st-done", label: "Selected" } : badge;
   const version = h.version?.replace(/\s*\(.*\)$/, "");
+  const head = (
+    <div className="onb-card-head">
+      <span className="onb-card-identity">
+        <AgentLogo harness={h.id} />
+        <span className="onb-card-name">{h.name}</span>
+      </span>
+      <span className={`status-badge ${visibleBadge.cls}`}>
+        {h.agentReady ? <Check size={12} strokeWidth={3} /> : <span className="dot" />}
+        {visibleBadge.label}
+      </span>
+    </div>
+  );
+  // An unready agent can't be selected — render it as a plain container, not a
+  // disabled button, so the copy button on its `agentNote` command stays live.
+  if (!h.agentReady) {
+    return (
+      <div className="onb-card onb-agent-choice">
+        {head}
+        <div className="onb-card-meta">{renderNote(h.agentNote)}</div>
+      </div>
+    );
+  }
   return (
     <button
       type="button"
       className={`onb-card onb-agent-choice${selected ? " selected" : ""}`}
-      disabled={!h.agentReady}
       aria-pressed={selected}
       onClick={onSelect}
     >
-      <div className="onb-card-head">
-        <span className="onb-card-identity">
-          <AgentLogo harness={h.id} />
-          <span className="onb-card-name">{h.name}</span>
-        </span>
-        <span className={`status-badge ${badge.cls}`}>
-          {h.agentReady ? <Check size={12} strokeWidth={3} /> : <span className="dot" />}
-          {badge.label}
-        </span>
+      {head}
+      <div className="onb-card-detail mono">
+        {h.account ?? "API key"}
+        {h.plan ? ` · ${h.plan}` : ""}
       </div>
-      {h.agentReady ? (
-        <>
-          <div className="onb-card-detail mono">
-            {h.account ?? "API key"}
-            {h.plan ? ` · ${h.plan}` : ""}
-          </div>
-          <div className="onb-card-meta">
-            {[
-              version,
-              h.models.length > 0 &&
-                `${h.models.length} model${h.models.length === 1 ? "" : "s"} — ${h.models
-                  .slice(0, 3)
-                  .map((m) => harnessModelLabel(m))
-                  .join(", ")}${h.models.length > 3 ? ", …" : ""}`,
-            ]
-              .filter(Boolean)
-              .join(" · ")}
-          </div>
-        </>
-      ) : (
-        <div className="onb-card-meta">{renderNote(h.agentNote)}</div>
-      )}
+      <div className="onb-card-meta">
+        {[
+          version,
+          h.models.length > 0 &&
+            `${h.models.length} model${h.models.length === 1 ? "" : "s"} — ${h.models
+              .slice(0, 3)
+              .map((m) => harnessModelLabel(m))
+              .join(", ")}${h.models.length > 3 ? ", …" : ""}`,
+        ]
+          .filter(Boolean)
+          .join(" · ")}
+      </div>
     </button>
   );
 }

@@ -1,16 +1,21 @@
-//! Anonymous, opt-out usage analytics → PostHog.
+//! Opt-out usage analytics → PostHog.
 //!
 //! Why this exists: `orx` shipped with no telemetry, so we had no way to see
 //! installs, DAU/WAU, retention, or which commands people actually use. This
-//! module sends anonymous events (a random per-install UUID as the only
-//! identity — never any PII, prompt text, file paths, ids, or repo contents).
+//! module sends events under a random per-install UUID that is not tied to an
+//! account. The disclosed onboarding research profile is included unfiltered
+//! in its own event; prompts, file paths, and repo contents are never read from
+//! the workspace or added automatically.
 //!
 //! Guarantees, enforced by this module:
+//! - **Official builds only.** Source builds never send production telemetry or
+//!   generate an install id. The official release workflow embeds the immutable
+//!   production build channel; a runtime override may only disable it.
 //! - **Opt-out.** A `--no-telemetry` flag and a persistent `orx telemetry off`
 //!   (also toggleable from the `orx up` onboarding step). A disabled run sends
-//!   nothing, touches no disk, and generates no install id. (Sole exception:
-//!   *agreeing* to the consent step persists the install id — an opt-in; see
-//!   `record_consent`.)
+//!   nothing, touches no disk, and generates no install id. (In an eligible
+//!   official build, *agreeing* to the consent step persists the install id —
+//!   an opt-in; see `record_consent`.)
 //! - **Never blocks or crashes the CLI.** Sends are fire-and-forget on a
 //!   background task with a bounded flush window (modeled on
 //!   [`crate::updates::UpdateWarning`]); every error is swallowed. A telemetry
@@ -38,6 +43,12 @@ const POSTHOG_KEY: &str = "phc_u2i23xa8CBjcZpQprf6kdDzzR8vb2iTpRT8FmdcREBvX";
 /// every current and future CLI event is `cli_*` by construction; call sites
 /// pass the bare name (`command`, `experiment_started`).
 const EVENT_PREFIX: &str = "cli_";
+
+const BUILD_CHANNEL: &str = env!("ORX_BUILD_CHANNEL");
+
+pub(crate) fn build_channel() -> &'static str {
+    BUILD_CHANNEL
+}
 
 /// US PostHog cloud. Overridable with `ORX_TELEMETRY_HOST` so tests can point
 /// at a throwaway local listener instead of production.
@@ -75,9 +86,7 @@ fn flush_window() -> Duration {
 /// settings.json` (the config dir, NOT the R2-snapshotted data dir) so the
 /// anonymous install id stays per-install rather than travelling with an agent
 /// box's data snapshot. Beyond telemetry, this is the one file for user-level
-/// config: the data-dir/compute defaults and the onboarding researcher profile
-/// (`background`/`linked_papers`) — the latter user free-text that, like
-/// everything here, stays on local disk and is never sent in any event.
+/// config: the data-dir/compute defaults and the onboarding researcher profile.
 /// Modeled on `K8sSettings`. Unknown fields on older files parse fine and are
 /// dropped on the next save.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -111,6 +120,12 @@ pub(crate) struct Settings {
     /// applied when a launch resolves to that same backend without a flavor.
     #[serde(default)]
     pub default_flavor: Option<String>,
+    /// Research areas selected in onboarding.
+    #[serde(default)]
+    pub research_areas: Vec<String>,
+    /// Free-text specialization supplied when `Other` is selected.
+    #[serde(default)]
+    pub other_area: Option<String>,
     /// Free-text researcher background captured in onboarding (Settings →
     /// profile). Optional; absent/empty = never provided.
     #[serde(default)]
@@ -139,6 +154,19 @@ pub(crate) struct ProfilePaper {
     pub paper_id: String,
     #[serde(default)]
     pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ResearchProfile {
+    #[serde(default)]
+    pub research_areas: Vec<String>,
+    #[serde(default)]
+    pub other_area: Option<String>,
+    #[serde(default)]
+    pub background: Option<String>,
+    #[serde(default)]
+    pub papers: Vec<ProfilePaper>,
 }
 
 /// The persisted data-dir choice, if any (non-empty). Read by `store::data_dir()`
@@ -187,26 +215,25 @@ pub(crate) fn set_compute_default(
     })
 }
 
-/// The persisted researcher profile: the background blurb (non-empty) and the
-/// linked papers. Read by the profile settings endpoint.
-pub(crate) fn load_profile() -> (Option<String>, Vec<ProfilePaper>) {
+/// The persisted researcher profile. Read by the profile settings endpoint.
+pub(crate) fn load_profile() -> ResearchProfile {
     let s = load_settings().unwrap_or_default();
-    // Trim on read too, so a hand-edited whitespace-only blurb reads as absent.
-    (
-        s.background.filter(|b| !b.trim().is_empty()),
-        s.linked_papers,
-    )
+    ResearchProfile {
+        research_areas: s.research_areas,
+        other_area: s.other_area.filter(|value| !value.trim().is_empty()),
+        background: s.background.filter(|value| !value.trim().is_empty()),
+        papers: s.linked_papers,
+    }
 }
 
 /// Set the researcher profile, preserving every other settings field (same
 /// `mutate_settings` guarantees as the data dir).
-pub(crate) fn set_profile(
-    background: Option<String>,
-    papers: Vec<ProfilePaper>,
-) -> std::io::Result<()> {
+pub(crate) fn set_profile(profile: ResearchProfile) -> std::io::Result<()> {
     mutate_settings(|s| {
-        s.background = background.filter(|b| !b.is_empty());
-        s.linked_papers = papers;
+        s.research_areas = profile.research_areas;
+        s.other_area = profile.other_area.filter(|value| !value.is_empty());
+        s.background = profile.background.filter(|value| !value.is_empty());
+        s.linked_papers = profile.papers;
     })
 }
 
@@ -257,7 +284,7 @@ enum SettingsState {
     /// File doesn't exist — never configured. Safe to create fresh.
     Absent,
     /// Parsed cleanly.
-    Loaded(Settings),
+    Loaded(Box<Settings>),
     /// File exists but didn't parse. Treat as "present but unknown".
     Corrupt,
 }
@@ -266,7 +293,7 @@ fn read_settings_state() -> SettingsState {
     match std::fs::read_to_string(settings_path()) {
         Err(_) => SettingsState::Absent,
         Ok(raw) => match serde_json::from_str::<Settings>(&raw) {
-            Ok(s) => SettingsState::Loaded(s),
+            Ok(s) => SettingsState::Loaded(Box::new(s)),
             Err(_) => SettingsState::Corrupt,
         },
     }
@@ -278,7 +305,7 @@ fn read_settings_state() -> SettingsState {
 /// see `mutate_settings`.)
 pub(crate) fn load_settings() -> Option<Settings> {
     match read_settings_state() {
-        SettingsState::Loaded(s) => Some(s),
+        SettingsState::Loaded(s) => Some(*s),
         _ => None,
     }
 }
@@ -370,7 +397,7 @@ fn mutate_settings<F: FnOnce(&mut Settings)>(f: F) -> std::io::Result<()> {
 
     let mut settings = match read_settings_state() {
         SettingsState::Absent => Settings::default(),
-        SettingsState::Loaded(s) => s,
+        SettingsState::Loaded(s) => *s,
         SettingsState::Corrupt => {
             return Err(std::io::Error::other(
                 "settings.json is unreadable; refusing to overwrite",
@@ -409,6 +436,8 @@ fn install_id() -> Option<String> {
 
 /// Why telemetry is off, for `orx telemetry status`. `None` = enabled.
 pub(crate) enum DisabledReason {
+    DevelopmentBuild,
+    RuntimeEnvironment,
     Flag,
     Persisted,
     CorruptSettings,
@@ -417,6 +446,8 @@ pub(crate) enum DisabledReason {
 impl DisabledReason {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
+            DisabledReason::DevelopmentBuild => "development build",
+            DisabledReason::RuntimeEnvironment => "disabled by ORX_TELEMETRY_ENV",
             DisabledReason::Flag => "--no-telemetry flag",
             DisabledReason::Persisted => "disabled via `orx telemetry off`",
             DisabledReason::CorruptSettings => "settings file unreadable (failing safe)",
@@ -424,16 +455,35 @@ impl DisabledReason {
     }
 }
 
-/// Resolves whether telemetry is disabled and why. The flag is checked before
-/// the persisted setting so a `--no-telemetry` run never reads disk.
+/// Resolves whether telemetry is disabled and why. Build/runtime eligibility
+/// is checked before flags or settings so source builds never read telemetry
+/// state merely to decide whether they may send.
 /// `cli_flag` is the `--no-telemetry` global flag.
 ///
-/// Opt-out surface is intentionally minimal: the `--no-telemetry` flag and the
-/// persistent `orx telemetry off`. Automated/CI runs are not auto-disabled —
-/// the `ci` property on every event lets those be filtered at query time
-/// instead, which also catches automation the old `CI` env check missed
-/// (agent boxes, Jenkins, ad-hoc scripts).
-pub(crate) fn disabled_reason(cli_flag: bool) -> Option<DisabledReason> {
+/// User preference controls are intentionally minimal: the `--no-telemetry`
+/// flag and persistent `orx telemetry off`. `ORX_TELEMETRY_ENV` is a separate
+/// eligibility downgrade for testing official binaries. Automated/CI runs are
+/// not otherwise auto-disabled — the `ci` property on every event lets those
+/// be filtered at query time instead.
+fn environment_disabled_reason_for(
+    build_channel: &str,
+    runtime_environment: Option<&str>,
+) -> Option<DisabledReason> {
+    if build_channel != "production" {
+        return Some(DisabledReason::DevelopmentBuild);
+    }
+    match runtime_environment.map(str::trim) {
+        None | Some("production") => None,
+        Some(_) => Some(DisabledReason::RuntimeEnvironment),
+    }
+}
+
+fn environment_disabled_reason() -> Option<DisabledReason> {
+    let runtime_environment = std::env::var("ORX_TELEMETRY_ENV").ok();
+    environment_disabled_reason_for(build_channel(), runtime_environment.as_deref())
+}
+
+fn preference_disabled_reason(cli_flag: bool) -> Option<DisabledReason> {
     if cli_flag {
         return Some(DisabledReason::Flag);
     }
@@ -447,6 +497,14 @@ pub(crate) fn disabled_reason(cli_flag: bool) -> Option<DisabledReason> {
         SettingsState::Corrupt => Some(DisabledReason::CorruptSettings),
         _ => None,
     }
+}
+
+pub(crate) fn disabled_reason(cli_flag: bool) -> Option<DisabledReason> {
+    environment_disabled_reason().or_else(|| preference_disabled_reason(cli_flag))
+}
+
+pub(crate) fn effective_disabled_reason() -> Option<DisabledReason> {
+    disabled_reason(flag())
 }
 
 /// Convenience: `true` when events should be sent.
@@ -529,16 +587,19 @@ fn is_ci() -> bool {
 }
 
 /// Builds the PostHog capture payload for an event. Every event carries the
-/// same base context (source, version, os, arch, ci, install_kind) plus
-/// `$process_person_profile: false` to keep it anonymous. `extra` supplies
-/// event-specific properties — callers MUST keep these free of PII (coarse
-/// enums only).
+/// same base context (source, version, build channel, os, arch, ci, install
+/// kind) plus `$process_person_profile: false` so PostHog does not create a
+/// person profile.
+/// `extra` supplies event-specific properties. Most callers use coarse enums;
+/// the onboarding research-profile event deliberately includes the fields
+/// disclosed in the UI.
 fn build_payload(event: &str, distinct_id: &str, extra: serde_json::Value) -> serde_json::Value {
     let mut props = json!({
-        // Anonymous: don't build a person profile for this distinct_id.
+        // Keep this random installation id out of PostHog person profiles.
         "$process_person_profile": false,
         "source": "cli",
         "cli_version": crate::updates::current_version().to_string(),
+        "build_channel": build_channel(),
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "ci": is_ci(),
@@ -549,8 +610,8 @@ fn build_payload(event: &str, distinct_id: &str, extra: serde_json::Value) -> se
     });
     // Merge event-specific props FIRST so the invariant base context above can
     // never be silently overwritten by a caller's `extra` (defense in depth —
-    // callers are expected to keep `extra` PII-free and disjoint, but a stray
-    // `source`/`ci`/`os` key must not be able to corrupt identity fields).
+    // callers keep keys disjoint, but a stray `source`/`ci`/`os` key must not
+    // be able to corrupt identity fields).
     if let (Some(obj), Some(add)) = (props.as_object_mut(), extra.as_object()) {
         for (k, v) in add {
             obj.entry(k.clone()).or_insert_with(|| v.clone());
@@ -680,10 +741,11 @@ fn consent_distinct_id(agreed: bool) -> String {
 }
 
 /// Record a telemetry consent decision — `cli_telemetry_consent` with
-/// `{ agreed: bool }`. This is the ONE event that fires UNCONDITIONALLY: it must
-/// land even when the user chose to disable telemetry, otherwise every rejection
-/// would be invisible and the agree/reject ratio would be hopelessly skewed
-/// toward "agree".
+/// `{ agreed: bool }`. Within an eligible official build, this is the ONE event
+/// that ignores the user's telemetry preference: it must land even when the
+/// user chose to disable telemetry, otherwise every rejection would be
+/// invisible and the agree/reject ratio would be hopelessly skewed toward
+/// "agree".
 ///
 /// Identity policy (phantom-free by construction):
 /// - `agreed` → the persistent install id. The user just consented to
@@ -697,6 +759,9 @@ fn consent_distinct_id(agreed: bool) -> String {
 /// the `orx telemetry on/off` command) can fire-and-confirm without hanging.
 /// Errors are swallowed — recording consent must never fail the action.
 pub(crate) async fn record_consent(agreed: bool) {
+    if environment_disabled_reason().is_some() {
+        return;
+    }
     let distinct_id = consent_distinct_id(agreed);
     let payload = build_payload(
         "telemetry_consent",
@@ -719,6 +784,31 @@ pub(crate) async fn record_consent(agreed: bool) {
 
 pub(crate) fn capture_onboarding_completed() {
     capture("onboarding_completed", json!({}));
+}
+
+pub(crate) fn capture_onboarding_research_profile(profile: &ResearchProfile) {
+    let paper_ids: Vec<_> = profile
+        .papers
+        .iter()
+        .map(|paper| paper.paper_id.as_str())
+        .collect();
+    let paper_titles: Vec<_> = profile
+        .papers
+        .iter()
+        .map(|paper| paper.title.as_deref())
+        .collect();
+    capture(
+        "onboarding_research_profile_submitted",
+        json!({
+            "research_areas": profile.research_areas,
+            "other_area": profile.other_area,
+            "background": profile.background,
+            "papers": profile.papers,
+            "paper_ids": paper_ids,
+            "paper_titles": paper_titles,
+            "paper_count": profile.papers.len(),
+        }),
+    );
 }
 
 pub(crate) fn capture_project_created(local: bool) {
@@ -815,8 +905,8 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard};
 
-    // Serializes the telemetry tests below, which mutate process-global env
-    // (XDG_CONFIG_HOME, and ORX_TELEMETRY_HOST in one test). IMPORTANT: this lock
+    // Serializes the telemetry tests below, which mutate the process-global
+    // variables in OPT_VARS. IMPORTANT: this lock
     // is telemetry-module-local — it does NOT protect against a test in ANOTHER
     // module reading those same vars concurrently under the default
     // multithreaded test runner. Today no other test reads them at runtime (the
@@ -856,24 +946,36 @@ mod tests {
         }
     }
 
-    const OPT_VARS: &[&str] = &["XDG_CONFIG_HOME", "ORX_TELEMETRY_CONTEXT"];
+    const OPT_VARS: &[&str] = &[
+        "XDG_CONFIG_HOME",
+        "ORX_TELEMETRY_CONTEXT",
+        "ORX_TELEMETRY_ENV",
+        "ORX_TELEMETRY_HOST",
+    ];
 
     #[test]
-    fn opt_out_precedence() {
+    fn environment_policy_is_fail_closed_and_downgrade_only() {
         let _g = EnvGuard::new(OPT_VARS);
-        // Point config dir at a fresh throwaway path so the persisted-setting
-        // branch reads nothing (unique per run to avoid cross-run leftovers).
-        let dir = std::env::temp_dir().join(format!("orx-tel-none-{}", uuid::Uuid::new_v4()));
-        std::env::set_var("XDG_CONFIG_HOME", &dir);
-
-        // Clean state, no flag → enabled. Automated/CI environments are NOT
-        // auto-disabled (that's a query-time filter via the `ci` property).
-        assert!(is_enabled(false));
-
-        // The only per-run opt-out is the --no-telemetry flag.
-        assert!(matches!(disabled_reason(true), Some(DisabledReason::Flag)));
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(
+            environment_disabled_reason_for("development", None),
+            Some(DisabledReason::DevelopmentBuild)
+        ));
+        assert!(matches!(
+            environment_disabled_reason_for("development", Some("production")),
+            Some(DisabledReason::DevelopmentBuild)
+        ));
+        assert!(environment_disabled_reason_for("production", None).is_none());
+        assert!(environment_disabled_reason_for("production", Some("production")).is_none());
+        for value in ["development", "test", "off", "", "unexpected"] {
+            assert!(matches!(
+                environment_disabled_reason_for("production", Some(value)),
+                Some(DisabledReason::RuntimeEnvironment)
+            ));
+        }
+        assert!(matches!(
+            preference_disabled_reason(true),
+            Some(DisabledReason::Flag)
+        ));
     }
 
     #[test]
@@ -882,20 +984,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("orx-tel-persist-{}", uuid::Uuid::new_v4()));
         std::env::set_var("XDG_CONFIG_HOME", &dir);
 
-        // Nothing persisted → enabled.
-        assert!(is_enabled(false));
+        assert!(preference_disabled_reason(false).is_none());
 
         // Persist an opt-out and confirm it disables.
         set_persisted_disabled(true).unwrap();
         assert!(matches!(
-            disabled_reason(false),
+            preference_disabled_reason(false),
             Some(DisabledReason::Persisted)
         ));
 
         // Clearing it re-enables (and doesn't wipe the install id via the lock).
         let _ = install_id();
         set_persisted_disabled(false).unwrap();
-        assert!(is_enabled(false));
+        assert!(preference_disabled_reason(false).is_none());
         assert!(
             load_settings().and_then(|s| s.install_id).is_some(),
             "clearing opt-out must not clobber the install id"
@@ -976,19 +1077,26 @@ mod tests {
 
         set_persisted_disabled(true).unwrap();
         let id = install_id().expect("install id");
-        set_profile(
-            Some("I study RL".into()),
-            vec![ProfilePaper {
+        set_profile(ResearchProfile {
+            research_areas: vec!["AI/ML".into(), "Other".into()],
+            other_area: Some("AI for theorem proving".into()),
+            background: Some("I study RL".into()),
+            papers: vec![ProfilePaper {
                 paper_id: "1706.03762".into(),
                 title: Some("Attention Is All You Need".into()),
             }],
-        )
+        })
         .unwrap();
 
-        let (background, papers) = load_profile();
-        assert_eq!(background.as_deref(), Some("I study RL"));
-        assert_eq!(papers.len(), 1);
-        assert_eq!(papers[0].paper_id, "1706.03762");
+        let profile = load_profile();
+        assert_eq!(profile.research_areas, vec!["AI/ML", "Other"]);
+        assert_eq!(
+            profile.other_area.as_deref(),
+            Some("AI for theorem proving")
+        );
+        assert_eq!(profile.background.as_deref(), Some("I study RL"));
+        assert_eq!(profile.papers.len(), 1);
+        assert_eq!(profile.papers[0].paper_id, "1706.03762");
         let s = load_settings().expect("settings present");
         assert_eq!(
             s.telemetry_disabled,
@@ -1001,11 +1109,25 @@ mod tests {
             "install id survived"
         );
 
-        // A whitespace-only background clears to None; papers can be emptied.
-        set_profile(Some("   ".into()), vec![]).unwrap();
-        let (background, papers) = load_profile();
-        assert!(background.is_none(), "whitespace background cleared");
-        assert!(papers.is_empty(), "papers cleared");
+        // Whitespace-only optional fields clear to None; papers can be emptied.
+        set_profile(ResearchProfile {
+            research_areas: vec!["Physics".into()],
+            other_area: Some("   ".into()),
+            background: Some("   ".into()),
+            papers: vec![],
+        })
+        .unwrap();
+        let profile = load_profile();
+        assert_eq!(profile.research_areas, vec!["Physics"]);
+        assert!(
+            profile.other_area.is_none(),
+            "whitespace other area cleared"
+        );
+        assert!(
+            profile.background.is_none(),
+            "whitespace background cleared"
+        );
+        assert!(profile.papers.is_empty(), "papers cleared");
         let s = load_settings().expect("settings present");
         assert_eq!(s.telemetry_disabled, Some(true), "opt-out still intact");
 
@@ -1023,7 +1145,12 @@ mod tests {
         assert!(disabled_lit_sources().is_empty(), "default: all enabled");
 
         set_persisted_disabled(true).unwrap();
-        set_profile(Some("I study RL".into()), vec![]).unwrap();
+        set_profile(ResearchProfile {
+            research_areas: vec!["AI/ML".into()],
+            background: Some("I study RL".into()),
+            ..ResearchProfile::default()
+        })
+        .unwrap();
         set_disabled_lit_sources(vec!["biorxiv".into(), "openalex".into()]).unwrap();
 
         assert_eq!(disabled_lit_sources(), vec!["biorxiv", "openalex"]);
@@ -1129,7 +1256,7 @@ mod tests {
     }
 
     #[test]
-    fn payload_shape_is_anonymous_and_pii_free() {
+    fn standard_payload_shape_excludes_sensitive_fields() {
         // build_payload reads the machine context (env + settings), so isolate.
         let _g = EnvGuard::new(OPT_VARS);
         let dir = std::env::temp_dir().join(format!("orx-tel-shape-{}", uuid::Uuid::new_v4()));
@@ -1151,6 +1278,7 @@ mod tests {
         assert_eq!(props["$process_person_profile"], false);
         assert_eq!(props["source"], "cli");
         assert!(props["cli_version"].is_string());
+        assert_eq!(props["build_channel"], build_channel());
         assert!(props["os"].is_string());
         assert!(props["arch"].is_string());
         assert!(props["ci"].is_boolean());
@@ -1164,8 +1292,8 @@ mod tests {
         // time, not ingestion time).
         assert!(payload["timestamp"].is_string());
 
-        // Guard against PII creep: the whole serialized payload must not contain
-        // obvious identifying keys.
+        // Standard product events must not automatically add obvious
+        // identifying fields.
         let text = serde_json::to_string(&payload).unwrap();
         for banned in ["email", "token", "path", "repo", "prompt", "title", "home"] {
             assert!(
@@ -1185,10 +1313,21 @@ mod tests {
         let payload = build_payload(
             "command",
             "did",
-            json!({ "source": "EVIL", "ci": "EVIL", "install_kind": "EVIL", "command": "login" }),
+            json!({
+                "source": "EVIL",
+                "build_channel": "EVIL",
+                "ci": "EVIL",
+                "install_kind": "EVIL",
+                "command": "login"
+            }),
         );
         let props = &payload["properties"];
         assert_eq!(props["source"], "cli", "base source must win");
+        assert_eq!(
+            props["build_channel"],
+            build_channel(),
+            "embedded build channel must win"
+        );
         assert!(props["ci"].is_boolean(), "base ci must win");
         assert_eq!(props["install_kind"], "human", "base install_kind must win");
         // Non-colliding extra keys still land.
@@ -1274,6 +1413,10 @@ mod tests {
         for (bare, wire) in [
             ("command", "cli_command"),
             ("onboarding_completed", "cli_onboarding_completed"),
+            (
+                "onboarding_research_profile_submitted",
+                "cli_onboarding_research_profile_submitted",
+            ),
             ("project_created", "cli_project_created"),
             ("chat_session_started", "cli_chat_session_started"),
             ("experiment_started", "cli_experiment_started"),
@@ -1311,6 +1454,7 @@ mod tests {
             vec![
                 "$process_person_profile",
                 "arch",
+                "build_channel",
                 "ci",
                 "cli_version",
                 "install_kind",
@@ -1318,6 +1462,35 @@ mod tests {
                 "source",
             ]
         );
+
+        let research_profile = build_payload(
+            "onboarding_research_profile_submitted",
+            "did",
+            json!({
+                "research_areas": ["AI/ML", "Other"],
+                "other_area": "AI for theorem proving",
+                "background": "I study RL",
+                "papers": [{"paperId": "1706.03762", "title": "Attention Is All You Need"}],
+                "paper_ids": ["1706.03762"],
+                "paper_titles": ["Attention Is All You Need"],
+                "paper_count": 1,
+            }),
+        );
+        assert_eq!(
+            research_profile["event"],
+            "cli_onboarding_research_profile_submitted"
+        );
+        assert_eq!(research_profile["properties"]["research_areas"][1], "Other");
+        assert_eq!(
+            research_profile["properties"]["other_area"],
+            "AI for theorem proving"
+        );
+        assert_eq!(research_profile["properties"]["background"], "I study RL");
+        assert_eq!(
+            research_profile["properties"]["papers"][0]["title"],
+            "Attention Is All You Need"
+        );
+        assert_eq!(research_profile["properties"]["paper_ids"][0], "1706.03762");
 
         let project = build_payload("project_created", "did", json!({ "local": true }));
         assert_eq!(project["event"], "cli_project_created");
@@ -1350,33 +1523,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_consent_sends_even_when_opted_out() {
-        // The consent event is UNCONDITIONAL: a persisted opt-out must not
-        // suppress it (otherwise rejections would be invisible). We can't easily
-        // assert the wire send in-process, but we CAN assert record_consent does
-        // not early-return on the opt-out path and returns promptly against a
-        // dead endpoint — i.e. it neither hangs nor panics while disabled.
+    async fn environment_disabled_consent_never_creates_an_install_id() {
         let _g = EnvGuard::new(OPT_VARS);
         let dir = std::env::temp_dir().join(format!("orx-tel-consent-{}", uuid::Uuid::new_v4()));
         std::env::set_var("XDG_CONFIG_HOME", &dir);
-        std::env::set_var("ORX_TELEMETRY_HOST", "http://127.0.0.1:9");
+        if build_channel() == "production" {
+            std::env::set_var("ORX_TELEMETRY_ENV", "off");
+        }
+        assert!(environment_disabled_reason().is_some());
 
-        // Persist an opt-out; normal telemetry is now disabled.
-        set_persisted_disabled(true).unwrap();
-        assert!(matches!(
-            disabled_reason(false),
-            Some(DisabledReason::Persisted)
-        ));
-
-        // Still returns (bounded by the internal timeout) without panicking, and
-        // does NOT create a persisted install id as a side effect.
         record_consent(false).await;
+        record_consent(true).await;
         assert!(
             load_settings().and_then(|s| s.install_id).is_none(),
-            "consent must not generate a persisted install id"
+            "environment-disabled consent must not generate a persisted install id"
         );
 
-        std::env::remove_var("ORX_TELEMETRY_HOST");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn environment_disabled_all_capture_paths_stay_inert() {
+        let _g = EnvGuard::new(OPT_VARS);
+        let dir = std::env::temp_dir().join(format!("orx-tel-inert-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        if build_channel() == "production" {
+            std::env::set_var("ORX_TELEMETRY_ENV", "off");
+        }
+        assert!(environment_disabled_reason().is_some());
+
+        let session = TelemetrySession::start("up");
+        capture_onboarding_completed();
+        capture_onboarding_research_profile(&ResearchProfile::default());
+        capture_project_created(true);
+        capture_chat_session_started("codex");
+        capture_experiment_started("run", true, Some("local"));
+
+        assert!(pending().lock().unwrap().is_empty());
+        session.finish(true).await;
+        assert!(load_settings().and_then(|s| s.install_id).is_none());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1409,7 +1595,7 @@ mod tests {
 
         // Fail safe: an unreadable file is treated as "disabled", not "enabled".
         assert!(matches!(
-            disabled_reason(false),
+            preference_disabled_reason(false),
             Some(DisabledReason::CorruptSettings)
         ));
 
@@ -1426,15 +1612,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capture_is_non_blocking_and_drains_at_flush() {
+    async fn capture_respects_the_embedded_build_channel() {
         let _g = EnvGuard::new(OPT_VARS);
         let dir = std::env::temp_dir().join(format!("orx-tel-flush-{}", uuid::Uuid::new_v4()));
         std::env::set_var("XDG_CONFIG_HOME", &dir);
         // Dead endpoint: the send will fail fast; we only care about registration
         // and that flush_pending returns (bounded, never hangs).
         std::env::set_var("ORX_TELEMETRY_HOST", "http://127.0.0.1:9");
-        // Start from a clean pending set (this is the only test that uses it,
-        // but guard against ordering just in case).
+        // Start clean in case another capture-path test ran first.
         pending().lock().unwrap().clear();
 
         // Disabled (persisted opt-out) → nothing registered. Using the persisted
@@ -1448,23 +1633,20 @@ mod tests {
         );
         set_persisted_disabled(false).unwrap();
 
-        // Enabled → capture returns immediately (non-blocking) and registers a
-        // handle for the exit-time flush.
+        // With the preference on, capture follows the embedded build channel.
         capture("experiment_started", json!({ "kind": "run" }));
-        assert_eq!(
-            pending().lock().unwrap().len(),
-            1,
-            "enabled capture must register exactly one pending send"
-        );
-
-        // Draining the pending set empties it and returns within bounds.
-        flush_pending().await;
+        if build_channel() == "production" {
+            assert_eq!(pending().lock().unwrap().len(), 1);
+            flush_pending().await;
+        } else {
+            assert!(pending().lock().unwrap().is_empty());
+            assert!(load_settings().and_then(|s| s.install_id).is_none());
+        }
         assert!(
             pending().lock().unwrap().is_empty(),
             "flush_pending must drain the pending set"
         );
 
-        std::env::remove_var("ORX_TELEMETRY_HOST");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

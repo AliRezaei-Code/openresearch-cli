@@ -146,6 +146,9 @@ enum Command {
     /// Update orx to the latest release (installer-script installs only).
     Update(UpdateArgs),
 
+    /// Permanently delete the local database, CLI executable, or both.
+    Delete(DeleteArgs),
+
     /// Loopback HTTP/SSE daemon over the local run store (jobs sibling of
     /// `opencode serve`); the api tunnels to it on agent boxes.
     Serve(ServeArgs),
@@ -802,6 +805,9 @@ pub struct LitArgs {
 
 #[derive(Args, Debug)]
 pub struct VersionArgs {
+    /// Print the embedded telemetry build channel.
+    #[arg(long, hide = true, conflicts_with_all = ["check", "json"])]
+    pub build_channel: bool,
     /// Also check the latest released version on GitHub.
     #[arg(long)]
     pub check: bool,
@@ -819,6 +825,23 @@ pub struct UpdateArgs {
     /// (multiple copies, or a `cargo install` overwrote it).
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DeleteArgs {
+    #[command(subcommand)]
+    pub command: DeleteCommand,
+}
+
+#[derive(Subcommand, Debug, Clone, Copy)]
+pub enum DeleteCommand {
+    /// Delete only orx.db and its SQLite sidecars. Project folders are untouched.
+    #[command(alias = "db")]
+    Database,
+    /// Delete the running orx executable and its matching installer receipt.
+    Cli,
+    /// Delete both the database and CLI executable.
+    All,
 }
 
 #[derive(Args, Debug)]
@@ -875,8 +898,11 @@ async fn main() {
         return;
     }
 
-    let warning = (!matches!(command, Command::Version(_) | Command::Update(_)))
-        .then(updates::UpdateWarning::start);
+    let warning = (!matches!(
+        command,
+        Command::Version(_) | Command::Update(_) | Command::Delete(_)
+    ))
+    .then(updates::UpdateWarning::start);
 
     // Anonymous usage analytics. Record the flag process-globally so command
     // modules can fire events without threading it through, then fire the
@@ -931,6 +957,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Paper(_) => "paper",
         Command::Version(_) => "version",
         Command::Update(_) => "update",
+        Command::Delete(_) => "delete",
         Command::Serve(_) => "serve",
         Command::Supervise(_) => "supervise",
         Command::Up(_) => "up",
@@ -941,6 +968,14 @@ fn command_name(command: &Command) -> &'static str {
 }
 
 async fn dispatch(command: Command) -> error::Result<()> {
+    let lifecycle_lock = command_uses_lifecycle_lock(&command)
+        .then(store::open_lifecycle_lock)
+        .transpose()?;
+    let _lifecycle_guard = lifecycle_lock
+        .as_ref()
+        .map(|lock| lock.read())
+        .transpose()?;
+
     match command {
         Command::Login(args) => commands::login::run(args).await,
         Command::Logout => commands::logout::run().await,
@@ -973,6 +1008,7 @@ async fn dispatch(command: Command) -> error::Result<()> {
         Command::Paper(args) => commands::paper::run(args).await,
         Command::Version(args) => commands::version::run(args).await,
         Command::Update(args) => commands::update::run(args).await,
+        Command::Delete(args) => commands::delete::run(args).await,
         Command::Serve(args) => commands::serve::run(args).await,
         Command::Supervise(args) => commands::supervise::run(args).await,
         Command::Up(args) => match args.remote.clone() {
@@ -984,4 +1020,20 @@ async fn dispatch(command: Command) -> error::Result<()> {
         Command::PlanGate => commands::plan_gate::run().await,
         Command::McpGate => commands::mcp_gate::run().await,
     }
+}
+
+fn command_uses_lifecycle_lock(command: &Command) -> bool {
+    !matches!(
+        command,
+        Command::Login(_)
+            | Command::Logout
+            | Command::InstallSkills(_)
+            | Command::Lit(_)
+            | Command::Paper(_)
+            | Command::Version(_)
+            | Command::Delete(_)
+            | Command::Telemetry(_)
+            | Command::PlanGate
+            | Command::McpGate
+    )
 }

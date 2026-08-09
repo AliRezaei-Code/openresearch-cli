@@ -7,6 +7,9 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
+# Mark only publishing builds and verify every packaged binary before hosting.
+github-build-setup = "../build-setup.yml"
+global-artifacts-jobs = ["./verify-build-channel"]
 # The installers to generate for each app
 installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax)

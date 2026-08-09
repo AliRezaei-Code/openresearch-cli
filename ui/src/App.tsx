@@ -19,17 +19,19 @@ import {
   cancelRun,
   DEMO_FIGURE_SESSION_ID,
   DEMO_LITERATURE_SESSION_ID,
-  DEMO_PROJECT_ID,
   getArtifacts,
+  getUiState,
   listExperiments,
-  listChatSessions,
   listProjects,
   listRuns,
   openProject,
+  updateUiState,
+  type AgentSelection,
   type Experiment,
   type ProjectArtifacts,
   type Project,
   type Run,
+  type UiState,
 } from "./api";
 import { ChatPanel } from "./components/ChatPanel";
 import { SubagentTab } from "./components/SubagentTab";
@@ -46,11 +48,10 @@ import { ExperimentsTable } from "./components/ExperimentsTable";
 import { Md } from "./components/Md";
 import { usePopover } from "./components/ModelPicker";
 import { SettingsView, type SettingsTab } from "./components/SettingsPage";
-import { Tour, TOUR_DONE_KEY } from "./components/Tour";
+import { Tour } from "./components/Tour";
 import { clearReadDemoSessions } from "./demoSessionState";
 import { TreeView } from "./components/TreeView";
 import { useOrxEvents } from "./events";
-import { saveAgentSelection } from "./agentSelection";
 
 /** An experiment view open as a right-panel tab. */
 interface ExpViewDef {
@@ -240,7 +241,6 @@ function parseFilePath(
   return path ? { path, sessionId } : null;
 }
 
-const ONBOARDED_KEY = "orx:onboarded";
 const PANEL_WIDTH_KEY = "orx:panel-width";
 const EXPERIMENTS_VIEW_KEY = "orx:experiments-view";
 
@@ -293,6 +293,9 @@ function upsert<T extends { id: string }>(list: T[], item: T): T[] {
 
 export default function App() {
   const [projects, setProjects] = useState<Project[] | null>(null);
+  const [uiState, setUiState] = useState<UiState | null>(null);
+  const [startupError, setStartupError] = useState<string | null>(null);
+  const persistedPreferredAgent = useRef<AgentSelection | null>(null);
   const [projectId, setProjectId] = useState<string | null>(null);
   const [experiments, setExperiments] = useState<Experiment[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
@@ -398,13 +401,7 @@ export default function App() {
     activeSessionIdRef.current = nextSessionId;
     setActiveSessionId(nextSessionId);
   }, []);
-  const [onboarded, setOnboarded] = useState(() => {
-    try {
-      return localStorage.getItem(ONBOARDED_KEY) === "1";
-    } catch {
-      return true; // storage unavailable — don't loop the walkthrough
-    }
-  });
+  const onboarded = uiState?.onboardingCompleted ?? false;
   // The spotlight tour of the workspace (Tour.tsx). Starting it normalizes
   // the layout so every tour target exists; those are the defaults, so
   // nothing needs restoring on finish/skip.
@@ -418,12 +415,9 @@ export default function App() {
     setPanelMax(false);
     setTourOpen(true);
   }, []);
-  const closeTour = useCallback(() => {
-    try {
-      localStorage.setItem(TOUR_DONE_KEY, "1");
-    } catch {
-      // private mode etc. — the tour just replays next boot
-    }
+  const closeTour = useCallback(async () => {
+    const saved = await updateUiState({ tourCompleted: true });
+    setUiState((current) => current && { ...current, tourCompleted: saved.tourCompleted });
     setTourOpen(false);
   }, []);
 
@@ -432,55 +426,67 @@ export default function App() {
   // zero projects this waits until the first one is created and opened.
   useEffect(() => {
     if (!projectId || homeOpen || !onboarded) return;
-    try {
-      if (localStorage.getItem(TOUR_DONE_KEY) === "1") return;
-    } catch {
-      return; // storage unavailable — don't loop the tour
-    }
+    if (uiState?.tourCompleted) return;
     startTour();
-  }, [projectId, homeOpen, onboarded, startTour]);
+  }, [projectId, homeOpen, onboarded, startTour, uiState?.tourCompleted]);
 
   const projectIdRef = useRef(projectId);
   projectIdRef.current = projectId;
 
-  // Initial project list.
+  const loadInitialState = useCallback(() => {
+    setStartupError(null);
+    setProjects(null);
+    setUiState(null);
+    void Promise.allSettled([listProjects(), getUiState()]).then(([projectsResult, uiStateResult]) => {
+      const errors: string[] = [];
+      if (projectsResult.status === "fulfilled") {
+        setProjects(projectsResult.value);
+        setProjectId((current) =>
+          current && projectsResult.value.some((project) => project.id === current)
+            ? current
+            : projectsResult.value[0]?.id ?? null,
+        );
+      } else {
+        errors.push("projects");
+      }
+      if (uiStateResult.status === "fulfilled") {
+        persistedPreferredAgent.current = uiStateResult.value.preferredAgent;
+        setUiState(uiStateResult.value);
+      } else {
+        errors.push("settings");
+      }
+      if (errors.length > 0) {
+        setStartupError(`Couldn't load OpenResearch ${errors.join(" and ")}.`);
+      }
+    });
+  }, []);
   useEffect(() => {
-    listProjects()
-      .then(async (list) => {
-        if (import.meta.env.DEV && list.length === 0) {
-          try {
-            localStorage.removeItem(TOUR_DONE_KEY);
-          } catch {
-            // The tour will start from in-memory state when storage is unavailable.
-          }
-          clearReadDemoSessions();
-          setOnboarded(false);
+    loadInitialState();
+  }, [loadInitialState]);
+
+  const preferredAgentWrite = useRef<Promise<void>>(Promise.resolve());
+  const preferredAgentSaveSeq = useRef(0);
+  const persistPreferredAgent = useCallback((selection: AgentSelection) => {
+    const saveSeq = ++preferredAgentSaveSeq.current;
+    setUiState((current) => current && { ...current, preferredAgent: selection });
+    const write = preferredAgentWrite.current
+      .then(() => updateUiState({ preferredAgent: selection }))
+      .then((saved) => {
+        persistedPreferredAgent.current = saved.preferredAgent;
+        if (saveSeq === preferredAgentSaveSeq.current) {
+          setUiState((current) => current && { ...current, preferredAgent: saved.preferredAgent });
         }
-        const demo = list.find((project) => project.id === DEMO_PROJECT_ID);
-        const recoveredDemo = !onboarded ? demo : undefined;
-        if (recoveredDemo) {
-          const session = (await listChatSessions(recoveredDemo.id))[0];
-          if (!session) throw new Error("The seeded demo conversation is missing.");
-          saveAgentSelection({
-            harness: session.harness,
-            model: session.model,
-            permissionMode: session.permissionMode,
-            reasoningLevel: session.reasoningLevel,
-          });
-          setOnboarded((current) => {
-            if (current) return current;
-            try {
-              localStorage.setItem(ONBOARDED_KEY, "1");
-            } catch {
-              // The server-side demo row remains the durable completion marker.
-            }
-            return true;
-          });
-        }
-        setProjects(list);
-        setProjectId((cur) => cur ?? recoveredDemo?.id ?? list[0]?.id ?? null);
       })
-      .catch(() => setProjects([]));
+      .catch((error: unknown) => {
+        if (saveSeq === preferredAgentSaveSeq.current) {
+          setUiState((current) =>
+            current && { ...current, preferredAgent: persistedPreferredAgent.current },
+          );
+        }
+        throw error;
+      });
+    preferredAgentWrite.current = write.catch(() => {});
+    return write;
   }, []);
 
   // Shrinking the window can push a fixed-width panel past its usable max —
@@ -538,7 +544,6 @@ export default function App() {
     setRightTab("artifacts");
     setPanelOpen(true);
   }, [refreshArtifacts]);
-
 
   // Live store updates.
   useOrxEvents({
@@ -956,7 +961,18 @@ export default function App() {
     ? (experiments.find((experiment) => experiment.id === codeTab.experimentId) ?? null)
     : null;
 
-  if (projects === null) {
+  if (startupError) {
+    return (
+      <div className="app">
+        <div className="empty-state">
+          <p>{startupError}</p>
+          <button className="btn primary" onClick={loadInitialState}>Retry</button>
+        </div>
+      </div>
+    );
+  }
+
+  if (projects === null || uiState === null) {
     return (
       <div className="app">
         <div className="empty-state">
@@ -979,17 +995,17 @@ export default function App() {
           />
         ) : (
           <Onboarding
-            onDone={(project) => {
+            preferredAgent={uiState.preferredAgent}
+            onDone={(project, selection) => {
               clearReadDemoSessions();
-              try {
-                localStorage.setItem(ONBOARDED_KEY, "1");
-                localStorage.removeItem(TOUR_DONE_KEY);
-              } catch {
-                // private mode etc. — the flow just replays next boot
-              }
+              persistedPreferredAgent.current = selection;
               setProjects([project]);
               setProjectId(project.id);
-              setOnboarded(true);
+              setUiState((current) => ({
+                ...(current ?? { tourCompleted: false }),
+                onboardingCompleted: true,
+                preferredAgent: selection,
+              }));
             }}
           />
         )}
@@ -1049,6 +1065,8 @@ export default function App() {
             onOpenWorktree={openWorktreeTab}
             onStartTour={startTour}
             onActiveSessionChange={onActiveSessionChange}
+            preferredAgent={uiState.preferredAgent}
+            onPreferredAgentChange={persistPreferredAgent}
           >
             {mainView !== "chat" && (
               <SettingsView

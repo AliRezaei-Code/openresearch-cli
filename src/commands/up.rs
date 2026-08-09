@@ -32,7 +32,9 @@ use crate::error::{anyhow, Result};
 use crate::local;
 use crate::local::chat::ChatHost;
 use crate::local::opencode::AgentHost;
-use crate::store::{log_path, now_ms, SshHostTest, Store, StoredChatSession, StoredRun};
+use crate::store::{
+    log_path, now_ms, SshHostTest, Store, StoredAgentSelection, StoredChatSession, StoredRun,
+};
 use crate::{browser, UpArgs};
 
 pub async fn run(args: UpArgs) -> Result<()> {
@@ -339,6 +341,7 @@ fn router(state: AppState) -> Router {
             "/api/settings/profile",
             get(profile_settings).post(set_profile_settings),
         )
+        .route("/api/settings/ui-state", get(ui_state).post(set_ui_state))
         .route("/api/settings/ssh", get(ssh_settings))
         .route("/api/settings/ssh/preflight", post(ssh_preflight))
         .route(
@@ -477,9 +480,55 @@ struct CompleteOnboardingReq {
     permission_mode: Option<String>,
     reasoning_level: Option<String>,
     #[serde(default)]
+    research_areas: Vec<String>,
+    #[serde(default)]
+    other_area: Option<String>,
+    #[serde(default)]
     background: Option<String>,
     #[serde(default)]
     papers: Vec<crate::telemetry::ProfilePaper>,
+}
+
+const RESEARCH_AREAS: [&str; 4] = ["AI/ML", "Biology", "Physics", "Other"];
+
+fn normalize_research_profile(
+    research_areas: Vec<String>,
+    other_area: Option<String>,
+    background: Option<String>,
+    papers: Vec<crate::telemetry::ProfilePaper>,
+) -> std::result::Result<crate::telemetry::ResearchProfile, ApiError> {
+    if research_areas.is_empty() {
+        return Err(bad_request("choose at least one research area"));
+    }
+    let mut normalized_areas = Vec::with_capacity(research_areas.len());
+    for area in research_areas {
+        let area = area.trim().to_string();
+        if !RESEARCH_AREAS.contains(&area.as_str()) {
+            return Err(bad_request(format!("unknown research area: {area}")));
+        }
+        if normalized_areas.contains(&area) {
+            return Err(bad_request(format!("duplicate research area: {area}")));
+        }
+        normalized_areas.push(area);
+    }
+    let other_area = other_area.filter(|value| !value.trim().is_empty());
+    let includes_other = normalized_areas.iter().any(|area| area == "Other");
+    if includes_other && other_area.is_none() {
+        return Err(bad_request(
+            "describe your research area when choosing Other",
+        ));
+    }
+    if !includes_other && other_area.is_some() {
+        return Err(bad_request(
+            "choose Other before describing another research area",
+        ));
+    }
+    Ok(crate::telemetry::ResearchProfile {
+        research_areas: normalized_areas,
+        other_area,
+        background: background.filter(|value| !value.trim().is_empty()),
+        papers,
+    })
 }
 
 async fn complete_onboarding(
@@ -497,16 +546,31 @@ async fn complete_onboarding(
         permission_mode: nonempty(req.permission_mode),
         reasoning_level: nonempty(req.reasoning_level),
     };
-    let background = req.background.map(|value| value.trim().to_string());
-    let papers = req.papers;
-    let completion = tokio::task::spawn_blocking(move || {
-        let _ = crate::telemetry::set_profile(background, papers);
-        local::demo::complete_onboarding(selection)
+    let profile = normalize_research_profile(
+        req.research_areas,
+        req.other_area,
+        req.background,
+        req.papers,
+    )?;
+    let profile_for_event = profile.clone();
+    let completion = tokio::task::spawn_blocking(move || -> Result<_> {
+        let _ = crate::telemetry::set_profile(profile);
+        let completion = local::demo::complete_onboarding(selection)?;
+        let store = Store::open()?;
+        store.set_preferred_agent(&StoredAgentSelection {
+            harness: completion.selection.harness.clone(),
+            model: completion.selection.model.clone(),
+            permission_mode: completion.selection.permission_mode.clone(),
+            reasoning_level: completion.selection.reasoning_level.clone(),
+        })?;
+        store.set_onboarding_completed(true)?;
+        Ok(completion)
     })
     .await
     .map_err(|e| ApiError::from(anyhow!("demo seed task failed: {e}")))??;
     if completion.newly_created {
         crate::telemetry::capture_onboarding_completed();
+        crate::telemetry::capture_onboarding_research_profile(&profile_for_event);
     }
     Ok(Json(json!({
         "project": project_json(&completion.project),
@@ -577,12 +641,18 @@ async fn project_path_status(Query(q): Query<ProjectPathStatusQ>) -> ApiResult {
                 "resolvedPath": null,
                 "exists": null,
                 "directory": null,
+                "empty": null,
                 "initialized": null,
             })));
         };
         let resolved = local::projects::expand_path(&path)?;
         let exists = resolved.exists();
         let directory = resolved.is_dir();
+        let empty = if directory {
+            Some(std::fs::read_dir(&resolved)?.next().is_none())
+        } else {
+            None
+        };
         let initialized =
             git_version.is_some() && directory && local::git::is_repository(&resolved);
         Ok(Json(json!({
@@ -590,6 +660,7 @@ async fn project_path_status(Query(q): Query<ProjectPathStatusQ>) -> ApiResult {
             "resolvedPath": resolved.to_string_lossy(),
             "exists": exists,
             "directory": directory,
+            "empty": empty,
             "initialized": initialized,
         })))
     })
@@ -2475,11 +2546,11 @@ async fn set_git_settings(Json(req): Json<SetGitSettingsReq>) -> ApiResult {
 
 // --- telemetry settings -----------------------------------------------------
 
-/// `{ enabled, reason }` — whether anonymous usage analytics is on, and if off,
-/// why (so the UI can explain a `--no-telemetry`-style override vs a persisted
-/// opt-out). `reason` is null when enabled.
+/// `{ enabled, reason }` — the effective analytics state after build/runtime
+/// eligibility, per-run flags, and the persisted preference. `reason` is null
+/// when enabled.
 fn telemetry_settings_json() -> Value {
-    match crate::telemetry::disabled_reason(false) {
+    match crate::telemetry::effective_disabled_reason() {
         None => json!({ "enabled": true, "reason": null }),
         Some(r) => json!({ "enabled": false, "reason": r.as_str() }),
     }
@@ -2508,8 +2579,7 @@ async fn set_telemetry_settings(Json(req): Json<SetTelemetryReq>) -> ApiResult {
 }
 
 fn profile_settings_json() -> Value {
-    let (background, papers) = crate::telemetry::load_profile();
-    json!({ "background": background, "papers": papers })
+    json!(crate::telemetry::load_profile())
 }
 
 async fn profile_settings() -> ApiResult {
@@ -2519,22 +2589,106 @@ async fn profile_settings() -> ApiResult {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SetProfileReq {
+    #[serde(default)]
+    research_areas: Vec<String>,
+    #[serde(default)]
+    other_area: Option<String>,
     #[serde(default)]
     background: Option<String>,
     #[serde(default)]
     papers: Vec<crate::telemetry::ProfilePaper>,
 }
 
+fn profile_settings_update(
+    req: SetProfileReq,
+    current: crate::telemetry::ResearchProfile,
+) -> std::result::Result<crate::telemetry::ResearchProfile, ApiError> {
+    if req.research_areas.is_empty() {
+        Ok(crate::telemetry::ResearchProfile {
+            research_areas: current.research_areas,
+            other_area: current.other_area,
+            background: req.background.filter(|value| !value.trim().is_empty()),
+            papers: req.papers,
+        })
+    } else {
+        normalize_research_profile(
+            req.research_areas,
+            req.other_area,
+            req.background,
+            req.papers,
+        )
+    }
+}
+
 async fn set_profile_settings(Json(req): Json<SetProfileReq>) -> ApiResult {
+    let profile = profile_settings_update(req, crate::telemetry::load_profile())?;
     tokio::task::spawn_blocking(move || {
-        let background = req.background.map(|b| b.trim().to_string());
-        crate::telemetry::set_profile(background, req.papers)
+        crate::telemetry::set_profile(profile)
             .map_err(|e| ApiError::from(anyhow!("could not save profile: {e}")))?;
         Ok(Json(profile_settings_json()))
     })
     .await
     .map_err(|e| ApiError::from(anyhow!("profile task failed: {e}")))?
+}
+
+async fn ui_state() -> ApiResult {
+    tokio::task::spawn_blocking(|| -> Result<Json<Value>> {
+        Ok(Json(json!(Store::open()?.ui_state()?)))
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow!("UI state task failed: {error}")))?
+    .map_err(ApiError::from)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetUiStateReq {
+    #[serde(default)]
+    tour_completed: Option<bool>,
+    #[serde(default)]
+    preferred_agent: Option<StoredAgentSelectionReq>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredAgentSelectionReq {
+    harness: String,
+    model: Option<String>,
+    permission_mode: Option<String>,
+    reasoning_level: Option<String>,
+}
+
+async fn set_ui_state(Json(req): Json<SetUiStateReq>) -> ApiResult {
+    tokio::task::spawn_blocking(move || -> Result<Json<Value>> {
+        let store = Store::open()?;
+        let selection = req
+            .preferred_agent
+            .map(|selection| {
+                if !local::harness::is_chat_harness(&selection.harness) {
+                    return Err(anyhow!("unknown harness: {}", selection.harness));
+                }
+                let nonempty = |value: Option<String>| value.filter(|item| !item.trim().is_empty());
+                Ok(StoredAgentSelection {
+                    harness: selection.harness,
+                    model: nonempty(selection.model),
+                    permission_mode: nonempty(selection.permission_mode),
+                    reasoning_level: nonempty(selection.reasoning_level),
+                })
+            })
+            .transpose()?;
+        if let Some(completed) = req.tour_completed {
+            store.set_tour_completed(completed)?;
+        }
+        if let Some(selection) = selection {
+            store.set_preferred_agent(&selection)?;
+        }
+        Ok(Json(json!(store.ui_state()?)))
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow!("UI state task failed: {error}")))?
+    .map_err(bad_request)
 }
 
 /// The lit-source toggles as booleans (enabled = not in the disabled set).
@@ -2581,10 +2735,9 @@ async fn set_lit_sources_settings(Json(req): Json<SetLitSourcesReq>) -> ApiResul
     .map_err(|e| ApiError::from(anyhow!("lit-sources task failed: {e}")))?
 }
 
-/// Record the consent decision (agree/reject) for the analytics choice — fired
-/// once when the user leaves the onboarding step, so every user who sees it is
-/// counted, including those who accept the default. Unconditional by design (see
-/// telemetry::record_consent): it lands even when the choice is "off".
+/// Record the analytics choice once when the user leaves onboarding. In an
+/// eligible official build this ignores the persisted preference so opt-outs
+/// are counted; development and runtime-disabled builds stay inert.
 async fn record_telemetry_consent(Json(req): Json<SetTelemetryReq>) -> ApiResult {
     crate::telemetry::record_consent(req.enabled).await;
     crate::telemetry::capture_onboarding_completed();
@@ -3906,6 +4059,77 @@ async fn spa(uri: Uri) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn expect_profile(
+        result: std::result::Result<crate::telemetry::ResearchProfile, ApiError>,
+    ) -> crate::telemetry::ResearchProfile {
+        match result {
+            Ok(profile) => profile,
+            Err(error) => panic!("unexpected profile error: {}", error.1),
+        }
+    }
+
+    #[test]
+    fn research_profile_requires_an_area_and_other_description() {
+        let missing_area = normalize_research_profile(vec![], None, None, vec![]).unwrap_err();
+        assert_eq!(missing_area.1, "choose at least one research area");
+
+        let missing_other =
+            normalize_research_profile(vec!["Other".into()], Some("   ".into()), None, vec![])
+                .unwrap_err();
+        assert_eq!(
+            missing_other.1,
+            "describe your research area when choosing Other"
+        );
+    }
+
+    #[test]
+    fn research_profile_preserves_disclosed_free_text() {
+        let profile = expect_profile(normalize_research_profile(
+            vec!["AI/ML".into(), "Other".into()],
+            Some("  AI for theorem proving  ".into()),
+            Some("  I study RL.\nSecond line.  ".into()),
+            vec![crate::telemetry::ProfilePaper {
+                paper_id: "1706.03762".into(),
+                title: Some("Attention Is All You Need".into()),
+            }],
+        ));
+
+        assert_eq!(
+            profile.other_area.as_deref(),
+            Some("  AI for theorem proving  ")
+        );
+        assert_eq!(
+            profile.background.as_deref(),
+            Some("  I study RL.\nSecond line.  ")
+        );
+        assert_eq!(
+            profile.papers[0].title.as_deref(),
+            Some("Attention Is All You Need")
+        );
+    }
+
+    #[test]
+    fn legacy_profile_update_preserves_saved_research_areas() {
+        let current = crate::telemetry::ResearchProfile {
+            research_areas: vec!["Physics".into(), "Other".into()],
+            other_area: Some("Quantum information".into()),
+            ..crate::telemetry::ResearchProfile::default()
+        };
+        let updated = expect_profile(profile_settings_update(
+            SetProfileReq {
+                research_areas: vec![],
+                other_area: None,
+                background: Some("Updated background".into()),
+                papers: vec![],
+            },
+            current,
+        ));
+
+        assert_eq!(updated.research_areas, vec!["Physics", "Other"]);
+        assert_eq!(updated.other_area.as_deref(), Some("Quantum information"));
+        assert_eq!(updated.background.as_deref(), Some("Updated background"));
+    }
 
     #[test]
     fn api_run_exposes_cancel_intent() {
