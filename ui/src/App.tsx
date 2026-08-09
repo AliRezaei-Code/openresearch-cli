@@ -5,6 +5,7 @@ import {
   Filter,
   FlaskConical,
   FolderGit2,
+  FolderOpen,
   FolderTree,
   Maximize2,
   Minimize2,
@@ -122,6 +123,7 @@ const sameCodeTab = (a: CodeTabDef, b: CodeTabDef) => a.branch === b.branch;
 type RightTab =
   | "experiments"
   | "files"
+  | "artifacts"
   | ExpViewDef
   | FileViewDef
   | PlanViewDef
@@ -328,6 +330,7 @@ export default function App() {
   const [rightTab, setRightTab] = useState<RightTab>("experiments");
   const [experimentsTabOpen, setExperimentsTabOpen] = useState(true);
   const [filesTabOpen, setFilesTabOpen] = useState(false);
+  const [artifactsTabOpen, setArtifactsTabOpen] = useState(false);
   const [expTabs, setExpTabs] = useState<ExpViewDef[]>([]);
   const [fileTabs, setFileTabs] = useState<FileViewDef[]>([]);
   const [planTabs, setPlanTabs] = useState<PlanViewDef[]>([]);
@@ -344,9 +347,7 @@ export default function App() {
   const [railOpen, setRailOpen] = useState(true);
   const [homeOpen, setHomeOpen] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
-  // What the middle pane shows: the agent chat, project artifacts, or
-  // one settings section (picked from the rail nav — no separate pages).
-  const [mainView, setMainView] = useState<"chat" | "artifacts" | SettingsTab>("chat");
+  const [mainView, setMainView] = useState<"chat" | SettingsTab>("chat");
   const [githubPublicationError, setGithubPublicationError] = useState<{
     projectId: string;
     message: string;
@@ -529,6 +530,15 @@ export default function App() {
     const id = projectIdRef.current;
     if (id) getArtifacts(id).then(setArtifacts).catch(() => {});
   }, []);
+
+  const openArtifactsTab = useCallback(() => {
+    refreshArtifacts();
+    setMainView("chat");
+    setArtifactsTabOpen(true);
+    setRightTab("artifacts");
+    setPanelOpen(true);
+  }, [refreshArtifacts]);
+
 
   // Live store updates.
   useOrxEvents({
@@ -838,11 +848,13 @@ export default function App() {
   }, []);
 
   const closeHomeTab = useCallback(
-    (tab: "experiments" | "files") => {
+    (tab: "experiments" | "files" | "artifacts") => {
       if (tab === "experiments") setExperimentsTabOpen(false);
-      else setFilesTabOpen(false);
+      else if (tab === "files") setFilesTabOpen(false);
+      else setArtifactsTabOpen(false);
       if (rightTab !== tab) return;
       const fallback =
+        (tab !== "artifacts" && artifactsTabOpen ? "artifacts" : undefined) ??
         (tab !== "experiments" && experimentsTabOpen ? "experiments" : undefined) ??
         (tab !== "files" && filesTabOpen ? "files" : undefined) ??
         expTabs[0] ??
@@ -858,6 +870,7 @@ export default function App() {
     },
     [
       rightTab,
+      artifactsTabOpen,
       experimentsTabOpen,
       filesTabOpen,
       expTabs,
@@ -1018,6 +1031,8 @@ export default function App() {
             onShowRail={() => setRailOpen(true)}
             mainView={mainView}
             onSelectMainView={setMainView}
+            artifactsActive={mainView === "chat" && panelOpen && rightTab === "artifacts"}
+            onOpenArtifacts={openArtifactsTab}
             panelOpen={panelOpen}
             onTogglePanel={() => {
               if (panelOpen) {
@@ -1035,22 +1050,7 @@ export default function App() {
             onStartTour={startTour}
             onActiveSessionChange={onActiveSessionChange}
           >
-            {mainView === "artifacts" ? (
-              (() => {
-                const project = projects.find((p) => p.id === projectId);
-                return project ? (
-                  <ArtifactsTab
-                    // Remount per project so selection cannot leak and saved
-                    // folder preferences reload for the newly active project.
-                    key={project.id}
-                    project={project}
-                    artifacts={artifacts}
-                    onChanged={refreshArtifacts}
-                    onOpenStorage={() => setMainView("storage")}
-                  />
-                ) : null;
-              })()
-            ) : mainView !== "chat" ? (
+            {mainView !== "chat" && (
               <SettingsView
                 tab={mainView}
                 project={activeProject}
@@ -1065,7 +1065,7 @@ export default function App() {
                 }}
                 onSelectTab={setMainView}
               />
-            ) : null}
+            )}
           </ChatPanel>
         )}
         {mainView === "chat" && panelOpen && (
@@ -1077,6 +1077,15 @@ export default function App() {
           {!panelMax && <div className="panel-resizer" onPointerDown={resizePanel} />}
           <div className="tabs">
             <div className="tab-strip">
+              {artifactsTabOpen && (
+                <ClosableTab
+                  active={rightTab === "artifacts"}
+                  label="Artifacts"
+                  icon={<FolderOpen size={12} style={{ flexShrink: 0 }} />}
+                  onSelect={() => setRightTab("artifacts")}
+                  onClose={() => closeHomeTab("artifacts")}
+                />
+              )}
               {experimentsTabOpen && (
                 <ClosableTab
                   active={rightTab === "experiments"}
@@ -1180,7 +1189,19 @@ export default function App() {
               </button>
             </div>
           </div>
-          {rightTab === "experiments" ? (
+          {rightTab === "artifacts" ? (
+            <div className="tab-body">
+              {activeProject && (
+                <ArtifactsTab
+                  key={activeProject.id}
+                  project={activeProject}
+                  artifacts={artifacts}
+                  onChanged={refreshArtifacts}
+                  onOpenStorage={() => setMainView("storage")}
+                />
+              )}
+            </div>
+          ) : rightTab === "experiments" ? (
             <div className="tab-body">
               <div className={`pane-toolbar${view === "table" ? " table-view" : ""}`}>
                 <span style={{ flex: 1 }} />
