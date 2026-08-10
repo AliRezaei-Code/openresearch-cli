@@ -34,10 +34,10 @@ export function NewProjectDialog({
         return;
       }
       if (
-        event.key.toLowerCase() === "n" &&
+        event.key === "Enter" &&
         (event.metaKey || event.ctrlKey) &&
         !event.altKey &&
-        !event.shiftKey
+        event.shiftKey
       ) {
         event.preventDefault();
         event.stopPropagation();

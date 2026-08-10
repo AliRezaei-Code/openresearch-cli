@@ -8,7 +8,7 @@ import {
   type Node,
   type NodeProps,
 } from "@xyflow/react";
-import { Ellipsis, FolderTree, GitBranch, Terminal } from "lucide-react";
+import { Ellipsis, FolderTree, Terminal } from "lucide-react";
 import { GitHubMark } from "./BackendLogos";
 import { memo, useMemo, useRef } from "react";
 import {
@@ -224,16 +224,8 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
           {latestRun && <span>{timeAgo(latestRun.createdAt)}</span>}
         </div>
       </div>
-      {/* Direct view shortcuts — changes and code always, logs once there's a run. */}
+      {/* Direct view shortcuts — code always, logs once there's a run. */}
       <div className="node-actions" onClick={(e) => e.stopPropagation()}>
-        <button
-          className="node-action"
-          title="Open changes"
-          onClick={() => onOpenCode(exp.id, exp.branchName, "changes")}
-        >
-          <GitBranch size={13} />
-          Changes
-        </button>
         {runs.length > 0 && (
           <button
             className="node-action"
@@ -276,7 +268,6 @@ const ExpNode = memo(function ExpNode({ data }: NodeProps<ExpFlowNode>) {
           parentSlug={parentSlug}
           anchor={hover.rect}
           onOpenLogs={runs.length > 0 ? () => onOpenView(exp.id, "terminal") : undefined}
-          onOpenChanges={() => onOpenCode(exp.id, exp.branchName, "changes")}
           onOpenCode={() => onOpenCode(exp.id, exp.branchName, "files")}
           onMouseEnter={hover.keepOpen}
           onMouseLeave={hover.onMouseLeave}

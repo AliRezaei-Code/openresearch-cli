@@ -500,6 +500,9 @@ mod tests {
             "orx logout",
             "orx install-skills",
             "orx update",
+            "orx delete database",
+            "orx delete cli",
+            "orx delete all",
             "orx up",
             "orx serve",
         ] {

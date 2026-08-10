@@ -5,7 +5,8 @@
 // source-agnostic — the caller decides which checkout the paths came from and
 // how a file open resolves.
 
-import { ChevronDown, ChevronRight, File as FileIcon, Folder, FolderOpen } from "lucide-react";
+import { ChevronDown, ChevronRight } from "lucide-react";
+import { FileTypeIcon } from "./FileTypeIcon";
 
 /** A node in the nested tree derived from the flat path list. */
 export interface DirNode {
@@ -68,18 +69,17 @@ function DirRow({
     <>
       <button
         type="button"
-        className="code-tree-row"
+        className="file-tree-row"
         style={{ paddingLeft: 8 + depth * 14 }}
         onClick={() => onToggle(path)}
         title={path}
       >
         {isOpen ? (
-          <ChevronDown size={13} className="code-tree-chev" />
+          <ChevronDown size={13} className="file-tree-chevron" />
         ) : (
-          <ChevronRight size={13} className="code-tree-chev" />
+          <ChevronRight size={13} className="file-tree-chevron" />
         )}
-        {isOpen ? <FolderOpen size={13} /> : <Folder size={13} />}
-        <span className="code-tree-name">{name}</span>
+        <span className="file-tree-name">{name}</span>
       </button>
       {isOpen && (
         <TreeLevel
@@ -135,13 +135,13 @@ export function TreeLevel({
           <button
             key={`f:${path}`}
             type="button"
-            className="code-tree-row"
+            className="file-tree-row"
             style={{ paddingLeft: 8 + depth * 14 }}
             onClick={() => onOpenFile(path)}
             title={path}
           >
-            <FileIcon size={13} />
-            <span className="code-tree-name">{name}</span>
+            <FileTypeIcon name={name} />
+            <span className="file-tree-name">{name}</span>
           </button>
         );
       })}

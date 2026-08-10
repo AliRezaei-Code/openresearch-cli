@@ -7,13 +7,13 @@ import {
   CornerDownLeft,
   FileText,
   FlaskConical,
-  FolderGit2,
   FolderOpen,
   GitBranch,
   HelpCircle,
   MoreHorizontal,
   PanelLeft,
   Paperclip,
+  Package,
   Plus,
   SlidersHorizontal,
   Users,
@@ -74,7 +74,6 @@ import {
 } from "./ModelPicker";
 import { ContextMeter } from "./ContextMeter";
 import { renderNote } from "./agentNote";
-import { loadAgentSelection, saveAgentSelection } from "../agentSelection";
 import { loadReadDemoSessions, markDemoSessionRead } from "../demoSessionState";
 
 // --- chat state --------------------------------------------------------------
@@ -1224,8 +1223,11 @@ export function ChatPanel({
   onShowRail,
   mainView,
   onSelectMainView,
-  panelOpen,
-  onTogglePanel,
+  experimentsActive,
+  filesActive,
+  artifactsActive,
+  onOpenExperiments,
+  onOpenArtifacts,
   onOpenFile,
   onOpenRun,
   onOpenPlan,
@@ -1233,6 +1235,8 @@ export function ChatPanel({
   onOpenWorktree,
   onStartTour,
   onActiveSessionChange,
+  preferredAgent,
+  onPreferredAgentChange,
   children,
 }: {
   projectId: string;
@@ -1245,12 +1249,14 @@ export function ChatPanel({
   railOpen: boolean;
   /** Reopen the rail (from the chat header's sidebar icon). */
   onShowRail: () => void;
-  /** What the middle pane shows: chat, artifacts, or a settings section. */
-  mainView: "chat" | "artifacts" | SettingsTab;
-  onSelectMainView: (view: "chat" | "artifacts" | SettingsTab) => void;
-  /** Whether the right panel is showing (toggled from the chat header). */
-  panelOpen: boolean;
-  onTogglePanel: () => void;
+  /** Settings sections replace chat; Artifacts remains a right-panel tool. */
+  mainView: "chat" | SettingsTab;
+  onSelectMainView: (view: "chat" | SettingsTab) => void;
+  experimentsActive: boolean;
+  filesActive: boolean;
+  artifactsActive: boolean;
+  onOpenExperiments: () => void;
+  onOpenArtifacts: () => void;
   /** Open a project file in the right pane (chat tool rows are clickable).
    * `sessionId` is the chat session the click came from, so relative paths
    * can resolve against that session's worktree. */
@@ -1264,12 +1270,15 @@ export function ChatPanel({
    * `sessionId` is the chat session; `spawnPartId` locates the spawn part. */
   onOpenSubagent?: (sessionId: string, spawnPartId: string) => void;
   /** Open the pinned Files home for the active session. */
-  onOpenWorktree?: () => void;
+  onOpenWorktree: () => void;
   /** Replay the onboarding tour (chat header help button). */
   onStartTour?: () => void;
   /** The open chat session, surfaced so the shell can scope panes to it. */
   onActiveSessionChange?: (sessionId: string | null) => void;
-  /** Middle-pane content when a settings section is active (the SettingsView). */
+  /** Database-backed selection used to seed new chat sessions. */
+  preferredAgent: ModelSelection | null;
+  onPreferredAgentChange: (selection: ModelSelection) => Promise<void>;
+  /** Middle-pane content when a settings section is active. */
   children?: React.ReactNode;
 }) {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
@@ -1288,7 +1297,8 @@ export function ChatPanel({
     busySessions: new Set<string>(),
   });
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
-  const [selection, setSelection] = useState<ModelSelection | null>(loadAgentSelection);
+  const [selection, setSelection] = useState<ModelSelection | null>(preferredAgent);
+  useEffect(() => setSelection(preferredAgent), [preferredAgent]);
   // Unsent composer tweaks (model/mode/reasoning) for the *open* session — the
   // session's harness is fixed, so these override only its mutable settings and
   // are applied (and persisted server-side) on the next send. Cleared when the
@@ -1444,7 +1454,7 @@ export function ChatPanel({
   // Reconcile the reasoning level against the *currently selected model* here
   // rather than only in the picker's `pick`. Two paths reach the composer with
   // a level nobody chose for this model: a session row stored by an older build
-  // (which always wrote an explicit effort), and a stale localStorage selection.
+  // (which always wrote an explicit effort), and a stale saved preference.
   // Reconciling at the point the composer derives its state covers both, so the
   // displayed value and the value `send` transmits can never be one the model
   // rejects.
@@ -1477,7 +1487,7 @@ export function ChatPanel({
     if (!composerSelection) return;
     const merged = { ...composerSelection, ...next };
     setSelection(merged);
-    saveAgentSelection(merged);
+    void onPreferredAgentChange(merged).catch(() => {});
     if (openSession) setSessionOverride((cur) => ({ ...cur, ...next }));
   };
   const setPermissionMode = (id: string) => selectModel({ permissionMode: id });
@@ -1814,8 +1824,7 @@ export function ChatPanel({
     onActiveSessionChange?.(activeId);
   }, [activeId, onActiveSessionChange]);
 
-  // Opening a session — or remounting the thread (leaving a settings view,
-  // history seeding in) — always starts pinned at the latest messages.
+  // Opening a session or returning from settings starts pinned at the latest messages.
   const threadMounted = mainView === "chat" && (messages.length > 0 || busy);
   useLayoutEffect(() => {
     stickToBottom.current = true;
@@ -1977,9 +1986,7 @@ export function ChatPanel({
   // Escape stops the streaming turn and drops focus back into the composer,
   // mirroring the Claude Code desktop app. Harness-agnostic — `stop()` →
   // `interruptChat` interrupts whichever harness (Claude, Codex, OpenCode, …)
-  // is running the active session. Only armed on the chat view while busy, so
-  // it never fires from the settings/artifacts panels that also render inside
-  // ChatPanel.
+  // is running the active session. Only armed while chat is visible.
   //
   // An overlay that should swallow Escape (rather than let it stop the turn)
   // must own the key ahead of this document-level bubble listener, by one of
@@ -2103,7 +2110,9 @@ export function ChatPanel({
   );
 
   const visibleSessions = sessions.filter((s) => matchesFilter(sessionFilter, s.archived));
-  const newTaskShortcut = /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘N" : "Ctrl+N";
+  const newTaskShortcut = /Mac|iPhone|iPad/.test(navigator.platform)
+    ? "⌘ ⇧ Enter"
+    : "Ctrl + Shift + Enter";
   const startNewTask = useCallback(() => {
     setSessionFilter("active");
     setActiveId(null);
@@ -2114,10 +2123,10 @@ export function ChatPanel({
     const onKeyDown = (event: KeyboardEvent) => {
       if (
         event.repeat ||
-        event.key.toLowerCase() !== "n" ||
+        event.key !== "Enter" ||
         (!event.metaKey && !event.ctrlKey) ||
         event.altKey ||
-        event.shiftKey
+        !event.shiftKey
       )
         return;
       event.preventDefault();
@@ -2130,20 +2139,34 @@ export function ChatPanel({
   const rail = (
     <aside className="session-rail floating-panel">
       {railHeader}
-      {/* Project-level sections shown in the middle pane. */}
+      {/* Workspace tools open beside chat; settings sections replace the middle pane. */}
       <nav className="rail-nav">
         <button
-          className={`rail-nav-item ${mainView === "artifacts" ? "active" : ""}`}
-          data-onboarding="nav-artifacts"
-          onClick={() => onSelectMainView("artifacts")}
+          className={`rail-nav-item ${experimentsActive ? "active" : ""}`}
+          onClick={onOpenExperiments}
+        >
+          <FlaskConical size={15} />
+          Experiments
+        </button>
+        <button
+          className={`rail-nav-item ${filesActive ? "active" : ""}`}
+          onClick={onOpenWorktree}
         >
           <FolderOpen size={15} />
+          Files
+        </button>
+        <button
+          className={`rail-nav-item ${artifactsActive ? "active" : ""}`}
+          data-onboarding="nav-artifacts"
+          onClick={onOpenArtifacts}
+        >
+          <Package size={15} />
           Artifacts
         </button>
         {SETTINGS_NAV.map((item) => (
           <button
             key={item.id}
-            className={`rail-nav-item ${mainView !== "chat" && mainView !== "artifacts" && item.activeTabs.includes(mainView) ? "active" : ""}`}
+            className={`rail-nav-item ${mainView !== "chat" && item.activeTabs.includes(mainView) ? "active" : ""}`}
             data-onboarding={item.id === "compute" ? "nav-compute" : undefined}
             onClick={() => onSelectMainView(item.id)}
           >
@@ -2161,7 +2184,7 @@ export function ChatPanel({
             className="rail-section-new tip-up"
             data-onboarding="new-session"
             data-tip={newTaskShortcut}
-            aria-keyshortcuts="Meta+N Control+N"
+            aria-keyshortcuts="Meta+Shift+Enter Control+Shift+Enter"
             onClick={startNewTask}
           >
             <Plus size={13} />
@@ -2225,10 +2248,6 @@ export function ChatPanel({
     </button>
   );
 
-  // A settings section replaces the chat entirely (no chat header, no
-  // composer, no right panel) — only the rail-reopen affordance survives.
-  // The pane spans the leftover width; .settings-view re-applies the readable
-  // column from inside the scroller, same as .chat-thread-inner does for chat.
   if (mainView !== "chat") {
     return (
       <>
@@ -2273,24 +2292,6 @@ export function ChatPanel({
             <HelpCircle size={15} />
           </button>
         )}
-        {onOpenWorktree && activeId && (
-          <button
-            className="icon-btn"
-            data-tip="View current worktree"
-            aria-label="View current worktree"
-            onClick={onOpenWorktree}
-          >
-            <FolderGit2 size={15} />
-          </button>
-        )}
-        <button
-          className={`icon-btn ${panelOpen ? "active" : ""}`}
-          title="Experiments"
-          aria-label="Experiments"
-          onClick={onTogglePanel}
-        >
-          <FlaskConical size={15} />
-        </button>
       </div>
 
       {historyLoading ? (

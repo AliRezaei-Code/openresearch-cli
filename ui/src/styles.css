@@ -291,13 +291,10 @@ textarea::placeholder {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   cursor: pointer;
-  transition:
-    border-color 120ms ease,
-    box-shadow 120ms ease;
+  transition: box-shadow 120ms ease;
 }
 .project-card:hover {
-  border-color: var(--text);
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
+  box-shadow: 0 3px 12px color-mix(in srgb, var(--text) 8%, transparent);
 }
 .project-card-open {
   position: absolute;
@@ -316,10 +313,11 @@ textarea::placeholder {
 .project-card-sync a {
   pointer-events: auto;
 }
-.project-delete {
+.project-card .project-delete {
   position: absolute;
   top: 10px;
   right: 10px;
+  z-index: 2;
   display: none;
   padding: 5px;
   border-radius: var(--radius-sm);
@@ -797,8 +795,8 @@ textarea::placeholder {
   display: flex;
   align-items: flex-end;
   gap: 0;
-  padding: 5px 6px 0 8px;
-  height: 44px;
+  padding: 4px 6px 0 8px;
+  height: 40px;
   border-bottom: 1px solid var(--border);
   background: var(--canvas);
   flex-shrink: 0;
@@ -820,21 +818,33 @@ textarea::placeholder {
 
 /* Dynamic (closable) tabs: truncated label, inline close "x". */
 .tab.closable {
-  max-width: 176px;
-  padding-right: 4px;
+  max-width: 150px;
+  padding-right: 2px;
 }
 .tab .tab-label {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
   min-width: 0;
+  overflow: hidden;
+}
+.tab .tab-label > span,
+.tab .tab-label::after {
+  grid-area: 1 / 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.tab .tab-label::after {
+  content: attr(data-label);
+  visibility: hidden;
+  font-weight: var(--fw-medium);
 }
 .tab .tab-close {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 16px;
-  height: 16px;
+  width: 14px;
+  height: 14px;
   border-radius: var(--radius-xs);
   color: var(--muted);
   flex-shrink: 0;
@@ -849,14 +859,14 @@ textarea::placeholder {
   position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  height: 36px;
-  padding: 0 12px;
+  gap: 5px;
+  height: 32px;
+  padding: 0 8px;
   border: 1px solid transparent;
   border-bottom: none;
   border-radius: var(--radius-md) var(--radius-md) 0 0;
-  font-size: var(--fs-md);
-  font-weight: var(--fw-medium);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-regular);
   color: var(--subtext);
   white-space: nowrap;
   flex-shrink: 0;
@@ -878,7 +888,7 @@ textarea::placeholder {
   border-color: var(--border);
   background: var(--base);
   color: var(--text);
-  font-weight: var(--fw-semibold);
+  font-weight: var(--fw-medium);
 }
 .tab.active::after {
   content: "";
@@ -914,6 +924,7 @@ textarea::placeholder {
   flex: 1;
   min-height: 0;
   position: relative;
+  background: var(--base);
 }
 
 /* Right-pane plan tab: a plain, padded document surface — the plan is a
@@ -3038,6 +3049,9 @@ textarea::placeholder {
   line-height: 1.5;
   text-wrap: balance;
 }
+.experiments-empty-state p {
+  font-size: var(--fs-2xl);
+}
 .empty-state-cta {
   gap: 6px;
 }
@@ -3068,6 +3082,9 @@ textarea::placeholder {
   font-size: var(--fs-3xl);
   letter-spacing: -0.01em;
 }
+.onb-profile-title {
+  margin-bottom: 22px;
+}
 .onb-sub {
   color: var(--text);
   font-size: var(--fs-base);
@@ -3094,18 +3111,19 @@ textarea::placeholder {
   color: inherit;
   font: inherit;
   text-align: left;
-  cursor: pointer;
   transition: border-color 120ms ease, box-shadow 120ms ease;
 }
-.onb-agent-choice:not(:disabled):hover {
+/* Only a selectable (ready) card is a button — the unready card is an inert div,
+   so keep the pointer cursor and hover feedback off it. */
+button.onb-agent-choice {
+  cursor: pointer;
+}
+button.onb-agent-choice:hover {
   border-color: var(--muted);
 }
 .onb-agent-choice.selected {
   border-color: var(--accent);
   box-shadow: 0 0 0 1px var(--accent);
-}
-.onb-agent-choice:disabled {
-  cursor: default;
 }
 .onb-card-head {
   display: flex;
@@ -3150,6 +3168,27 @@ textarea::placeholder {
   border-radius: var(--radius-xs);
   padding: 1px 5px;
   white-space: nowrap;
+}
+/* A renderNote() command plus its copy button, kept on one baseline. */
+.cmd-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  vertical-align: baseline;
+}
+.cmd-inline-copy {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+.cmd-inline-copy:hover {
+  background: var(--surface);
+  color: var(--text);
 }
 .onb-loading {
   display: flex;
@@ -3373,22 +3412,94 @@ textarea::placeholder {
 .form .repo-hint.ok {
   color: var(--accent-teal);
 }
-.form .folder-picker-row {
+.form .folder-picker-control {
   display: flex;
-  align-items: stretch;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  min-width: 0;
+  padding: 8px 10px;
+  overflow: hidden;
+  background: var(--base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  text-align: left;
+  transition:
+    border-color 120ms ease,
+    box-shadow 120ms ease;
+}
+.form .folder-picker-control:hover:not(:disabled) {
+  border-color: var(--muted);
+  box-shadow: 0 2px 8px rgb(0 0 0 / 5%);
+}
+.form .folder-picker-control:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 2px;
+}
+.form .folder-picker-control span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.form .folder-picker-control .placeholder {
+  color: var(--muted);
+}
+.form .folder-picker-icon {
+  flex: none;
+  color: currentColor;
+}
+.form .folder-picker-chevron {
+  flex: none;
+  color: var(--muted);
+}
+.form .folder-picker-control:hover:not(:disabled) .folder-picker-chevron {
+  color: var(--subtext);
+}
+.form .folder-picker-hint {
+  color: var(--subtext);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-regular);
+  line-height: 1.4;
+}
+.form .project-location-field {
+  display: flex;
+  flex-direction: column;
   gap: 8px;
 }
-.form .folder-picker-row input {
-  min-width: 0;
+.form .project-location-label,
+.form .project-field-label {
+  color: var(--text);
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semibold);
+}
+.form .folder-picker-control:disabled {
+  cursor: default;
+  opacity: 0.65;
+}
+.form .paper-destination {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 8px 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--base);
+}
+.form .paper-destination code {
   flex: 1;
-  cursor: pointer;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-regular);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.form .folder-picker-row input:focus {
-  border-color: var(--border);
-}
-.form .folder-picker-row .btn {
+.form .paper-destination .btn {
   flex: none;
-  padding-inline: 14px;
 }
 .form .project-path-notice {
   padding: 9px 11px;
@@ -3467,6 +3578,9 @@ textarea::placeholder {
   flex-direction: column;
   gap: 10px;
 }
+.new-project-form {
+  gap: 18px;
+}
 .form label {
   display: flex;
   flex-direction: column;
@@ -3474,6 +3588,9 @@ textarea::placeholder {
   font-size: var(--fs-xs);
   color: var(--text);
   font-weight: var(--fw-medium);
+}
+.new-project-form > label {
+  gap: 8px;
 }
 .form .row2 {
   display: grid;
@@ -3485,6 +3602,13 @@ textarea::placeholder {
   justify-content: flex-end;
   gap: 10px;
   margin-top: 6px;
+}
+.form .new-project-actions {
+  justify-content: flex-start;
+  margin-top: 10px;
+}
+.form .new-project-actions .primary {
+  margin-left: auto;
 }
 .form .error,
 .settings-card > .error {
@@ -3703,66 +3827,47 @@ a.files-pill:hover {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 10px 8px;
 }
-.ft-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 8px;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-}
-.ft-row:hover {
-  background: var(--surface);
-}
-.ft-row.selected,
-.ft-row.selected:hover {
-  background: var(--panel);
-}
-.ft-chevron {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 14px;
-  height: 14px;
+.file-tree-icon {
+  width: 15px;
+  height: 15px;
   flex-shrink: 0;
   color: var(--muted);
-  transition: transform 0.12s ease;
+  overflow: visible;
 }
-.ft-chevron.open {
-  transform: rotate(90deg);
+.file-tree-icon.markdown {
+  color: var(--accent-blue);
 }
-.ft-chevron.spacer {
-  visibility: hidden;
+.file-tree-icon.image {
+  color: var(--accent-purple);
 }
-.ft-dirname,
-.ft-name {
-  flex: 1;
-  min-width: 0;
-  font-family: var(--mono);
-  font-size: var(--fs-sm);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.file-tree-icon.spreadsheet {
+  color: var(--accent-green);
 }
-.ft-dirname {
-  color: var(--text);
+.file-tree-icon.code {
+  color: var(--accent-orange);
+}
+.file-tree-icon.archive {
+  color: var(--accent-amber);
+}
+.file-tree-icon.pdf {
+  color: var(--accent-red);
+}
+.file-tree-icon.document {
+  color: var(--subtext);
+}
+.artifact-tree-row.selected,
+.artifact-tree-row.selected:hover {
+  background: var(--panel);
 }
 .ft-row-delete {
-  opacity: 0.35;
-}
-.ft-row:hover .ft-row-delete,
-.ft-row-delete:focus-visible {
-  opacity: 1;
-}
-.ft-thumb {
   width: 18px;
   height: 18px;
-  object-fit: cover;
-  border-radius: var(--radius-xs);
-  border: 1px solid var(--border-variant);
-  flex-shrink: 0;
+  opacity: 0.35;
+}
+.artifact-tree-row:hover .ft-row-delete,
+.ft-row-delete:focus-visible {
+  opacity: 1;
 }
 /* The artifacts-directory path — demoted from header pills to a quiet footer. */
 .ftree-footer {
@@ -5250,7 +5355,7 @@ a.files-pill:hover {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 12px;
+  padding: 6px 12px;
   border-bottom: 1px solid var(--border-variant);
   color: var(--text);
   flex-shrink: 0;
@@ -5801,9 +5906,18 @@ a.files-pill:hover {
   align-items: center;
   gap: 8px;
   /* Match .file-view-header so Code ↔ file tab switches don't jump chrome. */
-  padding: 4px 12px;
+  padding: 6px 12px;
   border-bottom: 1px solid var(--border-variant);
   flex-shrink: 0;
+}
+.code-tab-header > .seg {
+  padding: 2px;
+  border-radius: var(--radius-sm);
+}
+.code-tab-header > .seg button {
+  padding: 2px 8px;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
 }
 .code-tab-select {
   max-width: 280px;
@@ -5835,11 +5949,11 @@ a.files-pill:hover {
 .branch-changes > .diff-explorer {
   margin: 14px 16px 0;
 }
-.code-tree {
+.file-tree {
   padding: 6px 0;
   font-size: var(--fs-md);
 }
-.code-tree-row {
+.file-tree-row {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -5853,17 +5967,39 @@ a.files-pill:hover {
   font-family: inherit;
   font-size: inherit;
 }
-.code-tree-row:hover {
+.file-tree-row:hover {
   background: var(--panel);
 }
-.code-tree-row > svg {
+.file-tree-row > svg {
   flex-shrink: 0;
   color: var(--subtext);
 }
-.code-tree-row > svg.code-tree-chev {
+.file-tree-row > svg.file-tree-chevron,
+.file-tree-chevron {
   color: var(--muted);
 }
-.code-tree-name {
+.file-tree-chevron {
+  flex-shrink: 0;
+}
+button.file-tree-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+button.file-tree-chevron > svg {
+  transition: transform 0.12s ease;
+}
+button.file-tree-chevron > svg.open {
+  transform: rotate(90deg);
+}
+.file-tree-name {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

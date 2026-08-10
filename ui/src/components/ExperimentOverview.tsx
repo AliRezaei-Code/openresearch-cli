@@ -2,7 +2,6 @@ import {
   CalendarDays,
   Clock3,
   FolderTree,
-  GitBranch,
   GitCommitHorizontal,
   Terminal,
 } from "lucide-react";
@@ -40,7 +39,6 @@ export function ExperimentOverview({
   project,
   runs,
   onOpenLogs,
-  onOpenChanges,
   onOpenCode,
 }: {
   experiment: Experiment;
@@ -48,7 +46,6 @@ export function ExperimentOverview({
   project: Project;
   runs: Run[];
   onOpenLogs: (runId: string) => void;
-  onOpenChanges: () => void;
   onOpenCode: () => void;
 }) {
   const latestRun = runs[0] ?? null;
@@ -85,10 +82,6 @@ export function ExperimentOverview({
               Logs
             </button>
           )}
-          <button className="experiment-overview-action" onClick={onOpenChanges}>
-            <GitBranch size={15} />
-            Changes
-          </button>
           <button className="experiment-overview-action" onClick={onOpenCode}>
             <FolderTree size={15} />
             Code
