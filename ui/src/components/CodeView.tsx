@@ -44,6 +44,8 @@ export function CodeView({
       return;
     }
     setBand({ top: padTop + (target - 1) * lineH, height: lineH });
+    // `rendered` is a dep so the band re-measures/re-scrolls once new file
+    // content has laid out, not against the previous file's metrics.
   }, [highlightLine, lineCount, rendered]);
 
   // Center the highlighted line in the scroll viewport once its band exists.

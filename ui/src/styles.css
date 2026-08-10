@@ -5370,22 +5370,6 @@ a.files-pill:hover {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* Branch badge on committed-state file views (code browser in branch mode) —
-   a plain source label, not a BranchPill: the header shouldn't grow a second
-   navigation affordance next to the path. */
-.file-view-ref {
-  font-family: var(--mono);
-  font-size: var(--fs-xs);
-  color: var(--muted);
-  border: 1px solid var(--border-variant);
-  border-radius: var(--radius-sm);
-  padding: 1px 6px;
-  max-width: 180px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex-shrink: 0;
-}
 /* Git-branch pill in the file header — names the branch a code tab's contents
    came from (an experiment branch, or the baseline). Monospace + muted like the
    old ref pill, icon-led. */

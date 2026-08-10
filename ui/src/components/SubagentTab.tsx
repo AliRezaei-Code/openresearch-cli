@@ -12,11 +12,13 @@ export function SubagentTab({
   sessionId,
   spawnPartId,
   onOpenFile,
+  onOpenRun,
   onOpenSubagent,
 }: {
   sessionId: string;
   spawnPartId: string;
   onOpenFile?: (path: string) => void;
+  onOpenRun?: (runId: string) => void;
   onOpenSubagent?: (spawnPartId: string) => void;
 }) {
   const [messages, setMessages] = useState<ChatMessage[] | null>(null);
@@ -68,6 +70,7 @@ export function SubagentTab({
           <SubagentTranscript
             spawn={spawn}
             onOpenFile={onOpenFile}
+            onOpenRun={onOpenRun}
             onOpenSubagent={onOpenSubagent}
           />
         ) : (

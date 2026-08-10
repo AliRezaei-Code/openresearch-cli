@@ -843,17 +843,19 @@ export function findPartById(parts: ChatPart[], id: string): ChatPart | null {
 export function SubagentTranscript({
   spawn,
   onOpenFile,
+  onOpenRun,
   onOpenSubagent,
 }: {
   spawn: ChatPart;
   onOpenFile?: (path: string, line?: number, exp?: string) => void;
+  onOpenRun?: (runId: string) => void;
   onOpenSubagent?: (spawnPartId: string) => void;
 }) {
   const parts = spawn.children ?? [];
   const running = spawn.state?.status === "running";
   // Gate the empty state on what actually renders, not the raw part count — a
   // stored transcript of nothing but invisible parts must still read as empty.
-  const rendered = renderParts(parts, { onOpenFile, onOpenSubagent });
+  const rendered = renderParts(parts, { onOpenFile, onOpenRun, onOpenSubagent });
   return (
     <div className="msg-assistant">
       <div className="subagent-tab-header">

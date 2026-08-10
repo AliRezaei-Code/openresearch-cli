@@ -338,10 +338,13 @@ export default function App() {
   const [projectId, setProjectId] = useState<string | null>(null);
   const [experiments, setExperiments] = useState<Experiment[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
-  // Latest runs, read by the stable openRunLogs so run-evidence chips resolve a
-  // runId to its experiment without re-creating the callback on every poll.
+  // Latest runs/experiments, read by the stable openRunLogs/openFileTab so
+  // evidence chips resolve ids without re-creating the callbacks on every poll
+  // (they feed the memoized transcript, which needs stable props).
   const runsRef = useRef(runs);
   runsRef.current = runs;
+  const experimentsRef = useRef(experiments);
+  experimentsRef.current = experiments;
   const [artifacts, setArtifacts] = useState<ProjectArtifacts | null>(null);
   const [view, setView] = useState<ExperimentsView>(initialExperimentsView);
   // Experiments pane scope: "agent" narrows to the open chat session's work.
@@ -700,7 +703,9 @@ export default function App() {
       // tab shows (and labels) the version behind the claim. Agents cite the
       // short id (`orx` prints an 8-char prefix), so match the full id or prefix.
       const experiment = exp
-        ? experiments.find((e) => e.id === exp || (exp.length >= 6 && e.id.startsWith(exp)))
+        ? experimentsRef.current.find(
+            (e) => e.id === exp || (exp.length >= 6 && e.id.startsWith(exp)),
+          )
         : undefined;
       const effectiveRef = ref ?? experiment?.branchName;
       // A branch ref only applies to repo files; artifacts have no branch.
@@ -713,7 +718,7 @@ export default function App() {
       selectRightTab(tab);
       setPanelOpen(true);
     },
-    [projects, projectId, experiments, selectRightTab],
+    [projects, projectId, selectRightTab],
   );
 
   // Chat file chips carry an optional target line (`file:line`) and cited
@@ -1343,6 +1348,7 @@ export default function App() {
               sessionId={subagentTab.sessionId}
               spawnPartId={subagentTab.spawnPartId}
               onOpenFile={(path) => openFileTab(path, subagentTab.sessionId)}
+              onOpenRun={openRunLogs}
               onOpenSubagent={(pid) => openSubagentTab(subagentTab.sessionId, pid)}
             />
           ) : codeTab ? (
