@@ -3134,16 +3134,6 @@ button.onb-agent-choice:hover {
   gap: 10px;
   min-width: 0;
 }
-.onb-agent-logo {
-  display: block;
-  width: 18px;
-  height: 18px;
-  flex: 0 0 auto;
-  fill: currentColor;
-}
-.onb-agent-logo.claude {
-  color: #d97757;
-}
 .onb-card-name {
   font-weight: var(--fw-semibold);
   font-size: var(--fs-base);
@@ -5078,6 +5068,16 @@ a.files-pill:hover {
 .composer-pill:hover {
   background: var(--surface);
 }
+/* Harness/provider brand mark (shared with the onboarding cards). Self-colored
+   for Claude; inherits text color otherwise so it reads in both themes. */
+.harness-logo {
+  display: block;
+  flex: 0 0 auto;
+  fill: currentColor;
+}
+.harness-logo.claude {
+  color: #d97757;
+}
 /* Text-only composer control (reasoning level) — sits beside the model label. */
 .composer-bare {
   display: inline-flex;
@@ -5171,7 +5171,6 @@ a.files-pill:hover {
 }
 /* Nested pickers open beside the panel, growing upward from the row, so they
    never overlap the panel's own rows. */
-.composer-settings-menu .model-menu,
 .composer-settings-menu .option-menu {
   bottom: 0;
   top: auto;
@@ -5209,6 +5208,7 @@ a.files-pill:hover {
   background: var(--border);
 }
 /* Right-anchored menus (bottom-right controls) open toward the left edge. */
+.model-menu.align-right,
 .option-menu.align-right {
   left: auto;
   right: 0;

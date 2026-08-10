@@ -2595,9 +2595,8 @@ export function ChatPanel({
             />
           </div>
           <div className="composer-actions">
-            {/* The model picker reflects the open session (harness locked once
-                it exists); the global default only applies before the first
-                message. */}
+            {/* Chat settings (permissions, reasoning, sources) live behind the
+                switch icon. */}
             <div className="option-picker" ref={chatSettings.ref}>
               <button
                 type="button"
@@ -2613,26 +2612,17 @@ export function ChatPanel({
               {chatSettings.open && (
                 <div className="option-menu composer-settings-menu">
                   <div className="composer-setting-row">
-                    <span className="composer-setting-label">Mode</span>
+                    <span className="composer-setting-label">Permissions</span>
                     <OptionPicker
                       choices={activeHarness?.agentReady ? (opts?.permissionModes ?? []) : []}
                       value={composerSelection?.permissionMode ?? null}
                       defaultId={opts?.defaultPermissionMode ?? null}
-                      header="Mode"
+                      header="Permissions"
                       align="left"
                       variant="pill"
                       numbered
                       title="Permission mode for this chat"
                       onSelect={setPermissionMode}
-                    />
-                  </div>
-                  <div className="composer-setting-row">
-                    <span className="composer-setting-label">Model</span>
-                    <ModelPicker
-                      value={composerSelection}
-                      onSelect={selectModel}
-                      onHarnesses={setHarnesses}
-                      lockHarness={!!openSession}
                     />
                   </div>
                   <div className="composer-setting-row">
@@ -2676,6 +2666,15 @@ export function ChatPanel({
               <Paperclip size={16} />
             </button>
             <div style={{ flex: 1 }} />
+            {/* The model picker reflects the open session (harness locked once
+                it exists); the global default only applies before the first
+                message. */}
+            <ModelPicker
+              value={composerSelection}
+              onSelect={selectModel}
+              onHarnesses={setHarnesses}
+              lockHarness={!!openSession}
+            />
             <ContextMeter usage={openSession?.contextUsage} />
             {busy && !pendingQuestion ? (
               // Stop whenever the turn is busy and typed text has nowhere to

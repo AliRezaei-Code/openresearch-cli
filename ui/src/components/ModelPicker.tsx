@@ -12,6 +12,7 @@ import {
   type OptionChoice,
 } from "../api";
 import { renderNote } from "./agentNote";
+import { HarnessLogo } from "./HarnessLogo";
 import { onHarnessAuth } from "../events";
 import type { AgentSelection } from "../api";
 
@@ -175,11 +176,12 @@ export function ModelPicker({
         title="Harness + model for this chat"
         onClick={() => setOpen((v) => !v)}
       >
+        {value?.harness && <HarnessLogo harness={value.harness} size={14} />}
         {label}
         <ChevronDown size={12} />
       </button>
       {open && (
-        <div className="model-menu">
+        <div className="model-menu align-right">
           <input
             autoFocus
             type="text"
@@ -296,7 +298,7 @@ export function OptionPicker({
   /** The harness's default id — pinned at top of the menu and used when
    * `value` is null. */
   defaultId?: string | null;
-  /** Group header (e.g. "Mode"). */
+  /** Group header (e.g. "Permissions"). */
   header?: string;
   align?: "left" | "right";
   /** `pill` = boxed (permission mode); `bare` = text-only (reasoning). */
