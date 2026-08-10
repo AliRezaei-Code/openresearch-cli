@@ -51,7 +51,6 @@ export function DetailDrawer({
         project={project}
         runs={expRuns}
         onOpenLogs={(runId) => onOpenView("terminal", runId)}
-        onOpenChanges={() => onOpenCode("changes")}
         onOpenCode={() => onOpenCode("files")}
       />
     );

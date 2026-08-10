@@ -1,7 +1,6 @@
 // Files and committed changes for one experiment branch. The opening
 // experiment fixes the Git source; users only switch between Files/Changes.
 
-import { GitBranch, RotateCw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   getCodeTree,
@@ -10,11 +9,11 @@ import {
   type Experiment,
   type Project,
 } from "../api";
-import { GitHubMark } from "./BackendLogos";
 import { BranchChanges } from "./BranchChanges";
+import { CodeBrowserHeader, type CodeBrowserView } from "./CodeBrowserHeader";
 import { buildTree, TreeLevel } from "./codeTree";
 
-export type CodeView = "files" | "changes";
+export type CodeView = CodeBrowserView;
 
 export function CodeTab({
   projectId,
@@ -103,40 +102,22 @@ export function CodeTab({
 
   return (
     <div className="code-tab">
-      <div className="code-tab-header">
-        <div className="seg">
-          <button className={view === "files" ? "active" : ""} onClick={() => onViewChange("files")}>
-            Files
-          </button>
-          <button className={view === "changes" ? "active" : ""} onClick={() => onViewChange("changes")}>
-            Changes
-          </button>
-        </div>
-        <span className="wt-branch-chip" title={`Committed branch ${branch}`}>
-          <GitBranch size={12} />
-          <span className="wt-branch-name">{branch}</span>
-        </span>
-        {project.githubEnabled && <a
-          className="icon-btn"
-          href={githubBranchUrl(project.githubOwner, project.githubRepo, branch)}
-          target="_blank"
-          rel="noopener noreferrer"
-          title={`Open ${branch} on GitHub`}
-        >
-          <GitHubMark size={13} />
-        </a>}
-        <span style={{ flex: 1 }} />
-        <button
-          className="icon-btn"
-          title="Refresh"
-          aria-label="Refresh"
-          onClick={() =>
-            view === "files" ? load() : setChangesRefreshKey((current) => current + 1)
-          }
-        >
-          {refreshing ? <span className="spinner" /> : <RotateCw size={13} />}
-        </button>
-      </div>
+      <CodeBrowserHeader
+        view={view}
+        onViewChange={onViewChange}
+        branchLabel={branch}
+        branchTitle={`Committed branch ${branch}`}
+        githubHref={
+          project.githubEnabled
+            ? githubBranchUrl(project.githubOwner, project.githubRepo, branch)
+            : undefined
+        }
+        githubTitle={`Open ${branch} on GitHub`}
+        refreshing={refreshing}
+        onRefresh={() =>
+          view === "files" ? load() : setChangesRefreshKey((current) => current + 1)
+        }
+      />
       {view === "changes" ? (
         <BranchChanges
           key={experiment.id}
@@ -156,7 +137,7 @@ export function CodeTab({
             ) : tree.dirs.size === 0 && tree.files.length === 0 ? (
               <div className="code-tab-note">No files.</div>
             ) : (
-              <div className="code-tree">
+              <div className="file-tree">
                 <TreeLevel
                   node={tree}
                   parentPath=""
