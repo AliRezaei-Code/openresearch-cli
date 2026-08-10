@@ -5,8 +5,8 @@ import {
   ExternalLink,
   Code,
   FileText,
-  FolderOpen,
   MousePointerClick,
+  Package,
   Settings2,
   Trash2,
 } from "lucide-react";
@@ -24,6 +24,7 @@ import {
   type ProjectArtifacts,
 } from "../api";
 import { CodeView } from "./CodeView";
+import { FileTypeIcon, isImageFile, isMarkdownFile } from "./FileTypeIcon";
 import { mdCodeComponents, normalizeMathDelimiters, remarkMathOptions } from "./Md";
 
 /** Any href with a URI scheme (https:, mailto:, data:, …) or a
@@ -70,8 +71,6 @@ function stripFrontmatter(md: string): string {
   return end === -1 ? md : md.slice(end + 4).replace(/^\r?\n/, "");
 }
 
-const IMAGE_RE = /\.(png|jpe?g|gif|webp|svg)$/i;
-const MD_RE = /\.(md|mdx|markdown)$/i;
 /** Raw text preview cap — matches the repo file viewer's truncation cap. */
 const MAX_TEXT_PREVIEW = 512 * 1024;
 
@@ -176,8 +175,8 @@ export function ArtifactMarkdown({
 type PreviewKind = "markdown" | "image" | "pdf" | "text";
 
 function previewKind(entry: ArtifactEntry): PreviewKind {
-  if (MD_RE.test(entry.name)) return "markdown";
-  if (IMAGE_RE.test(entry.name)) return "image";
+  if (isMarkdownFile(entry.name)) return "markdown";
+  if (isImageFile(entry.name)) return "image";
   if (/\.pdf$/i.test(entry.name)) return "pdf";
   return "text";
 }
@@ -330,7 +329,6 @@ function PreviewPane({
 }
 
 function TreeRows({
-  projectId,
   entries,
   depth,
   collapsed,
@@ -339,7 +337,6 @@ function TreeRows({
   onSelect,
   onDelete,
 }: {
-  projectId: string;
   entries: ArtifactEntry[];
   depth: number;
   collapsed: Set<string>;
@@ -356,18 +353,18 @@ function TreeRows({
           const open = !collapsed.has(e.path);
           return (
             <div key={e.path}>
-              <div className="ft-row" style={indent} onClick={() => onToggle(e.path)}>
+              <div className="file-tree-row artifact-tree-row" style={indent} onClick={() => onToggle(e.path)}>
                 <button
-                  className={`ft-chevron ${open ? "open" : ""}`}
+                  className="file-tree-chevron"
                   aria-label={open ? `Collapse ${e.name}` : `Expand ${e.name}`}
                   onClick={(ev) => {
                     ev.stopPropagation();
                     onToggle(e.path);
                   }}
                 >
-                  <ChevronRight size={12} />
+                  <ChevronRight size={13} className={open ? "open" : ""} />
                 </button>
-                <span className="ft-dirname">{e.name}/</span>
+                <span className="file-tree-name">{e.name}</span>
                 <button
                   className="icon-btn ft-row-delete"
                   data-tip="Delete folder"
@@ -384,7 +381,6 @@ function TreeRows({
               </div>
               {open && (e.children?.length ?? 0) > 0 && (
                 <TreeRows
-                  projectId={projectId}
                   entries={e.children ?? []}
                   depth={depth + 1}
                   collapsed={collapsed}
@@ -399,19 +395,18 @@ function TreeRows({
         }
 
         return (
-          <div
+          <button
             key={e.path}
-            className={`ft-row file ${selected === e.path ? "selected" : ""}`}
+            type="button"
+            className={`file-tree-row artifact-tree-row ${selected === e.path ? "selected" : ""}`}
             style={indent}
             title={e.path}
+            aria-pressed={selected === e.path}
             onClick={() => onSelect(e.path)}
           >
-            <span className="ft-chevron spacer" />
-            {IMAGE_RE.test(e.name) && (
-              <img className="ft-thumb" src={artifactUrl(projectId, e.path)} alt="" loading="lazy" />
-            )}
-            <span className="ft-name">{e.name}</span>
-          </div>
+            <FileTypeIcon name={e.name} />
+            <span className="file-tree-name">{e.name}</span>
+          </button>
         );
       })}
     </>
@@ -546,7 +541,6 @@ export function ArtifactsTab({
 
   const tree = (entries: ArtifactEntry[]) => (
     <TreeRows
-      projectId={project.id}
       entries={entries}
       depth={0}
       collapsed={collapsed}
@@ -562,7 +556,7 @@ export function ArtifactsTab({
     return (
       <div className="files-tab">
         <div className="files-empty-state">
-          <FolderOpen size={28} strokeWidth={1.5} />
+          <Package size={28} strokeWidth={1.5} />
           <h3>No artifacts yet</h3>
           <p>
             This is the project's durable output space for reports, figures, images, CSVs, PDFs,
@@ -578,7 +572,7 @@ export function ArtifactsTab({
     <div className="files-tab">
       <div className="ftree-pane" ref={treeRef} style={{ width: treeWidth }}>
         <div className="ftree-resizer" onPointerDown={resizeTree} />
-        <div className="ftree-scroll">
+        <div className="ftree-scroll file-tree">
           {tree(artifacts.entries)}
           {artifacts.truncated && (
             <p className="files-truncated">Listing truncated — the folder has more artifacts.</p>

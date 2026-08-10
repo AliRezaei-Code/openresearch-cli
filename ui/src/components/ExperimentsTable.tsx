@@ -9,7 +9,6 @@ export function ExperimentsTable({
   emptyHint,
   onOpen,
   onOpenLogs,
-  onOpenChanges,
   onOpenCode,
   onCancel,
 }: {
@@ -18,7 +17,6 @@ export function ExperimentsTable({
   emptyHint?: string;
   onOpen: (experiment: Experiment) => void;
   onOpenLogs: (experimentId: string, runId: string) => void;
-  onOpenChanges: (experimentId: string) => void;
   onOpenCode: (experimentId: string) => void;
   onCancel: (runId: string) => Promise<void>;
 }) {
@@ -42,7 +40,7 @@ export function ExperimentsTable({
 
   if (sortedExperiments.length === 0) {
     return (
-      <div className="empty-state">
+      <div className="empty-state experiments-empty-state">
         <p>{emptyHint ?? "No experiments yet."}</p>
       </div>
     );
@@ -139,14 +137,6 @@ export function ExperimentsTable({
                 >
                   <Terminal size={15} />
                   Logs
-                </button>
-                <button
-                  className="experiment-table-action"
-                  title="Open changes"
-                  onClick={() => onOpenChanges(experiment.id)}
-                >
-                  <GitBranch size={15} />
-                  Changes
                 </button>
                 <button
                   className="experiment-table-action"

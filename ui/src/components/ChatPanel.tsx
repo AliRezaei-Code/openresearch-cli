@@ -7,13 +7,13 @@ import {
   CornerDownLeft,
   FileText,
   FlaskConical,
-  FolderGit2,
   FolderOpen,
   GitBranch,
   HelpCircle,
   MoreHorizontal,
   PanelLeft,
   Paperclip,
+  Package,
   Plus,
   SlidersHorizontal,
   Users,
@@ -1215,10 +1215,11 @@ export function ChatPanel({
   onShowRail,
   mainView,
   onSelectMainView,
+  experimentsActive,
+  filesActive,
   artifactsActive,
+  onOpenExperiments,
   onOpenArtifacts,
-  panelOpen,
-  onTogglePanel,
   onOpenFile,
   onOpenPlan,
   onOpenSubagent,
@@ -1242,11 +1243,11 @@ export function ChatPanel({
   /** Settings sections replace chat; Artifacts remains a right-panel tool. */
   mainView: "chat" | SettingsTab;
   onSelectMainView: (view: "chat" | SettingsTab) => void;
+  experimentsActive: boolean;
+  filesActive: boolean;
   artifactsActive: boolean;
+  onOpenExperiments: () => void;
   onOpenArtifacts: () => void;
-  /** Whether the right panel is showing (toggled from the chat header). */
-  panelOpen: boolean;
-  onTogglePanel: () => void;
   /** Open a project file in the right pane (chat tool rows are clickable).
    * `sessionId` is the chat session the click came from, so relative paths
    * can resolve against that session's worktree. */
@@ -1257,7 +1258,7 @@ export function ChatPanel({
    * `sessionId` is the chat session; `spawnPartId` locates the spawn part. */
   onOpenSubagent?: (sessionId: string, spawnPartId: string) => void;
   /** Open the pinned Files home for the active session. */
-  onOpenWorktree?: () => void;
+  onOpenWorktree: () => void;
   /** Replay the onboarding tour (chat header help button). */
   onStartTour?: () => void;
   /** The open chat session, surfaced so the shell can scope panes to it. */
@@ -2123,14 +2124,28 @@ export function ChatPanel({
   const rail = (
     <aside className="session-rail floating-panel">
       {railHeader}
-      {/* Artifacts opens beside chat; settings sections replace the middle pane. */}
+      {/* Workspace tools open beside chat; settings sections replace the middle pane. */}
       <nav className="rail-nav">
+        <button
+          className={`rail-nav-item ${experimentsActive ? "active" : ""}`}
+          onClick={onOpenExperiments}
+        >
+          <FlaskConical size={15} />
+          Experiments
+        </button>
+        <button
+          className={`rail-nav-item ${filesActive ? "active" : ""}`}
+          onClick={onOpenWorktree}
+        >
+          <FolderOpen size={15} />
+          Files
+        </button>
         <button
           className={`rail-nav-item ${artifactsActive ? "active" : ""}`}
           data-onboarding="nav-artifacts"
           onClick={onOpenArtifacts}
         >
-          <FolderOpen size={15} />
+          <Package size={15} />
           Artifacts
         </button>
         {SETTINGS_NAV.map((item) => (
@@ -2262,24 +2277,6 @@ export function ChatPanel({
             <HelpCircle size={15} />
           </button>
         )}
-        {onOpenWorktree && activeId && (
-          <button
-            className="icon-btn"
-            data-tip="View current worktree"
-            aria-label="View current worktree"
-            onClick={onOpenWorktree}
-          >
-            <FolderGit2 size={15} />
-          </button>
-        )}
-        <button
-          className={`icon-btn ${panelOpen ? "active" : ""}`}
-          title="Experiments"
-          aria-label="Experiments"
-          onClick={onTogglePanel}
-        >
-          <FlaskConical size={15} />
-        </button>
       </div>
 
       {historyLoading ? (

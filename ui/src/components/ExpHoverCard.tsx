@@ -119,7 +119,6 @@ export function ExpHoverCard({
   parentSlug,
   anchor,
   onOpenLogs,
-  onOpenChanges,
   onOpenCode,
   onMouseEnter,
   onMouseLeave,
@@ -131,7 +130,6 @@ export function ExpHoverCard({
   /** Viewport rect of the hovered node (kept fresh by useHoverIntent). */
   anchor: DOMRect;
   onOpenLogs?: () => void;
-  onOpenChanges: () => void;
   onOpenCode: () => void;
   onMouseEnter: () => void;
   onMouseLeave: () => void;
@@ -260,10 +258,6 @@ export function ExpHoverCard({
       </div>
       {exp.title && <div className="hc-title">{exp.title}</div>}
       <div className="hc-actions">
-        <button type="button" onClick={onOpenChanges}>
-          <GitBranch size={13} />
-          Changes
-        </button>
         {onOpenLogs && (
           <button type="button" onClick={onOpenLogs}>
             <Terminal size={13} />

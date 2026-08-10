@@ -6,9 +6,9 @@ import {
   FlaskConical,
   FolderGit2,
   FolderOpen,
-  FolderTree,
   Maximize2,
   Minimize2,
+  Package,
   ScrollText,
   Terminal,
   Users,
@@ -131,10 +131,22 @@ type RightTab =
   | SubagentViewDef
   | CodeTabDef;
 
+function rightTabKey(tab: RightTab): string {
+  if (typeof tab === "string") return `home:${tab}`;
+  if ("code" in tab) return `code:${tab.branch}`;
+  if ("kind" in tab) {
+    return tab.kind === "plan" ? `plan:${tab.promptId}` : `subagent:${tab.spawnPartId}`;
+  }
+  if ("path" in tab) return `file:${fileTabKey(tab)}`;
+  return `experiment:${tab.id}:${tab.view}`;
+}
+
 interface RightPaneSessionState {
   rightTab: RightTab;
+  tabHistory: RightTab[];
   experimentsTabOpen: boolean;
   filesTabOpen: boolean;
+  artifactsTabOpen: boolean;
   expTabs: ExpViewDef[];
   fileTabs: FileViewDef[];
   planTabs: PlanViewDef[];
@@ -151,8 +163,10 @@ interface RightPaneSessionState {
 function initialRightPaneSessionState(sessionId?: string): RightPaneSessionState {
   const initial: RightPaneSessionState = {
     rightTab: "experiments",
+    tabHistory: ["experiments"],
     experimentsTabOpen: true,
     filesTabOpen: false,
+    artifactsTabOpen: false,
     expTabs: [],
     fileTabs: [],
     planTabs: [],
@@ -172,13 +186,25 @@ function initialRightPaneSessionState(sessionId?: string): RightPaneSessionState
       { path: "nanochat-training-throughput.svg", source: "artifacts" },
       { path: "nanochat-core-evaluation.svg", source: "artifacts" },
     ];
-    return { ...initial, rightTab: fileTabs[0], experimentsTabOpen: false, fileTabs };
+    return {
+      ...initial,
+      rightTab: fileTabs[0],
+      tabHistory: [...fileTabs.slice(1), fileTabs[0]],
+      experimentsTabOpen: false,
+      fileTabs,
+    };
   }
   if (sessionId === DEMO_LITERATURE_SESSION_ID) {
     const fileTabs: FileViewDef[] = [
       { path: "nanochat-bottleneck-diagnosis.md", source: "artifacts" },
     ];
-    return { ...initial, rightTab: fileTabs[0], experimentsTabOpen: false, fileTabs };
+    return {
+      ...initial,
+      rightTab: fileTabs[0],
+      tabHistory: [fileTabs[0]],
+      experimentsTabOpen: false,
+      fileTabs,
+    };
   }
   return initial;
 }
@@ -331,6 +357,7 @@ export default function App() {
   // Right-panel tab strip: closable home and working tabs. The same experiment
   // can keep both its overview and terminal open.
   const [rightTab, setRightTab] = useState<RightTab>("experiments");
+  const [tabHistory, setTabHistory] = useState<RightTab[]>(["experiments"]);
   const [experimentsTabOpen, setExperimentsTabOpen] = useState(true);
   const [filesTabOpen, setFilesTabOpen] = useState(false);
   const [artifactsTabOpen, setArtifactsTabOpen] = useState(false);
@@ -358,10 +385,37 @@ export default function App() {
   const rightPaneStatesRef = useRef(new Map<string, RightPaneSessionState>());
   const currentRightPaneStateRef = useRef<RightPaneSessionState>(initialRightPaneSessionState());
   const activeSessionIdRef = useRef<string | null>(null);
+  const tabHistoryRef = useRef(tabHistory);
+  tabHistoryRef.current = tabHistory;
+
+  const selectRightTab = useCallback((tab: RightTab) => {
+    const key = rightTabKey(tab);
+    const next = [...tabHistoryRef.current.filter((item) => rightTabKey(item) !== key), tab];
+    tabHistoryRef.current = next;
+    setTabHistory(next);
+    setRightTab(tab);
+  }, []);
+
+  const forgetRightTab = useCallback((tab: RightTab, selectFallback: boolean) => {
+    const key = rightTabKey(tab);
+    const next = tabHistoryRef.current.filter((item) => rightTabKey(item) !== key);
+    tabHistoryRef.current = next;
+    setTabHistory(next);
+    if (!selectFallback) return;
+    const fallback = next[next.length - 1];
+    if (fallback) setRightTab(fallback);
+    else {
+      setPanelOpen(false);
+      setPanelMax(false);
+    }
+  }, []);
+
   currentRightPaneStateRef.current = {
     rightTab,
+    tabHistory,
     experimentsTabOpen,
     filesTabOpen,
+    artifactsTabOpen,
     expTabs,
     fileTabs,
     planTabs,
@@ -385,8 +439,11 @@ export default function App() {
         initialRightPaneSessionState(nextSessionId))
       : initialRightPaneSessionState();
     setRightTab(nextState.rightTab);
+    tabHistoryRef.current = nextState.tabHistory;
+    setTabHistory(nextState.tabHistory);
     setExperimentsTabOpen(nextState.experimentsTabOpen);
     setFilesTabOpen(nextState.filesTabOpen);
+    setArtifactsTabOpen(nextState.artifactsTabOpen);
     setExpTabs(nextState.expTabs);
     setFileTabs(nextState.fileTabs);
     setPlanTabs(nextState.planTabs);
@@ -410,11 +467,11 @@ export default function App() {
     setMainView("chat");
     setRailOpen(true);
     setExperimentsTabOpen(true);
-    setRightTab("experiments");
+    selectRightTab("experiments");
     setPanelOpen(true);
     setPanelMax(false);
     setTourOpen(true);
-  }, []);
+  }, [selectRightTab]);
   const closeTour = useCallback(async () => {
     const saved = await updateUiState({ tourCompleted: true });
     setUiState((current) => current && { ...current, tourCompleted: saved.tourCompleted });
@@ -520,9 +577,12 @@ export default function App() {
     setCodeTabs([]);
     setFilesView("files");
     setFilesToggled(new Set());
+    tabHistoryRef.current = ["experiments"];
+    setTabHistory(["experiments"]);
     setRightTab("experiments");
     setExperimentsTabOpen(true);
     setFilesTabOpen(false);
+    setArtifactsTabOpen(false);
     // Scoping is an explicit per-project choice — don't let Current task scope
     // re-bind to whichever session ChatPanel auto-selects in the next project.
     setScope("project");
@@ -541,9 +601,16 @@ export default function App() {
     refreshArtifacts();
     setMainView("chat");
     setArtifactsTabOpen(true);
-    setRightTab("artifacts");
+    selectRightTab("artifacts");
     setPanelOpen(true);
-  }, [refreshArtifacts]);
+  }, [refreshArtifacts, selectRightTab]);
+
+  const openExperimentsTab = useCallback(() => {
+    setMainView("chat");
+    setExperimentsTabOpen(true);
+    selectRightTab("experiments");
+    setPanelOpen(true);
+  }, [selectRightTab]);
 
   // Live store updates.
   useOrxEvents({
@@ -571,42 +638,18 @@ export default function App() {
   const openExperimentTab = useCallback((id: string, view: ExperimentView = "overview") => {
     const tab = { id, view };
     setExpTabs((prev) => (prev.some((t) => sameExpTab(t, tab)) ? prev : [...prev, tab]));
-    setRightTab(tab);
+    selectRightTab(tab);
     setPanelOpen(true);
-  }, []);
+  }, [selectRightTab]);
 
   const closeExperimentTab = useCallback(
     (tab: ExpViewDef) => {
       const idx = expTabs.findIndex((t) => sameExpTab(t, tab));
       if (idx === -1) return;
-      const next = expTabs.filter((_, i) => i !== idx);
-      setExpTabs(next);
-      if (typeof rightTab === "object" && "id" in rightTab && sameExpTab(rightTab, tab)) {
-        const fallback =
-          next[Math.min(idx, next.length - 1)] ??
-          (experimentsTabOpen ? "experiments" : undefined) ??
-          (filesTabOpen ? "files" : undefined) ??
-          fileTabs[0] ??
-          planTabs[0] ??
-          subagentTabs[0] ??
-          codeTabs[0];
-        if (fallback) setRightTab(fallback);
-        else {
-          setPanelOpen(false);
-          setPanelMax(false);
-        }
-      }
+      setExpTabs((prev) => prev.filter((_, i) => i !== idx));
+      forgetRightTab(tab, rightTabKey(rightTab) === rightTabKey(tab));
     },
-    [
-      expTabs,
-      rightTab,
-      experimentsTabOpen,
-      filesTabOpen,
-      fileTabs,
-      planTabs,
-      subagentTabs,
-      codeTabs,
-    ],
+    [expTabs, forgetRightTab, rightTab],
   );
 
   // Open a project file as a right-panel tab. `contextSessionId` is the chat
@@ -626,44 +669,20 @@ export default function App() {
       // A branch ref only applies to repo files; artifacts have no branch.
       if (ref && tab.source !== "artifacts") tab.ref = ref;
       setFileTabs((prev) => (prev.some((t) => sameFileTab(t, tab)) ? prev : [...prev, tab]));
-      setRightTab(tab);
+      selectRightTab(tab);
       setPanelOpen(true);
     },
-    [projects, projectId],
+    [projects, projectId, selectRightTab],
   );
 
   const closeFileTab = useCallback(
     (tab: FileViewDef) => {
       const idx = fileTabs.findIndex((t) => sameFileTab(t, tab));
       if (idx === -1) return;
-      const next = fileTabs.filter((_, i) => i !== idx);
-      setFileTabs(next);
-      if (typeof rightTab === "object" && "path" in rightTab && sameFileTab(rightTab, tab)) {
-        const fallback =
-          next[Math.min(idx, next.length - 1)] ??
-          (experimentsTabOpen ? "experiments" : undefined) ??
-          (filesTabOpen ? "files" : undefined) ??
-          expTabs[0] ??
-          planTabs[0] ??
-          subagentTabs[0] ??
-          codeTabs[0];
-        if (fallback) setRightTab(fallback);
-        else {
-          setPanelOpen(false);
-          setPanelMax(false);
-        }
-      }
+      setFileTabs((prev) => prev.filter((_, i) => i !== idx));
+      forgetRightTab(tab, rightTabKey(rightTab) === rightTabKey(tab));
     },
-    [
-      fileTabs,
-      rightTab,
-      experimentsTabOpen,
-      filesTabOpen,
-      expTabs,
-      planTabs,
-      subagentTabs,
-      codeTabs,
-    ],
+    [fileTabs, forgetRightTab, rightTab],
   );
 
   // Open a proposed plan as a right-panel tab (the chat plan strip's "View
@@ -678,48 +697,18 @@ export default function App() {
       next[idx] = tab;
       return next;
     });
-    setRightTab(tab);
+    selectRightTab(tab);
     setPanelOpen(true);
-  }, []);
+  }, [selectRightTab]);
 
   const closePlanTab = useCallback(
     (tab: PlanViewDef) => {
       const idx = planTabs.findIndex((t) => t.promptId === tab.promptId);
       if (idx === -1) return;
-      const next = planTabs.filter((_, i) => i !== idx);
-      setPlanTabs(next);
-      if (
-        typeof rightTab === "object" &&
-        "kind" in rightTab &&
-        rightTab.kind === "plan" &&
-        rightTab.promptId === tab.promptId
-      )
-        {
-          const fallback =
-            next[Math.min(idx, next.length - 1)] ??
-            (experimentsTabOpen ? "experiments" : undefined) ??
-            (filesTabOpen ? "files" : undefined) ??
-            expTabs[0] ??
-            fileTabs[0] ??
-            subagentTabs[0] ??
-            codeTabs[0];
-          if (fallback) setRightTab(fallback);
-          else {
-            setPanelOpen(false);
-            setPanelMax(false);
-          }
-        }
+      setPlanTabs((prev) => prev.filter((_, i) => i !== idx));
+      forgetRightTab(tab, rightTabKey(rightTab) === rightTabKey(tab));
     },
-    [
-      planTabs,
-      rightTab,
-      experimentsTabOpen,
-      filesTabOpen,
-      expTabs,
-      fileTabs,
-      subagentTabs,
-      codeTabs,
-    ],
+    [forgetRightTab, planTabs, rightTab],
   );
 
   // Open a sub-agent's transcript as a right-panel tab (a chat spawn row's
@@ -730,48 +719,18 @@ export default function App() {
     setSubagentTabs((prev) =>
       prev.some((t) => t.spawnPartId === spawnPartId) ? prev : [...prev, tab],
     );
-    setRightTab(tab);
+    selectRightTab(tab);
     setPanelOpen(true);
-  }, []);
+  }, [selectRightTab]);
 
   const closeSubagentTab = useCallback(
     (tab: SubagentViewDef) => {
       const idx = subagentTabs.findIndex((t) => t.spawnPartId === tab.spawnPartId);
       if (idx === -1) return;
-      const next = subagentTabs.filter((_, i) => i !== idx);
-      setSubagentTabs(next);
-      if (
-        typeof rightTab === "object" &&
-        "kind" in rightTab &&
-        rightTab.kind === "subagent" &&
-        rightTab.spawnPartId === tab.spawnPartId
-      )
-        {
-          const fallback =
-            next[Math.min(idx, next.length - 1)] ??
-            (experimentsTabOpen ? "experiments" : undefined) ??
-            (filesTabOpen ? "files" : undefined) ??
-            expTabs[0] ??
-            fileTabs[0] ??
-            planTabs[0] ??
-            codeTabs[0];
-          if (fallback) setRightTab(fallback);
-          else {
-            setPanelOpen(false);
-            setPanelMax(false);
-          }
-        }
+      setSubagentTabs((prev) => prev.filter((_, i) => i !== idx));
+      forgetRightTab(tab, rightTabKey(rightTab) === rightTabKey(tab));
     },
-    [
-      subagentTabs,
-      rightTab,
-      experimentsTabOpen,
-      filesTabOpen,
-      expTabs,
-      fileTabs,
-      planTabs,
-      codeTabs,
-    ],
+    [forgetRightTab, rightTab, subagentTabs],
   );
 
   // One Git-backed code tab per branch. Reopening the same branch focuses it
@@ -792,10 +751,10 @@ export default function App() {
             )
           : [...prev, opened],
       );
-      setRightTab(opened);
+      selectRightTab(opened);
       setPanelOpen(true);
     },
-    [],
+    [selectRightTab],
   );
 
   const updateCodeTab = useCallback(
@@ -811,79 +770,27 @@ export default function App() {
     (tab: CodeTabDef) => {
       const idx = codeTabs.findIndex((item) => sameCodeTab(item, tab));
       if (idx === -1) return;
-      const next = codeTabs.filter((_, index) => index !== idx);
-      setCodeTabs(next);
-      if (
-        typeof rightTab === "object" &&
-        "code" in rightTab &&
-        sameCodeTab(rightTab, tab)
-      )
-        {
-          const fallback =
-            next[Math.min(idx, next.length - 1)] ??
-            (experimentsTabOpen ? "experiments" : undefined) ??
-            (filesTabOpen ? "files" : undefined) ??
-            expTabs[0] ??
-            fileTabs[0] ??
-            planTabs[0] ??
-            subagentTabs[0];
-          if (fallback) setRightTab(fallback);
-          else {
-            setPanelOpen(false);
-            setPanelMax(false);
-          }
-        }
+      setCodeTabs((prev) => prev.filter((_, index) => index !== idx));
+      forgetRightTab(tab, rightTabKey(rightTab) === rightTabKey(tab));
     },
-    [
-      codeTabs,
-      rightTab,
-      experimentsTabOpen,
-      filesTabOpen,
-      expTabs,
-      fileTabs,
-      planTabs,
-      subagentTabs,
-    ],
+    [codeTabs, forgetRightTab, rightTab],
   );
 
   const openWorktreeTab = useCallback(() => {
+    setMainView("chat");
     setFilesTabOpen(true);
-    setRightTab("files");
+    selectRightTab("files");
     setPanelOpen(true);
-  }, []);
+  }, [selectRightTab]);
 
   const closeHomeTab = useCallback(
     (tab: "experiments" | "files" | "artifacts") => {
       if (tab === "experiments") setExperimentsTabOpen(false);
       else if (tab === "files") setFilesTabOpen(false);
       else setArtifactsTabOpen(false);
-      if (rightTab !== tab) return;
-      const fallback =
-        (tab !== "artifacts" && artifactsTabOpen ? "artifacts" : undefined) ??
-        (tab !== "experiments" && experimentsTabOpen ? "experiments" : undefined) ??
-        (tab !== "files" && filesTabOpen ? "files" : undefined) ??
-        expTabs[0] ??
-        fileTabs[0] ??
-        planTabs[0] ??
-        subagentTabs[0] ??
-        codeTabs[0];
-      if (fallback) setRightTab(fallback);
-      else {
-        setPanelOpen(false);
-        setPanelMax(false);
-      }
+      forgetRightTab(tab, rightTab === tab);
     },
-    [
-      rightTab,
-      artifactsTabOpen,
-      experimentsTabOpen,
-      filesTabOpen,
-      expTabs,
-      fileTabs,
-      planTabs,
-      subagentTabs,
-      codeTabs,
-    ],
+    [forgetRightTab, rightTab],
   );
 
   // Drag the panel's left edge to resize; width persists across reloads.
@@ -1047,18 +954,13 @@ export default function App() {
             onShowRail={() => setRailOpen(true)}
             mainView={mainView}
             onSelectMainView={setMainView}
+            experimentsActive={
+              mainView === "chat" && panelOpen && rightTab === "experiments"
+            }
+            filesActive={mainView === "chat" && panelOpen && rightTab === "files"}
             artifactsActive={mainView === "chat" && panelOpen && rightTab === "artifacts"}
+            onOpenExperiments={openExperimentsTab}
             onOpenArtifacts={openArtifactsTab}
-            panelOpen={panelOpen}
-            onTogglePanel={() => {
-              if (panelOpen) {
-                setPanelMax(false);
-              } else {
-                setExperimentsTabOpen(true);
-                setRightTab("experiments");
-              }
-              setPanelOpen(!panelOpen);
-            }}
             onOpenFile={openFileTab}
             onOpenPlan={openPlanTab}
             onOpenSubagent={openSubagentTab}
@@ -1099,8 +1001,8 @@ export default function App() {
                 <ClosableTab
                   active={rightTab === "artifacts"}
                   label="Artifacts"
-                  icon={<FolderOpen size={12} style={{ flexShrink: 0 }} />}
-                  onSelect={() => setRightTab("artifacts")}
+                  icon={<Package size={12} style={{ flexShrink: 0 }} />}
+                  onSelect={() => selectRightTab("artifacts")}
                   onClose={() => closeHomeTab("artifacts")}
                 />
               )}
@@ -1109,7 +1011,7 @@ export default function App() {
                   active={rightTab === "experiments"}
                   label="Experiments"
                   icon={<FlaskConical size={12} style={{ flexShrink: 0 }} />}
-                  onSelect={() => setRightTab("experiments")}
+                  onSelect={() => selectRightTab("experiments")}
                   onClose={() => closeHomeTab("experiments")}
                 />
               )}
@@ -1117,8 +1019,8 @@ export default function App() {
                 <ClosableTab
                   active={rightTab === "files"}
                   label="Files"
-                  icon={<FolderGit2 size={12} style={{ flexShrink: 0 }} />}
-                  onSelect={() => setRightTab("files")}
+                  icon={<FolderOpen size={12} style={{ flexShrink: 0 }} />}
+                  onSelect={() => selectRightTab("files")}
                   onClose={() => closeHomeTab("files")}
                 />
               )}
@@ -1136,7 +1038,7 @@ export default function App() {
                         <Terminal size={12} style={{ flexShrink: 0 }} />
                       )
                     }
-                    onSelect={() => setRightTab(t)}
+                    onSelect={() => selectRightTab(t)}
                     onClose={() => closeExperimentTab(t)}
                   />
                 );
@@ -1147,7 +1049,7 @@ export default function App() {
                   active={fileTab !== null && sameFileTab(fileTab, t)}
                   label={t.path.split("/").pop() || t.path}
                   icon={<FileCode size={12} style={{ flexShrink: 0 }} />}
-                  onSelect={() => setRightTab(t)}
+                  onSelect={() => selectRightTab(t)}
                   onClose={() => closeFileTab(t)}
                 />
               ))}
@@ -1157,7 +1059,7 @@ export default function App() {
                   active={planTab !== null && planTab.promptId === t.promptId}
                   label="Plan"
                   icon={<ScrollText size={12} style={{ flexShrink: 0 }} />}
-                  onSelect={() => setRightTab(t)}
+                  onSelect={() => selectRightTab(t)}
                   onClose={() => closePlanTab(t)}
                 />
               ))}
@@ -1167,7 +1069,7 @@ export default function App() {
                   active={subagentTab !== null && subagentTab.spawnPartId === t.spawnPartId}
                   label="Sub-agent"
                   icon={<Users size={12} style={{ flexShrink: 0 }} />}
-                  onSelect={() => setRightTab(t)}
+                  onSelect={() => selectRightTab(t)}
                   onClose={() => closeSubagentTab(t)}
                 />
               ))}
@@ -1178,8 +1080,8 @@ export default function App() {
                     key={`code:${tab.branch}`}
                     active={codeTab !== null && sameCodeTab(codeTab, tab)}
                     label={experiment?.slug ?? tab.branch}
-                    icon={<FolderTree size={12} style={{ flexShrink: 0 }} />}
-                    onSelect={() => setRightTab(tab)}
+                    icon={<FolderOpen size={12} style={{ flexShrink: 0 }} />}
+                    onSelect={() => selectRightTab(tab)}
                     onClose={() => closeCodeTab(tab)}
                   />
                 );
@@ -1321,15 +1223,6 @@ export default function App() {
                       setSelectedRunId(runId);
                       openExperimentTab(experimentId, "terminal");
                     }}
-                    onOpenChanges={(experimentId) => {
-                      const experiment = experiments.find((item) => item.id === experimentId);
-                      if (experiment)
-                        openCodeTabForExperiment(
-                          experiment.id,
-                          experiment.branchName,
-                          "changes",
-                        );
-                    }}
                     onOpenCode={(experimentId) => {
                       const experiment = experiments.find((item) => item.id === experimentId);
                       if (experiment)
@@ -1342,11 +1235,11 @@ export default function App() {
             </div>
           ) : rightTab === "files" ? (
             <div className="tab-body">
-              {projectId && activeSessionId ? (
+              {activeProject ? (
                 <WorktreeTab
-                  key={`files:${activeSessionId}`}
-                  sessionId={activeSessionId}
-                  projectId={projectId}
+                  key={`files:${activeSessionId ?? `project:${activeProject.id}`}`}
+                  sessionId={activeSessionId ?? undefined}
+                  project={activeProject}
                   view={filesView}
                   toggled={filesToggled}
                   onViewChange={setFilesView}
@@ -1358,7 +1251,7 @@ export default function App() {
                   <div className="code-tab-body">
                     <div className="wt-empty">
                       <FolderGit2 size={22} />
-                      <p>Open a session to browse its current worktree.</p>
+                      <p>Select a project to browse its files.</p>
                     </div>
                   </div>
                 </div>
