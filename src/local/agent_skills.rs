@@ -21,7 +21,7 @@
 //! The two sets share the same public skill *names* so docs and references stay
 //! stable; several modules swap their **body** between a local-mode form
 //! (backend-based launches, logs-only evidence, project artifacts, worktree
-//! git flow) and a full/cloud form (managed-SKU compute, artifacts + query +
+//! git flow) and a full/server form (managed-SKU compute, artifacts + query +
 //! chart, `orx report` upload). The `orx-` prefix on every dir name makes them
 //! unmistakable in an agent's skill listing.
 
@@ -60,7 +60,7 @@ const COMPUTE_K8S: &str = include_str!("../../agent-skills/orx-compute-k8s/SKILL
 const EXPERIMENT_TREE_LOCAL: &str =
     include_str!("../../agent-skills/orx-experiment-tree/SKILL.local.md");
 const EXPERIMENT_TREE_CLOUD: &str = include_str!("../../agent-skills/orx-experiment-tree/SKILL.md");
-const GIT_LOCAL: &str = include_str!("../../agent-skills/orx-git/SKILL.local-only.md");
+const GIT_LOCAL: &str = include_str!("../../agent-skills/orx-git/SKILL.local.md");
 const GIT_CLOUD: &str = include_str!("../../agent-skills/orx-git/SKILL.md");
 const LIT: &str = include_str!("../../agent-skills/orx-lit/SKILL.md");
 const CREATE: &str = include_str!("../../agent-skills/orx-create/SKILL.md");
@@ -352,6 +352,7 @@ mod tests {
                 EXPERIMENT_TREE_LOCAL,
                 EXPERIMENT_TREE_CLOUD,
             ),
+            ("git", GIT_LOCAL, GIT_CLOUD),
             ("compute", COMPUTE_LOCAL, COMPUTE_CLOUD),
             ("reports", REPORTS_LOCAL, REPORTS_CLOUD),
         ];
@@ -416,6 +417,9 @@ mod tests {
         let compute = std::fs::read_to_string(tmp.join(rel).join("orx-compute/SKILL.md")).unwrap();
         assert!(compute.contains("content-addressed"));
         assert!(!compute.contains("git push"));
+        let tree =
+            std::fs::read_to_string(tmp.join(rel).join("orx-experiment-tree/SKILL.md")).unwrap();
+        assert!(!tree.contains("git fetch"));
         assert!(tmp.join(rel).join("orx-compute-k8s").exists());
         let _ = std::fs::remove_dir_all(tmp);
     }

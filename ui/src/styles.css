@@ -795,8 +795,8 @@ textarea::placeholder {
   display: flex;
   align-items: flex-end;
   gap: 0;
-  padding: 5px 6px 0 8px;
-  height: 44px;
+  padding: 4px 6px 0 8px;
+  height: 40px;
   border-bottom: 1px solid var(--border);
   background: var(--canvas);
   flex-shrink: 0;
@@ -818,21 +818,33 @@ textarea::placeholder {
 
 /* Dynamic (closable) tabs: truncated label, inline close "x". */
 .tab.closable {
-  max-width: 176px;
-  padding-right: 4px;
+  max-width: 150px;
+  padding-right: 2px;
 }
 .tab .tab-label {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
   min-width: 0;
+  overflow: hidden;
+}
+.tab .tab-label > span,
+.tab .tab-label::after {
+  grid-area: 1 / 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.tab .tab-label::after {
+  content: attr(data-label);
+  visibility: hidden;
+  font-weight: var(--fw-medium);
 }
 .tab .tab-close {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 16px;
-  height: 16px;
+  width: 14px;
+  height: 14px;
   border-radius: var(--radius-xs);
   color: var(--muted);
   flex-shrink: 0;
@@ -847,14 +859,14 @@ textarea::placeholder {
   position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  height: 36px;
-  padding: 0 12px;
+  gap: 5px;
+  height: 32px;
+  padding: 0 8px;
   border: 1px solid transparent;
   border-bottom: none;
   border-radius: var(--radius-md) var(--radius-md) 0 0;
-  font-size: var(--fs-md);
-  font-weight: var(--fw-medium);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-regular);
   color: var(--subtext);
   white-space: nowrap;
   flex-shrink: 0;
@@ -876,7 +888,7 @@ textarea::placeholder {
   border-color: var(--border);
   background: var(--base);
   color: var(--text);
-  font-weight: var(--fw-semibold);
+  font-weight: var(--fw-medium);
 }
 .tab.active::after {
   content: "";
@@ -912,6 +924,7 @@ textarea::placeholder {
   flex: 1;
   min-height: 0;
   position: relative;
+  background: var(--base);
 }
 
 /* Right-pane plan tab: a plain, padded document surface — the plan is a
@@ -2117,25 +2130,16 @@ textarea::placeholder {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  /* Tight: Changes + Logs + Code + the GitHub icon share one fixed-width row. */
   padding: 3px 6px;
   font-size: var(--fs-xs);
   font-weight: var(--fw-medium);
   color: var(--text);
   border-radius: var(--radius-sm);
-  /* The GitHub shortcut is an <a> among sibling <button>s. */
-  text-decoration: none;
 }
 .exp-node .node-action:hover {
   color: var(--text);
   background: var(--surface);
 }
-/* External GitHub shortcut: icon-only, pinned to the card's far edge. */
-.exp-node .node-action-ext {
-  margin-left: auto;
-  padding: 3px 5px;
-}
-
 /* Current task scope: dashed "…" pill standing in for other tasks' experiments.
  * Clicking it switches the pane back to Entire project scope. */
 .react-flow__node.react-flow__node-elided.selectable {
@@ -3030,6 +3034,9 @@ textarea::placeholder {
   line-height: 1.5;
   text-wrap: balance;
 }
+.experiments-empty-state p {
+  font-size: var(--fs-2xl);
+}
 .empty-state-cta {
   gap: 6px;
 }
@@ -3805,66 +3812,47 @@ a.files-pill:hover {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 10px 8px;
 }
-.ft-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 8px;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-}
-.ft-row:hover {
-  background: var(--surface);
-}
-.ft-row.selected,
-.ft-row.selected:hover {
-  background: var(--panel);
-}
-.ft-chevron {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 14px;
-  height: 14px;
+.file-tree-icon {
+  width: 15px;
+  height: 15px;
   flex-shrink: 0;
   color: var(--muted);
-  transition: transform 0.12s ease;
+  overflow: visible;
 }
-.ft-chevron.open {
-  transform: rotate(90deg);
+.file-tree-icon.markdown {
+  color: var(--accent-blue);
 }
-.ft-chevron.spacer {
-  visibility: hidden;
+.file-tree-icon.image {
+  color: var(--accent-purple);
 }
-.ft-dirname,
-.ft-name {
-  flex: 1;
-  min-width: 0;
-  font-family: var(--mono);
-  font-size: var(--fs-sm);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.file-tree-icon.spreadsheet {
+  color: var(--accent-green);
 }
-.ft-dirname {
-  color: var(--text);
+.file-tree-icon.code {
+  color: var(--accent-orange);
+}
+.file-tree-icon.archive {
+  color: var(--accent-amber);
+}
+.file-tree-icon.pdf {
+  color: var(--accent-red);
+}
+.file-tree-icon.document {
+  color: var(--subtext);
+}
+.artifact-tree-row.selected,
+.artifact-tree-row.selected:hover {
+  background: var(--panel);
 }
 .ft-row-delete {
-  opacity: 0.35;
-}
-.ft-row:hover .ft-row-delete,
-.ft-row-delete:focus-visible {
-  opacity: 1;
-}
-.ft-thumb {
   width: 18px;
   height: 18px;
-  object-fit: cover;
-  border-radius: var(--radius-xs);
-  border: 1px solid var(--border-variant);
-  flex-shrink: 0;
+  opacity: 0.35;
+}
+.artifact-tree-row:hover .ft-row-delete,
+.ft-row-delete:focus-visible {
+  opacity: 1;
 }
 /* The artifacts-directory path — demoted from header pills to a quiet footer. */
 .ftree-footer {
@@ -5352,7 +5340,7 @@ a.files-pill:hover {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 12px;
+  padding: 6px 12px;
   border-bottom: 1px solid var(--border-variant);
   color: var(--text);
   flex-shrink: 0;
@@ -5869,9 +5857,18 @@ a.files-pill:hover {
   align-items: center;
   gap: 8px;
   /* Match .file-view-header so Code ↔ file tab switches don't jump chrome. */
-  padding: 4px 12px;
+  padding: 6px 12px;
   border-bottom: 1px solid var(--border-variant);
   flex-shrink: 0;
+}
+.code-tab-header > .seg {
+  padding: 2px;
+  border-radius: var(--radius-sm);
+}
+.code-tab-header > .seg button {
+  padding: 2px 8px;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
 }
 .code-tab-select {
   max-width: 280px;
@@ -5903,11 +5900,11 @@ a.files-pill:hover {
 .branch-changes > .diff-explorer {
   margin: 14px 16px 0;
 }
-.code-tree {
+.file-tree {
   padding: 6px 0;
   font-size: var(--fs-md);
 }
-.code-tree-row {
+.file-tree-row {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -5921,17 +5918,39 @@ a.files-pill:hover {
   font-family: inherit;
   font-size: inherit;
 }
-.code-tree-row:hover {
+.file-tree-row:hover {
   background: var(--panel);
 }
-.code-tree-row > svg {
+.file-tree-row > svg {
   flex-shrink: 0;
   color: var(--subtext);
 }
-.code-tree-row > svg.code-tree-chev {
+.file-tree-row > svg.file-tree-chevron,
+.file-tree-chevron {
   color: var(--muted);
 }
-.code-tree-name {
+.file-tree-chevron {
+  flex-shrink: 0;
+}
+button.file-tree-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+button.file-tree-chevron > svg {
+  transition: transform 0.12s ease;
+}
+button.file-tree-chevron > svg.open {
+  transform: rotate(90deg);
+}
+.file-tree-name {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

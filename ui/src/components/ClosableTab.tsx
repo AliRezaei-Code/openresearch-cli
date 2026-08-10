@@ -23,7 +23,9 @@ export function ClosableTab({
       title={label}
     >
       {icon}
-      <span className="tab-label">{label}</span>
+      <span className="tab-label" data-label={label}>
+        <span>{label}</span>
+      </span>
       <span
         role="button"
         className="tab-close"

@@ -7,13 +7,13 @@ import {
   CornerDownLeft,
   FileText,
   FlaskConical,
-  FolderGit2,
   FolderOpen,
   GitBranch,
   HelpCircle,
   MoreHorizontal,
   PanelLeft,
   Paperclip,
+  Package,
   Plus,
   SlidersHorizontal,
   Users,
@@ -1215,8 +1215,11 @@ export function ChatPanel({
   onShowRail,
   mainView,
   onSelectMainView,
-  panelOpen,
-  onTogglePanel,
+  experimentsActive,
+  filesActive,
+  artifactsActive,
+  onOpenExperiments,
+  onOpenArtifacts,
   onOpenFile,
   onOpenPlan,
   onOpenSubagent,
@@ -1237,12 +1240,14 @@ export function ChatPanel({
   railOpen: boolean;
   /** Reopen the rail (from the chat header's sidebar icon). */
   onShowRail: () => void;
-  /** What the middle pane shows: chat, artifacts, or a settings section. */
-  mainView: "chat" | "artifacts" | SettingsTab;
-  onSelectMainView: (view: "chat" | "artifacts" | SettingsTab) => void;
-  /** Whether the right panel is showing (toggled from the chat header). */
-  panelOpen: boolean;
-  onTogglePanel: () => void;
+  /** Settings sections replace chat; Artifacts remains a right-panel tool. */
+  mainView: "chat" | SettingsTab;
+  onSelectMainView: (view: "chat" | SettingsTab) => void;
+  experimentsActive: boolean;
+  filesActive: boolean;
+  artifactsActive: boolean;
+  onOpenExperiments: () => void;
+  onOpenArtifacts: () => void;
   /** Open a project file in the right pane (chat tool rows are clickable).
    * `sessionId` is the chat session the click came from, so relative paths
    * can resolve against that session's worktree. */
@@ -1253,7 +1258,7 @@ export function ChatPanel({
    * `sessionId` is the chat session; `spawnPartId` locates the spawn part. */
   onOpenSubagent?: (sessionId: string, spawnPartId: string) => void;
   /** Open the pinned Files home for the active session. */
-  onOpenWorktree?: () => void;
+  onOpenWorktree: () => void;
   /** Replay the onboarding tour (chat header help button). */
   onStartTour?: () => void;
   /** The open chat session, surfaced so the shell can scope panes to it. */
@@ -1261,7 +1266,7 @@ export function ChatPanel({
   /** Database-backed selection used to seed new chat sessions. */
   preferredAgent: ModelSelection | null;
   onPreferredAgentChange: (selection: ModelSelection) => Promise<void>;
-  /** Middle-pane content when a settings section is active (the SettingsView). */
+  /** Middle-pane content when a settings section is active. */
   children?: React.ReactNode;
 }) {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
@@ -1804,8 +1809,7 @@ export function ChatPanel({
     onActiveSessionChange?.(activeId);
   }, [activeId, onActiveSessionChange]);
 
-  // Opening a session — or remounting the thread (leaving a settings view,
-  // history seeding in) — always starts pinned at the latest messages.
+  // Opening a session or returning from settings starts pinned at the latest messages.
   const threadMounted = mainView === "chat" && (messages.length > 0 || busy);
   useLayoutEffect(() => {
     stickToBottom.current = true;
@@ -1967,9 +1971,7 @@ export function ChatPanel({
   // Escape stops the streaming turn and drops focus back into the composer,
   // mirroring the Claude Code desktop app. Harness-agnostic — `stop()` →
   // `interruptChat` interrupts whichever harness (Claude, Codex, OpenCode, …)
-  // is running the active session. Only armed on the chat view while busy, so
-  // it never fires from the settings/artifacts panels that also render inside
-  // ChatPanel.
+  // is running the active session. Only armed while chat is visible.
   //
   // An overlay that should swallow Escape (rather than let it stop the turn)
   // must own the key ahead of this document-level bubble listener, by one of
@@ -2122,20 +2124,34 @@ export function ChatPanel({
   const rail = (
     <aside className="session-rail floating-panel">
       {railHeader}
-      {/* Project-level sections shown in the middle pane. */}
+      {/* Workspace tools open beside chat; settings sections replace the middle pane. */}
       <nav className="rail-nav">
         <button
-          className={`rail-nav-item ${mainView === "artifacts" ? "active" : ""}`}
-          data-onboarding="nav-artifacts"
-          onClick={() => onSelectMainView("artifacts")}
+          className={`rail-nav-item ${experimentsActive ? "active" : ""}`}
+          onClick={onOpenExperiments}
+        >
+          <FlaskConical size={15} />
+          Experiments
+        </button>
+        <button
+          className={`rail-nav-item ${filesActive ? "active" : ""}`}
+          onClick={onOpenWorktree}
         >
           <FolderOpen size={15} />
+          Files
+        </button>
+        <button
+          className={`rail-nav-item ${artifactsActive ? "active" : ""}`}
+          data-onboarding="nav-artifacts"
+          onClick={onOpenArtifacts}
+        >
+          <Package size={15} />
           Artifacts
         </button>
         {SETTINGS_NAV.map((item) => (
           <button
             key={item.id}
-            className={`rail-nav-item ${mainView !== "chat" && mainView !== "artifacts" && item.activeTabs.includes(mainView) ? "active" : ""}`}
+            className={`rail-nav-item ${mainView !== "chat" && item.activeTabs.includes(mainView) ? "active" : ""}`}
             data-onboarding={item.id === "compute" ? "nav-compute" : undefined}
             onClick={() => onSelectMainView(item.id)}
           >
@@ -2217,10 +2233,6 @@ export function ChatPanel({
     </button>
   );
 
-  // A settings section replaces the chat entirely (no chat header, no
-  // composer, no right panel) — only the rail-reopen affordance survives.
-  // The pane spans the leftover width; .settings-view re-applies the readable
-  // column from inside the scroller, same as .chat-thread-inner does for chat.
   if (mainView !== "chat") {
     return (
       <>
@@ -2265,24 +2277,6 @@ export function ChatPanel({
             <HelpCircle size={15} />
           </button>
         )}
-        {onOpenWorktree && activeId && (
-          <button
-            className="icon-btn"
-            data-tip="View current worktree"
-            aria-label="View current worktree"
-            onClick={onOpenWorktree}
-          >
-            <FolderGit2 size={15} />
-          </button>
-        )}
-        <button
-          className={`icon-btn ${panelOpen ? "active" : ""}`}
-          title="Experiments"
-          aria-label="Experiments"
-          onClick={onTogglePanel}
-        >
-          <FlaskConical size={15} />
-        </button>
       </div>
 
       {historyLoading ? (

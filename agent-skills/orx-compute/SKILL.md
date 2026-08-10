@@ -59,10 +59,10 @@ Rules and notes:
 
 ## The default compute target (local projects)
 
-A local-only project always launches on this machine with the `local` backend.
-After GitHub syncing is enabled, local projects can also use remote backends;
-the user may configure a **default compute target** that is machine-wide and
-shared by those projects. When one is set, `orx exp run <expId>` with no
+A local project can launch on this machine or transfer its immutable source
+snapshot directly to a remote backend. The user may configure a **default
+compute target** that is machine-wide and shared by local projects. When one is
+set, `orx exp run <expId>` with no
 `--backend` launches there with the saved default flavor — omitting the flag is
 how you use it (flavor-required backends still need `--flavor` if no default
 flavor is saved). When none is set, ask the user to choose an explicit backend.
@@ -71,8 +71,9 @@ stays their default.
 
 ## Running on Hugging Face Jobs — `--backend hf`
 
-**Managed compute (`--gpu`/`--cpu`/`--sandbox`) is the default. Use
-`--backend hf` ONLY when the user explicitly asks for Hugging Face Jobs**
+**Managed compute (`--gpu`/`--cpu`/`--sandbox`) is the default for server
+projects. `--backend hf` requires a local project (`orx up`); use it ONLY when
+the user explicitly asks for Hugging Face Jobs**
 (e.g. "run this on HF", "use my huggingface account"), it is the configured
 default target, or the project context says to
 prefer it. A connected HF token by itself is NOT a signal to switch — it just
@@ -97,12 +98,9 @@ Rules and notes:
   as managed GPUs.
 - **Set `--timeout` to cover the whole run** (default `4h`). HF kills the job
   at the timeout; a killed job reads as a failed run.
-- The job clones the experiment branch's **GitHub tip** and runs the fixed run
-  command, same contract as managed runs — commit and push first. Private
-  repos work automatically: the platform mints a repo-scoped clone token from
-  the project's connected GitHub app and passes it to the job as a secret.
-  Never ask the user to provision a `GITHUB_TOKEN`; setting one (env or
-  project env var) is only an override for repos outside the connected app.
+- For a local project, `orx` uploads the committed source snapshot into a
+  private job volume before starting the fixed run command. The job never
+  clones a repository and does not need repository credentials.
 - `--image` overrides the container (default: a CUDA pytorch image on GPU
   flavors, `python:3.12` on cpu flavors). Pick an image with your deps baked
   in when pip-install time dominates the run.
@@ -113,10 +111,10 @@ Rules and notes:
 
 ## Running on Modal — `--backend modal`
 
-**Same rule as HF: managed compute is the default. Use `--backend modal` ONLY
-when the user explicitly asks for Modal** ("run this on Modal", "use my Modal
-account") or it is the configured default target. Modal runs on the user's
-own Modal account, billed there per second; no OpenResearch balance is spent.
+**Same rule as HF: `--backend modal` requires a local project. Use it ONLY when
+the user explicitly asks for Modal** ("run this on Modal", "use my Modal
+account") or it is the configured default target. Modal runs on the user's own
+Modal account, billed there per second; no OpenResearch balance is spent.
 It runs the job in a Modal **Sandbox** (an ephemeral container that scales to
 zero when the run ends).
 
@@ -139,9 +137,8 @@ Rules and notes:
   Prefer the smallest flavor that fits.
 - **Set `--timeout` to cover the whole run** (default `4h`). Modal kills the
   sandbox at the timeout; a killed sandbox reads as a failed run.
-- Same clone contract as HF/managed: the sandbox clones the experiment branch's
-  **GitHub tip** and runs the fixed command — commit and push first. Private
-  repos work automatically via the platform's repo-scoped clone token.
+- `orx` copies the committed source snapshot into the sandbox before starting
+  the fixed command; Modal never needs repository access.
 - `--image` overrides the container (default: a CUDA pytorch image on GPU
   flavors, `python:3.12` on cpu). Pick one with your deps baked in when
   pip-install time dominates.
@@ -151,9 +148,10 @@ Rules and notes:
 
 ## Running on your Kubernetes cluster — `--backend k8s`
 
-Runs the experiment on your own Kubernetes cluster from a manifest committed on
-the experiment branch. The full manifest contract lives in the `orx-compute-k8s`
-skill — fetch it (`orx skill compute-k8s`) before your first k8s launch.
+Requires a local project (`orx up`). Runs the experiment on your own Kubernetes
+cluster from a manifest committed on the experiment branch. The full manifest
+contract lives in the `orx-compute-k8s` skill — fetch it (`orx skill compute-k8s`)
+before your first k8s launch.
 
 ## Running on your own box — `--backend ssh`
 
@@ -171,11 +169,11 @@ orx exp run <expId> --backend ssh --host my-gpu-box     # ~/.ssh/config alias
 Rules and notes:
 - **`--host` is the ssh host alias** (from `~/.ssh/config`) — a machine, not a
   hardware shape, so there is no `--flavor` here. Use one of the user's
-  configured aliases; OpenResearch validates reachability and git separately.
+  configured aliases; OpenResearch validates reachability and required tools.
 - Auth is your ssh keys/agent — orx never reads a key, it just shells out to
-  `ssh <alias>`. The host needs `git` and `bash`; it clones the experiment
-  branch's GitHub tip (private repos via the `GITHUB_TOKEN` passed in the run's
-  env) and runs the fixed command. Commit and push first, same as the others.
+  `ssh <alias>`. The host needs `bash` and `tar`; orx streams the committed
+  source snapshot over SSH, extracts it into the run directory, and starts the
+  fixed command.
 - No `--image` (the host's environment is used as-is) and no `--timeout` (the
   process runs until it exits or you cancel).
 - The run lives under `~/.orx/runs/<runId>/` on the host (`run.sh`, `log`,
@@ -204,9 +202,9 @@ Rules and notes:
   environment (modules, conda, whatever the login profile provides).
 - `--timeout` (default `4h`) applies — size it to cover the whole run; a job
   killed at the timeout reads as a failed run.
-- Same clone contract as every backend: the job clones the experiment branch's
-  GitHub tip and runs the fixed command — commit and push first. Everything
-  downstream (`orx exp wait` / `orx runs` / `orx logs` / `orx exp cancel`) is
+- `orx` streams the committed source snapshot to the login node before `sbatch`
+  starts the fixed command. Everything downstream (`orx exp wait` / `orx runs`
+  / `orx logs` / `orx exp cancel`) is
   identical; a detached `orx supervise` mirrors status and logs — don't kill it.
 
 ## Running on a Ray Jobs cluster — `--backend ray`
@@ -233,7 +231,8 @@ Rules and notes:
   that avoids Pending on small heads.
 - No `--image`, `--host`, or `--timeout` — the job runs in the cluster's
   runtime env until it finishes; size and bound work in the run command itself.
-- Same clone contract and downstream commands as every backend; a detached
+- Ray receives the committed snapshot as its `working_dir` package; downstream
+  commands stay the same, and a detached
   `orx supervise` mirrors status and logs — don't kill it.
 
 ## Running on an OpenResearch box — `--backend openresearch`
@@ -258,7 +257,8 @@ Rules and notes:
   `--provider <P>`. No `--image` — the platform's image is fixed.
 - `--timeout` (default `4h`) applies — the box is deleted when the run ends
   either way, so nothing persists on it; everything you need must be in the log.
-- Same clone contract and downstream commands as every backend; a detached
+- `orx` streams the committed source snapshot to the provisioned box;
+  downstream commands stay the same, and a detached
   `orx supervise` mirrors status and logs — don't kill it.
 
 ## Running on this machine — `--backend local`
@@ -279,9 +279,8 @@ Rules and notes:
   this machine has; prefer it for small or CPU-scale runs and use a remote
   backend for anything heavy — it shares CPU/RAM/GPU with everything else on
   the machine.
-- Same clone contract as every backend: the run clones the experiment
-  branch's GitHub tip into its own run dir (never your checkout) and runs the
-  fixed command — commit and push first. Never run training directly in your
+- The run extracts the committed source snapshot into its own run dir (never
+  your checkout) and runs the fixed command. Never run training directly in your
   shell instead: that would be unsupervised and untracked by OpenResearch.
 - The run lives under `<orx data dir>/local-runs/<runId>/` (`run.sh`, `log`,
   `pid`, `exit_code`). Cancellation through OpenResearch or `orx exp cancel` TERMs the

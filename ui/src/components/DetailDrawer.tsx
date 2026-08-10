@@ -46,7 +46,6 @@ export function DetailDrawer({
         parentExperiment={parentExperiment}
         runs={expRuns}
         onOpenLogs={(runId) => onOpenView("terminal", runId)}
-        onOpenChanges={() => onOpenCode("changes")}
         onOpenCode={() => onOpenCode("files")}
       />
     );
