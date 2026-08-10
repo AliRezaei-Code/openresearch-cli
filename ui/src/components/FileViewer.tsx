@@ -4,7 +4,7 @@
 // refractor-highlighted, opened as a right-pane tab from chat tool rows or
 // the code browser.
 
-import { Code, FileText, RotateCw } from "lucide-react";
+import { Code, FileText, FlaskConical, GitBranch, RotateCw } from "lucide-react";
 import { useEffect, useState } from "react";
 import { artifactUrl, getArtifactFileText, getProjectFile, type ProjectFile } from "../api";
 import { CodeView } from "./CodeView";
@@ -17,6 +17,8 @@ export function FileViewer({
   source = "repo",
   sessionId,
   gitRef,
+  line,
+  sourceLabel,
   onOpenFile,
 }: {
   projectId: string;
@@ -30,6 +32,12 @@ export function FileViewer({
   /** Branch whose committed copy to show — overrides the live checkout.
    * (Named gitRef because `ref` is reserved on React components.) */
   gitRef?: string;
+  /** 1-based line to scroll to and highlight once the source renders. */
+  line?: number;
+  /** Where this code came from — an experiment title, or "baseline" — shown in
+   * the header so a code tab always says its source. When set it replaces the
+   * raw branch pill. */
+  sourceLabel?: string;
   /** Open a linked file as another tab (rendered-markdown links). */
   onOpenFile?: (path: string, sessionId?: string, ref?: string) => void;
 }) {
@@ -116,10 +124,24 @@ export function FileViewer({
         <code className="file-view-path" title={path}>
           {path}
         </code>
-        {gitRef && (
-          <code className="file-view-ref" title={`Committed state of ${gitRef}`}>
-            {gitRef}
-          </code>
+        {sourceLabel ? (
+          <span
+            className={`file-view-exp${sourceLabel === "baseline" ? " is-baseline" : ""}`}
+            title={
+              (sourceLabel === "baseline"
+                ? "Baseline code"
+                : `From experiment "${sourceLabel}"`) + (gitRef ? ` (${gitRef})` : "")
+            }
+          >
+            {sourceLabel === "baseline" ? <GitBranch size={11} /> : <FlaskConical size={11} />}
+            {sourceLabel}
+          </span>
+        ) : (
+          gitRef && (
+            <code className="file-view-ref" title={`Committed state of ${gitRef}`}>
+              {gitRef}
+            </code>
+          )
         )}
         {isMarkdown && (
           <button
@@ -189,7 +211,7 @@ export function FileViewer({
                 )}
               </div>
             ) : (
-              <CodeView text={data.content} path={path} />
+              <CodeView text={data.content} path={path} highlightLine={line} />
             )}
             {!artifactsMode && data.truncated && (
               <div className="file-view-note">File truncated — showing the first 512 KB.</div>

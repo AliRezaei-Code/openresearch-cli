@@ -1,8 +1,10 @@
-// Chat markdown with file mentions, mirroring openresearch.sh's
+// Chat markdown with evidence mentions, mirroring openresearch.sh's
 // MarkdownContent: `<file path="..." lines="20-40"/>` tags (and plain relative
-// links) render as chips that open the file as a right-pane tab.
+// links) render as chips that open the file as a right-pane tab, and
+// `<run id="..."/>` tags render as chips that open a run's logs — so the agent
+// can cite the code and the run behind a claim.
 
-import { Check, Copy, FileCode } from "lucide-react";
+import { Check, Copy, FileCode, ScrollText } from "lucide-react";
 import { memo, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
@@ -54,17 +56,21 @@ function parseTagAttrs(attrs: string): Record<string, string> {
   return out;
 }
 
-/** Split raw-html text around `<file .../>` tags into text + custom nodes. */
-function parseFileMentionHtml(value: string): MdastNode[] | null {
-  const regex = /<file\b([^>]*?)\/?>/gi;
+/** Split raw-html text around `<file .../>` and `<run .../>` tags into text +
+ * custom nodes. A `<file>` needs a `path`; a `<run>` needs an `id` — a tag
+ * missing its required attribute is almost certainly not ours, so leave it as
+ * text. */
+function parseMentionHtml(value: string): MdastNode[] | null {
+  const regex = /<(file|run)\b([^>]*?)\/?>/gi;
   const nodes: MdastNode[] = [];
   let lastIndex = 0;
   let matched = false;
 
   for (const match of value.matchAll(regex)) {
-    const attrs = parseTagAttrs(match[1] ?? "");
-    // A tag with no path is almost certainly not ours — leave it as text.
-    if (!attrs["path"]) continue;
+    const tag = (match[1] ?? "").toLowerCase();
+    const attrs = parseTagAttrs(match[2] ?? "");
+    const required = tag === "run" ? "id" : "path";
+    if (!attrs[required]) continue;
 
     matched = true;
     if (match.index > lastIndex) {
@@ -72,8 +78,8 @@ function parseFileMentionHtml(value: string): MdastNode[] | null {
     }
     nodes.push({
       children: [],
-      data: { hName: "file-mention", hProperties: attrs },
-      type: "fileMention",
+      data: { hName: tag === "run" ? "run-mention" : "file-mention", hProperties: attrs },
+      type: tag === "run" ? "runMention" : "fileMention",
     });
     lastIndex = match.index + match[0].length;
   }
@@ -85,36 +91,39 @@ function parseFileMentionHtml(value: string): MdastNode[] | null {
   return nodes;
 }
 
-function replaceFileMentions(parent: MdastNode) {
+function replaceMentions(parent: MdastNode) {
   const children = parent.children;
   if (!children) return;
   for (let i = 0; i < children.length; i += 1) {
     const child = children[i];
     if (!child) continue;
     if (child.type === "html" && typeof child.value === "string") {
-      const replacement = parseFileMentionHtml(child.value);
+      const replacement = parseMentionHtml(child.value);
       if (replacement) {
         children.splice(i, 1, ...replacement);
         i += replacement.length - 1;
         continue;
       }
     }
-    replaceFileMentions(child);
+    replaceMentions(child);
   }
 }
 
-function remarkFileMentions() {
-  return (tree: MdastNode) => replaceFileMentions(tree);
+function remarkMentions() {
+  return (tree: MdastNode) => replaceMentions(tree);
 }
 
 function FileChip({
   path,
   lines,
+  exp,
   onOpenFile,
 }: {
   path: string;
   lines?: string;
-  onOpenFile?: (path: string) => void;
+  /** Experiment id this file was cited from, if any (`<file exp=…>`). */
+  exp?: string;
+  onOpenFile?: (path: string, line?: number, exp?: string) => void;
 }) {
   const name = path.split("/").pop() || path;
   // `lines` may be a single line or a range ("20-40"); show the first.
@@ -124,11 +133,36 @@ function FileChip({
     <button
       className="file-chip"
       title={`Open ${path}`}
-      onClick={() => onOpenFile?.(path)}
+      onClick={() => onOpenFile?.(path, line, exp)}
       disabled={!onOpenFile}
     >
       <FileCode size={12} />
       <span className="file-chip-label">{label}</span>
+    </button>
+  );
+}
+
+/** A `<run id="..."/>` evidence mention: a chip that opens the run's logs (the
+ * only evidence channel for a metric). `label` overrides the default text so a
+ * claim can read "…, not significant [+3.65pp]" rather than a bare run id. */
+function RunChip({
+  id,
+  label,
+  onOpenRun,
+}: {
+  id: string;
+  label?: string;
+  onOpenRun?: (runId: string) => void;
+}) {
+  return (
+    <button
+      className="file-chip run-chip"
+      title={`Open logs for run ${id}`}
+      onClick={() => onOpenRun?.(id)}
+      disabled={!onOpenRun}
+    >
+      <ScrollText size={12} />
+      <span className="file-chip-label">{label || "logs"}</span>
     </button>
   );
 }
@@ -199,13 +233,18 @@ export const mdCodeComponents: Record<string, (props: any) => ReactNode> = {
 export const Md = memo(function Md({
   text,
   onOpenFile,
+  onOpenRun,
 }: {
   text: string;
-  onOpenFile?: (path: string) => void;
+  onOpenFile?: (path: string, line?: number, exp?: string) => void;
+  onOpenRun?: (runId: string) => void;
 }) {
   const components: Record<string, (props: any) => ReactNode> = {
     "file-mention": (props) => (
-      <FileChip path={props.path} lines={props.lines} onOpenFile={onOpenFile} />
+      <FileChip path={props.path} lines={props.lines} exp={props.exp} onOpenFile={onOpenFile} />
+    ),
+    "run-mention": (props) => (
+      <RunChip id={props.id} label={props.label} onOpenRun={onOpenRun} />
     ),
     a: ({ node: _node, href, children, ...rest }) => {
       // Agents sometimes link files as plain markdown links; open those as
@@ -225,7 +264,7 @@ export const Md = memo(function Md({
   return (
     <div className="md">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, [remarkMath, remarkMathOptions], remarkFileMentions]}
+        remarkPlugins={[remarkGfm, [remarkMath, remarkMathOptions], remarkMentions]}
         rehypePlugins={[rehypeKatex]}
         components={components as any}
       >
