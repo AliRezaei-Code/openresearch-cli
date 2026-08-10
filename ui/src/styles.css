@@ -1783,16 +1783,13 @@ textarea::placeholder {
   justify-content: center;
   width: 30px;
   height: 30px;
-  border-radius: var(--radius-md);
-  color: var(--muted);
+  border-radius: var(--radius-sm);
+  color: var(--text);
   cursor: pointer;
-  transition:
-    background 100ms ease,
-    color 100ms ease;
+  transition: background 150ms ease;
 }
 .composer-attach:hover {
   background: var(--surface);
-  color: var(--text);
 }
 .composer-actions {
   display: flex;
@@ -4553,10 +4550,7 @@ a.files-pill:hover {
   font-size: var(--fs-md);
   font-weight: var(--fw-semibold);
 }
-/* Literature-sources popover (composer footer): source logo + name toggle rows. */
-.lit-sources-menu {
-  min-width: 210px;
-}
+/* Literature-source toggle rows: source logo + name. */
 .lit-source-item-label {
   display: inline-flex;
   align-items: center;
@@ -5078,10 +5072,11 @@ a.files-pill:hover {
   color: var(--text);
   padding: 5px 8px;
   border-radius: var(--radius-sm);
+  white-space: nowrap;
+  transition: background 150ms ease;
 }
 .composer-pill:hover {
   background: var(--surface);
-  color: var(--text);
 }
 /* Text-only composer control (reasoning level) — sits beside the model label. */
 .composer-bare {
@@ -5092,9 +5087,10 @@ a.files-pill:hover {
   color: var(--text);
   padding: 5px 4px;
   border-radius: var(--radius-sm);
+  transition: background 150ms ease;
 }
 .composer-bare:hover {
-  color: var(--text);
+  background: var(--surface);
 }
 .model-menu,
 .option-menu {
@@ -5117,6 +5113,70 @@ a.files-pill:hover {
 .option-menu {
   min-width: 190px;
   padding: 6px;
+}
+/* Consolidated chat-settings panel (opened by the composer switch icon): one
+   labeled row per control. Must not clip its children — the nested pickers open
+   as right-side flyouts that extend beyond the panel. */
+.composer-settings-menu {
+  min-width: 220px;
+  gap: 2px;
+  overflow: visible;
+}
+.composer-setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 3px 6px;
+  border-radius: var(--radius-sm);
+}
+.composer-setting-row:hover {
+  background: var(--surface);
+}
+.composer-setting-label {
+  font-size: var(--fs-md);
+  color: var(--muted);
+}
+/* Sources: toggles shown inline (no extra click) under a label, separated from
+   the single-line rows above. */
+.composer-setting-block {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 4px;
+  padding: 6px 6px 2px;
+  border-top: 1px solid var(--border);
+}
+.lit-sources-list {
+  display: flex;
+  flex-direction: column;
+}
+.lit-source-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 6px;
+  border-radius: var(--radius-sm);
+  transition: background 150ms ease;
+}
+.lit-source-row:hover:not(:disabled) {
+  background: var(--surface);
+}
+/* Equal side padding on every trigger so their chevrons line up in a column
+   regardless of pill vs bare variant. */
+.composer-settings-menu .composer-pill,
+.composer-settings-menu .composer-bare {
+  padding: 5px 6px;
+}
+/* Nested pickers open beside the panel, growing upward from the row, so they
+   never overlap the panel's own rows. */
+.composer-settings-menu .model-menu,
+.composer-settings-menu .option-menu {
+  bottom: 0;
+  top: auto;
+  left: calc(100% + 8px);
+  right: auto;
 }
 /* Context-window meter: ring trigger + title/value head over a thin bar. */
 .composer-bare.context-ring {
@@ -5149,7 +5209,6 @@ a.files-pill:hover {
   background: var(--border);
 }
 /* Right-anchored menus (bottom-right controls) open toward the left edge. */
-.model-menu.align-right,
 .option-menu.align-right {
   left: auto;
   right: 0;

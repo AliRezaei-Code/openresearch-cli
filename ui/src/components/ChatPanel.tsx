@@ -16,6 +16,7 @@ import {
   Package,
   Plus,
   SlidersHorizontal,
+  ToggleRight,
   Users,
   X,
 } from "lucide-react";
@@ -59,7 +60,7 @@ import {
 } from "../api";
 import { onChatEvent } from "../events";
 import { LitSourceLogo, parseOrxLit, paperUrl } from "./LitSourceLogo";
-import { LitSourcesPicker } from "./LitSourcesPicker";
+import { LitSourcesList } from "./LitSourcesPicker";
 import { Md } from "./Md";
 import { PlanStrip } from "./PlanStrip";
 import { SETTINGS_NAV, type SettingsTab } from "./SettingsPage";
@@ -1330,6 +1331,9 @@ export function ChatPanel({
   const threadInnerRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  // Consolidated chat-settings popover (mode/model/reasoning/sources), opened
+  // by the switch icon in the composer footer.
+  const chatSettings = usePopover();
 
   // Slash-skills: menu state is derived from the draft — open while the first
   // token is an unfinished `/command` (no whitespace yet) with matches.
@@ -2591,19 +2595,66 @@ export function ChatPanel({
             />
           </div>
           <div className="composer-actions">
-            {/* Bottom-left: permission mode + literature sources. */}
-            <OptionPicker
-              choices={activeHarness?.agentReady ? (opts?.permissionModes ?? []) : []}
-              value={composerSelection?.permissionMode ?? null}
-              defaultId={opts?.defaultPermissionMode ?? null}
-              header="Mode"
-              align="left"
-              variant="pill"
-              numbered
-              title="Permission mode for this chat"
-              onSelect={setPermissionMode}
-            />
-            <LitSourcesPicker />
+            {/* The model picker reflects the open session (harness locked once
+                it exists); the global default only applies before the first
+                message. */}
+            <div className="option-picker" ref={chatSettings.ref}>
+              <button
+                type="button"
+                className="composer-bare"
+                title="Chat settings"
+                aria-label="Chat settings"
+                aria-haspopup="dialog"
+                aria-expanded={chatSettings.open}
+                onClick={() => chatSettings.setOpen((v) => !v)}
+              >
+                <ToggleRight size={16} />
+              </button>
+              {chatSettings.open && (
+                <div className="option-menu composer-settings-menu">
+                  <div className="composer-setting-row">
+                    <span className="composer-setting-label">Mode</span>
+                    <OptionPicker
+                      choices={activeHarness?.agentReady ? (opts?.permissionModes ?? []) : []}
+                      value={composerSelection?.permissionMode ?? null}
+                      defaultId={opts?.defaultPermissionMode ?? null}
+                      header="Mode"
+                      align="left"
+                      variant="pill"
+                      numbered
+                      title="Permission mode for this chat"
+                      onSelect={setPermissionMode}
+                    />
+                  </div>
+                  <div className="composer-setting-row">
+                    <span className="composer-setting-label">Model</span>
+                    <ModelPicker
+                      value={composerSelection}
+                      onSelect={selectModel}
+                      onHarnesses={setHarnesses}
+                      lockHarness={!!openSession}
+                    />
+                  </div>
+                  <div className="composer-setting-row">
+                    <span className="composer-setting-label">Reasoning</span>
+                    <OptionPicker
+                      choices={activeHarness?.agentReady ? reasoning.choices : []}
+                      value={composerSelection?.reasoningLevel ?? null}
+                      defaultId={reasoning.defaultId}
+                      header="Reasoning"
+                      align="left"
+                      variant="bare"
+                      title="Reasoning level for this chat — Default sends no override, so the harness CLI's own configured effort applies"
+                      onSelect={setReasoningLevel}
+                    />
+                  </div>
+                  <div className="composer-setting-block">
+                    <span className="composer-setting-label">Sources</span>
+                    <LitSourcesList />
+                  </div>
+                </div>
+              )}
+            </div>
             <input
               ref={fileInputRef}
               type="file"
@@ -2625,25 +2676,6 @@ export function ChatPanel({
               <Paperclip size={16} />
             </button>
             <div style={{ flex: 1 }} />
-            {/* Bottom-right: model, reasoning level, then context meter. The
-                picker reflects the open session (harness locked once it exists);
-                the global default only applies before the first message. */}
-            <ModelPicker
-              value={composerSelection}
-              onSelect={selectModel}
-              onHarnesses={setHarnesses}
-              lockHarness={!!openSession}
-            />
-            <OptionPicker
-              choices={activeHarness?.agentReady ? reasoning.choices : []}
-              value={composerSelection?.reasoningLevel ?? null}
-              defaultId={reasoning.defaultId}
-              header="Reasoning"
-              align="right"
-              variant="bare"
-              title="Reasoning level for this chat — Default sends no override, so the harness CLI's own configured effort applies"
-              onSelect={setReasoningLevel}
-            />
             <ContextMeter usage={openSession?.contextUsage} />
             {busy && !pendingQuestion ? (
               // Stop whenever the turn is busy and typed text has nowhere to

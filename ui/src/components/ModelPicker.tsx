@@ -179,7 +179,7 @@ export function ModelPicker({
         <ChevronDown size={12} />
       </button>
       {open && (
-        <div className="model-menu align-right">
+        <div className="model-menu">
           <input
             autoFocus
             type="text"
