@@ -1913,6 +1913,12 @@ textarea::placeholder {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Run-evidence chips share the file-chip shape but tint their icon so a "logs"
+ * citation reads distinctly from a source-file link. */
+.md .run-chip svg {
+  opacity: 1;
+  color: var(--primary);
+}
 .md pre code {
   background: none;
   border: none;
@@ -5364,21 +5370,28 @@ a.files-pill:hover {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* Branch badge on committed-state file views (code browser in branch mode) —
-   a plain source label, not a BranchPill: the header shouldn't grow a second
-   navigation affordance next to the path. */
-.file-view-ref {
+/* Git-branch pill in the file header — names the branch a code tab's contents
+   came from (an experiment branch, or the baseline). Monospace + muted like the
+   old ref pill, icon-led. */
+.file-view-branch {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
   font-family: var(--mono);
   font-size: var(--fs-xs);
   color: var(--muted);
   border: 1px solid var(--border-variant);
   border-radius: var(--radius-sm);
   padding: 1px 6px;
-  max-width: 180px;
+  max-width: 260px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   flex-shrink: 0;
+}
+.file-view-branch svg {
+  flex: none;
 }
 .file-view-body {
   flex: 1;
@@ -5392,6 +5405,17 @@ a.files-pill:hover {
   display: flex;
   align-items: flex-start;
   min-width: max-content;
+  position: relative;
+}
+/* Full-width band behind a `file:line` chip's target row. Translucent so the
+   code and gutter number read through; spans the whole scroll width. */
+.file-view-line-highlight {
+  position: absolute;
+  left: 0;
+  right: 0;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--primary) 16%, transparent);
+  box-shadow: inset 2px 0 0 var(--primary);
 }
 /* Identical font metrics + vertical padding are the 1:1 row-alignment
    invariant — one rule so they can't drift apart. */

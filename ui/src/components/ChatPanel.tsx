@@ -434,7 +434,7 @@ function PromptCard({
 }: {
   part: ChatPart;
   onRespond?: (answer: PromptAnswer) => void;
-  onOpenFile?: (path: string) => void;
+  onOpenFile?: (path: string, line?: number, exp?: string) => void;
   onOpenPlan?: (plan: string, promptId: string) => void;
 }) {
   const p = part.prompt as ChatPrompt;
@@ -679,13 +679,15 @@ function attachmentPartView(p: ChatPart): { src: string; isPdf: boolean; name: s
 const Message = memo(function Message({
   message,
   onOpenFile,
+  onOpenRun,
   onRespond,
   onOpenPlan,
   onOpenSubagent,
   skills,
 }: {
   message: ChatMessage;
-  onOpenFile?: (path: string) => void;
+  onOpenFile?: (path: string, line?: number, exp?: string) => void;
+  onOpenRun?: (runId: string) => void;
   onRespond?: (answer: PromptAnswer) => void;
   /** Open a plan's full markdown in the right pane (plan cards/strip). */
   onOpenPlan?: (plan: string, promptId: string) => void;
@@ -743,7 +745,7 @@ const Message = memo(function Message({
   }
   return (
     <div className="msg-assistant">
-      {renderParts(message.parts, { onOpenFile, onRespond, onOpenPlan, onOpenSubagent })}
+      {renderParts(message.parts, { onOpenFile, onOpenRun, onRespond, onOpenPlan, onOpenSubagent })}
     </div>
   );
 });
@@ -756,13 +758,14 @@ const Message = memo(function Message({
 function renderParts(
   parts: ChatPart[],
   opts: {
-    onOpenFile?: (path: string) => void;
+    onOpenFile?: (path: string, line?: number, exp?: string) => void;
+    onOpenRun?: (runId: string) => void;
     onRespond?: (answer: PromptAnswer) => void;
     onOpenPlan?: (plan: string, promptId: string) => void;
     onOpenSubagent?: (spawnPartId: string) => void;
   },
 ): React.ReactNode[] {
-  const { onOpenFile, onRespond, onOpenPlan, onOpenSubagent } = opts;
+  const { onOpenFile, onOpenRun, onRespond, onOpenPlan, onOpenSubagent } = opts;
   const rendered: React.ReactNode[] = [];
   let toolRun: ChatPart[] = [];
   const flushTools = () => {
@@ -798,7 +801,9 @@ function renderParts(
     // The visibility skip above guarantees text/reasoning parts here are
     // non-empty.
     if (part.type === "text")
-      rendered.push(<Md key={part.id} text={part.text!} onOpenFile={onOpenFile} />);
+      rendered.push(
+        <Md key={part.id} text={part.text!} onOpenFile={onOpenFile} onOpenRun={onOpenRun} />,
+      );
     else if (part.type === "reasoning")
       rendered.push(
         <details key={part.id} className="reasoning">
@@ -838,17 +843,19 @@ export function findPartById(parts: ChatPart[], id: string): ChatPart | null {
 export function SubagentTranscript({
   spawn,
   onOpenFile,
+  onOpenRun,
   onOpenSubagent,
 }: {
   spawn: ChatPart;
-  onOpenFile?: (path: string) => void;
+  onOpenFile?: (path: string, line?: number, exp?: string) => void;
+  onOpenRun?: (runId: string) => void;
   onOpenSubagent?: (spawnPartId: string) => void;
 }) {
   const parts = spawn.children ?? [];
   const running = spawn.state?.status === "running";
   // Gate the empty state on what actually renders, not the raw part count — a
   // stored transcript of nothing but invisible parts must still read as empty.
-  const rendered = renderParts(parts, { onOpenFile, onOpenSubagent });
+  const rendered = renderParts(parts, { onOpenFile, onOpenRun, onOpenSubagent });
   return (
     <div className="msg-assistant">
       <div className="subagent-tab-header">
@@ -902,13 +909,15 @@ function SubagentBlock({
 const Transcript = memo(function Transcript({
   messages,
   onOpenFile,
+  onOpenRun,
   onRespond,
   onOpenPlan,
   onOpenSubagent,
   skills,
 }: {
   messages: ChatMessage[];
-  onOpenFile?: (path: string) => void;
+  onOpenFile?: (path: string, line?: number, exp?: string) => void;
+  onOpenRun?: (runId: string) => void;
   onRespond?: (answer: PromptAnswer) => void;
   onOpenPlan?: (plan: string, promptId: string) => void;
   onOpenSubagent?: (spawnPartId: string) => void;
@@ -921,6 +930,7 @@ const Transcript = memo(function Transcript({
           key={m.id}
           message={m}
           onOpenFile={onOpenFile}
+          onOpenRun={onOpenRun}
           onRespond={onRespond}
           onOpenPlan={onOpenPlan}
           onOpenSubagent={onOpenSubagent}
@@ -1221,6 +1231,7 @@ export function ChatPanel({
   onOpenExperiments,
   onOpenArtifacts,
   onOpenFile,
+  onOpenRun,
   onOpenPlan,
   onOpenSubagent,
   onOpenWorktree,
@@ -1251,7 +1262,10 @@ export function ChatPanel({
   /** Open a project file in the right pane (chat tool rows are clickable).
    * `sessionId` is the chat session the click came from, so relative paths
    * can resolve against that session's worktree. */
-  onOpenFile?: (path: string, sessionId?: string) => void;
+  onOpenFile?: (path: string, sessionId?: string, line?: number, exp?: string) => void;
+  /** Open a run's logs in the right pane (agent-emitted `<run>` evidence chips).
+   * Run ids are globally unique, so no session context is needed. */
+  onOpenRun?: (runId: string) => void;
   /** Open a plan's markdown as a right-pane tab (plan strip / plan cards). */
   onOpenPlan?: (plan: string, sessionId: string, promptId: string) => void;
   /** Open a sub-agent's transcript as a right-pane tab (spawn-row "view").
@@ -1796,7 +1810,10 @@ export function ChatPanel({
   // File opens resolve against the active session's worktree — the agent runs
   // there, so that's where its paths point.
   const openFileInSession = useMemo(
-    () => onOpenFile && ((path: string) => onOpenFile(path, activeId ?? undefined)),
+    () =>
+      onOpenFile &&
+      ((path: string, line?: number, exp?: string) =>
+        onOpenFile(path, activeId ?? undefined, line, exp)),
     [onOpenFile, activeId],
   );
 
@@ -2368,6 +2385,7 @@ export function ChatPanel({
             <Transcript
               messages={messages}
               onOpenFile={openFileInSession}
+              onOpenRun={onOpenRun}
               onRespond={respond}
               onOpenPlan={openPlan}
               onOpenSubagent={openSubagent}

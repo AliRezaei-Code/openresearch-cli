@@ -4,7 +4,7 @@
 // refractor-highlighted, opened as a right-pane tab from chat tool rows or
 // the code browser.
 
-import { Code, FileText, RotateCw } from "lucide-react";
+import { Code, FileText, GitBranch, RotateCw } from "lucide-react";
 import { useEffect, useState } from "react";
 import { artifactUrl, getArtifactFileText, getProjectFile, type ProjectFile } from "../api";
 import { CodeView } from "./CodeView";
@@ -17,6 +17,8 @@ export function FileViewer({
   source = "repo",
   sessionId,
   gitRef,
+  line,
+  branchLabel,
   onOpenFile,
 }: {
   projectId: string;
@@ -30,6 +32,11 @@ export function FileViewer({
   /** Branch whose committed copy to show — overrides the live checkout.
    * (Named gitRef because `ref` is reserved on React components.) */
   gitRef?: string;
+  /** 1-based line to scroll to and highlight once the source renders. */
+  line?: number;
+  /** The git branch this file's contents came from (experiment branch, or the
+   * baseline) — shown in the header so a code tab always names its branch. */
+  branchLabel?: string;
   /** Open a linked file as another tab (rendered-markdown links). */
   onOpenFile?: (path: string, sessionId?: string, ref?: string) => void;
 }) {
@@ -116,10 +123,11 @@ export function FileViewer({
         <code className="file-view-path" title={path}>
           {path}
         </code>
-        {gitRef && (
-          <code className="file-view-ref" title={`Committed state of ${gitRef}`}>
-            {gitRef}
-          </code>
+        {branchLabel && (
+          <span className="file-view-branch" title={`Branch: ${branchLabel}`}>
+            <GitBranch size={11} />
+            {branchLabel}
+          </span>
         )}
         {isMarkdown && (
           <button
@@ -189,7 +197,7 @@ export function FileViewer({
                 )}
               </div>
             ) : (
-              <CodeView text={data.content} path={path} />
+              <CodeView text={data.content} path={path} highlightLine={line} />
             )}
             {!artifactsMode && data.truncated && (
               <div className="file-view-note">File truncated — showing the first 512 KB.</div>

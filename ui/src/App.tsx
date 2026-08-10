@@ -76,6 +76,10 @@ interface FileViewDef {
   /** Branch whose committed copy to show (code browser in branch mode);
    * overrides the live checkout. */
   ref?: string;
+  /** 1-based line to scroll to and highlight on open (from a `file:line`
+   * evidence chip). Not part of tab identity — reopening at a new line updates
+   * the same tab. */
+  line?: number;
 }
 
 const sameFileTab = (a: FileViewDef, b: FileViewDef) =>
@@ -267,6 +271,15 @@ function parseFilePath(
   return path ? { path, sessionId } : null;
 }
 
+/** The git branch a code file tab is showing, for the header pill — a cited
+ * experiment's branch (or any ref view) names that branch, and a worktree/clone
+ * file falls back to the baseline branch, so a code tab always says which
+ * branch its contents came from. Artifacts have no branch. */
+function fileBranchLabel(tab: FileViewDef, baselineBranch?: string): string | undefined {
+  if (tab.source === "artifacts") return undefined;
+  return tab.ref ?? baselineBranch;
+}
+
 const PANEL_WIDTH_KEY = "orx:panel-width";
 const EXPERIMENTS_VIEW_KEY = "orx:experiments-view";
 
@@ -325,6 +338,13 @@ export default function App() {
   const [projectId, setProjectId] = useState<string | null>(null);
   const [experiments, setExperiments] = useState<Experiment[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
+  // Latest runs/experiments, read by the stable openRunLogs/openFileTab so
+  // evidence chips resolve ids without re-creating the callbacks on every poll
+  // (they feed the memoized transcript, which needs stable props).
+  const runsRef = useRef(runs);
+  runsRef.current = runs;
+  const experimentsRef = useRef(experiments);
+  experimentsRef.current = experiments;
   const [artifacts, setArtifacts] = useState<ProjectArtifacts | null>(null);
   const [view, setView] = useState<ExperimentsView>(initialExperimentsView);
   // Experiments pane scope: "agent" narrows to the open chat session's work.
@@ -642,6 +662,19 @@ export default function App() {
     setPanelOpen(true);
   }, [selectRightTab]);
 
+  // A `<run>` evidence chip in chat opens that run's logs — the only evidence
+  // channel for a metric. Run ids are globally unique, so resolve the run to its
+  // experiment and open the terminal view focused on it.
+  const openRunLogs = useCallback(
+    (runId: string) => {
+      const run = runsRef.current.find((r) => r.id === runId);
+      if (!run) return;
+      setSelectedRunId(runId);
+      openExperimentTab(run.experimentId, "terminal");
+    },
+    [openExperimentTab],
+  );
+
   const closeExperimentTab = useCallback(
     (tab: ExpViewDef) => {
       const idx = expTabs.findIndex((t) => sameExpTab(t, tab));
@@ -656,7 +689,7 @@ export default function App() {
   // session (or viewed file's session) the click came from — see
   // parseFilePath for how it resolves against the reported path.
   const openFileTab = useCallback(
-    (rawPath: string, contextSessionId?: string, ref?: string) => {
+    (rawPath: string, contextSessionId?: string, ref?: string, line?: number, exp?: string) => {
       const project = projects?.find((p) => p.id === projectId);
       const tab = parseFilePath(
         rawPath,
@@ -666,13 +699,36 @@ export default function App() {
         project?.slug,
       );
       if (!tab) return;
+      // A cited experiment pins the file to that node's committed branch, so the
+      // tab shows (and labels) the version behind the claim. Agents cite the
+      // short id (`orx` prints an 8-char prefix), so match the full id or prefix.
+      const experiment = exp
+        ? experimentsRef.current.find(
+            (e) => e.id === exp || (exp.length >= 6 && e.id.startsWith(exp)),
+          )
+        : undefined;
+      const effectiveRef = ref ?? experiment?.branchName;
       // A branch ref only applies to repo files; artifacts have no branch.
-      if (ref && tab.source !== "artifacts") tab.ref = ref;
+      if (effectiveRef && tab.source !== "artifacts") tab.ref = effectiveRef;
+      if (line != null) tab.line = line;
+      // Line is not part of tab identity: reopening a file at a new line reuses
+      // the tab but makes the new (line-carrying) def the active one so the
+      // viewer re-scrolls.
       setFileTabs((prev) => (prev.some((t) => sameFileTab(t, tab)) ? prev : [...prev, tab]));
       selectRightTab(tab);
       setPanelOpen(true);
     },
     [projects, projectId, selectRightTab],
+  );
+
+  // Chat file chips carry an optional target line (`file:line`) and cited
+  // experiment (`exp`), never a branch ref — adapt to openFileTab's
+  // (path, session, ref, line, exp) shape while staying referentially stable
+  // for ChatPanel's memoized transcript.
+  const openChatFile = useCallback(
+    (path: string, sessionId?: string, line?: number, exp?: string) =>
+      openFileTab(path, sessionId, undefined, line, exp),
+    [openFileTab],
   );
 
   const closeFileTab = useCallback(
@@ -961,7 +1017,8 @@ export default function App() {
             artifactsActive={mainView === "chat" && panelOpen && rightTab === "artifacts"}
             onOpenExperiments={openExperimentsTab}
             onOpenArtifacts={openArtifactsTab}
-            onOpenFile={openFileTab}
+            onOpenFile={openChatFile}
+            onOpenRun={openRunLogs}
             onOpenPlan={openPlanTab}
             onOpenSubagent={openSubagentTab}
             onOpenWorktree={openWorktreeTab}
@@ -1267,6 +1324,8 @@ export default function App() {
                   source={fileTab.source}
                   sessionId={fileTab.sessionId}
                   gitRef={fileTab.ref}
+                  line={fileTab.line}
+                  branchLabel={fileBranchLabel(fileTab, activeProject?.baselineBranch)}
                   onOpenFile={openFileTab}
                 />
               )}
@@ -1289,6 +1348,7 @@ export default function App() {
               sessionId={subagentTab.sessionId}
               spawnPartId={subagentTab.spawnPartId}
               onOpenFile={(path) => openFileTab(path, subagentTab.sessionId)}
+              onOpenRun={openRunLogs}
               onOpenSubagent={(pid) => openSubagentTab(subagentTab.sessionId, pid)}
             />
           ) : codeTab ? (
