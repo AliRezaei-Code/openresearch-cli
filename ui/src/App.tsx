@@ -78,10 +78,6 @@ interface FileViewDef {
    * evidence chip). Not part of tab identity — reopening at a new line updates
    * the same tab. */
   line?: number;
-  /** Experiment this file was cited from (a `<file exp=…>` chip). Drives the
-   * "from <experiment>" tab label; its branch also becomes `ref` so the tab
-   * shows that experiment's committed version. */
-  experimentId?: string;
 }
 
 const sameFileTab = (a: FileViewDef, b: FileViewDef) =>
@@ -246,26 +242,13 @@ function parseFilePath(
   return path ? { path, sessionId } : null;
 }
 
-/** Which experiment (or the baseline) a code file tab is showing, for the
- * header badge. A cited experiment or an experiment-branch view names that
- * node; anything else resolving from the baseline/worktree reads as "baseline"
- * so a code tab always says where its contents came from. Artifacts and
- * arbitrary non-experiment branches get no badge. */
-function fileSourceLabel(
-  tab: FileViewDef,
-  experiments: Experiment[],
-  baselineBranch?: string,
-): string | undefined {
+/** The git branch a code file tab is showing, for the header pill — a cited
+ * experiment's branch (or any ref view) names that branch, and a worktree/clone
+ * file falls back to the baseline branch, so a code tab always says which
+ * branch its contents came from. Artifacts have no branch. */
+function fileBranchLabel(tab: FileViewDef, baselineBranch?: string): string | undefined {
   if (tab.source === "artifacts") return undefined;
-  const byId = tab.experimentId && experiments.find((e) => e.id === tab.experimentId);
-  if (byId) return byId.title ?? byId.slug;
-  if (tab.ref) {
-    const byBranch = experiments.find((e) => e.branchName === tab.ref);
-    if (byBranch) return byBranch.title ?? byBranch.slug;
-    if (baselineBranch && tab.ref === baselineBranch) return "baseline";
-    return undefined; // an arbitrary branch keeps its raw ref pill
-  }
-  return "baseline";
+  return tab.ref ?? baselineBranch;
 }
 
 const ONBOARDED_KEY = "orx:onboarded";
@@ -655,17 +638,15 @@ export default function App() {
         project?.slug,
       );
       if (!tab) return;
-      // A cited experiment pins the file to that node's committed branch (so the
-      // tab shows the version behind the claim) and drives its "from …" label.
-      // Agents cite the short id (`orx` prints an 8-char prefix), so match the
-      // full id or that prefix.
+      // A cited experiment pins the file to that node's committed branch, so the
+      // tab shows (and labels) the version behind the claim. Agents cite the
+      // short id (`orx` prints an 8-char prefix), so match the full id or prefix.
       const experiment = exp
         ? experiments.find((e) => e.id === exp || (exp.length >= 6 && e.id.startsWith(exp)))
         : undefined;
       const effectiveRef = ref ?? experiment?.branchName;
       // A branch ref only applies to repo files; artifacts have no branch.
       if (effectiveRef && tab.source !== "artifacts") tab.ref = effectiveRef;
-      if (experiment && tab.source !== "artifacts") tab.experimentId = experiment.id;
       if (line != null) tab.line = line;
       // Line is not part of tab identity: reopening a file at a new line reuses
       // the tab but makes the new (line-carrying) def the active one so the
@@ -1407,7 +1388,7 @@ export default function App() {
                   sessionId={fileTab.sessionId}
                   gitRef={fileTab.ref}
                   line={fileTab.line}
-                  sourceLabel={fileSourceLabel(fileTab, experiments, activeProject?.baselineBranch)}
+                  branchLabel={fileBranchLabel(fileTab, activeProject?.baselineBranch)}
                   onOpenFile={openFileTab}
                 />
               )}

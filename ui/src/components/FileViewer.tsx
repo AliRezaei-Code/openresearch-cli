@@ -4,7 +4,7 @@
 // refractor-highlighted, opened as a right-pane tab from chat tool rows or
 // the code browser.
 
-import { Code, FileText, FlaskConical, GitBranch, RotateCw } from "lucide-react";
+import { Code, FileText, GitBranch, RotateCw } from "lucide-react";
 import { useEffect, useState } from "react";
 import { artifactUrl, getArtifactFileText, getProjectFile, type ProjectFile } from "../api";
 import { CodeView } from "./CodeView";
@@ -18,7 +18,7 @@ export function FileViewer({
   sessionId,
   gitRef,
   line,
-  sourceLabel,
+  branchLabel,
   onOpenFile,
 }: {
   projectId: string;
@@ -34,10 +34,9 @@ export function FileViewer({
   gitRef?: string;
   /** 1-based line to scroll to and highlight once the source renders. */
   line?: number;
-  /** Where this code came from — an experiment title, or "baseline" — shown in
-   * the header so a code tab always says its source. When set it replaces the
-   * raw branch pill. */
-  sourceLabel?: string;
+  /** The git branch this file's contents came from (experiment branch, or the
+   * baseline) — shown in the header so a code tab always names its branch. */
+  branchLabel?: string;
   /** Open a linked file as another tab (rendered-markdown links). */
   onOpenFile?: (path: string, sessionId?: string, ref?: string) => void;
 }) {
@@ -124,24 +123,11 @@ export function FileViewer({
         <code className="file-view-path" title={path}>
           {path}
         </code>
-        {sourceLabel ? (
-          <span
-            className={`file-view-exp${sourceLabel === "baseline" ? " is-baseline" : ""}`}
-            title={
-              (sourceLabel === "baseline"
-                ? "Baseline code"
-                : `From experiment "${sourceLabel}"`) + (gitRef ? ` (${gitRef})` : "")
-            }
-          >
-            {sourceLabel === "baseline" ? <GitBranch size={11} /> : <FlaskConical size={11} />}
-            {sourceLabel}
+        {branchLabel && (
+          <span className="file-view-branch" title={`Branch: ${branchLabel}`}>
+            <GitBranch size={11} />
+            {branchLabel}
           </span>
-        ) : (
-          gitRef && (
-            <code className="file-view-ref" title={`Committed state of ${gitRef}`}>
-              {gitRef}
-            </code>
-          )
         )}
         {isMarkdown && (
           <button
