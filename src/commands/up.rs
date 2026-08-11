@@ -1431,6 +1431,7 @@ async fn delete_project(State(state): State<AppState>, Path(id): Path<String>) -
         );
     }
     for session in &sessions {
+        state.chat.clear_queue(&session.id);
         let _ = state.chat.interrupt(&session.id).await;
         state.chat.opencode.kill_session(&session.id).await;
         state.chat.codex.kill_session(&session.id).await;

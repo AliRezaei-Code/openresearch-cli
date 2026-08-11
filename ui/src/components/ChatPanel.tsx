@@ -34,9 +34,9 @@ import {
 } from "react";
 import { BrandMark } from "./Wordmark";
 import {
+  cancelQueuedMessage,
   chatAttachmentUrl,
   createChatSession,
-  cancelQueuedMessage,
   deleteChatSession,
   DEMO_FIGURE_SESSION_ID,
   DEMO_LITERATURE_SESSION_ID,
@@ -2105,9 +2105,8 @@ export function ChatPanel({
     if (activeId) void interruptChat(activeId);
   }
 
-  // Drop a still-parked message (the ✕ on a queued chip). Optimistic: remove it
-  // locally now, and the server's chat.queued echo reconciles either way. A
-  // message that already started running server-side is simply not found.
+  // Optimistic: drop locally now; the server's chat.queued echo reconciles. A
+  // message that already started running server-side simply isn't found.
   function cancelQueued(itemId: string) {
     if (!activeId) return;
     const sid = activeId;

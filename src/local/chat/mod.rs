@@ -694,6 +694,16 @@ struct QueuedMessage {
     images: Vec<ImageAttachment>,
 }
 
+/// Chip label for a parked message: its text, or an attachment count for an
+/// image/file-only send (which carries no text to show).
+fn queued_label(m: &QueuedMessage) -> String {
+    if !m.text.trim().is_empty() || m.images.is_empty() {
+        return m.text.clone();
+    }
+    let n = m.images.len();
+    format!("{n} attachment{}", if n == 1 { "" } else { "s" })
+}
+
 /// Reserves a session's turn slot for the duration of `send_message`'s setup.
 /// `claim` inserts a `None` reservation under the `turns` lock iff the session
 /// isn't already busy — closing the check-then-insert race. On drop (early
@@ -1075,7 +1085,7 @@ impl ChatHost {
             .get(session_id)
             .map(|q| {
                 q.iter()
-                    .map(|m| json!({ "id": m.id, "text": m.text }))
+                    .map(|m| json!({ "id": m.id, "text": queued_label(m) }))
                     .collect()
             })
             .unwrap_or_default()
@@ -1091,7 +1101,7 @@ impl ChatHost {
 
     /// Drop every parked message for a session (user Stop / delete). Emits an
     /// empty `chat.queued` only if there was something to clear.
-    fn clear_queue(&self, session_id: &str) {
+    pub fn clear_queue(&self, session_id: &str) {
         let had = self
             .queued
             .lock()
@@ -1143,12 +1153,8 @@ impl ChatHost {
                 return;
             };
             self.emit_queued(session_id);
-            // `queue_if_busy = false`: if a fresh send raced in and claimed the
-            // slot in the gap after `finish_turn` freed it, this returns busy —
-            // restore the message at the front (arrival order) and let that
-            // turn drain it.
             let retry = item.clone();
-            if self
+            if let Err(err) = self
                 .send_message_showing(
                     session_id,
                     item.text,
@@ -1158,15 +1164,24 @@ impl ChatHost {
                     false,
                 )
                 .await
-                .is_err()
             {
-                self.queued
-                    .lock()
-                    .unwrap()
-                    .entry(session_id.to_string())
-                    .or_default()
-                    .push_front(retry);
-                self.emit_queued(session_id);
+                // Re-park only for the genuine race: a fresh send claimed the
+                // slot in the gap after `finish_turn` freed it (session busy
+                // again), so restore this message at the front and let that turn
+                // drain it. Any other failure (a real setup error, or a session
+                // being deleted) has no turn to retry against — drop it rather
+                // than strand a chip that re-fails on every future drain.
+                if self.is_busy(session_id).await {
+                    self.queued
+                        .lock()
+                        .unwrap()
+                        .entry(session_id.to_string())
+                        .or_default()
+                        .push_front(retry);
+                    self.emit_queued(session_id);
+                } else {
+                    eprintln!("orx up: dropped queued message after send failure: {err}");
+                }
             }
         })
     }
