@@ -127,11 +127,10 @@ fn ssh_opts(target: &SshTarget) -> Vec<String> {
 /// A non-zero exit is an error carrying stderr (the ssh/remote failure reason).
 /// Shared with the slurm backend, which drives a cluster's login node the same
 /// way, and the openresearch backend, which drives a provisioned box.
-async fn ssh_run_with_deadline(
+pub(crate) async fn ssh_run(
     target: &SshTarget,
     remote_cmd: &str,
     stdin: Option<&str>,
-    deadline: Option<Duration>,
 ) -> Result<String> {
     let _ = std::fs::create_dir_all(control_dir());
     let mut cmd = Command::new("ssh");
@@ -146,7 +145,6 @@ async fn ssh_run_with_deadline(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    cmd.kill_on_drop(true);
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             anyhow!("`ssh` not found on PATH — the SSH backend needs the OpenSSH client.")
@@ -154,29 +152,17 @@ async fn ssh_run_with_deadline(
             anyhow!("Could not run ssh: {e}")
         }
     })?;
-    let operation = async move {
-        if let Some(input) = stdin {
-            use tokio::io::AsyncWriteExt as _;
-            if let Some(mut pipe) = child.stdin.take() {
-                pipe.write_all(input.as_bytes()).await?;
-                drop(pipe);
-            }
+    if let Some(input) = stdin {
+        use tokio::io::AsyncWriteExt as _;
+        if let Some(mut pipe) = child.stdin.take() {
+            let _ = pipe.write_all(input.as_bytes()).await;
+            drop(pipe); // EOF
         }
-        child.wait_with_output().await
-    };
-    let out = match deadline {
-        Some(deadline) => tokio::time::timeout(deadline, operation)
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "ssh {} timed out after {}s",
-                    target.dest,
-                    deadline.as_secs()
-                )
-            })?,
-        None => operation.await,
     }
-    .map_err(|e| anyhow!("ssh I/O failed: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .await
+        .map_err(|e| anyhow!("ssh wait failed: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let err = err.trim();
@@ -191,23 +177,6 @@ async fn ssh_run_with_deadline(
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-pub(crate) async fn ssh_run(
-    target: &SshTarget,
-    remote_cmd: &str,
-    stdin: Option<&str>,
-) -> Result<String> {
-    ssh_run_with_deadline(target, remote_cmd, stdin, None).await
-}
-
-pub(crate) async fn ssh_run_bounded(
-    target: &SshTarget,
-    remote_cmd: &str,
-    stdin: Option<&str>,
-    deadline: Duration,
-) -> Result<String> {
-    ssh_run_with_deadline(target, remote_cmd, stdin, Some(deadline)).await
 }
 
 /// Single-quote a value for safe embedding in the remote bash script.
@@ -226,38 +195,9 @@ pub struct SshJobSpec {
     pub env: HashMap<String, String>,
 }
 
-fn setup_command(dir: &str, marker: &str) -> String {
-    format!(
-        "d=\"$HOME/{dir}\"; mkdir -p \"$d\" && chmod 700 \"$d\"; \
-         if [ -f \"$d/run.sh.ready\" ]; then cat >/dev/null; else \
-         tmp=\"$d/run.sh.tmp.$$\"; trap 'rm -f \"$tmp\"' EXIT; cat >\"$tmp\"; \
-         [ \"$(tail -n 1 \"$tmp\")\" = {marker} ] || exit 74; chmod 700 \"$tmp\"; \
-         mv \"$tmp\" \"$d/run.sh\"; : >\"$d/run.sh.ready\"; trap - EXIT; fi",
-        marker = sh_quote(marker),
-    )
-}
-
-fn launch_command(dir: &str) -> String {
-    format!(
-        "d=\"$HOME/{dir}\"; cd \"$d\" || exit 97; \
-         if [ -e pid ] || [ -e exit_code ]; then echo ALREADY_LAUNCHED; \
-         elif mkdir .launch-claim 2>/dev/null; then \
-         wrapper='set -e; printf \"%s\\n\" \"$$\" >pid.tmp; mv pid.tmp pid; exec bash run.sh'; \
-         if command -v setsid >/dev/null 2>&1; then setsid sh -c \"$wrapper\" </dev/null >/dev/null 2>&1 & \
-         else nohup sh -c \"$wrapper\" </dev/null >/dev/null 2>&1 & fi; \
-         for _ in 1 2 3 4 5 6 7 8 9 10; do \
-         if [ -e pid ] || [ -e exit_code ]; then echo LAUNCHED; exit 0; fi; sleep 1; done; \
-         echo 'launch child did not publish its pid' >&2; exit 75; \
-         else for _ in 1 2 3 4 5 6 7 8 9 10; do \
-         if [ -e pid ] || [ -e exit_code ]; then echo ALREADY_LAUNCHED; exit 0; fi; sleep 1; done; \
-         echo 'launch is claimed but no pid was published' >&2; exit 75; fi"
-    )
-}
-
 /// Submit the job: write run.sh, launch it detached, record its pid. Returns
 /// the remote run dir (relative to `$HOME`) — the reattach handle.
-async fn run_job_with_deadline(spec: &SshJobSpec, deadline: Option<Duration>) -> Result<String> {
-    let started = std::time::Instant::now();
+pub async fn run_job(spec: &SshJobSpec) -> Result<String> {
     let dir = format!(".orx/runs/{}", spec.run_id);
     // Default the remote job's Python to unbuffered so its prints land in `log`
     // (which we tail) live instead of block-buffering behind the redirect
@@ -272,34 +212,28 @@ async fn run_job_with_deadline(spec: &SshJobSpec, deadline: Option<Duration>) ->
     // record the exit status. The payload runs in a SUBSHELL `( … )` — not a
     // `{ … }` group — so an `exit`/`set -e` failure inside it ends the subshell,
     // not run.sh, and we still reach `echo $? > exit_code`.
-    let marker = format!("# orx-script-complete:{}", spec.run_id);
     let run_sh = format!(
-        "#!/usr/bin/env bash\n{exports}\ncd \"$HOME/{dir}\" || exit 97\n(\n{script}\n) > log 2>&1\necho $? > exit_code\n{marker}\n",
+        "#!/usr/bin/env bash\n{exports}\ncd \"$HOME/{dir}\" || exit 97\n(\n{script}\n) > log 2>&1\necho $? > exit_code\n",
         script = spec.script,
     );
 
-    // Publish a complete script before launch. A dropped SSH response may leave
-    // a partial temporary file, but never a ready script.
-    let setup = setup_command(&dir, &marker);
-    ssh_run_with_deadline(&spec.target, &setup, Some(&run_sh), deadline).await?;
+    // Create the dir (owner-only) and write run.sh from stdin.
+    let setup = format!(
+        "mkdir -p \"$HOME/{dir}\" && chmod 700 \"$HOME/{dir}\" && cat > \"$HOME/{dir}/run.sh\"",
+    );
+    ssh_run(&spec.target, &setup, Some(&run_sh)).await?;
 
-    // The remote claim makes an ambiguous SSH response safe to retry: only its
-    // owner may launch, while later calls observe the published pid.
-    let launch = launch_command(&dir);
-    let launch_deadline = deadline.map(|deadline| deadline.saturating_sub(started.elapsed()));
-    if launch_deadline.is_some_and(|remaining| remaining.is_zero()) {
-        return Err(anyhow!("SSH launch operation reached its deadline"));
-    }
-    ssh_run_with_deadline(&spec.target, &launch, None, launch_deadline).await?;
+    // Launch detached so it survives the ssh channel closing. Prefer `setsid`
+    // (new session → pid == pgid, so cancel can TERM the whole group); fall back
+    // to `nohup` where setsid is absent (e.g. a macOS host). Record the pid.
+    let launch = format!(
+        "cd \"$HOME/{dir}\" && \
+         if command -v setsid >/dev/null 2>&1; then setsid bash run.sh </dev/null >/dev/null 2>&1 & \
+         else nohup bash run.sh </dev/null >/dev/null 2>&1 & fi; \
+         echo $! > pid",
+    );
+    ssh_run(&spec.target, &launch, None).await?;
     Ok(dir)
-}
-
-pub async fn run_job(spec: &SshJobSpec) -> Result<String> {
-    run_job_with_deadline(spec, None).await
-}
-
-pub async fn run_job_bounded(spec: &SshJobSpec, deadline: Duration) -> Result<String> {
-    run_job_with_deadline(spec, Some(deadline)).await
 }
 
 /// Job state in the shared stage vocabulary (see `jobs::stage_to_run_status`).
@@ -309,11 +243,7 @@ pub struct JobState {
     pub message: Option<String>,
 }
 
-async fn inspect_job_with_deadline(
-    target: &SshTarget,
-    dir: &str,
-    deadline: Option<Duration>,
-) -> Result<JobState> {
+pub async fn inspect_job(target: &SshTarget, dir: &str) -> Result<JobState> {
     // exit_code present -> finished; pid alive -> running; pid dead & no
     // exit_code -> killed/crashed; no pid yet -> just starting.
     let cmd = format!(
@@ -322,7 +252,7 @@ async fn inspect_job_with_deadline(
          elif [ -f \"$d/pid\" ] && kill -0 \"$(cat \"$d/pid\")\" 2>/dev/null; then echo RUNNING; \
          elif [ -f \"$d/pid\" ]; then echo DEAD; else echo PENDING; fi",
     );
-    let out = ssh_run_with_deadline(target, &cmd, None, deadline).await?;
+    let out = ssh_run(target, &cmd, None).await?;
     let out = out.trim();
     if let Some(code) = out.strip_prefix("EXIT ") {
         let code: i32 = code.trim().parse().unwrap_or(-1);
@@ -352,18 +282,6 @@ async fn inspect_job_with_deadline(
             message: Some(format!("unexpected inspect output: {other}")),
         },
     })
-}
-
-pub async fn inspect_job(target: &SshTarget, dir: &str) -> Result<JobState> {
-    inspect_job_with_deadline(target, dir, None).await
-}
-
-pub async fn inspect_job_bounded(
-    target: &SshTarget,
-    dir: &str,
-    deadline: Duration,
-) -> Result<JobState> {
-    inspect_job_with_deadline(target, dir, Some(deadline)).await
 }
 
 /// One poll of the remote log past `skip` lines. Unlike the streaming backends
@@ -433,20 +351,6 @@ pub async fn preflight(target: &SshTarget) -> SshPreflight {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn remote_launch_uses_a_durable_claim_and_complete_script_marker() {
-        let setup = setup_command(".orx/runs/run-1", "# complete");
-        assert!(setup.contains("run.sh.ready"));
-        assert!(setup.contains("tail -n 1"));
-
-        let launch = launch_command(".orx/runs/run-1");
-        assert!(launch.contains("mkdir .launch-claim"));
-        assert!(launch.contains("[ -e pid ] || [ -e exit_code ]"));
-        assert!(launch.contains("\"$$\" >pid.tmp"));
-        assert!(!launch.contains("$!"));
-        assert!(launch.contains("mv pid.tmp pid"));
-    }
 
     #[test]
     fn alias_target_adds_no_extra_opts() {

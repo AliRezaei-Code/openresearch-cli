@@ -18,46 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::Credentials;
-use crate::error::{anyhow, Error, Result};
-
-#[derive(Debug)]
-struct ApiHttpError {
-    path: String,
-    status: u16,
-    reason: String,
-    detail: String,
-}
-
-impl std::fmt::Display for ApiHttpError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.status == 401 {
-            return write!(
-                f,
-                "Unauthorized — your token is invalid or revoked. Run `orx login` again."
-            );
-        }
-        write!(
-            f,
-            "Request to {} failed ({} {}){}",
-            self.path,
-            self.status,
-            self.reason,
-            if self.detail.is_empty() {
-                String::new()
-            } else {
-                format!(": {}", self.detail)
-            }
-        )
-    }
-}
-
-impl std::error::Error for ApiHttpError {}
-
-pub(crate) fn is_api_status(error: &Error, status: u16) -> bool {
-    error
-        .downcast_ref::<ApiHttpError>()
-        .is_some_and(|api_error| api_error.status == status)
-}
+use crate::error::{anyhow, Result};
 
 // ---------------------------------------------------------------------------
 // Response DTOs
@@ -679,13 +640,6 @@ pub enum SandboxTarget {
     },
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SandboxLifecycle {
-    Persistent,
-    Ephemeral,
-}
-
 /// Body of `POST /sandboxes`. `projectId` is intentionally omitted — the server
 /// rejects it for `new`/`new-cpu` (those are org-level standalone only).
 #[derive(Debug, Clone, Serialize)]
@@ -694,6 +648,13 @@ pub struct CreateSandboxBody {
     pub organization_id: String,
     pub lifecycle: SandboxLifecycle,
     pub target: SandboxTarget,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxLifecycle {
+    Ephemeral,
+    Persistent,
 }
 
 /// A sandbox as returned by `POST /sandboxes`. Mirrors the API's `zSandbox`;
@@ -804,15 +765,26 @@ async fn send_request(
     };
 
     let status = res.status();
+    if status.as_u16() == 401 {
+        return Err(anyhow!(
+            "Unauthorized — your token is invalid or revoked. Run `orx login` again."
+        ));
+    }
     if !status.is_success() {
         let reason = status.canonical_reason().unwrap_or("");
-        return Err(ApiHttpError {
-            path: path.to_string(),
-            status: status.as_u16(),
-            reason: reason.to_string(),
-            detail: res.text().await.unwrap_or_default(),
-        }
-        .into());
+        let detail = res.text().await.unwrap_or_default();
+        let suffix = if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", detail)
+        };
+        return Err(anyhow!(
+            "Request to {} failed ({} {}){}",
+            path,
+            status.as_u16(),
+            reason,
+            suffix
+        ));
     }
 
     Ok(res)
@@ -1096,22 +1068,22 @@ pub async fn get_sandbox(creds: &Credentials, sandbox_id: &str) -> Result<Sandbo
     api_get(creds, &format!("/sandboxes/{}", sandbox_id)).await
 }
 
-pub async fn claim_sandbox(creds: &Credentials, sandbox_id: &str) -> Result<()> {
-    request_no_content(
-        creds,
-        Method::POST,
-        &format!("/sandboxes/{}/claim", sandbox_id),
-        Some(serde_json::json!({})),
-    )
-    .await
-}
-
 /// Tear a box down (destroys the provider instance) — `DELETE /sandboxes/{id}`.
 pub async fn delete_sandbox(creds: &Credentials, sandbox_id: &str) -> Result<()> {
     request_no_content(
         creds,
         Method::DELETE,
         &format!("/sandboxes/{}", sandbox_id),
+        None,
+    )
+    .await
+}
+
+pub async fn delete_sandbox_unless_failed(creds: &Credentials, sandbox_id: &str) -> Result<()> {
+    request_no_content(
+        creds,
+        Method::DELETE,
+        &format!("/sandboxes/{}?preserveFailed=true", sandbox_id),
         None,
     )
     .await
@@ -1960,10 +1932,9 @@ pub async fn fetch_biorxiv(doi: &str) -> Result<Option<BiorxivDetail>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_api_status, openalex_selector, reconstruct_abstract, ApiHttpError,
-        CreateBaselineExperimentBody, CreateChildBody, CreateSandboxBody, ListCatalog,
-        ListCpuCatalog, LitHit, OpenAlexWork, PaperHit, RunBody, RunTarget, SandboxEnvelope,
-        SandboxLifecycle, SandboxTarget, BIORXIV_SOURCE_ID,
+        openalex_selector, reconstruct_abstract, CreateBaselineExperimentBody, CreateChildBody,
+        CreateSandboxBody, ListCatalog, ListCpuCatalog, LitHit, OpenAlexWork, PaperHit, RunBody,
+        RunTarget, SandboxEnvelope, SandboxLifecycle, SandboxTarget, BIORXIV_SOURCE_ID,
     };
     use serde_json::json;
 
@@ -2153,7 +2124,7 @@ mod tests {
     fn serializes_create_sandbox_body_without_project() {
         let body = CreateSandboxBody {
             organization_id: "org_123".into(),
-            lifecycle: SandboxLifecycle::Ephemeral,
+            lifecycle: SandboxLifecycle::Persistent,
             target: SandboxTarget::NewCpu {
                 cpu_flavor: "cpu5c".into(),
                 vcpu_count: 2,
@@ -2161,7 +2132,7 @@ mod tests {
         };
         let value = serde_json::to_value(&body).unwrap();
         assert_eq!(value.get("organizationId"), Some(&json!("org_123")));
-        assert_eq!(value.get("lifecycle"), Some(&json!("ephemeral")));
+        assert_eq!(value.get("lifecycle"), Some(&json!("persistent")));
         assert!(value.get("projectId").is_none());
     }
 
@@ -2239,83 +2210,6 @@ mod tests {
         assert_eq!(sb.ssh_hostname.as_deref(), Some("203.0.113.7"));
         assert_eq!(sb.ssh_port, Some(22022));
         assert_eq!(sb.ssh_username.as_deref(), Some("root"));
-    }
-
-    #[test]
-    fn deserializes_failed_sandbox_with_provision_reason() {
-        let json = r#"{
-            "sandbox": {
-                "id": "sb_failed",
-                "organizationId": "org_1",
-                "projectId": null,
-                "sshHostname": null,
-                "sshPort": null,
-                "sshUsername": null,
-                "status": "failed",
-                "machineType": "persistent",
-                "createdBy": "user_1",
-                "updatedAt": "2026-08-10T00:00:00Z",
-                "provisionWarnings": null,
-                "provisionStage": "ssh_auth",
-                "provisionErrorCode": "readiness_timeout",
-                "provisionErrorMessage": "The registered key was rejected",
-                "lastHealthCheckAt": "2026-08-10T00:00:01Z",
-                "lastHealthError": "Permission denied (publickey)",
-                "providerName": "nebius",
-                "providerInstanceId": "instance_1",
-                "pricePerHour": 1.5,
-                "gpu": "H100_SXM",
-                "gpuCount": 1,
-                "vcpuCount": null
-            }
-        }"#;
-
-        let sandbox = serde_json::from_str::<SandboxEnvelope>(json)
-            .expect("should deserialize")
-            .sandbox;
-        assert_eq!(sandbox.status, "failed");
-        assert_eq!(sandbox.provision_stage.as_deref(), Some("ssh_auth"));
-        assert_eq!(
-            sandbox.provision_error_code.as_deref(),
-            Some("readiness_timeout")
-        );
-        assert_eq!(
-            sandbox.provision_error_message.as_deref(),
-            Some("The registered key was rejected")
-        );
-        assert_eq!(
-            sandbox.last_health_error.as_deref(),
-            Some("Permission denied (publickey)")
-        );
-    }
-
-    #[test]
-    fn api_status_errors_remain_typed() {
-        let error = crate::error::Error::new(ApiHttpError {
-            path: "/sandboxes/sb_1".into(),
-            status: 404,
-            reason: "Not Found".into(),
-            detail: "Sandbox not found".into(),
-        });
-
-        assert!(is_api_status(&error, 404));
-        assert!(!is_api_status(&error, 500));
-        assert_eq!(
-            error.to_string(),
-            "Request to /sandboxes/sb_1 failed (404 Not Found): Sandbox not found"
-        );
-
-        let unauthorized = crate::error::Error::new(ApiHttpError {
-            path: "/sandboxes/sb_1/claim".into(),
-            status: 401,
-            reason: "Unauthorized".into(),
-            detail: String::new(),
-        });
-        assert!(is_api_status(&unauthorized, 401));
-        assert_eq!(
-            unauthorized.to_string(),
-            "Unauthorized — your token is invalid or revoked. Run `orx login` again."
-        );
     }
 
     /// The api declares `chatSessionId` optional: a lost `rename_all` would send
