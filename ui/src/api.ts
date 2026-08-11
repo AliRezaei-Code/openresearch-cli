@@ -951,9 +951,70 @@ export interface SkillInfo {
   name: string;
   description: string;
   argHint: string;
+  /** "builtin" = bundled catalog; "user" = uploaded via the Skills tab. */
+  source?: "builtin" | "user";
 }
 
-export const getSkills = () => get<{ skills: SkillInfo[] }>("/api/skills").then((r) => r.skills);
+export const getSkills = (projectId?: string) =>
+  get<{ skills: SkillInfo[] }>(
+    `/api/skills${projectId ? `?project=${encodeURIComponent(projectId)}` : ""}`,
+  ).then((r) => r.skills);
+
+/** Where an uploaded skill applies. */
+export type SkillScope = "global" | "project";
+
+/** A user-uploaded agent skill (a SKILL.md folder), managed in the Skills tab. */
+export interface UserSkill {
+  name: string;
+  description: string;
+  scope: SkillScope;
+  bytes: number;
+  updatedAt: number;
+}
+
+/** Global skills plus (when a project is given) that project's own. */
+export const listUserSkills = (projectId?: string) =>
+  get<{ skills: UserSkill[] }>(
+    `/api/user-skills${projectId ? `?project=${encodeURIComponent(projectId)}` : ""}`,
+  ).then((r) => r.skills);
+
+/** Upload a SKILL.md file or a .zip of a skill folder. `contentBase64` is the
+ * raw file bytes; `filename`'s extension selects single-file vs archive. */
+export const uploadUserSkill = (req: {
+  scope: SkillScope;
+  projectId?: string;
+  filename: string;
+  contentBase64: string;
+}) => post<{ skill: UserSkill }>("/api/user-skills", req).then((r) => r.skill);
+
+export const deleteUserSkill = (req: { scope: SkillScope; name: string; projectId?: string }) => {
+  const params = new URLSearchParams({ scope: req.scope, name: req.name });
+  if (req.projectId) params.set("project", req.projectId);
+  return fetch(`/api/user-skills?${params.toString()}`, { method: "DELETE" }).then((r) =>
+    json<{ ok: boolean }>(r),
+  );
+};
+
+/** A skill already installed in one of the user's coding agents, importable
+ * into the managed store. */
+export interface HarnessSkill {
+  harnessId: string;
+  harnessName: string;
+  name: string;
+  description: string;
+}
+
+/** Skills found in every installed harness's global skills dir. */
+export const listHarnessSkills = () =>
+  get<{ skills: HarnessSkill[] }>("/api/harness-skills").then((r) => r.skills);
+
+/** Copy a harness skill into the managed store at the given scope. */
+export const importHarnessSkill = (req: {
+  harness: string;
+  name: string;
+  scope: SkillScope;
+  projectId?: string;
+}) => post<{ skill: UserSkill }>("/api/user-skills/import", req).then((r) => r.skill);
 
 /** "openai/gpt-5.5" → "GPT 5.5", "anthropic/claude-opus-4-8" → "Opus 4.8". */
 export function modelLabel(id: string): string {
