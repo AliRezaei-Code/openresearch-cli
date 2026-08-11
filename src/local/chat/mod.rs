@@ -1134,53 +1134,66 @@ impl ChatHost {
         removed
     }
 
-    /// Run the next parked message once a turn finishes naturally. One per call:
-    /// the turn this spawns drains the following message on its own completion.
-    /// Boxed return: `drain_queue` → `send_message_showing` → (spawned)
-    /// `drain_queue` is an async recursion cycle the auto-`Send` solver can't
-    /// close on its own, so we assert the boxed future is `Send` to break it.
+    /// Drain the whole parked queue into a single turn once the current turn
+    /// finishes naturally — successive steering messages run together in one
+    /// turn, not a full turn each. Boxed return: `drain_queue` →
+    /// `send_message_showing` → (spawned) `drain_queue` is an async recursion
+    /// cycle the auto-`Send` solver can't close on its own, so we assert the
+    /// boxed future is `Send` to break it.
     fn drain_queue<'a>(
         self: &'a Arc<Self>,
         session_id: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             // Scope the guard: a std mutex must never be held across an await.
-            let item = {
+            let items: Vec<QueuedMessage> = {
                 let mut map = self.queued.lock().unwrap();
-                map.get_mut(session_id).and_then(VecDeque::pop_front)
+                match map.remove(session_id) {
+                    Some(q) => q.into(),
+                    None => return,
+                }
             };
-            let Some(item) = item else {
+            if items.is_empty() {
                 return;
-            };
+            }
             self.emit_queued(session_id);
-            let retry = item.clone();
+            // Coalesce every parked message into one turn: join their texts and
+            // concatenate their attachments; the most recent composer overrides win.
+            let text = items
+                .iter()
+                .map(|m| m.text.trim())
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let images: Vec<ImageAttachment> = items
+                .iter()
+                .flat_map(|m| m.images.iter().cloned())
+                .collect();
+            let overrides = items
+                .last()
+                .map(|m| m.overrides.clone())
+                .unwrap_or_default();
             if let Err(err) = self
-                .send_message_showing(
-                    session_id,
-                    item.text,
-                    None,
-                    item.overrides,
-                    item.images,
-                    false,
-                )
+                .send_message_showing(session_id, text, None, overrides, images, false)
                 .await
             {
                 // Re-park only for the genuine race: a fresh send claimed the
                 // slot in the gap after `finish_turn` freed it (session busy
-                // again), so restore this message at the front and let that turn
-                // drain it. Any other failure (a real setup error, or a session
-                // being deleted) has no turn to retry against — drop it rather
-                // than strand a chip that re-fails on every future drain.
+                // again), so restore the messages up front and let that turn
+                // drain them. Any other failure (a real setup error, or a session
+                // being deleted) has no turn to retry against — drop them rather
+                // than strand chips that re-fail on every future drain.
                 if self.is_busy(session_id).await {
-                    self.queued
-                        .lock()
-                        .unwrap()
-                        .entry(session_id.to_string())
-                        .or_default()
-                        .push_front(retry);
+                    {
+                        let mut map = self.queued.lock().unwrap();
+                        let q = map.entry(session_id.to_string()).or_default();
+                        for item in items.into_iter().rev() {
+                            q.push_front(item);
+                        }
+                    }
                     self.emit_queued(session_id);
                 } else {
-                    eprintln!("orx up: dropped queued message after send failure: {err}");
+                    eprintln!("orx up: dropped queued messages after send failure: {err}");
                 }
             }
         })
