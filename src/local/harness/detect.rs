@@ -5,7 +5,8 @@
 //! Detection is read-only and best-effort: missing files or unparseable JSON
 //! just mean "not detected", never an error.
 
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -162,11 +163,48 @@ impl HarnessInfo {
     }
 }
 
-pub(super) fn find_on_path(bin: &str) -> Option<PathBuf> {
+pub(crate) fn find_on_path(bin: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join(bin))
-        .find(|c| c.is_file())
+    std::env::split_paths(&paths).find_map(|directory| find_in_dir(&directory, bin))
+}
+
+pub(crate) fn find_in_dir(directory: &Path, bin: &str) -> Option<PathBuf> {
+    #[cfg(windows)]
+    let extensions =
+        std::env::var_os("PATHEXT").or_else(|| Some(OsString::from(".COM;.EXE;.BAT;.CMD")));
+    #[cfg(not(windows))]
+    let extensions: Option<OsString> = None;
+    let names = executable_names(bin, extensions.as_deref());
+
+    for name in names {
+        let candidate = directory.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn executable_names(bin: &str, path_extensions: Option<&OsStr>) -> Vec<OsString> {
+    if Path::new(bin).extension().is_some() {
+        return vec![OsString::from(bin)];
+    }
+    let mut names = Vec::new();
+    if let Some(path_extensions) = path_extensions {
+        names.extend(
+            path_extensions
+                .to_string_lossy()
+                .split(';')
+                .map(str::trim)
+                .filter(|extension| !extension.is_empty())
+                .map(|extension| {
+                    let extension = extension.strip_prefix('.').unwrap_or(extension);
+                    OsString::from(format!("{bin}.{extension}"))
+                }),
+        );
+    }
+    names.push(OsString::from(bin));
+    names
 }
 
 /// Dereference symlinks to the real installed binary. Installers commonly drop
@@ -290,5 +328,20 @@ mod tests {
     fn resolve_symlinks_keeps_unresolvable_path() {
         let missing = PathBuf::from("/nonexistent/orx-detect-test/codex");
         assert_eq!(resolve_symlinks(missing.clone()), missing);
+    }
+
+    #[test]
+    fn executable_names_expand_windows_path_extensions() {
+        assert_eq!(
+            executable_names("codex", Some(OsStr::new(".EXE;.CMD;.BAT"))),
+            vec!["codex.EXE", "codex.CMD", "codex.BAT", "codex"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            executable_names("codex.exe", Some(OsStr::new(".EXE;.CMD"))),
+            vec![OsString::from("codex.exe")]
+        );
     }
 }

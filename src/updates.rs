@@ -155,13 +155,29 @@ pub struct Receipt {
 }
 
 pub fn receipt_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+    let xdg_config = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".config")
-        });
+        .or_else(dirs::data_local_dir);
+    receipt_path_for_platform(xdg_config, local_app_data, dirs::home_dir(), cfg!(windows))
+}
+
+fn receipt_path_for_platform(
+    xdg_config: Option<PathBuf>,
+    local_app_data: Option<PathBuf>,
+    home: Option<PathBuf>,
+    windows: bool,
+) -> PathBuf {
+    let base = xdg_config.unwrap_or_else(|| {
+        if windows {
+            local_app_data.unwrap_or_else(|| PathBuf::from("."))
+        } else {
+            home.unwrap_or_else(|| PathBuf::from(".")).join(".config")
+        }
+    });
     base.join(APP_NAME)
         .join(format!("{}-receipt.json", APP_NAME))
 }
@@ -456,9 +472,39 @@ impl UpdateWarning {
 
 #[cfg(test)]
 mod tests {
-    use super::{bold, exe_matches_prefix, parse_manifest, precedence, render, warning_for};
+    use super::{
+        bold, exe_matches_prefix, parse_manifest, precedence, receipt_path_for_platform, render,
+        warning_for,
+    };
     use semver::Version;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn receipt_path_matches_each_installer_platform() {
+        let filename = "openresearch-cli/openresearch-cli-receipt.json";
+        assert_eq!(
+            receipt_path_for_platform(
+                None,
+                Some(PathBuf::from("C:/Users/test/AppData/Local")),
+                None,
+                true,
+            ),
+            PathBuf::from("C:/Users/test/AppData/Local").join(filename)
+        );
+        assert_eq!(
+            receipt_path_for_platform(
+                Some(PathBuf::from("D:/config")),
+                Some(PathBuf::from("C:/Users/test/AppData/Local")),
+                None,
+                true,
+            ),
+            PathBuf::from("D:/config").join(filename)
+        );
+        assert_eq!(
+            receipt_path_for_platform(None, None, Some(PathBuf::from("/home/test")), false),
+            PathBuf::from("/home/test/.config").join(filename)
+        );
+    }
 
     #[test]
     fn render_sets_off_the_warning_in_its_own_block() {

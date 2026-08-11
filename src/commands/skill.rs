@@ -53,7 +53,7 @@ pub async fn run(args: crate::SkillArgs) -> Result<()> {
                     agent_skills::session_content(skill, github_enabled).trim_end()
                 );
             } else {
-                println!("{}", skill.content.trim_end());
+                println!("{}", agent_skills::platform_content(skill).trim_end());
             }
             return Ok(());
         }
@@ -73,9 +73,15 @@ pub async fn run(args: crate::SkillArgs) -> Result<()> {
     // No path: print the bundled overview, then the bundled module index, then
     // list API-fetchable deep references (best effort — skip if unreachable).
     if publication == Some(false) {
-        println!(
-            "OpenResearch local-only skills. Commit experiment branches locally and run them on this machine. GitHub and external compute remain unavailable until the user enables GitHub syncing for this project."
-        );
+        if cfg!(windows) {
+            println!(
+                "OpenResearch local-only skills. Experiment execution is unavailable on Windows until the user enables GitHub syncing for this project and chooses a remote backend."
+            );
+        } else {
+            println!(
+                "OpenResearch local-only skills. Commit experiment branches locally and run them on this machine. GitHub and external compute remain unavailable until the user enables GitHub syncing for this project."
+            );
+        }
     } else {
         println!("{}", SKILL_MD);
     }

@@ -117,6 +117,7 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+#[cfg(not(windows))]
 pub(crate) fn local_clone_script(repo_path: &str, commit_sha: &str, cmd: &str) -> String {
     format!(
         "set -eo pipefail; git clone --no-checkout --local {} repo; cd repo; git checkout --detach {}; {}",
@@ -155,6 +156,14 @@ pub(crate) fn spawn_detached_supervise(run_id: &str) -> Result<()> {
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW);
     }
     cmd.spawn()
         .map_err(|e| anyhow!("Could not spawn `orx supervise {}`: {}", run_id, e))?;

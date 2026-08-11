@@ -1175,6 +1175,7 @@ const FLAVOR_SUGGESTIONS: Partial<Record<ComputeTargetId, string[]>> = {
 };
 
 function TargetStatusBadge({ t, isDefault }: { t: ComputeTargetSummary; isDefault: boolean }) {
+  if (!t.enabled) return <span className={BADGE_CLASS_NAME}>Unavailable</span>;
   if (t.id === "local") return <span className={SUCCESS_BADGE_CLASS_NAME}>Ready</span>;
   // Don't claim either answer when the check couldn't run.
   if (t.unverified) return <span className={BADGE_CLASS_NAME}>Unknown</span>;

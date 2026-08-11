@@ -2267,12 +2267,9 @@ pub async fn watch_runs(chat: Arc<ChatHost>) {
 pub fn prepare_env(cmd: &mut tokio::process::Command) {
     if let Ok(exe) = std::env::current_exe().and_then(|p| p.canonicalize()) {
         if let Some(dir) = exe.parent() {
-            let mut path = std::ffi::OsString::from(dir);
-            if let Some(existing) = std::env::var_os("PATH").filter(|p| !p.is_empty()) {
-                path.push(":");
-                path.push(existing);
+            if let Some(path) = prepend_to_path(dir, std::env::var_os("PATH").as_deref()) {
+                cmd.env("PATH", path);
             }
-            cmd.env("PATH", path);
         }
     }
     for (key, value) in crate::config::list_synced_env() {
@@ -2280,6 +2277,19 @@ pub fn prepare_env(cmd: &mut tokio::process::Command) {
             cmd.env(key, value);
         }
     }
+}
+
+pub(crate) fn prepend_to_path(
+    directory: &std::path::Path,
+    existing: Option<&std::ffi::OsStr>,
+) -> Option<std::ffi::OsString> {
+    let paths = std::iter::once(directory.to_path_buf()).chain(
+        existing
+            .filter(|path| !path.is_empty())
+            .into_iter()
+            .flat_map(std::env::split_paths),
+    );
+    std::env::join_paths(paths).ok()
 }
 
 /// Env var carrying the launching chat session's id into a harness child. The
@@ -2337,7 +2347,7 @@ pub fn harness_log(name: &str) -> Result<std::fs::File> {
 
 #[cfg(test)]
 mod session_env_tests {
-    use super::{in_local_session, CHAT_SESSION_ENV, LOCAL_SESSION_ENV};
+    use super::{in_local_session, prepend_to_path, CHAT_SESSION_ENV, LOCAL_SESSION_ENV};
     use std::sync::{Mutex, MutexGuard};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -2391,6 +2401,22 @@ mod session_env_tests {
         let _guard = EnvGuard::new(&[CHAT_SESSION_ENV, LOCAL_SESSION_ENV]);
         std::env::set_var(LOCAL_SESSION_ENV, "");
         assert!(!in_local_session());
+    }
+
+    #[test]
+    fn prepends_paths_with_the_platform_separator() {
+        let first = std::path::PathBuf::from("first");
+        let rest = std::env::join_paths(["second", "third"]).unwrap();
+        let joined = prepend_to_path(&first, Some(&rest)).unwrap();
+
+        assert_eq!(
+            std::env::split_paths(&joined).collect::<Vec<_>>(),
+            vec![
+                first,
+                std::path::PathBuf::from("second"),
+                std::path::PathBuf::from("third")
+            ]
+        );
     }
 }
 

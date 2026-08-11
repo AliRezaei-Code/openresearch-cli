@@ -30,8 +30,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 use super::detect::{
-    bin_version, find_on_path, nonempty_str, parse_version, read_json, HarnessAuthState,
-    HarnessInfo, ModelInfo,
+    bin_version, find_in_dir, find_on_path, nonempty_str, parse_version, read_json,
+    HarnessAuthState, HarnessInfo, ModelInfo,
 };
 use super::options::{HarnessOptions, PermissionMode, REASONING_DEFAULT_ID};
 use super::{Harness, ResumeAction};
@@ -409,10 +409,9 @@ async fn claude_generate_title(bin: &Path, first_message: &str) -> Option<String
 pub(crate) fn find_claude() -> Option<PathBuf> {
     find_on_path("claude").or_else(|| {
         let home = dirs::home_dir()?;
-        [".claude/local/claude", ".local/bin/claude"]
+        [".claude/local", ".local/bin"]
             .iter()
-            .map(|rel| home.join(rel))
-            .find(|c| c.is_file())
+            .find_map(|rel| find_in_dir(&home.join(rel), "claude"))
     })
 }
 

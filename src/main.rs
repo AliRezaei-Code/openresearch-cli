@@ -9,7 +9,6 @@
 //! error's `Display` to stderr and exits 1 — matching the TS
 //! `main().catch(err => { console.error(err.message); process.exit(1) })`.
 
-mod browser;
 // DTOs faithfully mirror every API wire field; not all are read by the CLI yet.
 #[allow(dead_code)]
 mod client;
@@ -29,6 +28,7 @@ mod telemetry;
 mod updates;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use openresearch_cli::browser;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -609,7 +609,7 @@ pub struct ExpRunArgs {
     /// (a batch job on your Slurm cluster, submitted via its login node),
     /// `ray` (a job on your Ray cluster, via the Ray Jobs API), `openresearch`
     /// (an ephemeral OpenResearch GPU/CPU box billed to your org; needs
-    /// `orx login`), or `local` (a detached process on this machine). k8s,
+    /// `orx login`), or `local` (a detached process on macOS or Linux). k8s,
     /// ssh, slurm, ray, openresearch, and local are local
     /// experiments only. orx submits the job and a detached supervisor
     /// mirrors status/logs back. Omitted on a local experiment: launches on

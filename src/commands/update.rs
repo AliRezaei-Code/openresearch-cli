@@ -2,7 +2,7 @@
 //! installer.
 //!
 //! The mechanism mirrors what axoupdater (uv's `self update`) does: download
-//! the `openresearch-cli-installer.sh` asset from the target release and run
+//! the platform installer asset from the target release and run
 //! it pinned to the existing install prefix via `CARGO_DIST_FORCE_INSTALL_DIR`.
 //! The installer owns the hard parts — checksum verification and the atomic
 //! rename into `~/.cargo/bin` (never an in-place overwrite, which on macOS
@@ -27,8 +27,11 @@ use std::time::Duration;
 use crate::error::{anyhow, Result};
 use crate::updates;
 
+#[cfg(not(windows))]
 const INSTALL_HINT: &str = "curl --proto '=https' --tlsv1.2 -LsSf \
 https://github.com/alphaXiv/openresearch-cli/releases/latest/download/openresearch-cli-installer.sh | sh";
+#[cfg(windows)]
+const INSTALL_HINT: &str = "powershell -ExecutionPolicy Bypass -Command \"irm https://github.com/alphaXiv/openresearch-cli/releases/latest/download/openresearch-cli-installer.ps1 | iex\" (or reinstall the OpenResearch desktop app from GitHub Releases)";
 
 pub async fn run(args: crate::UpdateArgs) -> Result<()> {
     if std::env::var("OPENRESEARCH_CLI_DISABLE_UPDATE").as_deref() == Ok("1") {
@@ -144,22 +147,40 @@ pub async fn run(args: crate::UpdateArgs) -> Result<()> {
 
     // Pin the installer to the same release the manifest described, so the
     // version we report is exactly the version that gets installed.
+    let installer_extension = if cfg!(windows) { "ps1" } else { "sh" };
     let installer = updates::fetch_release_asset(
         &latest.tag,
-        &format!("{}-installer.sh", updates::APP_NAME),
+        &format!("{}-installer.{installer_extension}", updates::APP_NAME),
         Duration::from_secs(60),
     )
     .await?;
-    let script = std::env::temp_dir().join(format!("orx-installer-{}.sh", uuid::Uuid::new_v4()));
+    let script = std::env::temp_dir().join(format!(
+        "orx-installer-{}.{}",
+        uuid::Uuid::new_v4(),
+        installer_extension
+    ));
     std::fs::write(&script, &installer)?;
 
-    // `sh <script>` rather than executing the file: immune to noexec /tmp
-    // mounts. The installer verifies artifact checksums and renames the new
-    // binary into place atomically; replacing a running orx is safe on
-    // macOS/Linux (old processes keep the old inode).
-    let mut cmd = std::process::Command::new("sh");
-    cmd.arg(&script)
-        .env("CARGO_DIST_FORCE_INSTALL_DIR", &receipt.install_prefix);
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg(&script);
+        cmd
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut cmd = std::process::Command::new("powershell.exe");
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&script);
+        cmd
+    };
+    cmd.env("CARGO_DIST_FORCE_INSTALL_DIR", &receipt.install_prefix);
     if !receipt.modify_path {
         cmd.env("OPENRESEARCH_CLI_NO_MODIFY_PATH", "1");
     }

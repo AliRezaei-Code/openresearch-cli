@@ -35,6 +35,7 @@ use crate::error::{anyhow, Result};
 use crate::local::chat::{PromptAnswer, ResumeCtx, TurnCtx, WirePrompt};
 
 pub(crate) use claude::{question_prompt, should_synthesize_plan, synthesize_resume};
+pub(crate) use detect::{find_in_dir, find_on_path};
 pub use detect::{HarnessAuthState, HarnessInfo, ModelInfo};
 pub use options::{HarnessOptions, PermissionMode};
 pub use plan_gate::command_is_readonly;

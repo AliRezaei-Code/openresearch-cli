@@ -477,7 +477,13 @@ impl From<&StoredRun> for ApiRun {
 // --- basic routes ---------------------------------------------------------
 
 async fn health() -> Json<Value> {
-    Json(json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") }))
+    Json(json!({
+        "desktopInstanceId": std::env::var("ORX_DESKTOP_INSTANCE_ID").ok(),
+        "ok": true,
+        "pid": std::process::id(),
+        "service": "openresearch",
+        "version": env!("CARGO_PKG_VERSION")
+    }))
 }
 
 #[derive(Deserialize)]
@@ -3286,6 +3292,7 @@ fn compute_settings_json(ssh: SshReadiness, github_enabled: bool) -> Value {
     // Presence of the credentials file only — whether the token still works is
     // the expanded row's (network) question.
     let or_logged_in = crate::config::credentials_present();
+    let local_supported = !cfg!(windows);
 
     // Same spellings as the expanded rows' SOURCE_LABELS/MODAL_TOKEN_LABELS
     // in the UI — the collapsed head stays visible above the open row, so the
@@ -3298,8 +3305,12 @@ fn compute_settings_json(ssh: SshReadiness, github_enabled: bool) -> Value {
     let mut targets = json!([
         {
             "id": "local",
-            "configured": true,
-            "summary": "Runs as a detached process on this machine",
+            "configured": local_supported,
+            "summary": if local_supported {
+                "Runs as a detached process on this machine"
+            } else {
+                "Local experiment execution requires macOS or Linux"
+            },
         },
         {
             "id": "hf",
@@ -3370,13 +3381,19 @@ fn compute_settings_json(ssh: SshReadiness, github_enabled: bool) -> Value {
     if let Some(targets) = targets.as_array_mut() {
         for target in targets {
             let local_target = target.get("id").and_then(Value::as_str) == Some("local");
-            let enabled = local_target || github_enabled;
+            let enabled = if local_target {
+                local_supported
+            } else {
+                github_enabled
+            };
             if let Some(target) = target.as_object_mut() {
                 target.insert("enabled".to_string(), Value::Bool(enabled));
                 target.insert(
                     "disabledReason".to_string(),
                     if enabled {
                         Value::Null
+                    } else if local_target {
+                        Value::String("Local runs require macOS or Linux".to_string())
                     } else {
                         Value::String("Connect GitHub to enable".to_string())
                     },
@@ -3385,11 +3402,15 @@ fn compute_settings_json(ssh: SshReadiness, github_enabled: bool) -> Value {
         }
     }
     let effective_backend = if github_enabled {
-        default_backend.unwrap_or("local")
+        default_backend
+            .filter(|backend| local_supported || *backend != "local")
+            .or_else(|| local_supported.then_some("local"))
     } else {
-        "local"
+        local_supported.then_some("local")
     };
-    let effective_flavor = github_enabled.then_some(default_flavor).flatten();
+    let effective_flavor = effective_backend
+        .filter(|backend| Some(*backend) == default_backend)
+        .and(default_flavor);
     json!({
         "defaultBackend": effective_backend,
         "defaultFlavor": effective_flavor,

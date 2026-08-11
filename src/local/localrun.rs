@@ -4,13 +4,20 @@
 //! its own run dir, never the agent's worktree. The run row lives in the
 //! local store only; a detached `orx supervise` watches the process.
 
+#[cfg(not(windows))]
 use std::collections::HashMap;
 
+#[cfg(not(windows))]
 use crate::commands::exp::{local_clone_script, spawn_detached_supervise};
 use crate::error::{anyhow, Result};
-use crate::jobs::{localbox, BackendDescriptor};
+#[cfg(not(windows))]
+use crate::jobs::localbox;
+use crate::jobs::BackendDescriptor;
+#[cfg(not(windows))]
 use crate::local::git;
-use crate::store::{now_ms, Store, StoredRun};
+use crate::store::StoredRun;
+#[cfg(not(windows))]
+use crate::store::{now_ms, Store};
 
 /// CLI wrapper around `submit_local_run`: submit, then print the summary.
 pub async fn launch_local_run(args: &crate::ExpRunArgs) -> Result<()> {
@@ -29,6 +36,14 @@ pub async fn launch_local_run(args: &crate::ExpRunArgs) -> Result<()> {
 /// Submit the local experiment's run as a detached process on this machine
 /// and detach a supervisor. Requires `--backend local`; there is nothing else
 /// to pick — the hardware is whatever this machine has.
+#[cfg(windows)]
+pub async fn submit_local_run(_args: &crate::ExpRunArgs) -> Result<StoredRun> {
+    Err(anyhow!(
+        "--backend local is unavailable on Windows because local runs require Unix process tools. Enable GitHub syncing and choose a remote compute backend."
+    ))
+}
+
+#[cfg(not(windows))]
 pub async fn submit_local_run(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     if args.sandbox.is_some() || args.gpu.is_some() || args.cpu.is_some() {
         return Err(anyhow!(

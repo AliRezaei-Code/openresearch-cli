@@ -13,8 +13,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(inputs.plan).ci.github.artifacts_matrix }}
-    runs-on: ${{ matrix.runner }}
-    container: ${{ matrix.container && matrix.container.image || null }}
+    runs-on: ${{ contains(matrix.targets[0], 'aarch64-pc-windows-') && 'windows-11-arm' || matrix.runner }}
+    container: ${{ !contains(matrix.targets[0], '-pc-windows-') && matrix.container && matrix.container.image || null }}
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -35,7 +35,7 @@ jobs:
             extract_dir="extracted/$verified"
             mkdir -p "$extract_dir"
             tar -xf "$archive" -C "$extract_dir"
-            binary="$(find "$extract_dir" -type f -name orx -print -quit)"
+            binary="$(find "$extract_dir" -type f \( -name orx -o -name orx.exe \) -print -quit)"
             if [[ -z "$binary" ]]; then
               echo "::error::No orx binary found in '$archive'"
               exit 1
@@ -47,7 +47,7 @@ jobs:
               exit 1
             fi
             verified=$((verified + 1))
-          done < <(find artifacts -type f \( -name '*.tar.xz' -o -name '*.tar.gz' \) -print0)
+          done < <(find artifacts -type f \( -name '*.tar.xz' -o -name '*.tar.gz' -o -name '*.zip' \) -print0)
           expected="$(jq 'length' <<< "$TARGETS_JSON")"
           if (( verified != expected )); then
             echo "::error::Expected $expected packaged archive(s), verified $verified"

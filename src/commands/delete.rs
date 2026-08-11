@@ -50,16 +50,15 @@ pub async fn run(args: DeleteArgs) -> Result<()> {
         remove_database(database)?;
         println!("✓ Deleted {} and its SQLite sidecars.", database.display());
     }
-    if let Some(executable) = &targets.executable {
-        std::fs::remove_file(executable)
-            .map_err(|error| anyhow!("Could not delete {}: {error}", executable.display()))?;
-        println!("✓ Deleted the orx CLI at {}.", executable.display());
-        if let Some(receipt) = &targets.receipt {
-            if let Err(error) = remove_if_exists(receipt) {
-                eprintln!(
-                    "Warning: the CLI was deleted, but its installer receipt remains: {error}"
-                );
-            }
+    if targets.executable.is_some() {
+        remove_cli(&targets)?;
+        #[cfg(windows)]
+        println!(
+            "✓ Scheduled the installed OpenResearch executables for deletion after this command exits."
+        );
+        #[cfg(not(windows))]
+        if let Some(executable) = &targets.executable {
+            println!("✓ Deleted the orx CLI at {}.", executable.display());
         }
     }
     Ok(())
@@ -105,6 +104,7 @@ fn confirm(command: DeleteCommand) -> Result<()> {
 struct DeleteTargets {
     database: Option<PathBuf>,
     executable: Option<PathBuf>,
+    desktop_executable: Option<PathBuf>,
     receipt: Option<PathBuf>,
 }
 
@@ -131,9 +131,15 @@ impl DeleteTargets {
             },
             None => None,
         };
+        let desktop_executable = executable.as_ref().and_then(|executable| {
+            let sibling =
+                executable.with_file_name(format!("openresearch{}", std::env::consts::EXE_SUFFIX));
+            ((receipt.is_some() || cfg!(windows)) && sibling.is_file()).then_some(sibling)
+        });
         Ok(Self {
             database: delete_database.then(|| crate::store::data_dir().join("orx.db")),
             executable,
+            desktop_executable,
             receipt,
         })
     }
@@ -147,10 +153,69 @@ impl DeleteTargets {
         if let Some(executable) = &self.executable {
             println!("  CLI executable: {}", executable.display());
         }
+        if let Some(executable) = &self.desktop_executable {
+            println!("  Desktop executable: {}", executable.display());
+        }
         if let Some(receipt) = &self.receipt {
             println!("  Installer receipt: {}", receipt.display());
         }
     }
+}
+
+#[cfg(not(windows))]
+fn remove_cli(targets: &DeleteTargets) -> Result<()> {
+    if let Some(executable) = &targets.executable {
+        remove_if_exists(executable)?;
+    }
+    if let Some(executable) = &targets.desktop_executable {
+        remove_if_exists(executable)?;
+    }
+    if let Some(receipt) = &targets.receipt {
+        if let Err(error) = remove_if_exists(receipt) {
+            eprintln!("Warning: the CLI was deleted, but its installer receipt remains: {error}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn remove_cli(targets: &DeleteTargets) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let executable = targets
+        .executable
+        .as_ref()
+        .ok_or_else(|| anyhow!("Could not locate the running orx executable"))?;
+    Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            "$orxPid = [int]$env:ORX_DELETE_PID; Wait-Process -Id $orxPid -ErrorAction SilentlyContinue; @($env:ORX_DELETE_CLI, $env:ORX_DELETE_DESKTOP, $env:ORX_DELETE_RECEIPT) | Where-Object { $_ } | ForEach-Object { Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue }",
+        ])
+        .env("ORX_DELETE_PID", std::process::id().to_string())
+        .env("ORX_DELETE_CLI", executable)
+        .env(
+            "ORX_DELETE_DESKTOP",
+            targets.desktop_executable.as_deref().unwrap_or(Path::new("")),
+        )
+        .env(
+            "ORX_DELETE_RECEIPT",
+            targets.receipt.as_deref().unwrap_or(Path::new("")),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|error| anyhow!("Could not schedule CLI deletion: {error}"))?;
+    Ok(())
 }
 
 fn remove_database(database: &Path) -> Result<()> {

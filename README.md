@@ -43,6 +43,23 @@ or turn one into an interactive marimo notebook:
 /paper-to-marimo <paper URL or title> on <compute>
 ```
 
+### Desktop app
+
+The desktop app starts the same local dashboard as `orx up` and opens it in
+your default browser. If the dashboard is already running, clicking the app
+opens the existing instance instead of starting another one. The `orx up`
+command remains available and behaves exactly as before.
+
+Download the current release for your platform:
+
+- **macOS:** [Apple Silicon](https://github.com/alphaXiv/openresearch-cli/releases/latest/download/OpenResearch-macos-arm64.dmg) or [Intel](https://github.com/alphaXiv/openresearch-cli/releases/latest/download/OpenResearch-macos-x64.dmg). Open the DMG and drag OpenResearch to Applications.
+- **Linux:** [ARM64](https://github.com/alphaXiv/openresearch-cli/releases/latest/download/OpenResearch-linux-arm64.AppImage) or [x64](https://github.com/alphaXiv/openresearch-cli/releases/latest/download/OpenResearch-linux-x64.AppImage). Make the AppImage executable, then open it.
+- **Windows:** [ARM64](https://github.com/alphaXiv/openresearch-cli/releases/latest/download/OpenResearch-windows-arm64-setup.exe) or [x64](https://github.com/alphaXiv/openresearch-cli/releases/latest/download/OpenResearch-windows-x64-setup.exe). Run the installer, then open OpenResearch from the Start menu or desktop shortcut.
+
+The dashboard and research agents run natively on Windows. Experiment execution
+on this machine (`--backend local`) requires macOS or Linux; Windows users can
+use any configured remote compute backend.
+
 ## The dashboard
 
 `orx up` runs a single local process on `127.0.0.1` — an embedded web UI plus a
@@ -55,10 +72,11 @@ JSON/SSE API over a local SQLite store. From there you get:
 - **The experiment tree** — every experiment is a git branch: a runnable
   snapshot of your code. The root is your baseline; children are variants
   measured against it, so lineage stays explicit.
-- **Runs** — projects and experiments stay local by default and run on this
-  machine from their recorded Git commit. Enable GitHub syncing for a project
-  when you want Modal, Hugging Face Jobs, Kubernetes, Slurm, SSH, Ray, or
-  OpenResearch compute; remote launches push the exact branch first.
+- **Runs** — projects and experiments stay local by default. On macOS and
+  Linux they can run on this machine from their recorded Git commit. On
+  Windows, enable GitHub syncing and choose Modal, Hugging Face Jobs,
+  Kubernetes, Slurm, SSH, Ray, or OpenResearch compute; remote launches push
+  the exact branch first.
 - **Autoresearch** — describe a goal and let the agent run autonomously toward
   it: proposing, launching, and analyzing experiments.
 
@@ -100,14 +118,22 @@ Run `orx --help` (or `orx <command> --help`) for full usage. The highlights:
 
 ## Installing
 
-The install script above fetches the latest prebuilt release (macOS and Linux,
-x86_64 and arm64) and is the same as:
+The CLI installers fetch the latest prebuilt release for macOS, Linux, or
+Windows on x86_64 or ARM64.
+
+macOS and Linux:
 
 ```sh
 curl -LsSf https://github.com/alphaXiv/openresearch-cli/releases/latest/download/openresearch-cli-installer.sh | sh
 ```
 
-`orx update` keeps script-installed binaries current; interactive terminals
+Windows PowerShell:
+
+```powershell
+irm https://github.com/alphaXiv/openresearch-cli/releases/latest/download/openresearch-cli-installer.ps1 | iex
+```
+
+`orx update` keeps installer-managed binaries current; interactive terminals
 also get a once-a-day background check with a one-line stderr notice (silence
 it with `ORX_NO_UPDATE_CHECK=1`).
 

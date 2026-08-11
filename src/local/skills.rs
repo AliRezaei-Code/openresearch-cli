@@ -267,6 +267,17 @@ Molab publication can be a later explicit step after the user enables GitHub
 for this project.
 "#;
 
+const WINDOWS_LOCAL_PROJECT_TEMPLATE: &str = r#"Prepare the requested research workflow for this local-only project.
+
+Request: {args}
+
+Experiment execution is unavailable for local-only projects on Windows. Do not
+run `orx exp run`, provision compute, or invent a workaround. Read the project
+and relevant papers, then prepare an experiment plan. Explain that the user
+must enable GitHub syncing for this project before a supported remote backend
+can clone and run it.
+"#;
+
 pub const CATALOG: &[Skill] = &[
     Skill {
         name: "lit-review",
@@ -301,6 +312,10 @@ pub const CATALOG: &[Skill] = &[
 /// Expand a leading `/name [args]` into the skill's full prompt. `None` when
 /// the text is not a known slash-skill (sent to the harness untouched).
 pub fn expand(text: &str, github_enabled: bool) -> Option<String> {
+    expand_for_platform(text, github_enabled, !cfg!(windows))
+}
+
+fn expand_for_platform(text: &str, github_enabled: bool, local_supported: bool) -> Option<String> {
     let rest = text.strip_prefix('/')?;
     let (cmd, args) = match rest.split_once(char::is_whitespace) {
         Some((cmd, args)) => (cmd, args.trim()),
@@ -308,7 +323,12 @@ pub fn expand(text: &str, github_enabled: bool) -> Option<String> {
     };
     let skill = CATALOG.iter().find(|s| s.name == cmd)?;
     let args = if args.is_empty() { skill.no_args } else { args };
-    let template = if github_enabled {
+    let template = if !github_enabled
+        && !local_supported
+        && matches!(skill.name, "reproduce-paper" | "paper-to-marimo")
+    {
+        WINDOWS_LOCAL_PROJECT_TEMPLATE
+    } else if github_enabled {
         skill.template
     } else {
         match skill.name {
@@ -435,6 +455,16 @@ mod tests {
         let icml = super::expand("/icml-repro example", false).unwrap();
         assert!(icml.contains("local-only"));
         assert!(icml.contains("Do not launch `hf jobs`"));
+    }
+
+    #[test]
+    fn windows_local_only_skills_do_not_suggest_local_runs() {
+        for name in ["reproduce-paper", "paper-to-marimo"] {
+            let prompt =
+                super::expand_for_platform(&format!("/{name} example"), false, false).unwrap();
+            assert!(prompt.contains("unavailable for local-only projects on Windows"));
+            assert!(!prompt.contains("--backend local"));
+        }
     }
 
     #[test]

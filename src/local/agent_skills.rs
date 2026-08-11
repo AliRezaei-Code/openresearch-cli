@@ -56,15 +56,20 @@ pub enum SkillSet {
 
 const COMPUTE_LOCAL: &str = include_str!("../../agent-skills/orx-compute/SKILL.local.md");
 const COMPUTE_LOCAL_ONLY: &str = include_str!("../../agent-skills/orx-compute/SKILL.local-only.md");
+const COMPUTE_WINDOWS: &str = include_str!("../../agent-skills/orx-compute/SKILL.windows.md");
 const COMPUTE_CLOUD: &str = include_str!("../../agent-skills/orx-compute/SKILL.md");
 const COMPUTE_K8S: &str = include_str!("../../agent-skills/orx-compute-k8s/SKILL.md");
 const EXPERIMENT_TREE_LOCAL: &str =
     include_str!("../../agent-skills/orx-experiment-tree/SKILL.local.md");
+const EXPERIMENT_TREE_WINDOWS: &str =
+    include_str!("../../agent-skills/orx-experiment-tree/SKILL.windows.md");
 const EXPERIMENT_TREE_CLOUD: &str = include_str!("../../agent-skills/orx-experiment-tree/SKILL.md");
 const GIT_EDITING: &str = include_str!("../../agent-skills/orx-git/SKILL.md");
 const EXPERIMENT_TREE_LOCAL_ONLY: &str =
     include_str!("../../agent-skills/orx-experiment-tree/SKILL.local-only.md");
 const GIT_LOCAL_ONLY: &str = include_str!("../../agent-skills/orx-git/SKILL.local-only.md");
+const GIT_WINDOWS_LOCAL_ONLY: &str =
+    include_str!("../../agent-skills/orx-git/SKILL.windows-local-only.md");
 const LIT: &str = include_str!("../../agent-skills/orx-lit/SKILL.md");
 const CREATE: &str = include_str!("../../agent-skills/orx-create/SKILL.md");
 const REPORTS_LOCAL: &str = include_str!("../../agent-skills/orx-reports/SKILL.local.md");
@@ -82,6 +87,7 @@ const EVIDENCE_CLOUD: &str = include_str!("../../agent-skills/orx-evidence/SKILL
 // cloud body variants (same public name, same triggers — only the body
 // changes), so they live in one const each.
 const D_COMPUTE: &str = "Launch experiment runs with `orx exp run`: backends (hf, modal, k8s, ssh, slurm, ray, openresearch, local), flavors, timeouts, images, sizing, and `orx exp wait`. Use before launching or re-launching any run, when choosing or switching a backend or GPU flavor, when a job OOMs, stalls, or times out, or when deciding GPU vs CPU.";
+const D_COMPUTE_WINDOWS: &str = "Launch experiment runs with `orx exp run` on Windows: remote backends (hf, modal, k8s, ssh, slurm, ray, openresearch), flavors, timeouts, images, sizing, and `orx exp wait`. Local compute is unavailable on Windows.";
 const D_EXPERIMENT_TREE: &str = "The experiment-tree model and the auto-research loop: shape the tree (stacked bushes), branch/launch/wait/promote, and `orx exp desc` notes. Use before creating, planning, or reorganizing experiments, when deciding what to try next, when a round of runs finishes, or whenever you're unsure how work maps onto the tree.";
 
 const S_COMPUTE_LOCAL: AgentSkill = AgentSkill {
@@ -184,10 +190,41 @@ pub fn find(name: &str, set: SkillSet) -> Option<&'static AgentSkill> {
 }
 
 pub fn available_in_session(skill: &AgentSkill, github_enabled: bool) -> bool {
-    github_enabled || skill.name != "orx-compute-k8s"
+    available_in_session_for_platform(skill, github_enabled, !cfg!(windows))
+}
+
+pub(crate) fn available_in_session_for_platform(
+    skill: &AgentSkill,
+    github_enabled: bool,
+    local_supported: bool,
+) -> bool {
+    if github_enabled {
+        return true;
+    }
+    if !local_supported && matches!(skill.name, "orx-compute" | "orx-experiment-tree") {
+        return false;
+    }
+    skill.name != "orx-compute-k8s"
 }
 
 pub fn session_content(skill: &AgentSkill, github_enabled: bool) -> &'static str {
+    session_content_for_platform(skill, github_enabled, !cfg!(windows))
+}
+
+fn session_content_for_platform(
+    skill: &AgentSkill,
+    github_enabled: bool,
+    local_supported: bool,
+) -> &'static str {
+    if !local_supported && skill.name == "orx-compute" {
+        return COMPUTE_WINDOWS;
+    }
+    if !local_supported && skill.name == "orx-experiment-tree" {
+        return EXPERIMENT_TREE_WINDOWS;
+    }
+    if !local_supported && !github_enabled && skill.name == "orx-git" {
+        return GIT_WINDOWS_LOCAL_ONLY;
+    }
     if github_enabled {
         return skill.content;
     }
@@ -199,7 +236,30 @@ pub fn session_content(skill: &AgentSkill, github_enabled: bool) -> &'static str
     }
 }
 
+pub fn platform_content(skill: &AgentSkill) -> &'static str {
+    platform_content_for_platform(skill, !cfg!(windows))
+}
+
+fn platform_content_for_platform(skill: &AgentSkill, local_supported: bool) -> &'static str {
+    if !local_supported && skill.name == "orx-compute" {
+        COMPUTE_WINDOWS
+    } else {
+        skill.content
+    }
+}
+
 pub fn session_description(skill: &AgentSkill, github_enabled: bool) -> &'static str {
+    session_description_for_platform(skill, github_enabled, !cfg!(windows))
+}
+
+pub(crate) fn session_description_for_platform(
+    skill: &AgentSkill,
+    github_enabled: bool,
+    local_supported: bool,
+) -> &'static str {
+    if !local_supported && skill.name == "orx-compute" {
+        return D_COMPUTE_WINDOWS;
+    }
     if github_enabled {
         return skill.description;
     }
@@ -373,6 +433,72 @@ mod tests {
         assert!(find("orx-create", SkillSet::Local).is_none());
     }
 
+    #[test]
+    fn local_only_windows_sessions_hide_run_skills() {
+        let available = skills(SkillSet::Local)
+            .into_iter()
+            .filter(|skill| available_in_session_for_platform(skill, false, false))
+            .map(|skill| skill.name)
+            .collect::<Vec<_>>();
+
+        assert!(!available.contains(&"orx-compute"));
+        assert!(!available.contains(&"orx-compute-k8s"));
+        assert!(!available.contains(&"orx-experiment-tree"));
+        assert!(available.contains(&"orx-lit"));
+        assert!(available.contains(&"orx-git"));
+    }
+
+    #[test]
+    fn windows_compute_skill_omits_local_backend() {
+        let skill = find("compute", SkillSet::Local).unwrap();
+        let content = session_content_for_platform(skill, true, false);
+        let description = session_description_for_platform(skill, true, false);
+        let frontmatter_description = content
+            .lines()
+            .nth(2)
+            .and_then(|line| line.strip_prefix("description: "))
+            .and_then(|value| serde_json::from_str::<String>(value).ok());
+
+        assert!(!content.contains("--backend local"));
+        assert!(!content.contains("use the `local` backend"));
+        assert!(!content.contains("openresearch, local"));
+        assert!(description.contains("unavailable on Windows"));
+        assert_eq!(frontmatter_description.as_deref(), Some(D_COMPUTE_WINDOWS));
+    }
+
+    #[test]
+    fn every_windows_session_skill_omits_local_launches() {
+        assert!(
+            EXPERIMENT_TREE_WINDOWS.contains("orx create-experiment <projectId> --title <name>")
+        );
+        for github_enabled in [false, true] {
+            for skill in skills(SkillSet::Local) {
+                if available_in_session_for_platform(skill, github_enabled, false) {
+                    let content = session_content_for_platform(skill, github_enabled, false);
+                    assert!(
+                        !content.contains("--backend local"),
+                        "{} advertises local compute on Windows",
+                        skill.name
+                    );
+                    assert!(
+                        !content.contains("local runner"),
+                        "{} advertises a local runner on Windows",
+                        skill.name
+                    );
+                }
+            }
+        }
+
+        for skill in skills(SkillSet::Full) {
+            let content = platform_content_for_platform(skill, false);
+            assert!(
+                !content.contains("--backend local"),
+                "globally installed {} advertises local compute on Windows",
+                skill.name
+            );
+        }
+    }
+
     /// `find` must return the body from the set it was asked for. `orx skill
     /// <name>` inside an `orx up` session relies on this: the playbook points
     /// there as the fallback, and a cloud body would name commands local mode
@@ -462,15 +588,12 @@ mod tests {
     fn bundled_skills_avoid_openresearch_ui_navigation() {
         for set in [SkillSet::Local, SkillSet::Full] {
             for skill in skills(set) {
-                for content in [
-                    skill.content,
-                    session_content(skill, true),
-                    session_content(skill, false),
-                ] {
+                crate::local::assert_agent_guidance_is_ui_agnostic(skill.name, skill.content);
+                for content in [session_content(skill, true), session_content(skill, false)] {
                     crate::local::assert_agent_guidance_is_ui_agnostic(skill.name, content);
                 }
+                crate::local::assert_agent_guidance_is_ui_agnostic(skill.name, skill.description);
                 for description in [
-                    skill.description,
                     session_description(skill, true),
                     session_description(skill, false),
                 ] {

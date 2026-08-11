@@ -9,13 +9,19 @@
 //! remote `~/.orx/runs/`. A restarted `orx supervise` reattaches purely from
 //! that directory.
 
+#[cfg(not(windows))]
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(windows))]
+use std::path::PathBuf;
 
 use crate::error::{anyhow, Result};
-use crate::jobs::ssh::{sh_quote, JobState};
+#[cfg(not(windows))]
+use crate::jobs::ssh::sh_quote;
+use crate::jobs::ssh::JobState;
 
 /// The run's working directory: `<data dir>/local-runs/<run id>`.
+#[cfg(not(windows))]
 pub fn run_dir(run_id: &str) -> PathBuf {
     // Run ids are locally-minted UUIDs; sanitize anyway (same as log_path).
     let safe: String = run_id
@@ -25,6 +31,7 @@ pub fn run_dir(run_id: &str) -> PathBuf {
     crate::store::data_dir().join("local-runs").join(safe)
 }
 
+#[cfg(not(windows))]
 pub struct LocalJobSpec {
     /// Names the run dir `<data dir>/local-runs/<run_id>`.
     pub run_id: String,
@@ -37,6 +44,7 @@ pub struct LocalJobSpec {
 /// Submit the job: write run.sh, launch it detached in its own process group
 /// (pid == pgid, so cancel can TERM the whole tree), record the pid. Returns
 /// the run dir — the reattach handle stored on the descriptor.
+#[cfg(not(windows))]
 pub fn run_job(spec: &LocalJobSpec) -> Result<PathBuf> {
     let dir = run_dir(&spec.run_id);
     std::fs::create_dir_all(&dir)
@@ -326,6 +334,7 @@ mod tests {
         state
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_job_lifecycle() {
         // The only test that touches ORX_DATA_DIR, so the global env is safe.

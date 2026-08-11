@@ -184,6 +184,11 @@ pub fn validate_compute_default(backend: &str, flavor: Option<&str>) -> Result<(
             BACKENDS.join(", ")
         ));
     }
+    if cfg!(windows) && backend == "local" {
+        return Err(anyhow!(
+            "The local compute backend is unavailable on Windows; choose a remote backend."
+        ));
+    }
     if flavor.is_some_and(|f| !f.is_empty()) && !FLAVORED_BACKENDS.contains(&backend) {
         return Err(anyhow!(
             "Backend '{backend}' does not take a flavor (flavors apply to {}).",
@@ -271,7 +276,11 @@ mod tests {
     #[test]
     fn validate_default_backend_ids_and_flavors() {
         for b in BACKENDS {
-            assert!(validate_compute_default(b, None).is_ok(), "{b} valid");
+            if cfg!(windows) && *b == "local" {
+                assert!(validate_compute_default(b, None).is_err());
+            } else {
+                assert!(validate_compute_default(b, None).is_ok(), "{b} valid");
+            }
         }
         assert!(validate_compute_default("gcp", None).is_err());
         for b in FLAVORED_BACKENDS {
@@ -285,10 +294,14 @@ mod tests {
                 validate_compute_default(b, Some("x")).is_err(),
                 "{b} must reject a flavor"
             );
-            assert!(
-                validate_compute_default(b, Some("")).is_ok(),
-                "{b} tolerates an empty flavor (treated as absent)"
-            );
+            if cfg!(windows) && b == "local" {
+                assert!(validate_compute_default(b, Some("")).is_err());
+            } else {
+                assert!(
+                    validate_compute_default(b, Some("")).is_ok(),
+                    "{b} tolerates an empty flavor (treated as absent)"
+                );
+            }
         }
     }
 }

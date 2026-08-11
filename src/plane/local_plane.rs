@@ -302,7 +302,13 @@ impl ControlPlane for LocalPlane {
             .get_local_project(project_id)?
             .ok_or_else(|| anyhow!("Local project {project_id} not found."))?
             .github_enabled();
+        let local_supported = !cfg!(windows);
         if !github_enabled {
+            if !local_supported {
+                return Err(anyhow!(
+                    "Experiment execution for a local-only project is unavailable on Windows. Enable GitHub syncing for this project, then choose a remote backend."
+                ));
+            }
             match args.backend.as_deref() {
                 None => {
                     args.backend = Some("local".to_string());
@@ -316,7 +322,7 @@ impl ControlPlane for LocalPlane {
             }
         } else {
             crate::local::apply_compute_default(&mut args.backend, &mut args.flavor);
-            if args.backend.is_none() {
+            if args.backend.is_none() && local_supported {
                 args.backend = Some("local".to_string());
             }
         }
@@ -343,15 +349,30 @@ impl ControlPlane for LocalPlane {
                 crate::local::openresearch::launch_local_openresearch(&args).await
             }
             Some("local") => crate::local::localrun::launch_local_run(&args).await,
-            Some(other) => Err(anyhow!(
-                "Unknown --backend '{}'. Local experiments support: hf (Hugging Face Jobs), \
+            Some(other) => {
+                let local_option = if local_supported {
+                    ", local (this machine)"
+                } else {
+                    ""
+                };
+                Err(anyhow!(
+                    "Unknown --backend '{}'. Local experiments support: hf (Hugging Face Jobs), \
                  modal (Modal serverless GPUs), k8s (your Kubernetes cluster), ssh (your own box), \
                  slurm (your Slurm cluster), ray (a Ray Jobs cluster), \
-                 openresearch (an ephemeral OpenResearch box), local (this machine).",
-                other
-            )),
-            None => Err(anyhow!(
-                "No --backend given and no default compute target is set. \
+                 openresearch (an ephemeral OpenResearch box){}.",
+                    other,
+                    local_option
+                ))
+            }
+            None => {
+                let local_option = if local_supported {
+                    ", \
+                 or `--backend local` (a detached process on this machine)"
+                } else {
+                    ""
+                };
+                Err(anyhow!(
+                    "No --backend given and no default compute target is set. \
                  Configure a default compute target in OpenResearch, \
                  or pass one per launch: \
                  `--backend hf --flavor <flavor>` (e.g. --flavor a10g-small), \
@@ -362,9 +383,10 @@ impl ControlPlane for LocalPlane {
                  `--backend slurm [--host <alias>] [--flavor h100:2]` (your Slurm cluster), \
                  `--backend ray [--flavor gpu:1]` (a Ray Jobs cluster), \
                  `--backend openresearch --flavor <shape>` (an ephemeral OpenResearch box, \
-                 e.g. --flavor h100_sxm or cpu5c; needs `orx login`), \
-                 or `--backend local` (a detached process on this machine)."
-            )),
+                 e.g. --flavor h100_sxm or cpu5c; needs `orx login`){}.",
+                    local_option
+                ))
+            }
         };
         // Key event, fired only on a successful launch. Coarse backend only.
         // `backend_label` is always `Some(<known backend>)` here — every arm that

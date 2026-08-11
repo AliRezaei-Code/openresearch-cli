@@ -63,8 +63,9 @@ const STEPS: TourStep[] = [
     anchor: "right",
     title: "Configure compute",
     description:
-      "This is where compute is configured. Point runs at this machine, Modal, SSH boxes, " +
-      "Kubernetes, or Slurm. Set it up once and agents pick the right hardware per run.",
+      "This is where compute is configured. Choose from the targets available on this platform, " +
+      "including hosted services, SSH boxes, Kubernetes, or Slurm. Set it up once and agents " +
+      "pick the right hardware per run.",
   },
   {
     focus: ["experiments"],

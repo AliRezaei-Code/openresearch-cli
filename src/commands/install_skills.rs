@@ -136,7 +136,7 @@ async fn write_full_skills(harness: &dyn Harness) -> Result<Vec<PathBuf>> {
         let dir = base.join(skill.name);
         fs::create_dir_all(&dir).await?;
         let path = dir.join("SKILL.md");
-        fs::write(&path, skill.content).await?;
+        fs::write(&path, crate::local::agent_skills::platform_content(skill)).await?;
         written.push(path);
     }
     Ok(written)

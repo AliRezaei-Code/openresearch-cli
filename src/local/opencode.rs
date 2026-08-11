@@ -31,24 +31,29 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `opencode` on PATH, else the installer's default drop location.
 pub fn find_opencode() -> Result<PathBuf> {
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join("opencode");
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
+    if let Some(candidate) = crate::local::harness::find_on_path("opencode") {
+        return Ok(candidate);
     }
     if let Some(home) = dirs::home_dir() {
-        let fallback = home.join(".opencode").join("bin").join("opencode");
-        if fallback.is_file() {
+        if let Some(fallback) =
+            crate::local::harness::find_in_dir(&home.join(".opencode").join("bin"), "opencode")
+        {
             return Ok(fallback);
         }
     }
     Err(anyhow!(
         "opencode not found (checked PATH and ~/.opencode/bin/opencode).\n\
-         Install it with: curl -fsSL https://opencode.ai/install | bash"
+         Install it with: {}",
+        opencode_install_hint(cfg!(windows))
     ))
+}
+
+fn opencode_install_hint(windows: bool) -> &'static str {
+    if windows {
+        "npm install -g opencode-ai"
+    } else {
+        "curl -fsSL https://opencode.ai/install | bash"
+    }
 }
 
 /// Ask the OS for a free loopback port (bind :0, read it back, release).
@@ -110,6 +115,10 @@ fn opencode_config_json(model: Option<&str>, instructions: &str) -> String {
 const SYSTEM_PROMPT: &str = include_str!("../../SYSTEM_PROMPT.md");
 
 fn playbook_md(project: &LocalProject) -> String {
+    playbook_md_for_platform(project, !cfg!(windows))
+}
+
+fn playbook_md_for_platform(project: &LocalProject, local_supported: bool) -> String {
     let id = &project.id;
     let name = &project.name;
     let publication_line = if project.github_enabled() {
@@ -129,13 +138,19 @@ fn playbook_md(project: &LocalProject) -> String {
     };
     let edit_step = if project.github_enabled() {
         "2. **Edit** in this worktree: check out `<branch>`, change the code, commit, and `git push`. Remote runs use the pushed commit."
+    } else if !local_supported {
+        "2. **Plan and edit** in this worktree: check out `<branch>`, change the code, and commit. Experiment execution remains unavailable until GitHub syncing is enabled."
     } else {
         "2. **Edit** in this worktree: check out `<branch>`, change the code, and commit. Never push; local runs clone the recorded local commit."
     };
-    let compute_contract = if project.github_enabled() {
+    let compute_contract = if project.github_enabled() && local_supported {
         "Remote backends clone the pushed GitHub commit; the local backend clones the recorded commit directly from the project folder."
-    } else {
+    } else if project.github_enabled() {
+        "Remote backends clone the pushed GitHub commit. The local compute backend is unavailable on Windows."
+    } else if local_supported {
         "This project is local-only: only the `local` backend is available, and it clones the recorded commit directly from the project folder."
+    } else {
+        "Experiment execution is unavailable on Windows until GitHub syncing is enabled for this project."
     };
     let baseline = &project.baseline_branch;
     let artifacts = super::files::files_dir(project)
@@ -158,43 +173,56 @@ fn playbook_md(project: &LocalProject) -> String {
     // stale prompt launches on the current default.
     let configured_compute_default = crate::config::compute_default();
     let compute_default = if project.github_enabled() {
-        Some(
-            configured_compute_default
-                .clone()
-                .unwrap_or_else(|| ("local".to_string(), None)),
-        )
+        configured_compute_default
+            .clone()
+            .filter(|(backend, _)| local_supported || backend != "local")
+            .or_else(|| local_supported.then(|| ("local".to_string(), None)))
     } else {
-        Some(("local".to_string(), None))
+        local_supported.then(|| ("local".to_string(), None))
     };
-    let compute_default_source = if configured_compute_default.is_some() {
+    let compute_default_source = if configured_compute_default.as_ref() == compute_default.as_ref()
+        && configured_compute_default.is_some()
+    {
         "the user's configured default"
     } else {
         "the local fallback"
     };
-    let compute_bullet = if !project.github_enabled() {
+    let compute_bullet = if !project.github_enabled() && !local_supported {
+        "- Compute: experiment execution is unavailable on Windows until the user enables GitHub syncing and chooses a remote backend."
+            .to_string()
+    } else if !project.github_enabled() {
         "- Compute: **local only** — run recorded commits on this machine. External backends remain unavailable until the user enables GitHub syncing for this project."
             .to_string()
     } else {
         match &compute_default {
-        Some((b, f)) => {
-            let flavor_part = f
-                .as_ref()
-                .map_or(String::new(), |f| format!(" (`--flavor {f}`)"));
-            format!(
+            Some((b, f)) => {
+                let flavor_part = f
+                    .as_ref()
+                    .map_or(String::new(), |f| format!(" (`--flavor {f}`)"));
+                format!(
                 "- Compute: default target **{b}**{flavor_part} — {compute_default_source}; omit `--backend` \
                  on `orx exp run` to launch there. \
                  Use another backend only when the user names one (see \"Compute backends\")"
             )
-        }
-        None => {
-            "- Compute: backends — `hf`, `modal`, `k8s`, `ssh`, `slurm`, `ray`, or `local` —\n  \
+            }
+            None => {
+                let backends = if local_supported {
+                    "`hf`, `modal`, `k8s`, `ssh`, `slurm`, `ray`, `openresearch`, or `local`"
+                } else {
+                    "`hf`, `modal`, `k8s`, `ssh`, `slurm`, `ray`, or `openresearch`"
+                };
+                format!(
+                    "- Compute: backends — {backends} —\n  \
                  chosen by the user per run; **there is no default backend** (see \"Compute\n  \
                  backends\")"
-                .to_string()
-        }
+                )
+            }
         }
     };
-    let backends_intro = if !project.github_enabled() {
+    let backends_intro = if !project.github_enabled() && !local_supported {
+        "`orx exp run` cannot execute this local-only project on Windows. Ask the user to enable GitHub syncing before selecting a remote backend."
+            .to_string()
+    } else if !project.github_enabled() {
         "`orx exp run` uses only the `local` backend for this project. Do not select, configure, or contact an external backend."
             .to_string()
     } else {
@@ -235,44 +263,80 @@ fn playbook_md(project: &LocalProject) -> String {
                 .to_string(),
         }
     };
-    let (run_invocation, run_guidance, compute_guidance) = if project.github_enabled() {
+    let (run_invocation, run_guidance, compute_guidance) = if project.github_enabled()
+        && local_supported
+    {
         (
             "`orx exp run <expId> [--backend <hf|modal|k8s|ssh|slurm|openresearch|local>] [flags]`",
             "Launch the node's run. Backend flags, flavors, and sizing: **`orx-compute` skill** (k8s manifest: **`orx-compute-k8s`**).",
             "Before launching on a backend you have not used this session, load the `orx-compute` skill; k8s additionally needs `orx-compute-k8s`.",
         )
-    } else {
+    } else if project.github_enabled() {
+        (
+            "`orx exp run <expId> [--backend <hf|modal|k8s|ssh|slurm|ray|openresearch>] [flags]`",
+            "Launch the node's run on a remote backend. Backend flags, flavors, and sizing: **`orx-compute` skill** (k8s manifest: **`orx-compute-k8s`**).",
+            "Before launching on a backend you have not used this session, load the `orx-compute` skill; k8s additionally needs `orx-compute-k8s`. The local backend is unavailable on Windows.",
+        )
+    } else if local_supported {
         (
             "`orx exp run <expId> --backend local`",
             "Launch the recorded commit on this machine. External backends are unavailable until the user enables GitHub.",
             "Load `orx-compute` for the local launch/wait contract. Do not configure or contact external providers.",
         )
+    } else {
+        (
+            "`orx exp run` is unavailable for this project on Windows",
+            "Do not launch an experiment. Ask the user to enable GitHub syncing so a remote backend can clone the project.",
+            "Experiment execution is unavailable until GitHub syncing is enabled for this project.",
+        )
     };
     let skills_scope = if project.github_enabled() {
         "backend flags and sizing, the k8s manifest, tree shaping, git recipes, log analysis, and artifact naming"
-    } else {
+    } else if local_supported {
         "local runs, tree shaping, local git recipes, log analysis, and artifact naming"
+    } else {
+        "local git recipes, literature review, existing log analysis, and artifact naming"
     };
-    let launch_step = if !project.github_enabled() {
+    let launch_step = if !project.github_enabled() && !local_supported {
+        "3. **Do not launch**: experiment execution is unavailable for a local-only project on Windows. Ask the user to enable GitHub syncing first."
+    } else if !project.github_enabled() {
         "3. **Launch locally**: `orx exp run <expId> --backend local`. External backends are unavailable until the user enables GitHub syncing for this project."
-    } else if compute_default.is_some() {
+    } else if compute_default.is_some() && local_supported {
         "3. **Launch**: `orx exp run <expId>` — omitting `--backend` uses the default\n   \
          target (flags the default still needs are listed under \"Compute backends\") —\n   \
          or name one explicitly (`--flavor` for hf/modal/ray, `--host` for ssh/slurm; k8s\n   \
          reads the committed manifest; local takes no flags)."
-    } else {
+    } else if compute_default.is_some() {
+        "3. **Launch**: `orx exp run <expId>` — omitting `--backend` uses the default\n   \
+         remote target (flags the default still needs are listed under \"Compute backends\") —\n   \
+         or name one explicitly (`--flavor` for hf/modal/ray, `--host` for ssh/slurm; k8s\n   \
+         reads the committed manifest)."
+    } else if local_supported {
         "3. **Launch**: `orx exp run <expId> --backend <backend>` (`--flavor` for\n   \
          hf/modal/ray, `--host` for ssh/slurm; k8s reads the committed manifest; local\n   \
          takes no flags)."
+    } else {
+        "3. **Launch**: `orx exp run <expId> --backend <backend>` (`--flavor` for\n   \
+         hf/modal/ray, `--host` for ssh/slurm; k8s reads the committed manifest)."
     };
     // The modular skills installed into this session's worktree (see
     // `agent_skills::ensure_session_skills`). Generated from the Local set so
     // the playbook index and the files on disk can never drift.
     let skills_list = super::agent_skills::skills(super::agent_skills::SkillSet::Local)
         .iter()
-        .filter(|skill| super::agent_skills::available_in_session(skill, project.github_enabled()))
+        .filter(|skill| {
+            super::agent_skills::available_in_session_for_platform(
+                skill,
+                project.github_enabled(),
+                local_supported,
+            )
+        })
         .map(|s| {
-            let description = super::agent_skills::session_description(s, project.github_enabled());
+            let description = super::agent_skills::session_description_for_platform(
+                s,
+                project.github_enabled(),
+                local_supported,
+            );
             format!("- **{}** — {description}", s.name)
         })
         .collect::<Vec<_>>()
@@ -535,15 +599,11 @@ async fn spawn_agent(
     // resolves to THIS orx (with local mode), not an older install on PATH.
     if let Ok(exe) = std::env::current_exe().and_then(|p| p.canonicalize()) {
         if let Some(dir) = exe.parent() {
-            let mut path = std::ffi::OsString::from(dir);
-            match std::env::var_os("PATH") {
-                Some(existing) if !existing.is_empty() => {
-                    path.push(":");
-                    path.push(existing);
-                }
-                _ => {}
+            if let Some(path) =
+                crate::local::chat::prepend_to_path(dir, std::env::var_os("PATH").as_deref())
+            {
+                cmd.env("PATH", path);
             }
-            cmd.env("PATH", path);
         }
     }
     // Vars saved in the dashboard's Environment tab reach the agent too;
@@ -781,6 +841,28 @@ mod tests {
         assert!(md.contains("`orx exp run <expId> --backend local`"));
         assert!(!md.contains("orx-compute-k8s"));
         assert!(!md.contains("--backend <hf|modal"));
+    }
+
+    #[test]
+    fn windows_playbook_never_suggests_local_compute() {
+        let mut local_only = sample_project();
+        local_only.github_owner.clear();
+        local_only.github_repo.clear();
+        let local_md = playbook_md_for_platform(&local_only, false);
+        assert!(local_md.contains("execution is unavailable"));
+        assert!(!local_md.contains("--backend local"));
+        assert!(!local_md.contains("local runs clone"));
+
+        let remote_md = playbook_md_for_platform(&sample_project(), false);
+        assert!(remote_md.contains("local backend is unavailable on Windows"));
+        assert!(!remote_md.contains("--backend <hf|modal|k8s|ssh|slurm|openresearch|local>"));
+        assert!(!remote_md.contains("local takes no flags"));
+    }
+
+    #[test]
+    fn opencode_install_hint_matches_the_platform() {
+        assert_eq!(opencode_install_hint(true), "npm install -g opencode-ai");
+        assert!(opencode_install_hint(false).contains("install | bash"));
     }
 
     #[test]
