@@ -18,7 +18,40 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::Credentials;
-use crate::error::{anyhow, Result};
+use crate::error::{anyhow, Error, Result};
+
+#[derive(Debug)]
+struct ApiHttpError {
+    path: String,
+    status: u16,
+    reason: String,
+    detail: String,
+}
+
+impl std::fmt::Display for ApiHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Request to {} failed ({} {}){}",
+            self.path,
+            self.status,
+            self.reason,
+            if self.detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", self.detail)
+            }
+        )
+    }
+}
+
+impl std::error::Error for ApiHttpError {}
+
+pub(crate) fn is_api_status(error: &Error, status: u16) -> bool {
+    error
+        .downcast_ref::<ApiHttpError>()
+        .is_some_and(|api_error| api_error.status == status)
+}
 
 // ---------------------------------------------------------------------------
 // Response DTOs
@@ -665,6 +698,16 @@ pub struct Sandbox {
     pub created_by: Option<String>,
     pub updated_at: String,
     pub provision_warnings: Option<String>,
+    #[serde(default)]
+    pub provision_stage: Option<String>,
+    #[serde(default)]
+    pub provision_error_code: Option<String>,
+    #[serde(default)]
+    pub provision_error_message: Option<String>,
+    #[serde(default)]
+    pub last_health_check_at: Option<String>,
+    #[serde(default)]
+    pub last_health_error: Option<String>,
     pub provider_name: Option<String>,
     pub provider_instance_id: Option<String>,
     pub price_per_hour: Option<f64>,
@@ -754,19 +797,13 @@ async fn send_request(
     }
     if !status.is_success() {
         let reason = status.canonical_reason().unwrap_or("");
-        let detail = res.text().await.unwrap_or_default();
-        let suffix = if detail.is_empty() {
-            String::new()
-        } else {
-            format!(": {}", detail)
-        };
-        return Err(anyhow!(
-            "Request to {} failed ({} {}){}",
-            path,
-            status.as_u16(),
-            reason,
-            suffix
-        ));
+        return Err(ApiHttpError {
+            path: path.to_string(),
+            status: status.as_u16(),
+            reason: reason.to_string(),
+            detail: res.text().await.unwrap_or_default(),
+        }
+        .into());
     }
 
     Ok(res)
@@ -1904,9 +1941,10 @@ pub async fn fetch_biorxiv(doi: &str) -> Result<Option<BiorxivDetail>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        openalex_selector, reconstruct_abstract, CreateBaselineExperimentBody, CreateChildBody,
-        CreateSandboxBody, ListCatalog, ListCpuCatalog, LitHit, OpenAlexWork, PaperHit, RunBody,
-        RunTarget, SandboxEnvelope, SandboxTarget, BIORXIV_SOURCE_ID,
+        is_api_status, openalex_selector, reconstruct_abstract, ApiHttpError,
+        CreateBaselineExperimentBody, CreateChildBody, CreateSandboxBody, ListCatalog,
+        ListCpuCatalog, LitHit, OpenAlexWork, PaperHit, RunBody, RunTarget, SandboxEnvelope,
+        SandboxTarget, BIORXIV_SOURCE_ID,
     };
     use serde_json::json;
 
@@ -2180,6 +2218,71 @@ mod tests {
         assert_eq!(sb.ssh_hostname.as_deref(), Some("203.0.113.7"));
         assert_eq!(sb.ssh_port, Some(22022));
         assert_eq!(sb.ssh_username.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn deserializes_failed_sandbox_with_provision_reason() {
+        let json = r#"{
+            "sandbox": {
+                "id": "sb_failed",
+                "organizationId": "org_1",
+                "projectId": null,
+                "sshHostname": null,
+                "sshPort": null,
+                "sshUsername": null,
+                "status": "failed",
+                "machineType": "persistent",
+                "createdBy": "user_1",
+                "updatedAt": "2026-08-10T00:00:00Z",
+                "provisionWarnings": null,
+                "provisionStage": "ssh_auth",
+                "provisionErrorCode": "readiness_timeout",
+                "provisionErrorMessage": "The registered key was rejected",
+                "lastHealthCheckAt": "2026-08-10T00:00:01Z",
+                "lastHealthError": "Permission denied (publickey)",
+                "providerName": "nebius",
+                "providerInstanceId": "instance_1",
+                "pricePerHour": 1.5,
+                "gpu": "H100_SXM",
+                "gpuCount": 1,
+                "vcpuCount": null
+            }
+        }"#;
+
+        let sandbox = serde_json::from_str::<SandboxEnvelope>(json)
+            .expect("should deserialize")
+            .sandbox;
+        assert_eq!(sandbox.status, "failed");
+        assert_eq!(sandbox.provision_stage.as_deref(), Some("ssh_auth"));
+        assert_eq!(
+            sandbox.provision_error_code.as_deref(),
+            Some("readiness_timeout")
+        );
+        assert_eq!(
+            sandbox.provision_error_message.as_deref(),
+            Some("The registered key was rejected")
+        );
+        assert_eq!(
+            sandbox.last_health_error.as_deref(),
+            Some("Permission denied (publickey)")
+        );
+    }
+
+    #[test]
+    fn api_status_errors_remain_typed() {
+        let error = crate::error::Error::new(ApiHttpError {
+            path: "/sandboxes/sb_1".into(),
+            status: 404,
+            reason: "Not Found".into(),
+            detail: "Sandbox not found".into(),
+        });
+
+        assert!(is_api_status(&error, 404));
+        assert!(!is_api_status(&error, 500));
+        assert_eq!(
+            error.to_string(),
+            "Request to /sandboxes/sb_1 failed (404 Not Found): Sandbox not found"
+        );
     }
 
     /// The api declares `chatSessionId` optional: a lost `rename_all` would send

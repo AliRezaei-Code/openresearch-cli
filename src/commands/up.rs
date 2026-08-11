@@ -52,6 +52,11 @@ pub async fn run(args: UpArgs) -> Result<()> {
                 }
             }
         }
+        for run_id in store.list_pending_sandbox_cleanup_run_ids()? {
+            if let Err(err) = crate::commands::exp::spawn_detached_supervise(&run_id) {
+                eprintln!("could not recover sandbox cleanup for run {run_id}: {err}");
+            }
+        }
     }
 
     // Harnesses spawn lazily on the first message to one of their sessions;

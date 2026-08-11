@@ -230,19 +230,33 @@ pub async fn submit_local_openresearch(args: &crate::ExpRunArgs) -> Result<Store
     // From here the box is billing: never leak it behind an error the store
     // doesn't know about.
     let persisted = store
-        .upsert_run(&run)
+        .mark_sandbox_cleanup_pending(&run_id, &sandbox.id, true)
+        .and_then(|()| store.upsert_run(&run))
         .and_then(|()| spawn_detached_supervise(&run_id));
     if let Err(err) = persisted {
         eprintln!(
             "submit failed after the box was provisioned — deleting box {}",
             sandbox.id
         );
-        if let Err(td) = openresearch::teardown(&creds, &sandbox.id).await {
-            eprintln!(
-                "warning: box {} could not be torn down ({td}) — delete it with \
-                 `orx instance delete {}` or through OpenResearch.",
-                sandbox.id, sandbox.id
-            );
+        loop {
+            let active_credentials = crate::config::load_credentials()
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| creds.clone());
+            match openresearch::teardown(&active_credentials, &sandbox.id).await {
+                Ok(()) => {
+                    let _ = store.clear_sandbox_cleanup(&run_id);
+                    break;
+                }
+                Err(td) => {
+                    eprintln!(
+                        "warning: box {} cleanup failed ({td}); retrying while it may still bill",
+                        sandbox.id
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                }
+            }
         }
         return Err(err);
     }

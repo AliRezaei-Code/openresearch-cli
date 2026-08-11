@@ -170,6 +170,19 @@ pub struct StoredRun {
     pub chat_session_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportOutage {
+    pub lost_at: i64,
+    pub last_error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxCleanup {
+    pub sandbox_id: String,
+    pub last_error: Option<String>,
+    pub retain_failed: bool,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -265,6 +278,29 @@ impl Store {
                 git_found INTEGER NOT NULL,
                 error     TEXT,
                 tested_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS run_transport_outages (
+                run_id     TEXT PRIMARY KEY,
+                lost_at    INTEGER NOT NULL,
+                last_error TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS run_launch_claims (
+                run_id     TEXT PRIMARY KEY,
+                claimed_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS run_transport_events (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id   TEXT NOT NULL,
+                message  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_run_transport_events_run
+                ON run_transport_events(run_id, sequence);
+            CREATE TABLE IF NOT EXISTS run_sandbox_cleanups (
+                run_id      TEXT PRIMARY KEY,
+                sandbox_id  TEXT NOT NULL,
+                last_error  TEXT,
+                retain_failed INTEGER NOT NULL,
+                updated_at  INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS ui_state (
                 id                       INTEGER PRIMARY KEY CHECK (id = 1),
@@ -605,6 +641,198 @@ impl Store {
         self.conn.execute(
             "UPDATE runs SET backend_json = ?2, updated_at = ?3 WHERE id = ?1",
             params![run_id, backend_json, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Persist an SSH inspection failure without moving the beginning of an
+    /// existing outage. Returns the outage and whether this call started it.
+    pub fn record_transport_failure(
+        &self,
+        run_id: &str,
+        error: &str,
+        observed_at: i64,
+        started_message: &str,
+    ) -> Result<(TransportOutage, bool)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let started = tx.execute(
+            "INSERT OR IGNORE INTO run_transport_outages (run_id, lost_at, last_error)
+             VALUES (?1, ?2, ?3)",
+            params![run_id, observed_at, error],
+        )? > 0;
+        if started {
+            tx.execute(
+                "INSERT INTO run_transport_events (run_id, message) VALUES (?1, ?2)",
+                params![run_id, started_message],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE run_transport_outages SET last_error = ?2 WHERE run_id = ?1",
+                params![run_id, error],
+            )?;
+        }
+        let outage = tx
+            .query_row(
+                "SELECT lost_at, last_error FROM run_transport_outages WHERE run_id = ?1",
+                params![run_id],
+                |row| {
+                    Ok(TransportOutage {
+                        lost_at: row.get(0)?,
+                        last_error: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("Could not persist SSH outage for run {run_id}."))?;
+        tx.commit()?;
+        Ok((outage, started))
+    }
+
+    pub fn transport_outage(&self, run_id: &str) -> Result<Option<TransportOutage>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT lost_at, last_error FROM run_transport_outages WHERE run_id = ?1",
+                params![run_id],
+                |row| {
+                    Ok(TransportOutage {
+                        lost_at: row.get(0)?,
+                        last_error: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn recover_transport_outage(&self, run_id: &str, message: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM run_transport_outages WHERE run_id = ?1",
+            params![run_id],
+        )?;
+        tx.execute(
+            "INSERT INTO run_transport_events (run_id, message) VALUES (?1, ?2)",
+            params![run_id, message],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn record_launch_claim(&self, run_id: &str, observed_at: i64) -> Result<i64> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO run_launch_claims (run_id, claimed_at) VALUES (?1, ?2)",
+            params![run_id, observed_at],
+        )?;
+        self.launch_claim_at(run_id)?
+            .ok_or_else(|| anyhow!("Could not persist launch claim for run {run_id}."))
+    }
+
+    pub fn launch_claim_at(&self, run_id: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT claimed_at FROM run_launch_claims WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn clear_launch_claim(&self, run_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM run_launch_claims WHERE run_id = ?1",
+            params![run_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_transport_event(&self, run_id: &str, message: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO run_transport_events (run_id, message) VALUES (?1, ?2)",
+            params![run_id, message],
+        )?;
+        Ok(())
+    }
+
+    pub fn transport_events(&self, run_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT message FROM run_transport_events WHERE run_id = ?1 ORDER BY sequence",
+        )?;
+        let rows = stmt.query_map(params![run_id], |row| row.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn clear_transport_history(&self, run_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM run_transport_outages WHERE run_id = ?1",
+            params![run_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM run_launch_claims WHERE run_id = ?1",
+            params![run_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM run_transport_events WHERE run_id = ?1",
+            params![run_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_sandbox_cleanup_pending(
+        &self,
+        run_id: &str,
+        sandbox_id: &str,
+        retain_failed: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO run_sandbox_cleanups (run_id, sandbox_id, retain_failed, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(run_id) DO UPDATE SET sandbox_id = excluded.sandbox_id,
+                 retain_failed = excluded.retain_failed,
+                 updated_at = excluded.updated_at",
+            params![run_id, sandbox_id, retain_failed, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn sandbox_cleanup(&self, run_id: &str) -> Result<Option<SandboxCleanup>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT sandbox_id, last_error, retain_failed
+                 FROM run_sandbox_cleanups WHERE run_id = ?1",
+                params![run_id],
+                |row| {
+                    Ok(SandboxCleanup {
+                        sandbox_id: row.get(0)?,
+                        last_error: row.get(1)?,
+                        retain_failed: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn list_pending_sandbox_cleanup_run_ids(&self) -> Result<Vec<String>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT run_id FROM run_sandbox_cleanups ORDER BY updated_at")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn record_sandbox_cleanup_error(&self, run_id: &str, error: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE run_sandbox_cleanups SET last_error = ?2, updated_at = ?3 WHERE run_id = ?1",
+            params![run_id, error, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_sandbox_cleanup(&self, run_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM run_sandbox_cleanups WHERE run_id = ?1",
+            params![run_id],
         )?;
         Ok(())
     }
@@ -1630,6 +1858,125 @@ mod tests {
             Some("chat_A".to_string()),
             "the launching session is never overwritten by a later upsert"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transport_outage_keeps_original_start_across_reopens() {
+        let dir = std::env::temp_dir().join(format!(
+            "orx-store-transport-outage-{}",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let store = Store::open_at(dir.clone()).unwrap();
+            let (outage, started) = store
+                .record_transport_failure("run_1", "connection refused", 1_000, "orx: SSH lost")
+                .unwrap();
+            assert!(started);
+            assert_eq!(outage.lost_at, 1_000);
+
+            let (outage, started) = store
+                .record_transport_failure(
+                    "run_1",
+                    "connection timed out",
+                    5_000,
+                    "orx: SSH lost again",
+                )
+                .unwrap();
+            assert!(!started);
+            assert_eq!(outage.lost_at, 1_000);
+            assert_eq!(outage.last_error, "connection timed out");
+        }
+
+        let store = Store::open_at(dir.clone()).unwrap();
+        assert_eq!(
+            store.transport_outage("run_1").unwrap(),
+            Some(TransportOutage {
+                lost_at: 1_000,
+                last_error: "connection timed out".into(),
+            })
+        );
+        store
+            .recover_transport_outage("run_1", "orx: SSH recovered")
+            .unwrap();
+        assert_eq!(store.transport_outage("run_1").unwrap(), None);
+        assert_eq!(
+            store.transport_events("run_1").unwrap(),
+            vec!["orx: SSH lost", "orx: SSH recovered"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transport_events_keep_transition_order_across_reopens() {
+        let dir = std::env::temp_dir().join(format!(
+            "orx-store-transport-events-{}",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let store = Store::open_at(dir.clone()).unwrap();
+            store
+                .record_transport_event("run_1", "orx: SSH connection lost")
+                .unwrap();
+            store
+                .record_transport_event("run_1", "orx: SSH connection recovered")
+                .unwrap();
+        }
+        let store = Store::open_at(dir.clone()).unwrap();
+        assert_eq!(
+            store.transport_events("run_1").unwrap(),
+            ["orx: SSH connection lost", "orx: SSH connection recovered"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn launch_claim_keeps_original_start_across_reopens() {
+        let dir =
+            std::env::temp_dir().join(format!("orx-store-launch-claim-{}", uuid::Uuid::new_v4()));
+        {
+            let store = Store::open_at(dir.clone()).unwrap();
+            assert_eq!(store.record_launch_claim("run_1", 1_000).unwrap(), 1_000);
+            assert_eq!(store.record_launch_claim("run_1", 5_000).unwrap(), 1_000);
+        }
+        let store = Store::open_at(dir.clone()).unwrap();
+        assert_eq!(store.launch_claim_at("run_1").unwrap(), Some(1_000));
+        store.clear_launch_claim("run_1").unwrap();
+        assert_eq!(store.launch_claim_at("run_1").unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sandbox_cleanup_remains_pending_until_confirmed() {
+        let dir = std::env::temp_dir().join(format!(
+            "orx-store-sandbox-cleanup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let store = Store::open_at(dir.clone()).unwrap();
+            store
+                .mark_sandbox_cleanup_pending("run_1", "sandbox_1", true)
+                .unwrap();
+            store
+                .record_sandbox_cleanup_error("run_1", "API unavailable")
+                .unwrap();
+        }
+
+        let store = Store::open_at(dir.clone()).unwrap();
+        assert_eq!(
+            store.sandbox_cleanup("run_1").unwrap(),
+            Some(SandboxCleanup {
+                sandbox_id: "sandbox_1".into(),
+                last_error: Some("API unavailable".into()),
+                retain_failed: true,
+            })
+        );
+        assert_eq!(
+            store.list_pending_sandbox_cleanup_run_ids().unwrap(),
+            vec!["run_1"]
+        );
+        store.clear_sandbox_cleanup("run_1").unwrap();
+        assert_eq!(store.sandbox_cleanup("run_1").unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
