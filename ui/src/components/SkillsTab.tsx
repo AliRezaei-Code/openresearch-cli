@@ -12,8 +12,22 @@ import {
   type SkillScope,
   type UserSkill,
 } from "../api";
+import {
+  BADGE_CLASS_NAME,
+  ICON_BUTTON_CLASS_NAME,
+  SMALL_BUTTON_CLASS_NAME,
+  SPINNER_CLASS_NAME,
+} from "../styleClasses";
 
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
+
+const CARD_CLASS_NAME =
+  "bg-background border border-border rounded-lg py-4 px-4.5 mb-4 [&_h3]:mt-0 [&_h3]:mx-0 [&_h3]:mb-2.5 [&_h3]:text-sm [&_h3]:font-semibold [&_h3]:text-text";
+const CARD_SUB_CLASS_NAME = "mt-0 mx-0 mb-3 text-muted text-md leading-normal";
+const SKILL_ROW_CLASS_NAME =
+  "flex items-start gap-3 py-2.5 border-t border-t-border first:border-t-0";
+const SKILL_NAME_CLASS_NAME = "font-mono text-sm font-medium text-text";
+const SKILL_DESC_CLASS_NAME = "mt-0.5 mb-0 text-xs leading-relaxed text-muted";
 
 /** Read a File into base64 (strips the `data:...;base64,` prefix). */
 function fileToBase64(file: File): Promise<string> {
@@ -49,14 +63,16 @@ function SkillRow({
 }) {
   const [busy, setBusy] = useState(false);
   return (
-    <div className="skill-row">
-      <div className="skill-row-main">
-        <code className="skill-row-name">/{skill.name}</code>
-        <p className="skill-row-desc">{skill.description}</p>
+    <div className={SKILL_ROW_CLASS_NAME}>
+      <div className="flex-1 min-w-0">
+        <code className={SKILL_NAME_CLASS_NAME}>/{skill.name}</code>
+        <p className={SKILL_DESC_CLASS_NAME}>{skill.description}</p>
       </div>
-      <span className="skill-row-size">{fmtBytes(skill.bytes)}</span>
+      <span className="shrink-0 text-2xs text-subtext pt-0.5 whitespace-nowrap">
+        {fmtBytes(skill.bytes)}
+      </span>
       <button
-        className="icon-btn"
+        className={ICON_BUTTON_CLASS_NAME}
         data-tip="Delete skill"
         data-tip-align="end"
         aria-label={`Delete skill ${skill.name}`}
@@ -93,15 +109,13 @@ function SkillList({
   onChanged: () => void;
 }) {
   return (
-    <section className="settings-card">
-      <div className="settings-card-head">
-        <h3>{title}</h3>
-      </div>
-      <p className="settings-sub">{hint}</p>
+    <section className={CARD_CLASS_NAME}>
+      <h3>{title}</h3>
+      <p className={CARD_SUB_CLASS_NAME}>{hint}</p>
       {skills.length === 0 ? (
-        <div className="skills-empty">No skills yet.</div>
+        <div className="text-muted text-sm">No skills yet.</div>
       ) : (
-        <div className="skill-list">
+        <div className="flex flex-col">
           {skills.map((s) => (
             <SkillRow key={s.name} skill={s} projectId={projectId} onDeleted={onChanged} />
           ))}
@@ -124,16 +138,16 @@ function HarnessSkillRow({
 }) {
   const [busy, setBusy] = useState(false);
   return (
-    <div className="skill-row">
-      <div className="skill-row-main">
-        <div className="skill-row-head">
-          <code className="skill-row-name">/{skill.name}</code>
-          <span className="skill-harness-badge">{skill.harnessName}</span>
+    <div className={SKILL_ROW_CLASS_NAME}>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2">
+          <code className={SKILL_NAME_CLASS_NAME}>/{skill.name}</code>
+          <span className={BADGE_CLASS_NAME}>{skill.harnessName}</span>
         </div>
-        <p className="skill-row-desc">{skill.description}</p>
+        <p className={SKILL_DESC_CLASS_NAME}>{skill.description}</p>
       </div>
       <button
-        className="skills-import-btn"
+        className={SMALL_BUTTON_CLASS_NAME}
         disabled={busy}
         title={`Import into ${scopeLabel}`}
         onClick={async () => {
@@ -145,7 +159,7 @@ function HarnessSkillRow({
           }
         }}
       >
-        {busy ? <span className="spinner" /> : <Download size={13} />}
+        {busy ? <span className={SPINNER_CLASS_NAME} /> : <Download size={13} />}
         {alreadyImported ? "Re-import" : "Import"}
       </button>
     </div>
@@ -154,7 +168,8 @@ function HarnessSkillRow({
 
 /** Middle-pane Skills tab — upload SKILL.md skills (single file or a zipped
  * folder) the agent auto-discovers in its session and the user invokes with
- * `/name`. Skills are Global (every project) or scoped to the open project. */
+ * `/name`, plus one-click import of skills already installed in the user's
+ * coding agents. Skills are Global (every project) or scoped to the open one. */
 export function SkillsTab({ project }: { project: Project | null }) {
   const [skills, setSkills] = useState<UserSkill[] | null>(null);
   const [harnessSkills, setHarnessSkills] = useState<HarnessSkill[]>([]);
@@ -249,43 +264,52 @@ export function SkillsTab({ project }: { project: Project | null }) {
     (skills ?? []).filter((s) => s.scope === scope).map((s) => s.name),
   );
 
+  const scopeBtn = (active: boolean) =>
+    `flex-1 flex flex-col gap-0.5 py-2.5 px-3 border rounded-md text-left text-sm font-medium cursor-pointer transition-[border-color,background] duration-120 disabled:opacity-50 disabled:cursor-not-allowed ${
+      active
+        ? "border-primary bg-surface"
+        : "border-border bg-background text-text [&:hover:not(:disabled)]:border-border-variant"
+    }`;
+
   return (
-    <div className="settings-view skills-view">
+    <div className="settings-view max-w-readable my-0 mx-auto pt-6 px-8 pb-15 [&_h1]:mt-0 [&_h1]:mx-0 [&_h1]:mb-1.5 [&_h1]:text-3xl">
       <h1>Skills</h1>
-      <p className="skills-intro">
+      <p className="mt-0 mx-0 mb-5 text-muted text-md leading-normal [&_code]:font-mono [&_code]:text-[0.92em] [&_code]:text-text">
         Upload <code>SKILL.md</code> skills your agent discovers automatically in every session and
         you can invoke with <code>/name</code> in chat. Add a single <code>SKILL.md</code> or a{" "}
         <code>.zip</code> of a skill folder (with supporting scripts and resources).
       </p>
 
-      <section className="settings-card">
-        <div className="settings-card-head">
-          <h3>Add a skill</h3>
-        </div>
+      <section className={CARD_CLASS_NAME}>
+        <h3>Add a skill</h3>
 
-        <div className="skills-scope" role="group" aria-label="Skill scope">
-          <button
-            type="button"
-            className={`skills-scope-btn ${scope === "global" ? "active" : ""}`}
-            onClick={() => setScope("global")}
-          >
+        <div className="flex gap-2 mb-3.5" role="group" aria-label="Skill scope">
+          <button type="button" className={scopeBtn(scope === "global")} onClick={() => setScope("global")}>
             Global
-            <span className="skills-scope-sub">Every project</span>
+            <span className="text-2xs font-normal text-muted">Every project</span>
           </button>
           <button
             type="button"
-            className={`skills-scope-btn ${scope === "project" ? "active" : ""}`}
+            className={scopeBtn(scope === "project")}
             disabled={!project}
             title={project ? undefined : "Open a project to add a project skill"}
             onClick={() => setScope("project")}
           >
             This project
-            <span className="skills-scope-sub">{project ? project.name : "No project open"}</span>
+            <span className="text-2xs font-normal text-muted">
+              {project ? project.name : "No project open"}
+            </span>
           </button>
         </div>
 
         <div
-          className={`skills-dropzone ${dragging ? "dragging" : ""} ${busy ? "busy" : ""}`}
+          className={`flex flex-col items-center justify-center gap-2 py-6.5 px-4.5 border-[1.5px] border-dashed rounded-md text-center text-sm transition-[border-color,background] duration-120 [&_code]:font-mono [&_code]:text-[0.92em] [&_code]:text-text ${
+            busy ? "cursor-default" : "cursor-pointer"
+          } ${
+            dragging
+              ? "border-primary bg-surface text-text"
+              : "border-border-variant bg-surface text-muted [&:hover]:border-primary [&:hover]:text-text"
+          }`}
           onDragOver={(e) => {
             e.preventDefault();
             setDragging(true);
@@ -312,7 +336,7 @@ export function SkillsTab({ project }: { project: Project | null }) {
           />
           {busy ? (
             <>
-              <span className="spinner" />
+              <span className={SPINNER_CLASS_NAME} />
               <span>Uploading…</span>
             </>
           ) : (
@@ -321,26 +345,27 @@ export function SkillsTab({ project }: { project: Project | null }) {
               <span>
                 Drop a <code>SKILL.md</code> or <code>.zip</code> here, or click to choose
               </span>
-              <span className="skills-dropzone-scope">
-                <FileUp size={12} /> Adding to <strong>{scope === "global" ? "Global" : project?.name}</strong>
+              <span className="inline-flex items-center gap-1.5 text-2xs text-subtext">
+                <FileUp size={12} /> Adding to{" "}
+                <strong className="text-text font-semibold">
+                  {scope === "global" ? "Global" : project?.name}
+                </strong>
               </span>
             </>
           )}
         </div>
 
-        {error && <div className="skills-error">{error}</div>}
+        {error && <div className="mt-2.5 text-accent-red text-sm whitespace-pre-wrap">{error}</div>}
       </section>
 
       {harnessSkills.length > 0 && (
-        <section className="settings-card">
-          <div className="settings-card-head">
-            <h3>Import from your agent</h3>
-          </div>
-          <p className="settings-sub">
+        <section className={CARD_CLASS_NAME}>
+          <h3>Import from your agent</h3>
+          <p className={`${CARD_SUB_CLASS_NAME} [&_code]:font-mono [&_code]:text-[0.92em] [&_code]:text-text [&_strong]:text-text [&_strong]:font-semibold`}>
             Skills already installed in your coding agents. Import a copy into{" "}
             <strong>{scopeLabel}</strong> so it's managed here and invocable with <code>/name</code>.
           </p>
-          <div className="skill-list">
+          <div className="flex flex-col">
             {harnessSkills.map((s) => (
               <HarnessSkillRow
                 key={`${s.harnessId}:${s.name}`}
@@ -355,8 +380,8 @@ export function SkillsTab({ project }: { project: Project | null }) {
       )}
 
       {skills === null ? (
-        <div className="settings-loading" style={{ padding: 12 }}>
-          <span className="spinner" /> Loading skills…
+        <div className="flex items-center gap-2 text-subtext text-md p-3">
+          <span className={SPINNER_CLASS_NAME} /> Loading skills…
         </div>
       ) : (
         <>
@@ -379,7 +404,7 @@ export function SkillsTab({ project }: { project: Project | null }) {
       )}
 
       {skills !== null && skills.length === 0 && (
-        <div className="skills-none-hint">
+        <div className="flex flex-col items-center gap-2 py-6 text-muted text-sm text-center">
           <Blocks size={22} strokeWidth={1.5} />
           <span>No skills uploaded yet. Add one above to get started.</span>
         </div>
