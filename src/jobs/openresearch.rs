@@ -5,19 +5,16 @@
 //! the supervisor polls `GET /sandboxes/{id}` until the box is online, runs
 //! the clone-and-run payload on it over ssh (the ssh backend's transport and
 //! run-dir layout, via `BackendDescriptor::openresearch_ssh_target`), and
-//! deletes the box (`DELETE /sandboxes/{id}`) once the run is terminal unless
-//! the API retained a failed box for diagnostics and scheduled termination.
+//! deletes the box (`DELETE /sandboxes/{id}`) once the run is terminal.
 //! Auth is the `orx login` credentials, not a backend-specific token.
 
 use std::time::Duration;
 
-use crate::client::{delete_sandbox_unless_failed, get_sandbox, Sandbox, SandboxTarget};
+use crate::client::{delete_sandbox, get_sandbox, Sandbox, SandboxTarget};
 use crate::config::Credentials;
 use crate::error::{anyhow, Result};
 
-/// How long provisioning may take before the run is failed and the box
-/// deleted. GPU boxes usually come online in single-digit minutes; a box
-/// stuck longer is billing for nothing.
+/// The API and CLI share the same five-minute provisioning deadline.
 pub const PROVISION_DEADLINE: Duration = Duration::from_secs(5 * 60);
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -84,18 +81,36 @@ pub fn wrap_with_timeout(script: &str, timeout_secs: u64) -> String {
 pub enum WaitOutcome {
     /// The box is online with its SSH endpoint populated.
     Online(Box<Sandbox>),
-    /// The API retained a terminal provisioning failure and its curated reason.
+    /// The API retained a terminal provisioning failure.
     Failed(String),
-    /// The local wait ended; the API still owns the terminal transition and teardown.
+    /// The local wait ended; the API still owns failure recording and cleanup.
     TimedOut(String),
     /// The caller's cancel check fired first; the box may still be booting.
     Cancelled,
 }
 
+fn retained_failure_reason(
+    status: &str,
+    code: Option<&str>,
+    message: Option<&str>,
+) -> Option<String> {
+    (status == "failed").then(|| {
+        format!(
+            "{}: {}",
+            code.unwrap_or("provider_error"),
+            message.unwrap_or("The provider could not provision this instance.")
+        )
+    })
+}
+
+fn is_not_found_error(message: &str) -> bool {
+    message.contains("(404 ")
+}
+
 /// Poll the box until it is online (SSH endpoint known), the deadline passes,
 /// or `cancel_check` fires. `offline`/`dead` mid-provision is a hard error —
 /// the box will never come up. Transient API errors are retried until the
-/// deadline. Retained API failures are returned without deleting their row.
+/// deadline. The API owns cleanup for failed and timed-out provisioning.
 pub async fn wait_online(
     creds: &Credentials,
     sandbox_id: &str,
@@ -103,49 +118,21 @@ pub async fn wait_online(
     mut cancel_check: impl FnMut() -> bool,
 ) -> Result<WaitOutcome> {
     let started = std::time::Instant::now();
-    let mut last_err: Option<String> = None;
     loop {
         if cancel_check() {
             return Ok(WaitOutcome::Cancelled);
         }
-        if started.elapsed() > deadline {
-            match get_sandbox(creds, sandbox_id).await {
-                Ok(envelope) => {
-                    let sandbox = envelope.sandbox;
-                    if sandbox.status == "online"
-                        && sandbox.ssh_hostname.is_some()
-                        && sandbox.ssh_port.is_some()
-                        && sandbox.ssh_username.is_some()
-                    {
-                        return Ok(WaitOutcome::Online(Box::new(sandbox)));
-                    }
-                    if sandbox.status == "failed" {
-                        return Ok(WaitOutcome::Failed(
-                            sandbox
-                                .provision_error_message
-                                .or(sandbox.last_health_error)
-                                .unwrap_or_else(|| "Compute provisioning failed.".to_string()),
-                        ));
-                    }
-                }
-                Err(err) if err.to_string().contains("(404 ") => {
-                    return Err(anyhow!(
-                        "Box {sandbox_id} disappeared after the API accepted its creation. This server does not retain provisioning failures; update the API to see the terminal provider reason."
-                    ));
-                }
-                Err(err) => last_err = Some(err.to_string()),
-            }
-            return Ok(WaitOutcome::TimedOut(format!(
-                "Box {sandbox_id} did not come online within {}m{}; the API will retain the terminal reason and tear it down.",
-                deadline.as_secs() / 60,
-                last_err
-                    .map(|e| format!(" (last API error: {e})"))
-                    .unwrap_or_default()
-            )));
-        }
-        match get_sandbox(creds, sandbox_id).await {
+        let deadline_reached = started.elapsed() > deadline;
+        let last_err = match get_sandbox(creds, sandbox_id).await {
             Ok(envelope) => {
                 let sandbox = envelope.sandbox;
+                if let Some(reason) = retained_failure_reason(
+                    &sandbox.status,
+                    sandbox.failure_code.as_deref(),
+                    sandbox.failure_message.as_deref(),
+                ) {
+                    return Ok(WaitOutcome::Failed(reason));
+                }
                 match sandbox.status.as_str() {
                     "online"
                         if sandbox.ssh_hostname.is_some()
@@ -153,14 +140,6 @@ pub async fn wait_online(
                             && sandbox.ssh_username.is_some() =>
                     {
                         return Ok(WaitOutcome::Online(Box::new(sandbox)));
-                    }
-                    "failed" => {
-                        return Ok(WaitOutcome::Failed(
-                            sandbox
-                                .provision_error_message
-                                .or(sandbox.last_health_error)
-                                .unwrap_or_else(|| "Compute provisioning failed.".to_string()),
-                        ));
                     }
                     "offline" | "dead" => {
                         return Err(anyhow!(
@@ -174,14 +153,23 @@ pub async fn wait_online(
                     }
                     _ => {}
                 }
-                last_err = None;
+                None
             }
-            Err(err) if err.to_string().contains("(404 ") => {
-                return Err(anyhow!(
-                    "Box {sandbox_id} disappeared after the API accepted its creation. This server does not retain provisioning failures; update the API to see the terminal provider reason."
-                ));
+            Err(err) if is_not_found_error(&err.to_string()) => {
+                return Ok(WaitOutcome::Failed(format!(
+                    "Box {sandbox_id} was not found; the server has no retained provisioning result."
+                )));
             }
-            Err(err) => last_err = Some(err.to_string()),
+            Err(err) => Some(err.to_string()),
+        };
+        if deadline_reached {
+            return Ok(WaitOutcome::TimedOut(format!(
+                "Box {sandbox_id} did not come online within {}m{}.",
+                deadline.as_secs() / 60,
+                last_err
+                    .map(|e| format!(" (last API error: {e})"))
+                    .unwrap_or_default()
+            )));
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -213,7 +201,7 @@ pub async fn teardown(creds: &Credentials, sandbox_id: &str) -> Result<()> {
         if backoff_secs > 0 {
             tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
         }
-        match delete_sandbox_unless_failed(creds, sandbox_id).await {
+        match delete_sandbox(creds, sandbox_id).await {
             Ok(()) => return Ok(()),
             Err(err) if err.to_string().contains("(404 ") => return Ok(()),
             Err(err) => last = Some(err),
@@ -311,5 +299,22 @@ mod tests {
     #[test]
     fn run_dir_matches_ssh_convention() {
         assert_eq!(run_dir("abc"), ".orx/runs/abc");
+    }
+
+    #[test]
+    fn provisioning_deadline_is_five_minutes() {
+        assert_eq!(PROVISION_DEADLINE, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn terminal_provisioning_results_are_classified() {
+        assert_eq!(
+            retained_failure_reason("failed", Some("capacity_unavailable"), Some("No capacity.")),
+            Some("capacity_unavailable: No capacity.".to_owned())
+        );
+        assert!(retained_failure_reason("provisioning", None, None).is_none());
+        assert!(is_not_found_error(
+            "Request to /sandboxes/sb failed (404 Not Found)"
+        ));
     }
 }

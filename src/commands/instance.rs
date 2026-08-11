@@ -12,8 +12,7 @@
 //! box whose automatic teardown failed.
 
 use crate::client::{
-    create_sandbox, delete_sandbox, list_sandboxes, CreateSandboxBody, SandboxLifecycle,
-    SandboxTarget,
+    create_sandbox, delete_sandbox, list_sandboxes, CreateSandboxBody, SandboxTarget,
 };
 use crate::error::{anyhow, require_credentials, Result};
 use crate::{InstanceCommand, InstanceCreateArgs, InstanceDeleteArgs, InstanceListArgs};
@@ -98,7 +97,6 @@ async fn create(creds: &crate::config::Credentials, args: InstanceCreateArgs) ->
         creds,
         &CreateSandboxBody {
             organization_id: args.org_id.clone(),
-            lifecycle: SandboxLifecycle::Persistent,
             target,
         },
     )

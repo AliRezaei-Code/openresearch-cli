@@ -646,15 +646,7 @@ pub enum SandboxTarget {
 #[serde(rename_all = "camelCase")]
 pub struct CreateSandboxBody {
     pub organization_id: String,
-    pub lifecycle: SandboxLifecycle,
     pub target: SandboxTarget,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SandboxLifecycle {
-    Ephemeral,
-    Persistent,
 }
 
 /// A sandbox as returned by `POST /sandboxes`. Mirrors the API's `zSandbox`;
@@ -674,15 +666,11 @@ pub struct Sandbox {
     pub updated_at: String,
     pub provision_warnings: Option<String>,
     #[serde(default)]
-    pub provision_stage: Option<String>,
+    pub failure_code: Option<String>,
     #[serde(default)]
-    pub provision_error_code: Option<String>,
+    pub failure_message: Option<String>,
     #[serde(default)]
-    pub provision_error_message: Option<String>,
-    #[serde(default)]
-    pub last_health_check_at: Option<String>,
-    #[serde(default)]
-    pub last_health_error: Option<String>,
+    pub failed_at: Option<String>,
     pub provider_name: Option<String>,
     pub provider_instance_id: Option<String>,
     pub price_per_hour: Option<f64>,
@@ -1074,16 +1062,6 @@ pub async fn delete_sandbox(creds: &Credentials, sandbox_id: &str) -> Result<()>
         creds,
         Method::DELETE,
         &format!("/sandboxes/{}", sandbox_id),
-        None,
-    )
-    .await
-}
-
-pub async fn delete_sandbox_unless_failed(creds: &Credentials, sandbox_id: &str) -> Result<()> {
-    request_no_content(
-        creds,
-        Method::DELETE,
-        &format!("/sandboxes/{}?preserveFailed=true", sandbox_id),
         None,
     )
     .await
@@ -1934,7 +1912,7 @@ mod tests {
     use super::{
         openalex_selector, reconstruct_abstract, CreateBaselineExperimentBody, CreateChildBody,
         CreateSandboxBody, ListCatalog, ListCpuCatalog, LitHit, OpenAlexWork, PaperHit, RunBody,
-        RunTarget, SandboxEnvelope, SandboxLifecycle, SandboxTarget, BIORXIV_SOURCE_ID,
+        RunTarget, SandboxEnvelope, SandboxTarget, BIORXIV_SOURCE_ID,
     };
     use serde_json::json;
 
@@ -2124,7 +2102,6 @@ mod tests {
     fn serializes_create_sandbox_body_without_project() {
         let body = CreateSandboxBody {
             organization_id: "org_123".into(),
-            lifecycle: SandboxLifecycle::Persistent,
             target: SandboxTarget::NewCpu {
                 cpu_flavor: "cpu5c".into(),
                 vcpu_count: 2,
@@ -2132,7 +2109,6 @@ mod tests {
         };
         let value = serde_json::to_value(&body).unwrap();
         assert_eq!(value.get("organizationId"), Some(&json!("org_123")));
-        assert_eq!(value.get("lifecycle"), Some(&json!("persistent")));
         assert!(value.get("projectId").is_none());
     }
 
@@ -2210,6 +2186,48 @@ mod tests {
         assert_eq!(sb.ssh_hostname.as_deref(), Some("203.0.113.7"));
         assert_eq!(sb.ssh_port, Some(22022));
         assert_eq!(sb.ssh_username.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn deserializes_retained_sandbox_failure() {
+        let json = r#"{
+            "sandbox": {
+                "id": "sb_1",
+                "organizationId": "org_1",
+                "projectId": null,
+                "sshHostname": null,
+                "sshPort": null,
+                "sshUsername": null,
+                "status": "failed",
+                "machineType": "persistent",
+                "createdBy": "user_1",
+                "updatedAt": "2026-06-18T00:05:00Z",
+                "provisionWarnings": null,
+                "failureCode": "capacity_unavailable",
+                "failureMessage": "No capacity is available.",
+                "failedAt": "2026-06-18T00:05:00Z",
+                "providerName": "runpod",
+                "providerInstanceId": null,
+                "pricePerHour": 2.5,
+                "gpu": "RTX_4090",
+                "gpuCount": 2,
+                "vcpuCount": null
+            }
+        }"#;
+
+        let sandbox = serde_json::from_str::<SandboxEnvelope>(json)
+            .expect("failed sandbox should deserialize")
+            .sandbox;
+        assert_eq!(sandbox.status, "failed");
+        assert_eq!(
+            sandbox.failure_code.as_deref(),
+            Some("capacity_unavailable")
+        );
+        assert_eq!(
+            sandbox.failure_message.as_deref(),
+            Some("No capacity is available.")
+        );
+        assert_eq!(sandbox.failed_at.as_deref(), Some("2026-06-18T00:05:00Z"));
     }
 
     /// The api declares `chatSessionId` optional: a lost `rename_all` would send

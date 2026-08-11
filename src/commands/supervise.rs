@@ -19,9 +19,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::client::{
-    get_sandbox, presign_external_run_log, update_external_run, upload_to_presigned,
-};
+use crate::client::{presign_external_run_log, update_external_run, upload_to_presigned};
 use crate::config::Credentials;
 use crate::error::{anyhow, require_credentials, Result};
 use crate::jobs::huggingface as hf;
@@ -751,32 +749,8 @@ async fn run_ssh(
     eprintln!("supervise {run_id}: watching ssh job {host}:{dir}");
     let target = ssh::SshTarget::alias(host);
     let dir = dir.to_string();
-    let _ = watch_ssh_job(&store, &stored.status, target, dir, &creds, &run_id, None).await?;
+    watch_ssh_job(&store, &stored.status, target, dir, &creds, &run_id).await?;
     Ok(())
-}
-
-enum ApiSandboxState {
-    Present,
-    Failed(String),
-    Gone,
-}
-
-async fn api_sandbox_state(creds: &Credentials, sandbox_id: &str) -> Result<ApiSandboxState> {
-    let envelope = match get_sandbox(creds, sandbox_id).await {
-        Ok(envelope) => envelope,
-        Err(err) if err.to_string().contains("(404 ") => return Ok(ApiSandboxState::Gone),
-        Err(err) => return Err(err),
-    };
-    if envelope.sandbox.status != "failed" {
-        return Ok(ApiSandboxState::Present);
-    }
-    Ok(ApiSandboxState::Failed(
-        envelope
-            .sandbox
-            .last_health_error
-            .or(envelope.sandbox.provision_error_message)
-            .unwrap_or_else(|| "Compute transport failed.".to_string()),
-    ))
 }
 
 /// The ssh two-half loop, shared by every backend whose job is a run dir on a
@@ -789,8 +763,7 @@ async fn watch_ssh_job(
     dir: String,
     creds: &Option<Credentials>,
     run_id: &str,
-    api_sandbox: Option<(&Credentials, &str)>,
-) -> Result<(String, bool)> {
+) -> Result<String> {
     let path = log_path(run_id);
     let (done_tx, done_rx) = tokio::sync::watch::channel(false);
     let mut log_task = tokio::spawn(tail_logs_ssh(
@@ -803,77 +776,21 @@ async fn watch_ssh_job(
 
     let mut last_status = initial_status.to_string();
     let mut cancel_sent = false;
-    let mut api_failed_observed = false;
 
     loop {
-        let mut job = match ssh::inspect_job(&target, &dir).await {
+        let job = match ssh::inspect_job(&target, &dir).await {
             Ok(j) => j,
             Err(err) => {
-                if let Some((api_creds, sandbox_id)) = api_sandbox {
-                    match api_sandbox_state(api_creds, sandbox_id).await {
-                        Ok(ApiSandboxState::Failed(reason)) => {
-                            api_failed_observed = true;
-                            eprintln!("supervise {run_id}: API marked box failed: {reason}");
-                            ssh::JobState {
-                                stage: "ERROR".into(),
-                                message: Some(reason),
-                            }
-                        }
-                        Ok(ApiSandboxState::Gone) => {
-                            api_failed_observed = true;
-                            ssh::JobState {
-                                stage: "ERROR".into(),
-                                message: Some("Compute sandbox was deleted.".into()),
-                            }
-                        }
-                        Ok(ApiSandboxState::Present) | Err(_) => {
-                            eprintln!("supervise {run_id}: inspect failed (will retry): {err}");
-                            tokio::time::sleep(POLL_INTERVAL).await;
-                            continue;
-                        }
-                    }
-                } else {
-                    eprintln!("supervise {run_id}: inspect failed (will retry): {err}");
-                    tokio::time::sleep(POLL_INTERVAL).await;
-                    continue;
-                }
+                eprintln!("supervise {run_id}: inspect failed (will retry): {err}");
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
             }
         };
-        if is_terminal_stage(&job.stage) {
-            if let Some((api_creds, sandbox_id)) = api_sandbox {
-                match api_sandbox_state(api_creds, sandbox_id).await {
-                    Ok(ApiSandboxState::Failed(reason)) => {
-                        api_failed_observed = true;
-                        job = ssh::JobState {
-                            stage: "ERROR".into(),
-                            message: Some(reason),
-                        };
-                    }
-                    Ok(ApiSandboxState::Gone) => api_failed_observed = true,
-                    Ok(ApiSandboxState::Present) => {}
-                    Err(err) => {
-                        eprintln!(
-                            "supervise {run_id}: terminal SSH state awaiting API confirmation: {err}"
-                        );
-                        tokio::time::sleep(POLL_INTERVAL).await;
-                        continue;
-                    }
-                }
-            }
-        }
         let stage = job.stage.as_str();
         let status = run_status_for_stage(store, run_id, creds.is_none(), cancel_sent, stage);
 
         if is_terminal_stage(stage) {
-            if let Err(err) = store.update_status(run_id, &status, Some(now_ms()), None) {
-                if api_failed_observed {
-                    eprintln!(
-                        "supervise {run_id}: could not persist API-owned failure locally: {err}"
-                    );
-                } else {
-                    return Err(err);
-                }
-            }
+            store.update_status(run_id, &status, Some(now_ms()), None)?;
             if creds.is_none() && status == "failed" {
                 if let Some(msg) = &job.message {
                     if let Err(err) =
@@ -914,7 +831,7 @@ async fn watch_ssh_job(
                 }
             }
             eprintln!("supervise {run_id}: finished ({status})");
-            return Ok((status, api_failed_observed));
+            return Ok(status);
         }
 
         if status != last_status {
@@ -1002,8 +919,7 @@ async fn cancel_ssh(target: &ssh::SshTarget, dir: &str, run_id: &str, cancel_sen
 // comes from the platform, so the supervisor first waits for it to come online
 // (recording the SSH endpoint on the descriptor for restarts), launches the
 // payload over ssh, runs the shared watch loop, and deletes the box at the
-// end. API-failed boxes are retained for diagnostics and terminated server-side;
-// every other exit path tears the box down so it cannot keep billing.
+// end. Provisioning cleanup stays API-owned; post-readiness exits tear down here.
 
 async fn run_openresearch(
     store: Store,
@@ -1060,7 +976,6 @@ async fn run_openresearch(
                 }
                 Ok(openresearch::WaitOutcome::Failed(reason))
                 | Ok(openresearch::WaitOutcome::TimedOut(reason)) => {
-                    eprintln!("supervise {run_id}: provisioning failed: {reason}");
                     store.update_status(&run_id, "failed", Some(now_ms()), None)?;
                     store
                         .set_result_markdown(&run_id, &format!("Provisioning failed: {reason}"))?;
@@ -1086,27 +1001,9 @@ async fn run_openresearch(
     // Launch, unless a previous supervisor already did (restart mid-run just
     // reattaches to the watch loop). An unreachable box reads as fresh here;
     // the launch retries below absorb that.
-    let already_launched = match openresearch::launched(&target, &run_id).await {
-        Ok(launched) => launched,
-        Err(err) => {
-            match api_sandbox_state(&lifecycle, &sandbox_id).await {
-                Ok(ApiSandboxState::Failed(reason)) => {
-                    eprintln!("supervise {run_id}: API marked box failed: {reason}");
-                    store.update_status(&run_id, "failed", Some(now_ms()), None)?;
-                    store.set_result_markdown(&run_id, &reason)?;
-                    return Ok(());
-                }
-                Ok(ApiSandboxState::Gone) => {
-                    store.update_status(&run_id, "failed", Some(now_ms()), None)?;
-                    store.set_result_markdown(&run_id, "Compute sandbox was deleted.")?;
-                    return Ok(());
-                }
-                Ok(ApiSandboxState::Present) | Err(_) => {}
-            }
-            eprintln!("supervise {run_id}: launch inspection failed (will retry launch): {err}");
-            false
-        }
-    };
+    let already_launched = openresearch::launched(&target, &run_id)
+        .await
+        .unwrap_or(false);
     if !already_launched {
         let source = match crate::compute::SourceSnapshot::from_run(&stored, &descriptor) {
             Ok(source) => source,
@@ -1166,20 +1063,6 @@ async fn run_openresearch(
             }
         }
         if let Some(err) = launch_err {
-            match api_sandbox_state(&lifecycle, &sandbox_id).await {
-                Ok(ApiSandboxState::Failed(reason)) => {
-                    eprintln!("supervise {run_id}: API marked box failed: {reason}");
-                    store.update_status(&run_id, "failed", Some(now_ms()), None)?;
-                    store.set_result_markdown(&run_id, &reason)?;
-                    return Ok(());
-                }
-                Ok(ApiSandboxState::Gone) => {
-                    store.update_status(&run_id, "failed", Some(now_ms()), None)?;
-                    store.set_result_markdown(&run_id, "Compute sandbox was deleted.")?;
-                    return Ok(());
-                }
-                Ok(ApiSandboxState::Present) | Err(_) => {}
-            }
             store.update_status(&run_id, "failed", Some(now_ms()), None)?;
             store.set_result_markdown(
                 &run_id,
@@ -1197,20 +1080,8 @@ async fn run_openresearch(
     // The shared ssh loop owns status/logs/mirror; the box is deleted after
     // it returns (logs are drained from the box BEFORE teardown), and even
     // when it errors.
-    let watch = watch_ssh_job(
-        &store,
-        &stored.status,
-        target,
-        dir,
-        &creds,
-        &run_id,
-        Some((&lifecycle, &sandbox_id)),
-    )
-    .await;
-    let api_failed = matches!(&watch, Ok((_, true)));
-    if !api_failed {
-        teardown_box(&store, &lifecycle, &sandbox_id, &run_id).await;
-    }
+    let watch = watch_ssh_job(&store, &stored.status, target, dir, &creds, &run_id).await;
+    teardown_box(&store, &lifecycle, &sandbox_id, &run_id).await;
     watch?;
     Ok(())
 }
