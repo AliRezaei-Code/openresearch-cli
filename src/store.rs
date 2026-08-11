@@ -645,8 +645,7 @@ impl Store {
         Ok(())
     }
 
-    /// Persist an SSH inspection failure without moving the beginning of an
-    /// existing outage. Returns the outage and whether this call started it.
+    /// Persist a transport failure without moving the beginning of an existing outage.
     pub fn record_transport_failure(
         &self,
         run_id: &str,
@@ -742,14 +741,6 @@ impl Store {
         self.conn.execute(
             "DELETE FROM run_launch_claims WHERE run_id = ?1",
             params![run_id],
-        )?;
-        Ok(())
-    }
-
-    pub fn record_transport_event(&self, run_id: &str, message: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO run_transport_events (run_id, message) VALUES (?1, ?2)",
-            params![run_id, message],
         )?;
         Ok(())
     }
@@ -1862,7 +1853,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_outage_keeps_original_start_across_reopens() {
+    fn transport_transition_state_survives_reopen() {
         let dir = std::env::temp_dir().join(format!(
             "orx-store-transport-outage-{}",
             uuid::Uuid::new_v4()
@@ -1870,31 +1861,16 @@ mod tests {
         {
             let store = Store::open_at(dir.clone()).unwrap();
             let (outage, started) = store
-                .record_transport_failure("run_1", "connection refused", 1_000, "orx: SSH lost")
+                .record_transport_failure("run_1", "tcp: refused", 1_000, "orx: SSH lost")
                 .unwrap();
             assert!(started);
             assert_eq!(outage.lost_at, 1_000);
-
-            let (outage, started) = store
-                .record_transport_failure(
-                    "run_1",
-                    "connection timed out",
-                    5_000,
-                    "orx: SSH lost again",
-                )
-                .unwrap();
-            assert!(!started);
-            assert_eq!(outage.lost_at, 1_000);
-            assert_eq!(outage.last_error, "connection timed out");
         }
 
         let store = Store::open_at(dir.clone()).unwrap();
         assert_eq!(
-            store.transport_outage("run_1").unwrap(),
-            Some(TransportOutage {
-                lost_at: 1_000,
-                last_error: "connection timed out".into(),
-            })
+            store.transport_outage("run_1").unwrap().unwrap().lost_at,
+            1_000
         );
         store
             .recover_transport_outage("run_1", "orx: SSH recovered")
@@ -1902,32 +1878,10 @@ mod tests {
         assert_eq!(store.transport_outage("run_1").unwrap(), None);
         assert_eq!(
             store.transport_events("run_1").unwrap(),
-            vec!["orx: SSH lost", "orx: SSH recovered"]
+            ["orx: SSH lost", "orx: SSH recovered"]
         );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn transport_events_keep_transition_order_across_reopens() {
-        let dir = std::env::temp_dir().join(format!(
-            "orx-store-transport-events-{}",
-            uuid::Uuid::new_v4()
-        ));
-        {
-            let store = Store::open_at(dir.clone()).unwrap();
-            store
-                .record_transport_event("run_1", "orx: SSH connection lost")
-                .unwrap();
-            store
-                .record_transport_event("run_1", "orx: SSH connection recovered")
-                .unwrap();
-        }
-        let store = Store::open_at(dir.clone()).unwrap();
-        assert_eq!(
-            store.transport_events("run_1").unwrap(),
-            ["orx: SSH connection lost", "orx: SSH connection recovered"]
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

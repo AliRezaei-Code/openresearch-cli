@@ -36,8 +36,12 @@ use crate::store::{log_path, now_ms, Store};
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How long a silent log stream is held before re-checking job state.
 const LOG_IDLE: Duration = Duration::from_secs(30);
-const SSH_LOSS_DEADLINE: Duration = Duration::from_secs(2 * 60);
+const LAUNCH_CLAIM_DEADLINE: Duration = Duration::from_secs(2 * 60);
+const SANDBOX_CLAIM_DEADLINE: Duration = Duration::from_secs(2 * 60);
+const CLIENT_SSH_FAILURE_DEADLINE: Duration = Duration::from_secs(2 * 60);
+const SANDBOX_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const SSH_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const SANDBOX_STATUS_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn open_supervisor_lock(path: &std::path::Path) -> Result<fd_lock::RwLock<std::fs::File>> {
     let file = std::fs::OpenOptions::new()
@@ -758,9 +762,7 @@ async fn run_ssh(
         dir,
         &creds,
         &run_id,
-        SshWatchOptions {
-            loss_deadline: None,
-        },
+        SshWatchOptions { sandbox: None },
     )
     .await?;
     Ok(())
@@ -769,8 +771,35 @@ async fn run_ssh(
 /// The ssh two-half loop, shared by every backend whose job is a run dir on a
 /// box we ssh into (ssh itself, openresearch). Runs until the job is terminal;
 /// returns the final run status after logs are drained and mirrored.
-struct SshWatchOptions {
-    loss_deadline: Option<Duration>,
+#[derive(Clone, Copy)]
+struct SandboxMonitor<'a> {
+    credentials: &'a Credentials,
+    sandbox_id: &'a str,
+}
+
+struct SshWatchOptions<'a> {
+    sandbox: Option<SandboxMonitor<'a>>,
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+enum SshWatchOutcome {
+    Workload,
+    SandboxFailed(String),
+    ClientTransportFailed(String),
+}
+
+enum SandboxHealth {
+    Online,
+    Offline(String),
+    Failed(String),
+    Other,
 }
 
 async fn watch_ssh_job(
@@ -780,8 +809,8 @@ async fn watch_ssh_job(
     dir: String,
     creds: &Option<Credentials>,
     run_id: &str,
-    options: SshWatchOptions,
-) -> Result<String> {
+    options: SshWatchOptions<'_>,
+) -> Result<SshWatchOutcome> {
     let path = log_path(run_id);
     let (done_tx, done_rx) = tokio::sync::watch::channel(false);
     let mut initial_log = std::fs::File::create(&path)?;
@@ -802,100 +831,102 @@ async fn watch_ssh_job(
     let mut cancel_sent = false;
 
     loop {
-        let probe_started_at = now_ms();
-        let probe = if options.loss_deadline.is_some() && local_cancel_requested(store, run_id) {
+        if let Some(sandbox) = options.sandbox {
+            match sandbox_health(sandbox).await {
+                Ok(SandboxHealth::Failed(message)) => {
+                    if let Err(error) = record_sandbox_health_transition(
+                        store,
+                        run_id,
+                        SandboxHealth::Failed(message.clone()),
+                    ) {
+                        eprintln!(
+                            "supervise {run_id}: could not record API sandbox failure event: {error}"
+                        );
+                    }
+                    if let Err(error) = store
+                        .update_status(run_id, "failed", Some(now_ms()), None)
+                        .and_then(|()| {
+                            store.set_result_markdown(run_id, &format!("Job failed: {message}"))
+                        })
+                    {
+                        eprintln!(
+                            "supervise {run_id}: could not record API sandbox failure: {error}"
+                        );
+                    }
+                    let _ = done_tx.send(true);
+                    if tokio::time::timeout(Duration::from_secs(20), &mut log_task)
+                        .await
+                        .is_err()
+                    {
+                        log_task.abort();
+                    }
+                    return Ok(SshWatchOutcome::SandboxFailed(message));
+                }
+                Ok(health) => {
+                    if let Some(message) = record_sandbox_health_transition(store, run_id, health)?
+                    {
+                        if let Err(error) = store
+                            .update_status(run_id, "failed", Some(now_ms()), None)
+                            .and_then(|()| {
+                                store.set_result_markdown(run_id, &format!("Job failed: {message}"))
+                            })
+                        {
+                            eprintln!(
+                                "supervise {run_id}: could not record API sandbox failure: {error}"
+                            );
+                        }
+                        let _ = done_tx.send(true);
+                        if tokio::time::timeout(Duration::from_secs(20), &mut log_task)
+                            .await
+                            .is_err()
+                        {
+                            log_task.abort();
+                        }
+                        return Ok(SshWatchOutcome::SandboxFailed(message));
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "supervise {run_id}: sandbox status check failed (will retry): {error}"
+                    );
+                }
+            }
+        }
+        let probe = if options.sandbox.is_some() && local_cancel_requested(store, run_id) {
             Ok(ssh::JobState {
                 stage: "ERROR".to_string(),
                 message: Some("cancelled while supervising the provider sandbox".to_string()),
             })
-        } else if let Some(deadline) = options.loss_deadline {
-            let budget = match store.transport_outage(run_id)? {
-                Some(outage) => deadline.saturating_sub(elapsed_since(outage.lost_at, now_ms())),
-                None => SSH_PROBE_TIMEOUT,
-            }
-            .min(SSH_PROBE_TIMEOUT);
-            if budget.is_zero() {
-                Err(anyhow!("persisted SSH outage reached its deadline"))
-            } else {
-                ssh::inspect_job_bounded(&target, &dir, budget).await
-            }
+        } else if options.sandbox.is_some() {
+            ssh::inspect_job_bounded(&target, &dir, SSH_PROBE_TIMEOUT).await
         } else {
             ssh::inspect_job(&target, &dir).await
         };
         let job = match probe {
             Ok(j) => {
-                if let Some(deadline) = options.loss_deadline {
-                    if let Some(outage) = store.transport_outage(run_id)? {
-                        let unavailable_for = elapsed_since(outage.lost_at, now_ms());
-                        if unavailable_for >= deadline {
-                            let message = format!(
-                                "SSH transport to {} was unavailable for {}s before recovering.",
-                                target.dest,
-                                unavailable_for.as_secs()
-                            );
-                            let transition = format!("orx: {message}");
-                            store.record_transport_event(run_id, &transition)?;
-                            append_transport_log_line(run_id, &transition)?;
-                            ssh::JobState {
-                                stage: "ERROR".to_string(),
-                                message: Some(message),
-                            }
-                        } else {
-                            let message = format!(
-                                "orx: SSH connection recovered after {}s.",
-                                unavailable_for.as_secs()
-                            );
-                            store.recover_transport_outage(run_id, &message)?;
-                            append_transport_log_line(run_id, &message)?;
-                            eprintln!("supervise {run_id}: {message}");
-                            j
-                        }
-                    } else {
-                        j
-                    }
-                } else {
-                    j
-                }
+                recover_client_transport_outage(store, run_id)?;
+                j
             }
             Err(err) => {
-                let Some(deadline) = options.loss_deadline else {
-                    eprintln!("supervise {run_id}: inspect failed (will retry): {err}");
-                    tokio::time::sleep(POLL_INTERVAL).await;
-                    continue;
-                };
-                let observed_at = now_ms();
-                let detail = ssh_failure_detail(&err.to_string());
-                let lost_message = format!(
-                    "orx: SSH connection lost; retrying for up to {}s: {detail}",
-                    deadline.as_secs()
-                );
-                let (outage, started) = store.record_transport_failure(
-                    run_id,
-                    &detail,
-                    probe_started_at,
-                    &lost_message,
-                )?;
-                if started {
-                    append_transport_log_line(run_id, &lost_message)?;
-                    eprintln!("supervise {run_id}: {lost_message}");
+                eprintln!("supervise {run_id}: inspect failed (will retry): {err}");
+                if options.sandbox.is_some() {
+                    if let Some(message) =
+                        record_client_transport_failure(store, run_id, &err.to_string(), now_ms())?
+                    {
+                        store.update_status(run_id, "failed", Some(now_ms()), None)?;
+                        store.set_result_markdown(run_id, &format!("Job failed: {message}"))?;
+                        let _ = done_tx.send(true);
+                        if tokio::time::timeout(Duration::from_secs(20), &mut log_task)
+                            .await
+                            .is_err()
+                        {
+                            log_task.abort();
+                        }
+                        return Ok(SshWatchOutcome::ClientTransportFailed(message));
+                    }
                 }
-                let unavailable_for = elapsed_since(outage.lost_at, observed_at);
-                if !ssh_outage_timed_out(outage.lost_at, observed_at, deadline) {
-                    tokio::time::sleep(POLL_INTERVAL.min(deadline - unavailable_for)).await;
-                    continue;
-                }
-                let message = format!(
-                    "SSH transport to {} remained unavailable for {}s: {detail}",
-                    target.dest,
-                    unavailable_for.as_secs()
-                );
-                let transition = format!("orx: {message}");
-                store.record_transport_event(run_id, &transition)?;
-                append_transport_log_line(run_id, &transition)?;
-                ssh::JobState {
-                    stage: "ERROR".to_string(),
-                    message: Some(message),
-                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
             }
         };
         let stage = job.stage.as_str();
@@ -942,11 +973,9 @@ async fn watch_ssh_job(
                     eprintln!("supervise {run_id}: final status mirror failed: {err}");
                 }
             }
-            if options.loss_deadline.is_none() {
-                store.clear_transport_history(run_id)?;
-            }
+            store.clear_transport_history(run_id)?;
             eprintln!("supervise {run_id}: finished ({status})");
-            return Ok(status);
+            return Ok(SshWatchOutcome::Workload);
         }
 
         if status != last_status {
@@ -965,7 +994,7 @@ async fn watch_ssh_job(
                     &dir,
                     run_id,
                     &mut cancel_sent,
-                    options.loss_deadline.is_some(),
+                    options.sandbox.is_some(),
                 )
                 .await;
             }
@@ -983,7 +1012,7 @@ async fn watch_ssh_job(
                     &dir,
                     run_id,
                     &mut cancel_sent,
-                    options.loss_deadline.is_some(),
+                    options.sandbox.is_some(),
                 )
                 .await;
             }
@@ -1029,6 +1058,10 @@ async fn tail_logs_ssh(
     }
 }
 
+fn elapsed_since(started_at: i64, observed_at: i64) -> Duration {
+    Duration::from_millis(observed_at.saturating_sub(started_at).max(0) as u64)
+}
+
 fn append_transport_log_line(run_id: &str, message: &str) -> Result<()> {
     let path = log_path(run_id);
     let mut file = std::fs::OpenOptions::new()
@@ -1040,37 +1073,195 @@ fn append_transport_log_line(run_id: &str, message: &str) -> Result<()> {
     Ok(())
 }
 
-fn elapsed_since(started_at: i64, observed_at: i64) -> Duration {
-    Duration::from_millis(observed_at.saturating_sub(started_at).max(0) as u64)
+fn record_sandbox_health_transition(
+    store: &Store,
+    run_id: &str,
+    health: SandboxHealth,
+) -> Result<Option<String>> {
+    match health {
+        SandboxHealth::Online => {
+            if let Some(outage) = store.transport_outage(run_id)? {
+                if outage.last_error.starts_with("client_ssh: ") {
+                    return Ok(None);
+                }
+                let message = format!(
+                    "orx: SSH connection recovered after {}s.",
+                    elapsed_since(outage.lost_at, now_ms()).as_secs()
+                );
+                store.recover_transport_outage(run_id, &message)?;
+                append_transport_log_line(run_id, &message)?;
+                eprintln!("supervise {run_id}: {message}");
+            }
+            Ok(None)
+        }
+        SandboxHealth::Offline(detail) => {
+            let message = format!("orx: SSH connection lost; API health check: {detail}");
+            let (_, started) =
+                store.record_transport_failure(run_id, &detail, now_ms(), &message)?;
+            if started {
+                append_transport_log_line(run_id, &message)?;
+                eprintln!("supervise {run_id}: {message}");
+            }
+            Ok(None)
+        }
+        SandboxHealth::Failed(message) => {
+            let detail = message.clone();
+            let transition = format!("orx: SSH connection lost; API health check: {detail}");
+            let (_, started) =
+                store.record_transport_failure(run_id, &detail, now_ms(), &transition)?;
+            if started {
+                append_transport_log_line(run_id, &transition)?;
+                eprintln!("supervise {run_id}: {transition}");
+            }
+            Ok(Some(message))
+        }
+        SandboxHealth::Other => Ok(None),
+    }
 }
 
-fn ssh_outage_timed_out(started_at: i64, observed_at: i64, deadline: Duration) -> bool {
-    elapsed_since(started_at, observed_at) >= deadline
+fn record_client_transport_failure(
+    store: &Store,
+    run_id: &str,
+    error: &str,
+    observed_at: i64,
+) -> Result<Option<String>> {
+    let detail = format!("client_ssh: {error}");
+    let transition = format!("orx: SSH connection lost from this device: {error}");
+    let (outage, started) =
+        store.record_transport_failure(run_id, &detail, observed_at, &transition)?;
+    if started {
+        if log_path(run_id).exists() {
+            append_transport_log_line(run_id, &transition)?;
+        }
+        eprintln!("supervise {run_id}: {transition}");
+    }
+    if elapsed_since(outage.lost_at, observed_at) >= CLIENT_SSH_FAILURE_DEADLINE {
+        return Ok(Some(format!(
+            "This device could not reach the sandbox over SSH for {} continuous seconds: {}",
+            CLIENT_SSH_FAILURE_DEADLINE.as_secs(),
+            error
+        )));
+    }
+    Ok(None)
 }
 
-fn ssh_failure_detail(message: &str) -> String {
-    let lower = message.to_ascii_lowercase();
-    let kind = if lower.contains("permission denied")
-        || lower.contains("authentication")
-        || lower.contains("publickey")
-    {
-        "ssh_auth"
-    } else if lower.contains("could not resolve hostname")
-        || lower.contains("name or service not known")
-        || lower.contains("nodename nor servname")
-    {
-        "endpoint"
-    } else if lower.contains("connection refused")
-        || lower.contains("connection timed out")
-        || lower.contains("operation timed out")
-        || lower.contains("no route to host")
-        || lower.contains("connection reset")
-    {
-        "tcp"
-    } else {
-        "ssh"
+fn recover_client_transport_outage(store: &Store, run_id: &str) -> Result<()> {
+    let Some(outage) = store.transport_outage(run_id)? else {
+        return Ok(());
     };
-    format!("{kind}: {message}")
+    if !outage.last_error.starts_with("client_ssh: ") {
+        return Ok(());
+    }
+    let message = format!(
+        "orx: SSH connection from this device recovered after {}s.",
+        elapsed_since(outage.lost_at, now_ms()).as_secs()
+    );
+    store.recover_transport_outage(run_id, &message)?;
+    if log_path(run_id).exists() {
+        append_transport_log_line(run_id, &message)?;
+    }
+    eprintln!("supervise {run_id}: {message}");
+    Ok(())
+}
+
+async fn renew_sandbox_lease(monitor: SandboxMonitor<'_>) -> Result<Option<String>> {
+    let credentials = crate::config::load_credentials()
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| monitor.credentials.clone());
+    match tokio::time::timeout(
+        SANDBOX_STATUS_TIMEOUT,
+        crate::client::claim_sandbox(&credentials, monitor.sandbox_id),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(None),
+        Ok(Err(error))
+            if [401, 403, 404, 409]
+                .into_iter()
+                .any(|status| crate::client::is_api_status(&error, status)) =>
+        {
+            Ok(Some(format!(
+                "The API rejected the sandbox supervisor lease: {error}"
+            )))
+        }
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(anyhow!(
+            "sandbox lease renewal timed out after {}s",
+            SANDBOX_STATUS_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+fn keep_sandbox_lease_alive(
+    fallback_credentials: Credentials,
+    sandbox_id: String,
+    run_id: String,
+) -> AbortOnDrop {
+    AbortOnDrop(tokio::spawn(async move {
+        let mut retry_delay = SANDBOX_LEASE_RENEW_INTERVAL;
+        loop {
+            tokio::time::sleep(retry_delay).await;
+            let credentials = crate::config::load_credentials()
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| fallback_credentials.clone());
+            let monitor = SandboxMonitor {
+                credentials: &credentials,
+                sandbox_id: &sandbox_id,
+            };
+            match renew_sandbox_lease(monitor).await {
+                Ok(None) => retry_delay = SANDBOX_LEASE_RENEW_INTERVAL,
+                Ok(Some(message)) => {
+                    eprintln!("supervise {run_id}: {message}");
+                    return;
+                }
+                Err(error) => {
+                    retry_delay = POLL_INTERVAL;
+                    eprintln!(
+                        "supervise {run_id}: sandbox lease renewal failed (will retry): {error}"
+                    );
+                }
+            }
+        }
+    }))
+}
+
+async fn sandbox_health(monitor: SandboxMonitor<'_>) -> Result<SandboxHealth> {
+    let credentials = crate::config::load_credentials()
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| monitor.credentials.clone());
+    match tokio::time::timeout(
+        SANDBOX_STATUS_TIMEOUT,
+        crate::client::get_sandbox(&credentials, monitor.sandbox_id),
+    )
+    .await
+    {
+        Ok(Ok(response)) if response.sandbox.status == "failed" => Ok(SandboxHealth::Failed(
+            openresearch::failed_sandbox_message(&response.sandbox),
+        )),
+        Ok(Ok(response)) if response.sandbox.status == "offline" => Ok(SandboxHealth::Offline(
+            response
+                .sandbox
+                .last_health_error
+                .unwrap_or_else(|| "SSH health check failed".to_string()),
+        )),
+        Ok(Ok(response)) if response.sandbox.status == "online" => Ok(SandboxHealth::Online),
+        Ok(Ok(_)) => Ok(SandboxHealth::Other),
+        Ok(Err(error)) if crate::client::is_api_status(&error, 404) => Ok(SandboxHealth::Failed(format!(
+            "Box {} disappeared after it was created (the API returned 404). This is a terminal failure on an older server.",
+            monitor.sandbox_id
+        ))),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(anyhow!(
+            "sandbox status request timed out after {}s",
+            SANDBOX_STATUS_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1079,39 +1270,20 @@ enum LaunchState {
     Fresh,
     Cancelled,
     LaunchClaimTimedOut(String),
-    TransportTimedOut(String),
+    SandboxFailed(String),
+    ClientTransportFailed(String),
 }
 
 fn evaluate_launch_probe(
     store: &Store,
-    target: &ssh::SshTarget,
     run_id: &str,
     deadline: Duration,
-    probe_started_at: i64,
     observed_at: i64,
     probe: Result<openresearch::LaunchProbe>,
 ) -> Result<Option<LaunchState>> {
     match probe {
         Ok(state) => {
-            if let Some(outage) = store.transport_outage(run_id)? {
-                let unavailable_for = elapsed_since(outage.lost_at, observed_at);
-                if unavailable_for >= deadline {
-                    let message = format!(
-                        "SSH transport to {} was unavailable for {}s before recovering.",
-                        target.dest,
-                        unavailable_for.as_secs()
-                    );
-                    store.record_transport_event(run_id, &format!("orx: {message}"))?;
-                    return Ok(Some(LaunchState::TransportTimedOut(message)));
-                }
-                let message = format!(
-                    "orx: SSH connection recovered after {}s.",
-                    unavailable_for.as_secs()
-                );
-                store.recover_transport_outage(run_id, &message)?;
-                eprintln!("supervise {run_id}: {message}");
-            }
-
+            recover_client_transport_outage(store, run_id)?;
             if state == openresearch::LaunchProbe::Claimed {
                 let existing = store.launch_claim_at(run_id)?;
                 let claimed_at = store.record_launch_claim(run_id, observed_at)?;
@@ -1121,12 +1293,11 @@ fn evaluate_launch_probe(
                         deadline.as_secs()
                     );
                 }
-                if ssh_outage_timed_out(claimed_at, observed_at, deadline) {
+                if elapsed_since(claimed_at, observed_at) >= deadline {
                     let message = format!(
                         "Remote launch claim did not publish a pid within {}s.",
                         deadline.as_secs()
                     );
-                    store.record_transport_event(run_id, &format!("orx: {message}"))?;
                     return Ok(Some(LaunchState::LaunchClaimTimedOut(message)));
                 }
                 return Ok(None);
@@ -1135,22 +1306,20 @@ fn evaluate_launch_probe(
             if state == openresearch::LaunchProbe::Started {
                 if let Some(claimed_at) = store.launch_claim_at(run_id)? {
                     store.clear_launch_claim(run_id)?;
-                    if ssh_outage_timed_out(claimed_at, observed_at, deadline) {
+                    if elapsed_since(claimed_at, observed_at) >= deadline {
                         let message = format!(
                             "Remote launch claim exceeded {}s before publishing a pid.",
                             deadline.as_secs()
                         );
-                        store.record_transport_event(run_id, &format!("orx: {message}"))?;
                         return Ok(Some(LaunchState::LaunchClaimTimedOut(message)));
                     }
                 }
             } else if let Some(claimed_at) = store.launch_claim_at(run_id)? {
-                if ssh_outage_timed_out(claimed_at, observed_at, deadline) {
+                if elapsed_since(claimed_at, observed_at) >= deadline {
                     let message = format!(
                         "Remote launch intent did not create a job within {}s.",
                         deadline.as_secs()
                     );
-                    store.record_transport_event(run_id, &format!("orx: {message}"))?;
                     return Ok(Some(LaunchState::LaunchClaimTimedOut(message)));
                 }
             }
@@ -1161,36 +1330,11 @@ fn evaluate_launch_probe(
             }))
         }
         Err(err) => {
-            let detail = ssh_failure_detail(&err.to_string());
-            let lost_message = format!(
-                "orx: SSH connection lost before launch; retrying for up to {}s: {detail}",
-                deadline.as_secs()
-            );
-            let (outage, started) =
-                store.record_transport_failure(run_id, &detail, probe_started_at, &lost_message)?;
-            if started {
-                eprintln!("supervise {run_id}: {lost_message}");
-            }
-            if let Some(claimed_at) = store.launch_claim_at(run_id)? {
-                if ssh_outage_timed_out(claimed_at, observed_at, deadline) {
-                    let message = format!(
-                        "Remote launch did not complete within {}s.",
-                        deadline.as_secs()
-                    );
-                    store.record_transport_event(run_id, &format!("orx: {message}"))?;
-                    return Ok(Some(LaunchState::LaunchClaimTimedOut(message)));
-                }
-            }
-            if ssh_outage_timed_out(outage.lost_at, observed_at, deadline) {
-                let message = format!(
-                    "SSH transport to {} remained unavailable for {}s before launch: {detail}",
-                    target.dest,
-                    elapsed_since(outage.lost_at, observed_at).as_secs()
-                );
-                store.record_transport_event(run_id, &format!("orx: {message}"))?;
-                return Ok(Some(LaunchState::TransportTimedOut(message)));
-            }
-            Ok(None)
+            eprintln!("supervise {run_id}: launch-state SSH probe failed (will retry): {err}");
+            Ok(
+                record_client_transport_failure(store, run_id, &err.to_string(), observed_at)?
+                    .map(LaunchState::ClientTransportFailed),
+            )
         }
     }
 }
@@ -1200,68 +1344,47 @@ async fn await_launch_state(
     target: &ssh::SshTarget,
     run_id: &str,
     deadline: Duration,
+    sandbox: Option<SandboxMonitor<'_>>,
     mut cancel_check: impl FnMut() -> bool,
 ) -> Result<LaunchState> {
     loop {
         if cancel_check() {
             return Ok(LaunchState::Cancelled);
         }
-        let probe_started_at = now_ms();
-        let budget = match store.transport_outage(run_id)? {
-            Some(outage) => deadline.saturating_sub(elapsed_since(outage.lost_at, now_ms())),
-            None => SSH_PROBE_TIMEOUT,
+        if let Some(sandbox) = sandbox {
+            match sandbox_health(sandbox).await {
+                Ok(SandboxHealth::Failed(message)) => {
+                    if let Err(error) = record_sandbox_health_transition(
+                        store,
+                        run_id,
+                        SandboxHealth::Failed(message.clone()),
+                    ) {
+                        eprintln!(
+                            "supervise {run_id}: could not record API sandbox failure event: {error}"
+                        );
+                    }
+                    return Ok(LaunchState::SandboxFailed(message));
+                }
+                Ok(health) => {
+                    if let Some(message) = record_sandbox_health_transition(store, run_id, health)?
+                    {
+                        return Ok(LaunchState::SandboxFailed(message));
+                    }
+                }
+                Err(error) => eprintln!(
+                    "supervise {run_id}: sandbox status check failed (will retry): {error}"
+                ),
+            }
         }
-        .min(
-            store
-                .launch_claim_at(run_id)?
-                .map(|claimed_at| deadline.saturating_sub(elapsed_since(claimed_at, now_ms())))
-                .unwrap_or(SSH_PROBE_TIMEOUT),
-        )
-        .min(SSH_PROBE_TIMEOUT);
-        let probe = if budget.is_zero() {
-            Err(anyhow!("persisted SSH outage reached its deadline"))
-        } else {
-            openresearch::launched(target, run_id, budget).await
-        };
-        if let Some(state) = evaluate_launch_probe(
-            store,
-            target,
-            run_id,
-            deadline,
-            probe_started_at,
-            now_ms(),
-            probe,
-        )? {
+        let probe = openresearch::launched(target, run_id, SSH_PROBE_TIMEOUT).await;
+        if let Some(state) = evaluate_launch_probe(store, run_id, deadline, now_ms(), probe)? {
             return Ok(state);
         }
         if cancel_check() {
             return Ok(LaunchState::Cancelled);
         }
-        let observed_at = now_ms();
-        let outage_delay = store
-            .transport_outage(run_id)?
-            .map(|outage| deadline.saturating_sub(elapsed_since(outage.lost_at, observed_at)))
-            .unwrap_or(POLL_INTERVAL);
-        let claim_delay = store
-            .launch_claim_at(run_id)?
-            .map(|claimed_at| deadline.saturating_sub(elapsed_since(claimed_at, observed_at)))
-            .unwrap_or(POLL_INTERVAL);
-        tokio::time::sleep(POLL_INTERVAL.min(outage_delay).min(claim_delay)).await;
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
-}
-
-fn materialize_transport_log(store: &Store, run_id: &str) -> Result<()> {
-    let path = log_path(run_id);
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)?;
-    for message in store.transport_events(run_id)? {
-        writeln!(file, "{message}")?;
-    }
-    file.flush()?;
-    Ok(())
 }
 
 async fn cancel_ssh(target: &ssh::SshTarget, dir: &str, run_id: &str, cancel_sent: &mut bool) {
@@ -1303,8 +1426,8 @@ async fn cancel_ssh_for_watch(
 // The ssh loop with a provisioning prologue and a billing epilogue: the box
 // comes from the platform, so the supervisor first waits for it to come online
 // (recording the SSH endpoint on the descriptor for restarts), launches the
-// payload over ssh, runs the shared watch loop, and deletes the box at the
-// end. EVERY exit path tears the box down — a leaked box bills the org.
+// payload over ssh, and runs the shared watch loop. The API owns health-failure
+// teardown; the CLI deletes the box after the workload exits.
 
 async fn run_openresearch(
     store: Store,
@@ -1336,7 +1459,7 @@ async fn run_openresearch(
     // needed even though local runs skip the mirror (`creds`). Never
     // `require_credentials()` here: it exit(1)s, and dying silently in a
     // detached process would strand the run as "starting" and leak the box.
-    let lifecycle = match crate::config::load_credentials().await {
+    let mut lifecycle = match crate::config::load_credentials().await {
         Ok(Some(c)) => c,
         _ => {
             let record_result = store
@@ -1362,6 +1485,66 @@ async fn run_openresearch(
     };
 
     let dir = openresearch::run_dir(&run_id);
+
+    let claim_started = std::time::Instant::now();
+    loop {
+        if let Ok(Some(credentials)) = crate::config::load_credentials().await {
+            lifecycle = credentials;
+        }
+        match tokio::time::timeout(
+            SANDBOX_STATUS_TIMEOUT,
+            crate::client::claim_sandbox(&lifecycle, &sandbox_id),
+        )
+        .await
+        {
+            Ok(Ok(())) => break,
+            Ok(Err(error))
+                if [401, 403, 404, 409]
+                    .into_iter()
+                    .any(|status| crate::client::is_api_status(&error, status)) =>
+            {
+                let message = if crate::client::is_api_status(&error, 404) {
+                    "The API does not support durable ephemeral sandbox claims; refusing to supervise a box that could be stranded."
+                } else {
+                    "The API rejected the ephemeral sandbox claim."
+                };
+                store.update_status(&run_id, "failed", Some(now_ms()), None)?;
+                store.set_result_markdown(&run_id, &format!("Job failed: {message}"))?;
+                if ![401, 403]
+                    .into_iter()
+                    .any(|status| crate::client::is_api_status(&error, status))
+                {
+                    teardown_box(&store, &lifecycle, &sandbox_id, &run_id).await;
+                }
+                return Err(error.context(message));
+            }
+            Ok(Err(error)) => {
+                eprintln!("supervise {run_id}: sandbox claim failed (will retry): {error}");
+            }
+            Err(_) => eprintln!(
+                "supervise {run_id}: sandbox claim timed out after {}s (will retry)",
+                SANDBOX_STATUS_TIMEOUT.as_secs()
+            ),
+        }
+        if local_cancel_requested(&store, &run_id) {
+            teardown_box(&store, &lifecycle, &sandbox_id, &run_id).await;
+            store.update_status(&run_id, "cancelled", Some(now_ms()), None)?;
+            return Ok(());
+        }
+        if claim_started.elapsed() >= SANDBOX_CLAIM_DEADLINE {
+            let message = format!(
+                "The sandbox could not be claimed within {} seconds.",
+                SANDBOX_CLAIM_DEADLINE.as_secs()
+            );
+            store.update_status(&run_id, "failed", Some(now_ms()), None)?;
+            store.set_result_markdown(&run_id, &format!("Job failed: {message}"))?;
+            return Err(anyhow!(message));
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    let _lease_keeper =
+        keep_sandbox_lease_alive(lifecycle.clone(), sandbox_id.clone(), run_id.clone());
 
     // Provisioning: wait for the box unless a restarted supervisor already
     // recorded its endpoint.
@@ -1457,36 +1640,48 @@ async fn run_openresearch(
         return Err(error);
     }
 
+    let monitor = SandboxMonitor {
+        credentials: &lifecycle,
+        sandbox_id: &sandbox_id,
+    };
+    let mut api_owns_cleanup = false;
     let owned_result: Result<()> = async {
         // Launch only after a successful SSH probe proves the run directory is
-        // fresh. A transport error is ambiguous and may hide a running workload,
-        // so it shares the durable post-readiness outage deadline instead of being
-        // treated as permission to launch again.
-        let already_launched =
-            match await_launch_state(&store, &target, &run_id, SSH_LOSS_DEADLINE, || {
-                local_cancel_requested(&store, &run_id)
-            })
-            .await?
-            {
-                LaunchState::AlreadyLaunched => true,
-                LaunchState::Fresh => false,
-                LaunchState::Cancelled => {
-                    store.update_status(&run_id, "cancelled", Some(now_ms()), None)?;
-                    return Ok(());
-                }
-                LaunchState::LaunchClaimTimedOut(message) => {
-                    store.update_status(&run_id, "failed", Some(now_ms()), None)?;
-                    store.set_result_markdown(&run_id, &format!("Job failed: {message}"))?;
-                    materialize_transport_log(&store, &run_id)?;
-                    return Ok(());
-                }
-                LaunchState::TransportTimedOut(message) => {
-                    store.update_status(&run_id, "failed", Some(now_ms()), None)?;
-                    store.set_result_markdown(&run_id, &format!("Job failed: {message}"))?;
-                    materialize_transport_log(&store, &run_id)?;
-                    return Ok(());
-                }
-            };
+        // fresh. Ambiguous transport errors are retried while the API remains
+        // authoritative for provider health; this client separately bounds a route-specific SSH loss.
+        let already_launched = match await_launch_state(
+            &store,
+            &target,
+            &run_id,
+            LAUNCH_CLAIM_DEADLINE,
+            Some(monitor),
+            || local_cancel_requested(&store, &run_id),
+        )
+        .await?
+        {
+            LaunchState::AlreadyLaunched => true,
+            LaunchState::Fresh => false,
+            LaunchState::Cancelled => {
+                store.update_status(&run_id, "cancelled", Some(now_ms()), None)?;
+                return Ok(());
+            }
+            LaunchState::LaunchClaimTimedOut(message) => {
+                store.update_status(&run_id, "failed", Some(now_ms()), None)?;
+                store.set_result_markdown(&run_id, &format!("Job failed: {message}"))?;
+                return Ok(());
+            }
+            LaunchState::SandboxFailed(message) => {
+                api_owns_cleanup = true;
+                store.update_status(&run_id, "failed", Some(now_ms()), None)?;
+                store.set_result_markdown(&run_id, &format!("Job failed: {message}"))?;
+                return Ok(());
+            }
+            LaunchState::ClientTransportFailed(message) => {
+                store.update_status(&run_id, "failed", Some(now_ms()), None)?;
+                store.set_result_markdown(&run_id, &format!("Job failed: {message}"))?;
+                return Ok(());
+            }
+        };
         if !already_launched {
             // The payload is re-derivable from the store + config, so a restart
             // that died before launching can rebuild it exactly.
@@ -1541,7 +1736,6 @@ async fn run_openresearch(
                     return Ok(());
                 }
                 store.record_launch_claim(&run_id, now_ms())?;
-                let launch_attempt_started_at = now_ms();
                 match ssh::run_job_bounded(
                     &ssh::SshJobSpec {
                         target: target.clone(),
@@ -1560,22 +1754,15 @@ async fn run_openresearch(
                     Err(err) => {
                         eprintln!("supervise {run_id}: launch failed (will retry): {err}");
                         let error_message = err.to_string();
-                        let detail = ssh_failure_detail(&error_message);
-                        let lost_message = format!(
-                            "orx: SSH launch failed; retrying for up to {}s: {detail}",
-                            SSH_LOSS_DEADLINE.as_secs()
-                        );
-                        store.record_transport_failure(
+                        let state = await_launch_state(
+                            &store,
+                            &target,
                             &run_id,
-                            &detail,
-                            launch_attempt_started_at,
-                            &lost_message,
-                        )?;
-                        let state =
-                            await_launch_state(&store, &target, &run_id, SSH_LOSS_DEADLINE, || {
-                                local_cancel_requested(&store, &run_id)
-                            })
-                            .await?;
+                            LAUNCH_CLAIM_DEADLINE,
+                            Some(monitor),
+                            || local_cancel_requested(&store, &run_id),
+                        )
+                        .await?;
                         match state {
                             LaunchState::AlreadyLaunched => {
                                 launch_err = None;
@@ -1592,16 +1779,23 @@ async fn run_openresearch(
                                     &run_id,
                                     &format!("Job failed: {message}"),
                                 )?;
-                                materialize_transport_log(&store, &run_id)?;
                                 return Ok(());
                             }
-                            LaunchState::TransportTimedOut(message) => {
+                            LaunchState::SandboxFailed(message) => {
+                                api_owns_cleanup = true;
                                 store.update_status(&run_id, "failed", Some(now_ms()), None)?;
                                 store.set_result_markdown(
                                     &run_id,
                                     &format!("Job failed: {message}"),
                                 )?;
-                                materialize_transport_log(&store, &run_id)?;
+                                return Ok(());
+                            }
+                            LaunchState::ClientTransportFailed(message) => {
+                                store.update_status(&run_id, "failed", Some(now_ms()), None)?;
+                                store.set_result_markdown(
+                                    &run_id,
+                                    &format!("Job failed: {message}"),
+                                )?;
                                 return Ok(());
                             }
                         }
@@ -1617,14 +1811,18 @@ async fn run_openresearch(
                         &err.to_string(),
                     ),
                 )?;
-                materialize_transport_log(&store, &run_id)?;
                 return Ok(());
             }
         }
 
-        match await_launch_state(&store, &target, &run_id, SSH_LOSS_DEADLINE, || {
-            local_cancel_requested(&store, &run_id)
-        })
+        match await_launch_state(
+            &store,
+            &target,
+            &run_id,
+            LAUNCH_CLAIM_DEADLINE,
+            Some(monitor),
+            || local_cancel_requested(&store, &run_id),
+        )
         .await?
         {
             LaunchState::AlreadyLaunched => {}
@@ -1638,10 +1836,20 @@ async fn run_openresearch(
                 store.update_status(&run_id, "cancelled", Some(now_ms()), None)?;
                 return Ok(());
             }
-            LaunchState::LaunchClaimTimedOut(message) | LaunchState::TransportTimedOut(message) => {
+            LaunchState::LaunchClaimTimedOut(message) => {
                 store.update_status(&run_id, "failed", Some(now_ms()), None)?;
                 store.set_result_markdown(&run_id, &format!("Job failed: {message}"))?;
-                materialize_transport_log(&store, &run_id)?;
+                return Ok(());
+            }
+            LaunchState::SandboxFailed(message) => {
+                api_owns_cleanup = true;
+                store.update_status(&run_id, "failed", Some(now_ms()), None)?;
+                store.set_result_markdown(&run_id, &format!("Job failed: {message}"))?;
+                return Ok(());
+            }
+            LaunchState::ClientTransportFailed(message) => {
+                store.update_status(&run_id, "failed", Some(now_ms()), None)?;
+                store.set_result_markdown(&run_id, &format!("Job failed: {message}"))?;
                 return Ok(());
             }
         }
@@ -1653,7 +1861,7 @@ async fn run_openresearch(
         // The shared ssh loop owns status/logs/mirror; the box is deleted after
         // it returns (logs are drained from the box BEFORE teardown), and even
         // when it errors.
-        watch_ssh_job(
+        let watch_outcome = watch_ssh_job(
             &store,
             &stored.status,
             target,
@@ -1661,10 +1869,20 @@ async fn run_openresearch(
             &creds,
             &run_id,
             SshWatchOptions {
-                loss_deadline: Some(SSH_LOSS_DEADLINE),
+                sandbox: Some(monitor),
             },
         )
         .await?;
+        match watch_outcome {
+            SshWatchOutcome::SandboxFailed(message) => {
+                eprintln!("supervise {run_id}: {message}");
+                api_owns_cleanup = true;
+            }
+            SshWatchOutcome::ClientTransportFailed(message) => {
+                eprintln!("supervise {run_id}: {message}");
+            }
+            SshWatchOutcome::Workload => {}
+        }
         Ok(())
     }
     .await;
@@ -1679,19 +1897,16 @@ async fn run_openresearch(
             let _ = store.set_result_markdown(&run_id, &format!("Job failed: {error}"));
         }
     }
-    teardown_box(&store, &lifecycle, &sandbox_id, &run_id).await;
-    if store
-        .get_run(&run_id)
-        .ok()
-        .flatten()
-        .is_some_and(|run| matches!(run.status.as_str(), "done" | "failed" | "cancelled"))
-    {
-        let _ = store.clear_transport_history(&run_id);
+    if api_owns_cleanup {
+        store.clear_sandbox_cleanup(&run_id)?;
+    } else {
+        teardown_box(&store, &lifecycle, &sandbox_id, &run_id).await;
     }
+    let _ = store.clear_launch_claim(&run_id);
     owned_result
 }
 
-/// Keep retrying a durable cleanup intent until deletion or 404 is confirmed.
+/// Retry cleanup until deletion, a retained failure, or 404 is confirmed.
 async fn resume_sandbox_cleanup(
     store: &Store,
     cleanup: &crate::store::SandboxCleanup,
@@ -1706,44 +1921,51 @@ async fn resume_sandbox_cleanup(
             tokio::time::sleep(Duration::from_secs(15)).await;
             continue;
         };
-        if cleanup.retain_failed {
-            match tokio::time::timeout(
-                Duration::from_secs(20),
-                crate::client::get_sandbox(&lifecycle, &cleanup.sandbox_id),
-            )
-            .await
-            {
-                Ok(Ok(response)) if response.sandbox.status == "failed" => {
-                    if store.clear_sandbox_cleanup(run_id).is_ok() {
-                        eprintln!(
-                            "supervise {run_id}: retained failed box {} for diagnosis",
-                            cleanup.sandbox_id
-                        );
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
+        match tokio::time::timeout(
+            Duration::from_secs(20),
+            crate::client::get_sandbox(&lifecycle, &cleanup.sandbox_id),
+        )
+        .await
+        {
+            Ok(Ok(response)) if response.sandbox.status == "failed" => {
+                if store.clear_sandbox_cleanup(run_id).is_ok() {
+                    eprintln!(
+                        "supervise {run_id}: retained failed box {} for diagnosis",
+                        cleanup.sandbox_id
+                    );
+                    return;
                 }
-                Ok(Err(error)) if crate::client::is_api_status(&error, 404) => {
-                    if store.clear_sandbox_cleanup(run_id).is_ok() {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
-                }
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    let _ = store.record_sandbox_cleanup_error(run_id, &error.to_string());
-                    tokio::time::sleep(Duration::from_secs(15)).await;
-                    continue;
-                }
-                Err(_) => {
-                    let message = "sandbox cleanup status check timed out after 20s";
-                    let _ = store.record_sandbox_cleanup_error(run_id, message);
-                    tokio::time::sleep(Duration::from_secs(15)).await;
-                    continue;
-                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
             }
+            Ok(Ok(response))
+                if cleanup.retain_failed && response.sandbox.status == "provisioning" =>
+            {
+                let message = "waiting for the API to retain the terminal provisioning result";
+                let _ = store.record_sandbox_cleanup_error(run_id, message);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+            Ok(Err(error)) if crate::client::is_api_status(&error, 404) => {
+                if store.clear_sandbox_cleanup(run_id).is_ok() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) if cleanup.retain_failed => {
+                let _ = store.record_sandbox_cleanup_error(run_id, &error.to_string());
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                continue;
+            }
+            Err(_) if cleanup.retain_failed => {
+                let message = "sandbox cleanup status check timed out after 20s";
+                let _ = store.record_sandbox_cleanup_error(run_id, message);
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                continue;
+            }
+            Ok(Err(_)) | Err(_) => {}
         }
         teardown_box(store, &lifecycle, &cleanup.sandbox_id, run_id).await;
         return;
@@ -2363,81 +2585,56 @@ mod tests {
     }
 
     #[test]
-    fn ssh_outage_uses_one_continuous_two_minute_window() {
-        let started_at = 1_000;
-        assert!(!ssh_outage_timed_out(
-            started_at,
-            started_at + 119_999,
-            SSH_LOSS_DEADLINE
-        ));
-        assert!(ssh_outage_timed_out(
-            started_at,
-            started_at + 120_000,
-            SSH_LOSS_DEADLINE
-        ));
-        assert!(!ssh_outage_timed_out(
-            started_at,
-            started_at - 1,
-            SSH_LOSS_DEADLINE
-        ));
-    }
-
-    #[test]
-    fn launch_probe_respects_persisted_outage_and_clears_it_on_recovery() {
+    fn launch_probe_transport_errors_are_not_terminal() {
         let dir = std::env::temp_dir().join(format!(
             "orx-supervise-launch-probe-{}",
             uuid::Uuid::new_v4()
         ));
         let store = Store::open_at(dir.clone()).unwrap();
-        let target = ssh::SshTarget::alias("gpu-box");
-        let started_at = 1_000;
 
         let pending = evaluate_launch_probe(
             &store,
-            &target,
             "run-1",
-            SSH_LOSS_DEADLINE,
-            started_at,
-            started_at,
+            LAUNCH_CLAIM_DEADLINE,
+            500_000,
             Err(anyhow!("connection refused")),
         )
         .unwrap();
         assert_eq!(pending, None);
 
-        let recovered = evaluate_launch_probe(
-            &store,
-            &target,
-            "run-1",
-            SSH_LOSS_DEADLINE,
-            started_at + 119_000,
-            started_at + 119_000,
-            Ok(openresearch::LaunchProbe::Started),
-        )
-        .unwrap();
-        assert_eq!(recovered, Some(LaunchState::AlreadyLaunched));
-        assert_eq!(store.transport_outage("run-1").unwrap(), None);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
-        evaluate_launch_probe(
-            &store,
-            &target,
-            "run-2",
-            SSH_LOSS_DEADLINE,
-            started_at,
-            started_at,
-            Err(anyhow!("connection refused")),
-        )
-        .unwrap();
-        let timed_out = evaluate_launch_probe(
-            &store,
-            &target,
-            "run-2",
-            SSH_LOSS_DEADLINE,
-            started_at + SSH_LOSS_DEADLINE.as_millis() as i64,
-            started_at + SSH_LOSS_DEADLINE.as_millis() as i64,
-            Ok(openresearch::LaunchProbe::Started),
-        )
-        .unwrap();
-        assert!(matches!(timed_out, Some(LaunchState::TransportTimedOut(_))));
+    #[test]
+    fn continuous_client_transport_failure_is_terminal_after_two_minutes() {
+        let dir = std::env::temp_dir().join(format!(
+            "orx-supervise-client-transport-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open_at(dir.clone()).unwrap();
+        assert_eq!(
+            evaluate_launch_probe(
+                &store,
+                "run-1",
+                LAUNCH_CLAIM_DEADLINE,
+                1_000,
+                Err(anyhow!("connection refused")),
+            )
+            .unwrap(),
+            None
+        );
+        assert!(matches!(
+            evaluate_launch_probe(
+                &store,
+                "run-1",
+                LAUNCH_CLAIM_DEADLINE,
+                121_000,
+                Err(anyhow!("connection refused")),
+            )
+            .unwrap(),
+            Some(LaunchState::ClientTransportFailed(_))
+        ));
 
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
@@ -2450,50 +2647,49 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let store = Store::open_at(dir.clone()).unwrap();
-        let target = ssh::SshTarget::alias("gpu-box");
-
         evaluate_launch_probe(
             &store,
-            &target,
             "run-1",
-            SSH_LOSS_DEADLINE,
-            1_000,
+            LAUNCH_CLAIM_DEADLINE,
             1_000,
             Err(anyhow!("connection refused")),
         )
         .unwrap();
         let pending = evaluate_launch_probe(
             &store,
-            &target,
             "run-1",
-            SSH_LOSS_DEADLINE,
-            100_000,
+            LAUNCH_CLAIM_DEADLINE,
             100_000,
             Ok(openresearch::LaunchProbe::Claimed),
         )
         .unwrap();
         assert_eq!(pending, None);
-        assert_eq!(store.transport_outage("run-1").unwrap(), None);
         assert_eq!(store.launch_claim_at("run-1").unwrap(), Some(100_000));
 
         evaluate_launch_probe(
             &store,
-            &target,
             "run-1",
-            SSH_LOSS_DEADLINE,
-            150_000,
+            LAUNCH_CLAIM_DEADLINE,
             150_000,
             Err(anyhow!("connection reset")),
         )
         .unwrap();
         assert_eq!(store.launch_claim_at("run-1").unwrap(), Some(100_000));
 
+        let transport_pending = evaluate_launch_probe(
+            &store,
+            "run-1",
+            LAUNCH_CLAIM_DEADLINE,
+            220_000,
+            Err(anyhow!("connection reset after deadline")),
+        )
+        .unwrap();
+        assert_eq!(transport_pending, None);
+
         let timed_out = evaluate_launch_probe(
             &store,
-            &target,
             "run-1",
-            SSH_LOSS_DEADLINE,
-            220_000,
+            LAUNCH_CLAIM_DEADLINE,
             220_000,
             Ok(openresearch::LaunchProbe::Claimed),
         )
@@ -2518,7 +2714,8 @@ mod tests {
             &store,
             &ssh::SshTarget::alias("must-not-connect"),
             "run-1",
-            SSH_LOSS_DEADLINE,
+            LAUNCH_CLAIM_DEADLINE,
+            None,
             || true,
         )
         .await

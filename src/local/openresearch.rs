@@ -4,7 +4,7 @@
 //! the run as `starting` and the detached supervisor does the rest (wait for
 //! online, launch over ssh, watch, tear the box down at terminal state).
 
-use crate::client::{create_sandbox, list_orgs, CreateSandboxBody};
+use crate::client::{create_sandbox, list_orgs, CreateSandboxBody, SandboxLifecycle};
 use crate::commands::exp::spawn_detached_supervise;
 use crate::error::{anyhow, require_credentials, Result};
 use crate::jobs::{openresearch, BackendDescriptor};
@@ -60,7 +60,8 @@ pub async fn submit_local_openresearch(args: &crate::ExpRunArgs) -> Result<Store
     if args.image.is_some() {
         return Err(anyhow!(
             "--image doesn't apply to --backend openresearch — boxes run the platform's \
-             fixed image (CUDA + PyTorch + uv preinstalled)."
+             fixed image (CUDA runtime + Python + uv preinstalled; workload dependencies such \
+             as PyTorch stay project-owned)."
         ));
     }
     let flavor = args.flavor.clone().ok_or_else(|| {
@@ -187,6 +188,7 @@ pub async fn submit_local_openresearch(args: &crate::ExpRunArgs) -> Result<Store
         &creds,
         &CreateSandboxBody {
             organization_id: org_id.clone(),
+            lifecycle: SandboxLifecycle::Ephemeral,
             target,
         },
     )

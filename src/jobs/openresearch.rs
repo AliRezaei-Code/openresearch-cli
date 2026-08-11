@@ -98,7 +98,7 @@ pub fn parse_flavor(flavor: &str, disk_gb: i64, provider: Option<String>) -> Res
         })
     } else {
         Ok(SandboxTarget::New {
-            gpu: base.to_string(),
+            gpu: base.to_ascii_uppercase(),
             gpu_count: count.unwrap_or(1),
             disk_gb,
             provider,
@@ -133,10 +133,11 @@ pub enum WaitOutcome {
     TimedOut(String),
 }
 
-fn failed_provision_message(sandbox: &Sandbox) -> String {
+pub(crate) fn failed_sandbox_message(sandbox: &Sandbox) -> String {
     let stage = sandbox
-        .provision_stage
-        .as_deref()
+        .provision_error_code
+        .as_ref()
+        .and(sandbox.provision_stage.as_deref())
         .map(|stage| format!(" during {stage}"))
         .unwrap_or_default();
     let code = sandbox
@@ -150,10 +151,7 @@ fn failed_provision_message(sandbox: &Sandbox) -> String {
         .or(sandbox.last_health_error.as_deref())
         .or(sandbox.provision_warnings.as_deref())
         .unwrap_or("the provider did not return a failure reason");
-    format!(
-        "Box {} failed to provision{stage}{code}: {detail}.",
-        sandbox.id
-    )
+    format!("Box {} failed{stage}{code}: {detail}.", sandbox.id)
 }
 
 /// Poll the box until it is online (SSH endpoint known), the deadline passes,
@@ -199,7 +197,7 @@ pub async fn wait_online(
             Ok(Ok(envelope)) => {
                 let sandbox = envelope.sandbox;
                 if sandbox.status == "failed" {
-                    return Ok(WaitOutcome::Failed(failed_provision_message(&sandbox)));
+                    return Ok(WaitOutcome::Failed(failed_sandbox_message(&sandbox)));
                 }
                 let response_at_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -328,7 +326,7 @@ mod tests {
                 disk_gb,
                 provider,
             } => {
-                assert_eq!(gpu, "h100_sxm");
+                assert_eq!(gpu, "H100_SXM");
                 assert_eq!(gpu_count, 1);
                 assert_eq!(disk_gb, 100);
                 assert!(provider.is_none());
@@ -346,7 +344,7 @@ mod tests {
                 disk_gb,
                 provider,
             } => {
-                assert_eq!(gpu, "h100_sxm");
+                assert_eq!(gpu, "H100_SXM");
                 assert_eq!(gpu_count, 2);
                 assert_eq!(disk_gb, 250);
                 assert_eq!(provider.as_deref(), Some("runpod"));
@@ -443,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_provision_message_includes_typed_reason() {
+    fn failed_sandbox_message_includes_typed_reason() {
         let sandbox: Sandbox = serde_json::from_value(serde_json::json!({
             "id": "sb_1",
             "organizationId": "org_1",
@@ -469,13 +467,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            failed_provision_message(&sandbox),
-            "Box sb_1 failed to provision during ssh_auth (readiness_timeout): The registered key was rejected."
+            failed_sandbox_message(&sandbox),
+            "Box sb_1 failed during ssh_auth (readiness_timeout): The registered key was rejected."
         );
     }
 
     #[test]
-    fn failed_provision_message_falls_back_for_legacy_payload() {
+    fn failed_sandbox_message_falls_back_for_legacy_payload() {
         let sandbox: Sandbox = serde_json::from_value(serde_json::json!({
             "id": "sb_legacy",
             "organizationId": "org_1",
@@ -498,8 +496,41 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            failed_provision_message(&sandbox),
-            "Box sb_legacy failed to provision: provider capacity unavailable."
+            failed_sandbox_message(&sandbox),
+            "Box sb_legacy failed: provider capacity unavailable."
+        );
+    }
+
+    #[test]
+    fn failed_sandbox_message_distinguishes_post_ready_ssh_loss() {
+        let sandbox: Sandbox = serde_json::from_value(serde_json::json!({
+            "id": "sb_health",
+            "organizationId": "org_1",
+            "projectId": null,
+            "sshHostname": "example.test",
+            "sshPort": 22,
+            "sshUsername": "root",
+            "status": "failed",
+            "machineType": "ephemeral",
+            "createdBy": null,
+            "updatedAt": "2026-08-10T00:00:00Z",
+            "provisionWarnings": null,
+            "provisionStage": "ready",
+            "provisionErrorCode": null,
+            "provisionErrorMessage": null,
+            "lastHealthError": "ssh_auth: authentication failed",
+            "providerName": "vast",
+            "providerInstanceId": "instance_1",
+            "pricePerHour": 1.0,
+            "gpu": "RTX_4090",
+            "gpuCount": 2,
+            "vcpuCount": null
+        }))
+        .unwrap();
+
+        assert_eq!(
+            failed_sandbox_message(&sandbox),
+            "Box sb_health failed: ssh_auth: authentication failed."
         );
     }
 }

@@ -30,6 +30,12 @@ struct ApiHttpError {
 
 impl std::fmt::Display for ApiHttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.status == 401 {
+            return write!(
+                f,
+                "Unauthorized — your token is invalid or revoked. Run `orx login` again."
+            );
+        }
         write!(
             f,
             "Request to {} failed ({} {}){}",
@@ -673,12 +679,20 @@ pub enum SandboxTarget {
     },
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxLifecycle {
+    Persistent,
+    Ephemeral,
+}
+
 /// Body of `POST /sandboxes`. `projectId` is intentionally omitted — the server
 /// rejects it for `new`/`new-cpu` (those are org-level standalone only).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateSandboxBody {
     pub organization_id: String,
+    pub lifecycle: SandboxLifecycle,
     pub target: SandboxTarget,
 }
 
@@ -790,11 +804,6 @@ async fn send_request(
     };
 
     let status = res.status();
-    if status.as_u16() == 401 {
-        return Err(anyhow!(
-            "Unauthorized — your token is invalid or revoked. Run `orx login` again."
-        ));
-    }
     if !status.is_success() {
         let reason = status.canonical_reason().unwrap_or("");
         return Err(ApiHttpError {
@@ -1085,6 +1094,16 @@ pub async fn create_sandbox(
 /// openresearch backend polls this while its box goes provisioning → online.
 pub async fn get_sandbox(creds: &Credentials, sandbox_id: &str) -> Result<SandboxEnvelope> {
     api_get(creds, &format!("/sandboxes/{}", sandbox_id)).await
+}
+
+pub async fn claim_sandbox(creds: &Credentials, sandbox_id: &str) -> Result<()> {
+    request_no_content(
+        creds,
+        Method::POST,
+        &format!("/sandboxes/{}/claim", sandbox_id),
+        Some(serde_json::json!({})),
+    )
+    .await
 }
 
 /// Tear a box down (destroys the provider instance) — `DELETE /sandboxes/{id}`.
@@ -1944,7 +1963,7 @@ mod tests {
         is_api_status, openalex_selector, reconstruct_abstract, ApiHttpError,
         CreateBaselineExperimentBody, CreateChildBody, CreateSandboxBody, ListCatalog,
         ListCpuCatalog, LitHit, OpenAlexWork, PaperHit, RunBody, RunTarget, SandboxEnvelope,
-        SandboxTarget, BIORXIV_SOURCE_ID,
+        SandboxLifecycle, SandboxTarget, BIORXIV_SOURCE_ID,
     };
     use serde_json::json;
 
@@ -2134,6 +2153,7 @@ mod tests {
     fn serializes_create_sandbox_body_without_project() {
         let body = CreateSandboxBody {
             organization_id: "org_123".into(),
+            lifecycle: SandboxLifecycle::Ephemeral,
             target: SandboxTarget::NewCpu {
                 cpu_flavor: "cpu5c".into(),
                 vcpu_count: 2,
@@ -2141,6 +2161,7 @@ mod tests {
         };
         let value = serde_json::to_value(&body).unwrap();
         assert_eq!(value.get("organizationId"), Some(&json!("org_123")));
+        assert_eq!(value.get("lifecycle"), Some(&json!("ephemeral")));
         assert!(value.get("projectId").is_none());
     }
 
@@ -2282,6 +2303,18 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "Request to /sandboxes/sb_1 failed (404 Not Found): Sandbox not found"
+        );
+
+        let unauthorized = crate::error::Error::new(ApiHttpError {
+            path: "/sandboxes/sb_1/claim".into(),
+            status: 401,
+            reason: "Unauthorized".into(),
+            detail: String::new(),
+        });
+        assert!(is_api_status(&unauthorized, 401));
+        assert_eq!(
+            unauthorized.to_string(),
+            "Unauthorized — your token is invalid or revoked. Run `orx login` again."
         );
     }
 
