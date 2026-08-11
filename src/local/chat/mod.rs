@@ -8,7 +8,7 @@
 //! normalized parts into the per-turn assistant message; every flush persists
 //! the message and broadcasts it as a `chat.message` SSE event.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -296,7 +296,7 @@ impl WirePart {
 // --- image attachments ---------------------------------------------------------
 
 /// A pasted image or uploaded file riding the send-message request.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageAttachment {
     pub media_type: String,
@@ -677,6 +677,21 @@ pub struct ChatHost {
     bridge_prompted: std::sync::Mutex<HashSet<String>>,
     /// The port `orx up` bound, for the bridge env contract.
     up_port: std::sync::OnceLock<u16>,
+    /// Messages the user sent while the session's turn was in flight, oldest
+    /// first. `drain_queue` runs the front one when a turn finishes naturally;
+    /// a user Stop clears the whole queue. In-memory and uncommitted — a queued
+    /// message only becomes a transcript bubble once it actually runs.
+    queued: std::sync::Mutex<HashMap<String, VecDeque<QueuedMessage>>>,
+}
+
+/// A user message parked while the session was busy, replayed verbatim through
+/// the normal send path once the running turn ends.
+#[derive(Clone)]
+struct QueuedMessage {
+    id: String,
+    text: String,
+    overrides: TurnOverrides,
+    images: Vec<ImageAttachment>,
 }
 
 /// Reserves a session's turn slot for the duration of `send_message`'s setup.
@@ -771,6 +786,7 @@ impl ChatHost {
             gate_tokens: std::sync::Mutex::new(HashMap::new()),
             bridge_prompted: std::sync::Mutex::new(HashSet::new()),
             up_port: std::sync::OnceLock::new(),
+            queued: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1051,6 +1067,110 @@ impl ChatHost {
         })
     }
 
+    /// The session's parked messages, oldest first — for the reload snapshot.
+    pub fn queued_items(&self, session_id: &str) -> Vec<Value> {
+        self.queued
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|q| {
+                q.iter()
+                    .map(|m| json!({ "id": m.id, "text": m.text }))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn queued_json(&self, session_id: &str) -> Value {
+        json!({ "sessionId": session_id, "items": self.queued_items(session_id) })
+    }
+
+    fn emit_queued(&self, session_id: &str) {
+        self.emit("chat.queued", self.queued_json(session_id));
+    }
+
+    /// Drop every parked message for a session (user Stop / delete). Emits an
+    /// empty `chat.queued` only if there was something to clear.
+    fn clear_queue(&self, session_id: &str) {
+        let had = self
+            .queued
+            .lock()
+            .unwrap()
+            .remove(session_id)
+            .is_some_and(|q| !q.is_empty());
+        if had {
+            self.emit_queued(session_id);
+        }
+    }
+
+    /// Remove one parked message by id (the ✕ on a queued chip).
+    pub fn cancel_queued(&self, session_id: &str, item_id: &str) -> bool {
+        let removed = {
+            let mut map = self.queued.lock().unwrap();
+            let Some(q) = map.get_mut(session_id) else {
+                return false;
+            };
+            let before = q.len();
+            q.retain(|m| m.id != item_id);
+            let removed = q.len() != before;
+            if q.is_empty() {
+                map.remove(session_id);
+            }
+            removed
+        };
+        if removed {
+            self.emit_queued(session_id);
+        }
+        removed
+    }
+
+    /// Run the next parked message once a turn finishes naturally. One per call:
+    /// the turn this spawns drains the following message on its own completion.
+    /// Boxed return: `drain_queue` → `send_message_showing` → (spawned)
+    /// `drain_queue` is an async recursion cycle the auto-`Send` solver can't
+    /// close on its own, so we assert the boxed future is `Send` to break it.
+    fn drain_queue<'a>(
+        self: &'a Arc<Self>,
+        session_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            // Scope the guard: a std mutex must never be held across an await.
+            let item = {
+                let mut map = self.queued.lock().unwrap();
+                map.get_mut(session_id).and_then(VecDeque::pop_front)
+            };
+            let Some(item) = item else {
+                return;
+            };
+            self.emit_queued(session_id);
+            // `queue_if_busy = false`: if a fresh send raced in and claimed the
+            // slot in the gap after `finish_turn` freed it, this returns busy —
+            // restore the message at the front (arrival order) and let that
+            // turn drain it.
+            let retry = item.clone();
+            if self
+                .send_message_showing(
+                    session_id,
+                    item.text,
+                    None,
+                    item.overrides,
+                    item.images,
+                    false,
+                )
+                .await
+                .is_err()
+            {
+                self.queued
+                    .lock()
+                    .unwrap()
+                    .entry(session_id.to_string())
+                    .or_default()
+                    .push_front(retry);
+                self.emit_queued(session_id);
+            }
+        })
+    }
+
     /// Persist the user message and run one harness turn in the background.
     pub async fn send_message(
         self: &Arc<Self>,
@@ -1059,7 +1179,7 @@ impl ChatHost {
         overrides: TurnOverrides,
         images: Vec<ImageAttachment>,
     ) -> Result<()> {
-        self.send_message_showing(session_id, text, None, overrides, images)
+        self.send_message_showing(session_id, text, None, overrides, images, true)
             .await
     }
 
@@ -1078,6 +1198,7 @@ impl ChatHost {
         transcript_text: Option<String>,
         overrides: TurnOverrides,
         images: Vec<ImageAttachment>,
+        queue_if_busy: bool,
     ) -> Result<()> {
         // Atomically claim the session's turn slot: the busy-check and the
         // reservation happen under one lock so two concurrent sends (or a
@@ -1085,6 +1206,24 @@ impl ChatHost {
         // same session. `_guard` releases the reservation on any early error.
         let _guard = match TurnGuard::claim(self, session_id).await {
             Some(guard) => guard,
+            // Busy: park a genuine user send (Claude-desktop steering) so it
+            // runs when the turn ends, instead of rejecting it. System/resume
+            // sends pass `queue_if_busy = false` and keep the old rejection.
+            None if queue_if_busy && !(text.trim().is_empty() && images.is_empty()) => {
+                self.queued
+                    .lock()
+                    .unwrap()
+                    .entry(session_id.to_string())
+                    .or_default()
+                    .push_back(QueuedMessage {
+                        id: format!("q_{}", uuid::Uuid::new_v4()),
+                        text,
+                        overrides,
+                        images,
+                    });
+                self.emit_queued(session_id);
+                return Ok(());
+            }
             None => return Err(anyhow!("session is busy — interrupt it first")),
         };
         let store = Store::open()?;
@@ -1297,6 +1436,10 @@ impl ChatHost {
                     }
                 }
                 ctx.host.finish_turn(&ctx.session_id).await;
+                // Natural completion only: a user Stop aborts this task before
+                // it reaches here (and clears the queue itself), so an
+                // interrupted turn never drains.
+                ctx.host.drain_queue(&ctx.session_id).await;
             });
             turns.insert(sid, Some(task.abort_handle()));
             if let Some(seed) = title_seed {
@@ -1387,6 +1530,9 @@ impl ChatHost {
         // still paint them in arrival order for a few ms; a reload converges
         // on the stored order.)
         let created_at = now_ms();
+        // Stop means stop everything: drop any messages parked behind this turn
+        // so they don't fire the moment it aborts.
+        self.clear_queue(session_id);
         if !self.interrupt(session_id).await? {
             return Ok(());
         }
@@ -1504,8 +1650,15 @@ impl ChatHost {
                     "plan" | "permission" => Some(req.note.clone().unwrap_or_default()),
                     _ => None,
                 };
-                self.send_message_showing(&req.session_id, text, transcript, overrides, Vec::new())
-                    .await?;
+                self.send_message_showing(
+                    &req.session_id,
+                    text,
+                    transcript,
+                    overrides,
+                    Vec::new(),
+                    false,
+                )
+                .await?;
                 self.resolve_prompt_card(&req);
                 Ok(())
             }
@@ -1646,6 +1799,7 @@ impl ChatHost {
         let _deleting = self
             .begin_session_delete(session_id)
             .ok_or_else(|| anyhow!("session deletion is already in progress"))?;
+        self.clear_queue(session_id);
         let _ = self.interrupt(session_id).await;
         // A live opencode serve child would keep running in (and lock) the
         // session's worktree; the resident claude child's cwd is that worktree
@@ -1895,7 +2049,7 @@ impl ChatHost {
 
 /// Composer selections a single message can override, mirroring the sticky
 /// per-session settings. Empty/None fields leave the stored value in place.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct TurnOverrides {
     pub model: Option<String>,
     pub permission_mode: Option<String>,
