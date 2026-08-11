@@ -12,6 +12,7 @@ import {
   type OptionChoice,
 } from "../api";
 import { renderNote } from "./agentNote";
+import { HarnessLogo } from "./HarnessLogo";
 import { onHarnessAuth } from "../events";
 import type { AgentSelection } from "../api";
 import { MODEL_ITEM_CLASS_NAME } from "../styleClasses";
@@ -184,10 +185,11 @@ export function ModelPicker({
     <div className="model-picker relative inline-flex" data-onboarding="model-picker" ref={rootRef}>
       <button
         type="button"
-        className="composer-pill inline-flex items-center gap-[5px] text-md text-text py-[5px] px-2 rounded-sm [&:hover]:bg-surface [&:hover]:text-text"
+        className="composer-pill inline-flex items-center gap-[5px] text-md text-text py-[5px] px-2 rounded-sm whitespace-nowrap transition-[background] duration-150 ease-standard [&:hover]:bg-surface"
         title="Harness + model for this chat"
         onClick={() => setOpen((v) => !v)}
       >
+        {value?.harness && <HarnessLogo harness={value.harness} size={14} />}
         {label}
         <ChevronDown size={12} />
       </button>
@@ -344,7 +346,7 @@ export function OptionPicker({
     <div className="option-picker relative inline-flex" ref={ref}>
       <button
         type="button"
-        className={variant === "pill" ? "composer-pill inline-flex items-center gap-[5px] text-md text-text py-[5px] px-2 rounded-sm [&:hover]:bg-surface [&:hover]:text-text" : "composer-bare inline-flex items-center gap-[3px] text-md text-text py-[5px] px-1 rounded-sm [&:hover]:text-text [&.context-ring]:inline-flex [&.context-ring]:items-center [&.context-ring]:mr-2"}
+        className={variant === "pill" ? "composer-pill inline-flex items-center gap-[5px] text-md text-text py-[5px] px-2 rounded-sm whitespace-nowrap transition-[background] duration-150 ease-standard [&:hover]:bg-surface" : "composer-bare inline-flex items-center gap-[3px] text-md text-text py-[5px] px-1 rounded-sm transition-[background] duration-150 ease-standard [&:hover]:bg-surface [&.context-ring]:inline-flex [&.context-ring]:items-center [&.context-ring]:mr-2"}
         title={title}
         onClick={() => setOpen((v) => !v)}
       >
