@@ -16,6 +16,7 @@ import {
   Package,
   Plus,
   SlidersHorizontal,
+  ToggleRight,
   Users,
   X,
 } from "lucide-react";
@@ -59,7 +60,7 @@ import {
 } from "../api";
 import { onChatEvent } from "../events";
 import { LitSourceLogo, parseOrxLit, paperUrl } from "./LitSourceLogo";
-import { LitSourcesPicker } from "./LitSourcesPicker";
+import { LitSourcesList } from "./LitSourcesPicker";
 import { Md } from "./Md";
 import { PlanStrip } from "./PlanStrip";
 import { SETTINGS_NAV, type SettingsTab } from "./SettingsPage";
@@ -1376,6 +1377,9 @@ export function ChatPanel({
   const threadInnerRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  // Consolidated chat-settings popover (permissions/reasoning/sources), opened
+  // by the switch icon in the composer footer.
+  const chatSettings = usePopover();
 
   // Slash-skills: menu state is derived from the draft — open while the first
   // token is an unfinished `/command` (no whitespace yet) with matches.
@@ -2637,19 +2641,56 @@ export function ChatPanel({
             />
           </div>
           <div className="composer-actions flex justify-end items-center gap-2 pt-1.5 px-2 pb-2">
-            {/* Bottom-left: permission mode + literature sources. */}
-            <OptionPicker
-              choices={activeHarness?.agentReady ? (opts?.permissionModes ?? []) : []}
-              value={composerSelection?.permissionMode ?? null}
-              defaultId={opts?.defaultPermissionMode ?? null}
-              header="Mode"
-              align="left"
-              variant="pill"
-              numbered
-              title="Permission mode for this chat"
-              onSelect={setPermissionMode}
-            />
-            <LitSourcesPicker />
+            {/* Chat settings (permissions, reasoning, sources) live behind the
+                switch icon. */}
+            <div className="option-picker relative inline-flex" ref={chatSettings.ref}>
+              <button
+                type="button"
+                className="composer-bare inline-flex items-center gap-[3px] text-md text-text py-[5px] px-1 rounded-sm transition-[background] duration-150 ease-standard [&:hover]:bg-surface"
+                title="Chat settings"
+                aria-label="Chat settings"
+                aria-haspopup="dialog"
+                aria-expanded={chatSettings.open}
+                onClick={() => chatSettings.setOpen((v) => !v)}
+              >
+                <ToggleRight size={16} />
+              </button>
+              {chatSettings.open && (
+                <div className="composer-settings-menu absolute bottom-[calc(100%_+_8px)] left-0 flex flex-col gap-0.5 min-w-55 bg-background border border-border rounded-lg shadow-[0_12px_32px_rgba(0,_0,_0,_0.18)] z-50 p-1.5 [&_.composer-pill]:px-1.5 [&_.composer-bare]:px-1.5 [&_.option-menu]:bottom-0 [&_.option-menu]:top-auto [&_.option-menu]:left-[calc(100%_+_8px)] [&_.option-menu]:right-auto">
+                  <div className="flex items-center justify-between gap-3 pl-2">
+                    <span className="text-md text-muted">Permissions</span>
+                    <OptionPicker
+                      choices={activeHarness?.agentReady ? (opts?.permissionModes ?? []) : []}
+                      value={composerSelection?.permissionMode ?? null}
+                      defaultId={opts?.defaultPermissionMode ?? null}
+                      header="Permissions"
+                      align="left"
+                      variant="pill"
+                      numbered
+                      title="Permission mode for this chat"
+                      onSelect={setPermissionMode}
+                    />
+                  </div>
+                  <div className="flex items-center justify-between gap-3 pl-2">
+                    <span className="text-md text-muted">Reasoning</span>
+                    <OptionPicker
+                      choices={activeHarness?.agentReady ? reasoning.choices : []}
+                      value={composerSelection?.reasoningLevel ?? null}
+                      defaultId={reasoning.defaultId}
+                      header="Reasoning"
+                      align="left"
+                      variant="bare"
+                      title="Reasoning level for this chat — Default sends no override, so the harness CLI's own configured effort applies"
+                      onSelect={setReasoningLevel}
+                    />
+                  </div>
+                  <div className="flex flex-col gap-0.5 mt-1 pt-2 border-t border-border">
+                    <span className="text-md text-muted pl-2">Sources</span>
+                    <LitSourcesList />
+                  </div>
+                </div>
+              )}
+            </div>
             <input
               ref={fileInputRef}
               type="file"
@@ -2663,7 +2704,7 @@ export function ChatPanel({
             />
             <button
               type="button"
-              className="composer-attach inline-flex items-center justify-center w-7.5 h-7.5 rounded-md text-muted cursor-pointer transition-[background,color] duration-100 ease-standard [&:hover]:bg-surface [&:hover]:text-text"
+              className="composer-attach inline-flex items-center justify-center w-7.5 h-7.5 rounded-sm text-text cursor-pointer transition-[background] duration-150 ease-standard [&:hover]:bg-surface"
               title="Attach a PDF or image"
               aria-label="Attach a PDF or image"
               onClick={() => fileInputRef.current?.click()}
@@ -2671,24 +2712,14 @@ export function ChatPanel({
               <Paperclip size={16} />
             </button>
             <div style={{ flex: 1 }} />
-            {/* Bottom-right: model, reasoning level, then context meter. The
-                picker reflects the open session (harness locked once it exists);
-                the global default only applies before the first message. */}
+            {/* The model picker reflects the open session (harness locked once it
+                exists); the global default only applies before the first
+                message. */}
             <ModelPicker
               value={composerSelection}
               onSelect={selectModel}
               onHarnesses={setHarnesses}
               lockHarness={!!openSession}
-            />
-            <OptionPicker
-              choices={activeHarness?.agentReady ? reasoning.choices : []}
-              value={composerSelection?.reasoningLevel ?? null}
-              defaultId={reasoning.defaultId}
-              header="Reasoning"
-              align="right"
-              variant="bare"
-              title="Reasoning level for this chat — Default sends no override, so the harness CLI's own configured effort applies"
-              onSelect={setReasoningLevel}
             />
             <ContextMeter usage={openSession?.contextUsage} />
             {busy && !pendingQuestion ? (

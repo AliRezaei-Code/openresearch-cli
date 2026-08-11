@@ -4,16 +4,10 @@
 
 import type { HarnessId } from "../api";
 
-export function HarnessLogo({
-  harness,
-  size = 16,
-  className = "harness-logo",
-}: {
-  harness: HarnessId;
-  size?: number;
-  className?: string;
-}) {
-  const cls = harness === "claude-code" ? `${className} claude` : className;
+export function HarnessLogo({ harness, size = 16 }: { harness: HarnessId; size?: number }) {
+  // Self-colored for Claude; inherits text color otherwise so it reads in both
+  // themes.
+  const cls = `block shrink-0 fill-current${harness === "claude-code" ? " text-[#d97757]" : ""}`;
   if (harness === "claude-code") {
     return (
       <svg className={cls} width={size} height={size} viewBox="0 0 24 24" aria-hidden="true">
