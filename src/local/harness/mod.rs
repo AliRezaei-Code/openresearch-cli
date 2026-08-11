@@ -184,6 +184,14 @@ pub trait Harness: Send + Sync {
         self.config_home().map(|h| h.exists()).unwrap_or(false)
     }
 
+    /// The agent's global native-skills dir (`~/.claude/skills`,
+    /// `~/.agents/skills`, `<xdg>/opencode/skills`) — where the user's own
+    /// installed skills live. Derived from the `skills/orx/SKILL.md` shim
+    /// target every installable harness shares. `None` if not installable.
+    fn global_skills_dir(&self) -> Option<PathBuf> {
+        Some(self.skill_target()?.parent()?.parent()?.to_path_buf())
+    }
+
     // --- session-skills capability ----------------------------------------
 
     /// The worktree-relative dir this harness discovers native `SKILL.md` skill

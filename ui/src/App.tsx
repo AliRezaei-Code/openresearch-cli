@@ -38,6 +38,7 @@ import { SubagentTab } from "./components/SubagentTab";
 import { CodeTab, type CodeView } from "./components/CodeTab";
 import { WorktreeTab, type WorktreeView } from "./components/WorktreeTab";
 import { ArtifactsTab } from "./components/ArtifactsTab";
+import { SkillsTab } from "./components/SkillsTab";
 import { ClosableTab } from "./components/ClosableTab";
 import { DetailDrawer, type ExperimentView } from "./components/DetailDrawer";
 import { FileViewer } from "./components/FileViewer";
@@ -407,7 +408,7 @@ export default function App() {
   const [railOpen, setRailOpen] = useState(true);
   const [homeOpen, setHomeOpen] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
-  const [mainView, setMainView] = useState<"chat" | SettingsTab>("chat");
+  const [mainView, setMainView] = useState<"chat" | "skills" | SettingsTab>("chat");
   const [githubPublicationError, setGithubPublicationError] = useState<{
     projectId: string;
     message: string;
@@ -1037,7 +1038,9 @@ export default function App() {
             preferredAgent={uiState.preferredAgent}
             onPreferredAgentChange={persistPreferredAgent}
           >
-            {mainView !== "chat" && (
+            {mainView === "skills" ? (
+              <SkillsTab project={activeProject} />
+            ) : mainView !== "chat" ? (
               <SettingsView
                 tab={mainView}
                 project={activeProject}
@@ -1052,7 +1055,7 @@ export default function App() {
                 }}
                 onSelectTab={setMainView}
               />
-            )}
+            ) : null}
           </ChatPanel>
         )}
         {mainView === "chat" && panelOpen && (
