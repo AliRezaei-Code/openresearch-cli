@@ -60,6 +60,7 @@ fn prepare_path(
     create_folder: bool,
     initialize_git: bool,
     clone_url: Option<&str>,
+    shallow_clone: bool,
 ) -> Result<PathBuf> {
     let path = expand_path(path)?;
     if let Some(url) = clone_url.map(str::trim).filter(|url| !url.is_empty()) {
@@ -74,7 +75,7 @@ fn prepare_path(
         } else if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        git::clone_public(url, &path)?;
+        git::clone_public(url, &path, shallow_clone)?;
         git::rename_origin_to_upstream(&path)?;
     } else if !path.exists() {
         if !create_folder {
@@ -115,11 +116,18 @@ pub fn create_project(
         create_folder,
         initialize_git,
         clone_url,
+        shallow_clone,
         run_command,
         paper_id,
     } = options;
     let slug = unique_project_slug(store, &slugify(name))?;
-    let repo_path = prepare_path(path, create_folder, initialize_git, clone_url.as_deref())?;
+    let repo_path = prepare_path(
+        path,
+        create_folder,
+        initialize_git,
+        clone_url.as_deref(),
+        shallow_clone,
+    )?;
     if store
         .list_local_projects()?
         .iter()
@@ -131,14 +139,16 @@ pub fn create_project(
         ));
     }
     let baseline_branch = git::require_current_branch(&repo_path)?;
+    let publication = git::github_publication(&repo_path);
+    let (github_owner, github_repo) = publication.unwrap_or_default();
 
     let now = now_ms();
     let project = LocalProject {
         id: uuid::Uuid::new_v4().to_string(),
         name: name.to_string(),
         slug,
-        github_owner: String::new(),
-        github_repo: String::new(),
+        github_owner,
+        github_repo,
         github_sync_enabled: false,
         baseline_branch,
         repo_path: repo_path.to_string_lossy().to_string(),
@@ -156,6 +166,7 @@ pub struct CreateProjectOptions {
     pub create_folder: bool,
     pub initialize_git: bool,
     pub clone_url: Option<String>,
+    pub shallow_clone: bool,
     pub run_command: Option<String>,
     pub paper_id: Option<String>,
 }
@@ -285,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_remote_is_not_project_metadata() {
+    fn ordinary_github_origin_remains_opt_in() {
         let root = root();
         let project_path = root.join("project");
         initialized(&project_path);
@@ -306,13 +317,14 @@ mod tests {
             CreateProjectOptions::default(),
         )
         .unwrap();
-        assert!(project.github_owner.is_empty());
-        assert!(project.github_repo.is_empty());
+        assert!(!project.github_enabled());
+        assert_eq!(project.github_owner, "example");
+        assert_eq!(project.github_repo, "research");
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn legacy_publication_remote_is_not_project_metadata() {
+    fn dedicated_github_remote_is_recognized_but_remains_opt_in() {
         let root = root();
         let project_path = root.join("project");
         initialized(&project_path);
@@ -333,8 +345,9 @@ mod tests {
             CreateProjectOptions::default(),
         )
         .unwrap();
-        assert!(project.github_owner.is_empty());
-        assert!(project.github_repo.is_empty());
+        assert!(!project.github_enabled());
+        assert_eq!(project.github_owner, "example");
+        assert_eq!(project.github_repo, "research");
         std::fs::remove_dir_all(root).unwrap();
     }
 

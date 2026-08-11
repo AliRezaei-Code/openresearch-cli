@@ -501,6 +501,31 @@ impl ControlPlane for LocalPlane {
             run_command,
         )?;
 
+        if project.github_enabled() {
+            let repo_path = project.repo_path.clone();
+            let branch = experiment.branch_name.clone();
+            let owner = project.github_owner.clone();
+            let repo = project.github_repo.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::local::git::push_branch(
+                    std::path::Path::new(&repo_path),
+                    &branch,
+                    &owner,
+                    &repo,
+                )
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!(
+                    "  warning: experiment created locally, but GitHub sync failed: {error}"
+                ),
+                Err(error) => eprintln!(
+                    "  warning: experiment created locally, but the GitHub sync task failed: {error}"
+                ),
+            }
+        }
+
         println!("\u{2713} Created local {} experiment", kind);
         if defaulted_to_root {
             let root = parent_exp.as_ref().unwrap();

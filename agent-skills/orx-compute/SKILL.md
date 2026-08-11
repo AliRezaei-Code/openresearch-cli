@@ -33,11 +33,11 @@ Rules and notes:
   touch a command is the baseline having none yet.
 - **Set a run command before launching.** `orx exp run` fails with a pointer to
   `orx exp cmd --set` if the node has none.
-- **Push your edits before launching.** A run trains the branch's tip **as it is
-  on GitHub** — so commit and push first (see the `orx-git` skill). As a
-  safety net, `orx exp run` refuses a child whose branch has **no changes over its
-  parent** (the tell-tale of "queued before pushing") — push and retry, or pass
-  `--force` to run the unchanged code deliberately.
+- **Commit your edits before launching.** Local projects run an immutable source
+  snapshot of the committed branch and never need a GitHub push. Managed server
+  projects still run their recorded remote revision. As a safety net, `orx exp
+  run` refuses a child whose branch has no changes over its parent; commit a
+  meaningful change and retry, or pass `--force` deliberately.
 - **Pick compute with exactly one of `--gpu`, `--cpu`, or `--sandbox`.** With
   `--gpu`, `--count` defaults to `1` and `--disk` to `100` (GB). A new GPU
   instance defaults to **RunPod** (the cheapest matching RunPod offer for the

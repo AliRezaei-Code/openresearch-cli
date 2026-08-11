@@ -64,8 +64,8 @@ pub fn legacy_root_warning(project: &LocalProject, experiment: &LocalExperiment)
         })
 }
 
-/// Create a local experiment. Every node gets its own `orx/<slug>` branch,
-/// pushed to origin: a child forks off its parent's tip, a baseline/root off
+/// Create a local experiment. Every node gets its own `orx/<slug>` branch:
+/// a child forks off its parent's tip, a baseline/root off
 /// the project's base branch. The base branch itself is never an experiment
 /// node — it stays mutable (README, notebooks, publication surface) while
 /// `orx/*` branches hold the experiment nodes' recorded code. Matches the

@@ -9,6 +9,9 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
 use async_trait::async_trait;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -36,7 +39,7 @@ impl SourceSnapshot {
         let repo = Path::new(&project.repo_path);
         let revision = crate::local::git::local_head_sha(repo, &experiment.branch_name)?;
         let dir = crate::store::data_dir().join("source-snapshots");
-        std::fs::create_dir_all(&dir)?;
+        prepare_snapshot_dir(&dir)?;
 
         let nonce = uuid::Uuid::new_v4();
         let tar_tmp = dir.join(format!(".{nonce}.tar"));
@@ -121,7 +124,11 @@ impl SourceSnapshot {
 }
 
 fn archive(repo: &Path, revision: &str, format: &str, destination: &Path) -> Result<()> {
-    let file = std::fs::File::create(destination)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(destination)?;
     let output = Command::new("git")
         .current_dir(repo)
         .args(["archive", &format!("--format={format}"), revision])
@@ -138,6 +145,24 @@ fn archive(repo: &Path, revision: &str, format: &str, destination: &Path) -> Res
         revision,
         String::from_utf8_lossy(&output.stderr).trim()
     ))
+}
+
+fn prepare_snapshot_dir(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(anyhow!(
+                "Source snapshot directory {} is not owned by the current user.",
+                path.display()
+            ));
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 fn digest_file(path: &Path) -> Result<(String, u64)> {
@@ -166,17 +191,18 @@ fn install_content_addressed(
         let (digest, size) = digest_file(destination)?;
         if digest == expected_digest && size == expected_size {
             std::fs::remove_file(source)?;
+            restrict_snapshot_file(destination)?;
             return Ok(());
         }
         std::fs::remove_file(destination)?;
     }
     match std::fs::rename(source, destination) {
-        Ok(()) => Ok(()),
+        Ok(()) => restrict_snapshot_file(destination),
         Err(_err) if destination.exists() => {
             let (digest, size) = digest_file(destination)?;
             std::fs::remove_file(source)?;
             if digest == expected_digest && size == expected_size {
-                Ok(())
+                restrict_snapshot_file(destination)
             } else {
                 Err(anyhow!(
                     "Cached source snapshot {} failed its digest check.",
@@ -186,6 +212,12 @@ fn install_content_addressed(
         }
         Err(err) => Err(err.into()),
     }
+}
+
+fn restrict_snapshot_file(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 pub fn snapshot_script(archive_path: &str, command: &str) -> String {
@@ -314,189 +346,291 @@ pub trait ComputeBackend: Send + Sync {
     }
 }
 
-pub struct LocalBackend {
-    id: &'static str,
+async fn stage_snapshot(
+    project: &LocalProject,
+    experiment: &LocalExperiment,
+    include_ray_package: bool,
+) -> Result<StagedSource> {
+    let project = project.clone();
+    let experiment = experiment.clone();
+    tokio::task::spawn_blocking(move || {
+        SourceSnapshot::create(&project, &experiment, include_ray_package)
+    })
+    .await
+    .map_err(|error| anyhow!("source snapshot task failed: {error}"))?
+    .map(StagedSource)
 }
 
-impl LocalBackend {
-    pub fn named(id: &str) -> Result<Self> {
-        let id = crate::local::BACKENDS
-            .iter()
-            .copied()
-            .find(|candidate| *candidate == id)
-            .ok_or_else(|| anyhow!("Unknown compute backend '{id}'."))?;
-        Ok(Self { id })
-    }
+fn ready() -> Result<Preflight> {
+    Ok(Preflight {
+        ready: true,
+        detail: None,
+    })
 }
 
-#[async_trait]
-impl ComputeBackend for LocalBackend {
-    fn capabilities(&self) -> Capabilities {
-        let (label, transport) = match self.id {
-            "local" => ("This machine", "local archive"),
-            "hf" => ("Hugging Face Jobs", "private job volume"),
-            "modal" => ("Modal", "sandbox filesystem"),
-            "k8s" => ("Kubernetes", "kubectl cp"),
-            "ssh" => ("SSH", "SSH tar stream"),
-            "slurm" => ("Slurm", "SSH tar stream"),
-            "ray" => ("Ray Jobs", "working_dir package"),
-            "openresearch" => ("OpenResearch", "SSH tar stream"),
-            _ => unreachable!(),
-        };
-        Capabilities {
-            id: self.id,
-            label,
-            remote: self.id != "local",
-            flavors: crate::local::FLAVORED_BACKENDS.contains(&self.id),
-            requires_flavor: crate::local::FLAVOR_REQUIRED_BACKENDS.contains(&self.id),
-            source_transport: transport,
+macro_rules! backend_adapter {
+    (
+        $name:ident, $id:literal, $label:literal, $remote:literal, $flavors:literal,
+        $requires_flavor:literal, $transport:literal, $ray_package:literal,
+        preflight |$preflight_args:ident| $preflight:expr,
+        submit |$submit_args:ident, $source:ident, $run_id:ident| $submit:expr
+    ) => {
+        pub struct $name;
+
+        #[async_trait]
+        impl ComputeBackend for $name {
+            fn capabilities(&self) -> Capabilities {
+                Capabilities {
+                    id: $id,
+                    label: $label,
+                    remote: $remote,
+                    flavors: $flavors,
+                    requires_flavor: $requires_flavor,
+                    source_transport: $transport,
+                }
+            }
+
+            async fn preflight(&self, args: &crate::ExpRunArgs) -> Result<Preflight> {
+                let $preflight_args = args;
+                $preflight
+            }
+
+            async fn stage_source(
+                &self,
+                project: &LocalProject,
+                experiment: &LocalExperiment,
+            ) -> Result<StagedSource> {
+                stage_snapshot(project, experiment, $ray_package).await
+            }
+
+            async fn submit(
+                &self,
+                args: &crate::ExpRunArgs,
+                staged: StagedSource,
+                id: String,
+            ) -> Result<StoredRun> {
+                let $submit_args = args;
+                let $source = staged.0;
+                let $run_id = id;
+                $submit
+            }
         }
-    }
+    };
+}
 
-    async fn preflight(&self, args: &crate::ExpRunArgs) -> Result<Preflight> {
-        let detail = match self.id {
-            "local" => None,
-            "hf" => {
-                if args.flavor.is_none() {
-                    return Ok(not_ready("Hugging Face Jobs requires --flavor."));
-                }
-                let token = crate::jobs::huggingface::resolve_token()?;
-                crate::jobs::huggingface::whoami(&token).await?;
-                None
-            }
-            "modal" => {
-                if args.flavor.is_none() {
-                    return Ok(not_ready("Modal requires --flavor."));
-                }
-                crate::jobs::modal::preflight().await?;
-                None
-            }
-            "k8s" => {
-                let settings = crate::jobs::kubernetes::load_settings()?.unwrap_or_default();
-                let check = crate::jobs::kubernetes::preflight(
-                    settings.context.as_deref(),
-                    &settings.namespace,
-                )
+backend_adapter!(
+    LocalCompute,
+    "local",
+    "This machine",
+    false,
+    false,
+    false,
+    "local archive",
+    false,
+    preflight | _args | ready(),
+    submit | args,
+    source,
+    run_id | { crate::local::localrun::submit_local_run_with_source(args, source, run_id).await }
+);
+
+backend_adapter!(
+    HuggingFaceCompute,
+    "hf",
+    "Hugging Face Jobs",
+    true,
+    true,
+    true,
+    "private job volume",
+    false,
+    preflight | args | {
+        if args.flavor.is_none() {
+            return Ok(not_ready("Hugging Face Jobs requires --flavor."));
+        }
+        let token = crate::jobs::huggingface::resolve_token()?;
+        crate::jobs::huggingface::whoami(&token).await?;
+        ready()
+    },
+    submit | args,
+    source,
+    run_id | { crate::local::hf::submit_local_hf_with_source(args, source, run_id).await }
+);
+
+backend_adapter!(
+    ModalCompute,
+    "modal",
+    "Modal",
+    true,
+    true,
+    true,
+    "sandbox filesystem",
+    false,
+    preflight | args | {
+        if args.flavor.is_none() {
+            return Ok(not_ready("Modal requires --flavor."));
+        }
+        crate::jobs::modal::preflight().await?;
+        ready()
+    },
+    submit | args,
+    source,
+    run_id | { crate::local::modal::submit_local_modal_with_source(args, source, run_id).await }
+);
+
+backend_adapter!(
+    KubernetesCompute,
+    "k8s",
+    "Kubernetes",
+    true,
+    false,
+    false,
+    "kubectl cp",
+    false,
+    preflight | _args | {
+        let settings = crate::jobs::kubernetes::load_settings()?.unwrap_or_default();
+        let check =
+            crate::jobs::kubernetes::preflight(settings.context.as_deref(), &settings.namespace)
                 .await;
-                if !check.kubectl_found || !check.reachable || !check.can_create_jobs {
-                    return Ok(not_ready(check.error.as_deref().unwrap_or(
-                        "kubectl cannot reach the cluster or create Jobs in the namespace.",
-                    )));
-                }
-                None
-            }
-            "ssh" => {
-                let host = args
-                    .host
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("SSH requires --host <alias>."))?;
-                let check =
-                    crate::jobs::ssh::preflight(&crate::jobs::ssh::SshTarget::alias(host)).await;
-                if !check.reachable || !check.tools_found {
-                    return Ok(not_ready(
-                        check
-                            .error
-                            .as_deref()
-                            .unwrap_or("The SSH host needs bash and tar."),
-                    ));
-                }
-                None
-            }
-            "slurm" => {
-                let settings = crate::jobs::slurm::load_settings()?.unwrap_or_default();
-                let host = args
-                    .host
-                    .as_deref()
-                    .or(settings.host.as_deref())
-                    .ok_or_else(|| anyhow!("Slurm requires --host or a configured host."))?;
-                let check = crate::jobs::slurm::preflight(host).await;
-                if !check.reachable || !check.slurm_found || !check.tools_found {
-                    return Ok(not_ready(check.error.as_deref().unwrap_or(
-                        "The Slurm host needs bash, tar, sbatch, squeue, and scancel.",
-                    )));
-                }
-                None
-            }
-            "ray" => {
-                let address = crate::jobs::ray::resolve_address(None);
-                crate::jobs::ray::preflight(&address).await?;
-                None
-            }
-            "openresearch" => {
-                if args.flavor.is_none() {
-                    return Ok(not_ready("OpenResearch requires --flavor."));
-                }
-                if crate::config::load_credentials().await?.is_none() {
-                    return Ok(not_ready("OpenResearch requires `orx login`."));
-                }
-                None
-            }
-            _ => unreachable!(),
-        };
-        Ok(Preflight {
-            ready: true,
-            detail,
-        })
-    }
-
-    async fn stage_source(
-        &self,
-        project: &LocalProject,
-        experiment: &LocalExperiment,
-    ) -> Result<StagedSource> {
-        let project = project.clone();
-        let experiment = experiment.clone();
-        let include_ray_package = self.id == "ray";
-        tokio::task::spawn_blocking(move || {
-            SourceSnapshot::create(&project, &experiment, include_ray_package)
-        })
-        .await
-        .map_err(|e| anyhow!("source snapshot task failed: {e}"))?
-        .map(StagedSource)
-    }
-
-    async fn submit(
-        &self,
-        args: &crate::ExpRunArgs,
-        source: StagedSource,
-        run_id: String,
-    ) -> Result<StoredRun> {
-        match self.id {
-            "local" => {
-                crate::local::localrun::submit_local_run_with_source(args, source.0, run_id).await
-            }
-            "hf" => crate::local::hf::submit_local_hf_with_source(args, source.0, run_id).await,
-            "modal" => {
-                crate::local::modal::submit_local_modal_with_source(args, source.0, run_id).await
-            }
-            "k8s" => crate::local::k8s::submit_local_k8s_with_source(args, source.0, run_id).await,
-            "ssh" => crate::local::ssh::submit_local_ssh_with_source(args, source.0, run_id).await,
-            "slurm" => {
-                crate::local::slurm::submit_local_slurm_with_source(args, source.0, run_id).await
-            }
-            "ray" => crate::local::ray::submit_local_ray_with_source(args, source.0, run_id).await,
-            "openresearch" => {
-                crate::local::openresearch::submit_local_openresearch_with_source(
-                    args, source.0, run_id,
-                )
-                .await
-            }
-            _ => unreachable!(),
+        if !check.kubectl_found || !check.reachable || !check.can_create_jobs {
+            return Ok(not_ready(check.error.as_deref().unwrap_or(
+                "kubectl cannot reach the cluster or create Jobs in the namespace.",
+            )));
         }
+        ready()
+    },
+    submit | args,
+    source,
+    run_id | { crate::local::k8s::submit_local_k8s_with_source(args, source, run_id).await }
+);
+
+backend_adapter!(
+    SshCompute,
+    "ssh",
+    "SSH",
+    true,
+    false,
+    false,
+    "SSH tar stream",
+    false,
+    preflight | args | {
+        let host = args
+            .host
+            .as_deref()
+            .ok_or_else(|| anyhow!("SSH requires --host <alias>."))?;
+        let check = crate::jobs::ssh::preflight(&crate::jobs::ssh::SshTarget::alias(host)).await;
+        if !check.reachable || !check.tools_found {
+            return Ok(not_ready(
+                check
+                    .error
+                    .as_deref()
+                    .unwrap_or("The SSH host needs bash and tar."),
+            ));
+        }
+        ready()
+    },
+    submit | args,
+    source,
+    run_id | { crate::local::ssh::submit_local_ssh_with_source(args, source, run_id).await }
+);
+
+backend_adapter!(
+    SlurmCompute,
+    "slurm",
+    "Slurm",
+    true,
+    false,
+    false,
+    "SSH tar stream",
+    false,
+    preflight | args | {
+        let settings = crate::jobs::slurm::load_settings()?.unwrap_or_default();
+        let host = args
+            .host
+            .as_deref()
+            .or(settings.host.as_deref())
+            .ok_or_else(|| anyhow!("Slurm requires --host or a configured host."))?;
+        let check = crate::jobs::slurm::preflight(host).await;
+        if !check.reachable || !check.slurm_found || !check.tools_found {
+            return Ok(not_ready(check.error.as_deref().unwrap_or(
+                "The Slurm host needs bash, tar, sbatch, squeue, and scancel.",
+            )));
+        }
+        ready()
+    },
+    submit | args,
+    source,
+    run_id | { crate::local::slurm::submit_local_slurm_with_source(args, source, run_id).await }
+);
+
+backend_adapter!(
+    RayCompute,
+    "ray",
+    "Ray Jobs",
+    true,
+    false,
+    false,
+    "working_dir package",
+    true,
+    preflight | _args | {
+        let address = crate::jobs::ray::resolve_address(None);
+        crate::jobs::ray::preflight(&address).await?;
+        ready()
+    },
+    submit | args,
+    source,
+    run_id | { crate::local::ray::submit_local_ray_with_source(args, source, run_id).await }
+);
+
+backend_adapter!(
+    OpenResearchCompute,
+    "openresearch",
+    "OpenResearch",
+    true,
+    true,
+    true,
+    "SSH tar stream",
+    false,
+    preflight | args | {
+        if args.flavor.is_none() {
+            return Ok(not_ready("OpenResearch requires --flavor."));
+        }
+        if crate::config::load_credentials().await?.is_none() {
+            return Ok(not_ready("OpenResearch requires `orx login`."));
+        }
+        ready()
+    },
+    submit | args,
+    source,
+    run_id | {
+        crate::local::openresearch::submit_local_openresearch_with_source(args, source, run_id)
+            .await
+    }
+);
+
+pub fn backend(id: &str) -> Result<Box<dyn ComputeBackend>> {
+    match id {
+        "local" => Ok(Box::new(LocalCompute)),
+        "hf" => Ok(Box::new(HuggingFaceCompute)),
+        "modal" => Ok(Box::new(ModalCompute)),
+        "k8s" => Ok(Box::new(KubernetesCompute)),
+        "ssh" => Ok(Box::new(SshCompute)),
+        "slurm" => Ok(Box::new(SlurmCompute)),
+        "ray" => Ok(Box::new(RayCompute)),
+        "openresearch" => Ok(Box::new(OpenResearchCompute)),
+        _ => Err(anyhow!("Unknown compute backend '{id}'.")),
     }
 }
 
 pub fn capabilities() -> Vec<Capabilities> {
     crate::local::BACKENDS
         .iter()
-        .filter_map(|id| LocalBackend::named(id).ok())
+        .filter_map(|id| backend(id).ok())
         .map(|backend| backend.capabilities())
         .collect()
 }
 
 pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     let backend_id = args.backend.as_deref().unwrap_or("local");
-    let backend = LocalBackend::named(backend_id)?;
+    let backend = backend(backend_id)?;
     let store = Store::open()?;
     let experiment = store
         .get_local_experiment(&args.exp_id)?
@@ -563,7 +697,33 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     reserve_run(&store, &pending, args.force)?;
     let pending_backend_json = descriptor.to_json();
     match backend.submit(args, source, run_id.clone()).await {
-        Ok(run) => Ok(run),
+        Ok(run) => {
+            if project.github_enabled() {
+                let repo_path = project.repo_path.clone();
+                let branch = experiment.branch_name.clone();
+                let owner = project.github_owner.clone();
+                let repo = project.github_repo.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::local::git::push_branch(
+                        Path::new(&repo_path),
+                        &branch,
+                        &owner,
+                        &repo,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => eprintln!(
+                        "GitHub sync failed; compute is already running from the source snapshot: {error}"
+                    ),
+                    Err(error) => eprintln!(
+                        "GitHub sync task failed; compute is already running from the source snapshot: {error}"
+                    ),
+                }
+            }
+            Ok(run)
+        }
         Err(error) => {
             let current = store.get_run(&run_id)?;
             let handle_was_persisted = current

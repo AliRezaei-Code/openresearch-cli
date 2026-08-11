@@ -113,7 +113,11 @@ fn playbook_md(project: &LocalProject) -> String {
     let all_backends_enabled = true;
     let id = &project.id;
     let name = &project.name;
-    let publication_line = "- Source: immutable snapshots from committed local Git revisions";
+    let publication_line = if project.github_enabled() {
+        "- Source: immutable snapshots from committed local Git revisions\n- GitHub publication: enabled for experiment visibility; never used for compute transport"
+    } else {
+        "- Source: immutable snapshots from committed local Git revisions\n- GitHub publication: disabled"
+    };
     let experiment_publish_clause = "created locally";
     let edit_step = "2. **Edit** in this worktree: check out `<branch>`, change the code, and commit. Do not push just to launch compute; `orx` snapshots the committed revision directly.";
     let compute_contract = "Every backend receives the same immutable archive of the recorded local Git revision; no backend clones a repository or needs GitHub credentials.";

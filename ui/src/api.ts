@@ -20,6 +20,11 @@ export interface Project {
   runCommand?: string | null;
   /** arXiv id the project starts from (versionless). */
   paperId?: string | null;
+  githubOwner: string;
+  githubRepo: string;
+  githubSyncEnabled: boolean;
+  githubEnabled: boolean;
+  githubUrl?: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -176,6 +181,8 @@ export interface ProjectPathStatus {
   directory: boolean | null;
   empty: boolean | null;
   initialized: boolean | null;
+  githubOwner?: string | null;
+  githubRepo?: string | null;
 }
 
 export const getProjectPathStatus = (path = "") => {
@@ -194,14 +201,24 @@ export interface NewProject {
   cloneUrl?: string;
   createFolder?: boolean;
   initializeGit?: boolean;
+  githubSyncEnabled?: boolean;
 }
 
 export interface CreateProjectResult {
   project: Project;
+  githubPublicationError?: string | null;
 }
 
 export const createProject = (body: NewProject) =>
   post<CreateProjectResult>("/api/projects", body);
+
+export const getGithubAccount = () =>
+  get<{ login: string | null }>("/api/github/account");
+
+export const getGithubRepoAccess = (owner: string, repo: string) =>
+  get<{ canPush: boolean }>(
+    `/api/github/repo-access?owner=${encodeURIComponent(owner)}&repo=${encodeURIComponent(repo)}`,
+  );
 
 export interface PaperHit {
   paperId: string;

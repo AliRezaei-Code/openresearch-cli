@@ -22,9 +22,47 @@ use tokio::process::Command;
 
 use crate::error::{anyhow, Result};
 
-/// Where ssh keeps its ControlMaster sockets. Created on first use.
+/// Keep sockets out of config paths, which can exceed macOS's 104-byte limit.
+#[cfg(unix)]
+fn control_dir() -> PathBuf {
+    use std::hash::{Hash as _, Hasher as _};
+
+    let uid = unsafe { libc::geteuid() };
+    let mut namespace = std::collections::hash_map::DefaultHasher::new();
+    crate::config::config_dir().hash(&mut namespace);
+    PathBuf::from("/tmp").join(format!("orx-ssh-{uid}-{:08x}", namespace.finish() as u32))
+}
+
+#[cfg(not(unix))]
 fn control_dir() -> PathBuf {
     crate::config::config_dir().join("ssh-cm")
+}
+
+fn prepare_control_dir() -> Result<()> {
+    let dir = control_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        anyhow!(
+            "Could not create SSH control directory {}: {e}",
+            dir.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let metadata = std::fs::symlink_metadata(&dir)?;
+        let uid = unsafe { libc::geteuid() };
+        if !metadata.file_type().is_dir() || metadata.uid() != uid {
+            return Err(anyhow!(
+                "SSH control path {} is not an owner-controlled directory.",
+                dir.display()
+            ));
+        }
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&dir, permissions)?;
+    }
+    Ok(())
 }
 
 /// An ssh endpoint. The classic ssh backend connects by `~/.ssh/config` alias
@@ -96,12 +134,8 @@ impl SshTarget {
 /// Shared ssh options: BatchMode (never hang on a prompt) + connection
 /// multiplexing so repeated polls are cheap.
 fn ssh_opts(target: &SshTarget) -> Vec<String> {
-    // Not ssh's %C token: the expanded path must fit in sun_path (104 bytes
-    // on macOS) and `<config dir>/ssh-cm/<40-hex>.<12-char tmp suffix>`
-    // overflows it for ordinary home dirs — ssh then fails outright rather
-    // than skip multiplexing. A 16-hex hash keeps it short. It folds in the
-    // extra opts (where %C folds in user/host/port) so `user@host -p 2222`
-    // and `user@host -p 2223` never share a control socket.
+    // A 16-hex hash leaves room for ssh's temporary bind suffix. It folds in
+    // the extra opts so different ports never share a control socket.
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     target.dest.hash(&mut h);
@@ -140,7 +174,7 @@ async fn ssh_run_bytes(
     remote_cmd: &str,
     stdin: Option<&[u8]>,
 ) -> Result<String> {
-    let _ = std::fs::create_dir_all(control_dir());
+    prepare_control_dir()?;
     let mut cmd = Command::new("ssh");
     cmd.args(ssh_opts(target))
         .arg("--")
@@ -192,7 +226,7 @@ async fn ssh_run_file(
     remote_cmd: &str,
     source: &std::path::Path,
 ) -> Result<String> {
-    let _ = std::fs::create_dir_all(control_dir());
+    prepare_control_dir()?;
     let mut child = Command::new("ssh")
         .args(ssh_opts(target))
         .arg("--")
@@ -488,5 +522,22 @@ mod tests {
         };
         assert_ne!(control_path(&mk("22022")), control_path(&mk("22023")));
         assert_eq!(control_path(&mk("22022")), control_path(&mk("22022")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_path_fits_macos_unix_socket_limit() {
+        let option = ssh_opts(&SshTarget::host_port(
+            "root@ssh3.vast.ai".into(),
+            22,
+            HostKeyPolicy::Ephemeral,
+        ))
+        .into_iter()
+        .find(|o| o.starts_with("ControlPath="))
+        .unwrap();
+        let path = option.strip_prefix("ControlPath=").unwrap();
+
+        assert!(path.starts_with("/tmp/orx-ssh-"));
+        assert!(path.len() + 17 < 104, "{path}");
     }
 }

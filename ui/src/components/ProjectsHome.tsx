@@ -147,7 +147,9 @@ export function ProjectsHome({
                   onClick={() => onOpen(p.id)}
                 />
                 <span className="name">{p.name}</span>
-                <span className="project-card-sync mono">local Git</span>
+                <span className="project-card-sync mono">
+                  {p.githubEnabled ? "GitHub syncing" : "local Git"}
+                </span>
                 {p.paperId && <span className="paper mono">arXiv {p.paperId}</span>}
                 <span className="time">created {timeAgo(p.createdAt)}</span>
                 <button

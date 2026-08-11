@@ -252,6 +252,8 @@ fn router(state: AppState) -> Router {
         .route("/api/projects/{id}/open", post(open_project))
         .route("/api/projects/{id}/git", get(project_git_status))
         .route("/api/projects/{id}/git/init", post(initialize_project_git))
+        .route("/api/github/account", get(github_account))
+        .route("/api/github/repo-access", get(github_repo_access))
         .route("/api/projects/{id}/experiments", get(list_experiments))
         .route("/api/projects/{id}/runs", get(list_project_runs))
         .route("/api/papers/search", get(search_papers_api))
@@ -584,6 +586,11 @@ fn project_json_with_artifacts_dir(p: &local::model::LocalProject, artifacts_dir
         map.insert("artifactsDir".into(), dir.clone());
         map.insert("filesDir".into(), dir);
         map.insert("path".into(), Value::String(p.repo_path.clone()));
+        map.insert("githubEnabled".into(), Value::Bool(p.github_enabled()));
+        map.insert(
+            "githubUrl".into(),
+            p.github_url().map(Value::String).unwrap_or(Value::Null),
+        );
     }
     v
 }
@@ -622,6 +629,9 @@ async fn project_path_status(Query(q): Query<ProjectPathStatusQ>) -> ApiResult {
         };
         let initialized =
             git_version.is_some() && directory && local::git::is_repository(&resolved);
+        let github_publication = initialized
+            .then(|| local::git::github_publication(&resolved))
+            .flatten();
         Ok(Json(json!({
             "gitVersion": git_version,
             "resolvedPath": resolved.to_string_lossy(),
@@ -629,6 +639,8 @@ async fn project_path_status(Query(q): Query<ProjectPathStatusQ>) -> ApiResult {
             "directory": directory,
             "empty": empty,
             "initialized": initialized,
+            "githubOwner": github_publication.as_ref().map(|(owner, _)| owner),
+            "githubRepo": github_publication.as_ref().map(|(_, repo)| repo),
         })))
     })
     .await
@@ -692,6 +704,8 @@ struct CreateProjectReq {
     create_folder: bool,
     #[serde(default)]
     initialize_git: bool,
+    #[serde(default)]
+    github_sync_enabled: bool,
 }
 
 async fn create_project(
@@ -711,9 +725,20 @@ async fn create_project(
     let path = req.path;
     let create_folder = req.create_folder;
     let initialize_git = req.initialize_git;
-    let clone_url = req.clone_url;
+    let clone_url = req.clone_url.filter(|url| !url.trim().is_empty());
+    let paper_id = req.paper_id.filter(|paper_id| !paper_id.trim().is_empty());
+    if paper_id.is_some() && clone_url.is_none() {
+        return Err(bad_request(
+            "A paper project requires a linked public code repository.",
+        ));
+    }
+    let github_sync_enabled = req.github_sync_enabled;
+    let repo_size_kb = match clone_url.as_deref() {
+        Some(url) => local::github::public_repo_size_kb(url).await,
+        None => None,
+    };
+    let shallow_clone = local::github::should_shallow_clone(repo_size_kb);
     let run_command = req.run_command;
-    let paper_id = req.paper_id.filter(|p| !p.trim().is_empty());
     let result = tokio::task::spawn_blocking(move || {
         let store = Store::open()?;
         local::projects::create_project(
@@ -724,6 +749,7 @@ async fn create_project(
                 create_folder,
                 initialize_git,
                 clone_url,
+                shallow_clone,
                 run_command,
                 paper_id,
             },
@@ -737,9 +763,23 @@ async fn create_project(
         .admit(&project.id)
         .ok_or_else(|| bad_request("project deletion is in progress"))?;
     drop(create_admission);
+    let (project, github_publication_error) = if github_sync_enabled {
+        match push_project_for_sync(project.clone()).await {
+            Ok(project) => (project, None),
+            Err(error) => {
+                let project = Store::open()?
+                    .get_local_project(&project.id)?
+                    .unwrap_or(project);
+                (project, Some(error.to_string()))
+            }
+        }
+    } else {
+        (project, None)
+    };
     crate::telemetry::capture_project_created(true);
     Ok(Json(json!({
         "project": project_json(&project),
+        "githubPublicationError": github_publication_error,
     })))
 }
 
@@ -827,6 +867,132 @@ async fn initialize_project_git(
     })
     .await
     .map_err(|error| ApiError::from(anyhow!("git task failed: {error}")))?
+}
+
+fn push_project(project: &local::model::LocalProject) -> Result<()> {
+    if !project.github_enabled() {
+        return Err(anyhow!(
+            "Enable GitHub syncing for this project before pushing."
+        ));
+    }
+    let path = std::path::Path::new(&project.repo_path);
+    local::git::add_github_remote(path, &project.github_owner, &project.github_repo)?;
+    local::git::push_all(
+        path,
+        &project.baseline_branch,
+        &project.github_owner,
+        &project.github_repo,
+    )
+}
+
+fn github_push_was_rejected(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("403")
+        || error.contains("permission denied")
+        || error.contains("write access")
+        || error.contains("archived")
+        || error.contains("read-only")
+        || error.contains("repository not found")
+        || error.contains("authentication failed")
+        || error.contains("could not read username")
+}
+
+async fn create_independent_project_repository(
+    mut project: local::model::LocalProject,
+) -> Result<local::model::LocalProject> {
+    let store = Store::open()?;
+    let session_ids = store
+        .list_chat_sessions_by_project(&project.id)?
+        .into_iter()
+        .map(|session| session.id)
+        .collect::<Vec<_>>();
+    local::git::migrate_legacy_project_worktrees(&project, &session_ids)?;
+    let source_repository = project
+        .has_github_repository()
+        .then(|| (project.github_owner.clone(), project.github_repo.clone()));
+    let (owner, repo, _) = local::github::create_project_repo(&project.slug).await?;
+    if local::git::is_shallow_repository(std::path::Path::new(&project.repo_path))? {
+        local::git::reroot_shallow_repository(
+            std::path::Path::new(&project.repo_path),
+            &project.baseline_branch,
+            source_repository.as_ref(),
+        )?;
+    }
+    project.github_owner = owner;
+    project.github_repo = repo;
+    project.github_sync_enabled = false;
+    store.update_local_project(&project)?;
+    Ok(project)
+}
+
+async fn push_project_for_sync(
+    mut project: local::model::LocalProject,
+) -> Result<local::model::LocalProject> {
+    if local::git::resolve_github_token().is_none() {
+        return Err(anyhow!(
+            "Connect GitHub first with `gh auth login` or a GitHub token."
+        ));
+    }
+
+    let mut using_existing_repository = project.has_github_repository();
+    if using_existing_repository {
+        let can_push = local::github::repo_meta(&project.github_owner, &project.github_repo)
+            .await
+            .is_some_and(|meta| meta.can_push && !meta.archived);
+        if !can_push {
+            project = create_independent_project_repository(project).await?;
+            using_existing_repository = false;
+        }
+    } else {
+        project = create_independent_project_repository(project).await?;
+        using_existing_repository = false;
+    }
+
+    let push_once = |project: &local::model::LocalProject| {
+        let mut project = project.clone();
+        project.github_sync_enabled = true;
+        tokio::task::spawn_blocking(move || push_project(&project))
+    };
+    let first_push = push_once(&project)
+        .await
+        .map_err(|error| anyhow!("Git push task failed: {error}"))?;
+    if let Err(error) = first_push {
+        if !using_existing_repository || !github_push_was_rejected(&error.to_string()) {
+            return Err(error);
+        }
+        project = create_independent_project_repository(project).await?;
+        push_once(&project)
+            .await
+            .map_err(|error| anyhow!("Git push task failed: {error}"))??;
+    }
+
+    project.github_sync_enabled = true;
+    Store::open()?.update_local_project(&project)?;
+    Ok(project)
+}
+
+async fn github_account() -> ApiResult {
+    Ok(Json(
+        json!({ "login": local::github::viewer_login().await }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct RepoAccessQuery {
+    owner: String,
+    repo: String,
+}
+
+async fn github_repo_access(Query(q): Query<RepoAccessQuery>) -> ApiResult {
+    let owner = q.owner.trim();
+    let repo = q.repo.trim();
+    if owner.is_empty() || repo.is_empty() {
+        return Err(bad_request("owner and repo are required"));
+    }
+    let meta = local::github::repo_meta(owner, repo).await;
+    Ok(Json(json!({
+        "canPush": meta.is_some_and(|meta| meta.can_push && !meta.archived),
+    })))
 }
 
 /// Mark a project visited: bumps updated_at, which drives the recency sort
@@ -1036,7 +1202,9 @@ async fn create_run(State(state): State<AppState>, Json(req): Json<CreateRunReq>
     Ok(Json(json!({ "run": ApiRun::from(&run) })))
 }
 
-fn backend_for_run(run: &StoredRun) -> std::result::Result<crate::compute::LocalBackend, ApiError> {
+fn backend_for_run(
+    run: &StoredRun,
+) -> std::result::Result<Box<dyn crate::compute::ComputeBackend>, ApiError> {
     let descriptor =
         crate::jobs::BackendDescriptor::parse(&run.backend_json).map_err(bad_request)?;
     let id = descriptor
@@ -1044,11 +1212,10 @@ fn backend_for_run(run: &StoredRun) -> std::result::Result<crate::compute::Local
         .strip_suffix("_job")
         .unwrap_or(&descriptor.kind);
     let id = if id == "k8s" { "k8s" } else { id };
-    crate::compute::LocalBackend::named(id).map_err(bad_request)
+    crate::compute::backend(id).map_err(bad_request)
 }
 
 async fn get_run(Path(id): Path<String>) -> ApiResult {
-    use crate::compute::ComputeBackend as _;
     let run = Store::open()?
         .get_run(&id)?
         .ok_or_else(|| not_found("run"))?;
@@ -1090,7 +1257,6 @@ async fn list_instances() -> ApiResult {
 }
 
 async fn cancel_run(Path(id): Path<String>) -> ApiResult {
-    use crate::compute::ComputeBackend as _;
     let store = Store::open()?;
     let run = local::local_run(&store, &id)?.ok_or_else(|| not_found("run"))?;
     // A terminal run must not gain a stale cancel_requested flag.
@@ -1108,7 +1274,6 @@ struct LogsQuery {
 }
 
 async fn run_logs(Path(id): Path<String>, Query(q): Query<LogsQuery>) -> ApiResult {
-    use crate::compute::ComputeBackend as _;
     let run = Store::open()?
         .get_run(&id)?
         .ok_or_else(|| not_found("run"))?;

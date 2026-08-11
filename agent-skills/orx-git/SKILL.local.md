@@ -3,8 +3,10 @@ name: orx-git
 description: "Read, edit, commit, and diff experiment code with local Git only. Use whenever you touch an experiment branch, compare nodes, prepare a local run, or diagnose stale code in a local-only project."
 ---
 
-This project is local-only. Git records every experiment, but no remote is part
-of the workflow. Do not fetch, publish, or contact the paper repository.
+Git records every experiment locally. GitHub publication may be enabled for
+collaborator visibility, but it is never part of compute transport. Follow the
+project playbook's publication status; do not push merely to launch compute and
+do not fetch from or publish back to the paper's upstream repository.
 
 Each experiment node has a local `orx/<slug>` branch. `orx
 create-experiment` creates it from its parent. Work in the session worktree,

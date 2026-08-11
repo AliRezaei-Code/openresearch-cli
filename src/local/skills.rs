@@ -220,16 +220,17 @@ Finish by reporting:
 Do not stop after creating the notebook. Finish only after the reproduction is analyzed, the notebook is validated, public links work, and provenance is recorded in the experiment tree.
 "#;
 
-const REPRODUCE_PAPER_LOCAL_TEMPLATE: &str = r#"Reproduce a research paper claim by claim in this local-only project.
+const REPRODUCE_PAPER_LOCAL_TEMPLATE: &str = r#"Reproduce a research paper claim by claim in this unpublished project.
 
 Paper and compute: {args}
 
 Use the configured local repository and `orx` experiment tree. Read the paper,
 enumerate its empirical claims, and choose the smallest honest reproduction
-that fits this machine. Create experiment nodes for meaningful variants, make
-each change on its printed local branch, commit it, and launch only with
-`orx exp run <experiment-id> --backend local`. Keep the inherited run command
-fixed. Wait with `orx exp wait --project <project-id>`, inspect `orx runs`, and
+that fits the available compute. Create experiment nodes for meaningful variants,
+make each change on its printed local branch, and commit it. Use the configured
+default compute target, or the explicit backend and flavor/host the user chose;
+source snapshots do not require GitHub. Keep the inherited run command fixed.
+Wait with `orx exp wait --project <project-id>`, inspect `orx runs`, and
 read every terminal run with `orx logs <run-id>`.
 
 Record the paper number, observed number, scale or substitutions, sample size,
@@ -248,9 +249,10 @@ const PAPER_TO_MARIMO_LOCAL_TEMPLATE: &str = r#"Reproduce a paper's main illustr
 
 Paper, compute, and preferences: {args}
 
-This project is local-only. Read the paper, choose one illustrative empirical
-claim, and use committed `orx/*` experiment branches with
-`orx exp run <experiment-id> --backend local`. Keep formal evidence in run
+This project is unpublished. Read the paper, choose one illustrative empirical
+claim, and use committed `orx/*` experiment branches on the configured default
+compute target or the explicit backend the user chose. Source snapshots do not
+require GitHub. Keep formal evidence in run
 logs, record conclusions with `orx exp desc`, and state every downscaling or
 substitution honestly.
 
@@ -422,7 +424,7 @@ mod tests {
     #[test]
     fn local_publication_skills_keep_artifacts_local() {
         let reproduce = super::expand("/reproduce-paper example", false).unwrap();
-        assert!(reproduce.contains("local-only"));
+        assert!(reproduce.contains("unpublished"));
         assert!(!reproduce.contains("git push"));
         assert!(!reproduce.contains("public GitHub"));
         let marimo = super::expand("/paper-to-marimo example", false).unwrap();

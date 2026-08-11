@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronRight, FolderOpen } from "lucide-react";
+import { ChevronRight, CircleAlert, FolderOpen } from "lucide-react";
 import {
   createProject,
+  getGithubAccount,
+  getGithubRepoAccess,
   getProjectPathStatus,
   pickProjectFolder,
   resolvePaper,
@@ -26,6 +28,21 @@ function parsePaperId(input: string): string | null {
   const last = input.trim().split(/[?#]/)[0].split("/").filter(Boolean).pop() ?? "";
   const id = last.replace(/\.(pdf|md)$/i, "");
   return /^\d{4}\.\d{4,5}(v\d+)?$/.test(id) ? id : null;
+}
+
+function parseGithubRepository(url?: string | null): { owner: string; repo: string } | null {
+  const match = url?.trim().match(/github\.com[/:]([^/]+)\/([^/?#]+)/i);
+  if (!match) return null;
+  return { owner: match[1], repo: match[2].replace(/\.git$/, "") };
+}
+
+function displayRepository(url: string): string {
+  return url
+    .trim()
+    .replace(/^https?:\/\//i, "")
+    .replace(/^git@([^:]+):/i, "$1/")
+    .replace(/\.git$/i, "")
+    .replace(/\/$/, "");
 }
 
 type Mode = "folder" | "paper";
@@ -54,6 +71,9 @@ export function NewProjectForm({
   const [pickingFolder, setPickingFolder] = useState(false);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [githubSyncEnabled, setGithubSyncEnabled] = useState(false);
+  const [githubLogin, setGithubLogin] = useState<string | null | undefined>(undefined);
+  const [writableGithubRepo, setWritableGithubRepo] = useState<string | null>(null);
   const [paperQuery, setPaperQuery] = useState("");
   const [paper, setPaper] = useState<ResolvedPaper | null>(null);
   const [hits, setHits] = useState<PaperHit[]>([]);
@@ -65,9 +85,37 @@ export function NewProjectForm({
     folder: { name: "", nameTouched: false, path: "", pathTouched: false },
     paper: { name: "", nameTouched: false, path: "", pathTouched: false },
   });
+  const paperGithubRepo = mode === "paper" ? parseGithubRepository(paper?.repoUrl) : null;
+  const existingGithubRepo = paperGithubRepo ?? (
+    pathStatus?.githubOwner && pathStatus.githubRepo
+      ? { owner: pathStatus.githubOwner, repo: pathStatus.githubRepo }
+      : null
+  );
 
   useEffect(() => {
-    if (mode !== "paper" || !paper || pathTouched) return;
+    void getGithubAccount()
+      .then(({ login }) => setGithubLogin(login))
+      .catch(() => setGithubLogin(null));
+  }, []);
+
+  useEffect(() => {
+    let current = true;
+    setWritableGithubRepo(null);
+    if (!existingGithubRepo) return;
+    void getGithubRepoAccess(existingGithubRepo.owner, existingGithubRepo.repo)
+      .then(({ canPush }) => {
+        if (current && canPush) {
+          setWritableGithubRepo(`github.com/${existingGithubRepo.owner}/${existingGithubRepo.repo}`);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      current = false;
+    };
+  }, [existingGithubRepo?.owner, existingGithubRepo?.repo]);
+
+  useEffect(() => {
+    if (mode !== "paper" || !paper?.repoUrl || pathTouched) return;
     const nextPath = `~/OpenResearch/${slugify(name || paper.title || paper.paperId)}`;
     if (nextPath === path) return;
     setPathStatus(null);
@@ -216,10 +264,16 @@ export function NewProjectForm({
         path: path.trim(),
         createFolder: mode === "paper",
         initializeGit: true,
+        githubSyncEnabled,
         ...(mode === "paper" && paper
           ? { paperId: paper.paperId, cloneUrl: paper.repoUrl ?? undefined }
           : {}),
       });
+      if (result.githubPublicationError) {
+        window.alert(
+          `Project created locally, but GitHub syncing could not be enabled: ${result.githubPublicationError}`,
+        );
+      }
       onCreated(result.project);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -261,7 +315,10 @@ export function NewProjectForm({
     !missingLocalFolder &&
     !invalidProjectDestination &&
     !nonemptyPaperCloneFolder &&
-    (mode !== "paper" || paper !== null);
+    (mode !== "paper" || Boolean(paper?.repoUrl));
+  const githubRepository =
+    writableGithubRepo ?? `github.com/${githubLogin ?? "you"}/${slugify(name)}`;
+  const githubAction = writableGithubRepo ? "Pushes to" : "Creates";
 
   return (
     <form className="form new-project-form" onSubmit={submit}>
@@ -311,9 +368,13 @@ export function NewProjectForm({
         <div className="paper-pick">
           <div className="meta">
             <div className="title">{paper.title || paper.paperId}</div>
-            <div className="id">
-              {paper.repoUrl ? "Public code repository found" : "No public code repository found"}
-            </div>
+            {paper.repoUrl ? (
+              <div className="id">{displayRepository(paper.repoUrl)}</div>
+            ) : (
+              <div className="paper-repo-missing">
+                <CircleAlert size={14} /> No public repository
+              </div>
+            )}
           </div>
           <button type="button" className="btn sm" aria-label="Change selected paper" onClick={changePaper}>
             Change
@@ -321,7 +382,7 @@ export function NewProjectForm({
         </div>
       )}
 
-      {(mode !== "paper" || paper) && (
+      {(mode !== "paper" || paper?.repoUrl) && (
         <>
           {mode === "paper" ? (
             <div className="project-location-field">
@@ -406,9 +467,30 @@ export function NewProjectForm({
       )}
 
       {error && <div className="error">{error}</div>}
+      {(mode !== "paper" || paper?.repoUrl) && path && (
+        <label className="github-sync-option">
+          <span className="github-sync-header">
+            <input
+              type="checkbox"
+              checked={githubSyncEnabled}
+              onChange={(event) => setGithubSyncEnabled(event.target.checked)}
+              disabled={pending}
+            />
+            <strong>Sync experiments to GitHub</strong>
+          </span>
+          <span className="github-sync-copy">
+            <span>{githubAction} <code>{githubRepository}</code>.</span>
+            <span>Experiment branches will be pushed to the remote GitHub repository.</span>
+            {githubLogin === null && "Connect GitHub before creating the project."}
+          </span>
+        </label>
+      )}
       <div className="actions new-project-actions">
         {onCancel && <button type="button" className="btn" onClick={onCancel}>Cancel</button>}
-        <button className="btn primary" disabled={!canCreate}>
+        <button
+          className={`btn primary${mode === "paper" && paper && !paper.repoUrl ? " paper-repo-missing-button" : ""}`}
+          disabled={!canCreate}
+        >
           {pending
             ? "Creating…"
             : mode === "paper"
