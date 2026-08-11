@@ -109,7 +109,7 @@ fn parse_frontmatter(content: &str) -> Result<Frontmatter> {
     let mut description = None;
     for line in block.lines() {
         if let Some(v) = line.strip_prefix("name:") {
-            name = Some(v.trim().to_string());
+            name = Some(parse_scalar(v.trim()));
         } else if let Some(v) = line.strip_prefix("description:") {
             description = Some(parse_scalar(v.trim()));
         }
@@ -243,8 +243,12 @@ fn save_zip_in(
         if files.len() >= MAX_FILES {
             return Err(anyhow!("zip has too many files (max {MAX_FILES})"));
         }
+        // Bound the read to the remaining budget so a deflate-bombed entry
+        // (whose declared size can't be trusted) can't balloon `buf`.
         let mut buf = Vec::new();
-        entry
+        let room = MAX_TOTAL_BYTES.saturating_sub(total);
+        (&mut entry)
+            .take(room + 1)
             .read_to_end(&mut buf)
             .map_err(|e| anyhow!("reading zip entry {name}: {e}"))?;
         total = total.saturating_add(buf.len() as u64);
@@ -340,10 +344,6 @@ fn read_skill_at(scope: Scope, dir: &Path) -> Result<UserSkill> {
 
 /// Skills in one scope, name-sorted. Unreadable/malformed folders are skipped
 /// rather than failing the whole listing.
-pub fn list_scope(scope: Scope, project_id: Option<&str>) -> Vec<UserSkill> {
-    list_scope_in(&root(), scope, project_id)
-}
-
 fn list_scope_in(root: &Path, scope: Scope, project_id: Option<&str>) -> Vec<UserSkill> {
     let Ok(base) = scope_dir(root, scope, project_id) else {
         return Vec::new();
@@ -364,19 +364,16 @@ fn list_scope_in(root: &Path, scope: Scope, project_id: Option<&str>) -> Vec<Use
 /// own. Both scopes are returned (the UI manages each separately); a project
 /// skill and a global of the same name both appear.
 pub fn list_for_project(project_id: Option<&str>) -> Vec<UserSkill> {
-    let mut out = list_scope(Scope::Global, None);
+    let root = root();
+    let mut out = list_scope_in(&root, Scope::Global, None);
     if let Some(id) = project_id {
-        out.extend(list_scope(Scope::Project, Some(id)));
+        out.extend(list_scope_in(&root, Scope::Project, Some(id)));
     }
     out
 }
 
 /// Resolve an applicable skill by name for `/`-invocation. Project scope wins
 /// over global.
-pub fn find(name: &str, project_id: Option<&str>) -> Option<UserSkill> {
-    find_in(&root(), name, project_id)
-}
-
 fn find_in(root: &Path, name: &str, project_id: Option<&str>) -> Option<UserSkill> {
     if let Some(id) = project_id {
         if let Some(s) = list_scope_in(root, Scope::Project, Some(id))
@@ -448,12 +445,10 @@ pub fn list_harness_skills() -> Vec<HarnessSkill> {
             let Ok(fm) = parse_frontmatter(&content) else {
                 continue;
             };
-            // The frontmatter name is canonical; fall back to the dir name.
-            let name = if is_valid_slug(&fm.name) {
-                fm.name
-            } else {
-                dir_name
-            };
+            // Import keys off the frontmatter name (it becomes the store dir and
+            // the `/name`); skip skills whose name isn't a clean, free slug so
+            // the folder==name invariant always holds after import.
+            let name = fm.name;
             if !is_valid_slug(&name) || is_reserved(&name) {
                 continue;
             }
@@ -502,8 +497,9 @@ fn import_from_harness_in(
     write_skill(root, scope, project_id, name, files)
 }
 
-/// The skill folder in `skills_dir` whose `SKILL.md` frontmatter (or dir name)
-/// matches `name`.
+/// The skill folder in `skills_dir` whose `SKILL.md` frontmatter name matches
+/// `name` — the same key `list_harness_skills` surfaces, so the folder stored on
+/// import always equals its frontmatter name.
 fn locate_harness_skill(skills_dir: &Path, name: &str) -> Result<PathBuf> {
     let entries = fs::read_dir(skills_dir)
         .map_err(|e| anyhow!("could not read {}: {e}", skills_dir.display()))?;
@@ -512,14 +508,13 @@ fn locate_harness_skill(skills_dir: &Path, name: &str) -> Result<PathBuf> {
         if !path.is_dir() {
             continue;
         }
-        let dir_name = entry.file_name().to_string_lossy().into_owned();
         let Ok(content) = fs::read_to_string(path.join("SKILL.md")) else {
             continue;
         };
         let Ok(fm) = parse_frontmatter(&content) else {
             continue;
         };
-        if fm.name == name || dir_name == name {
+        if fm.name == name {
             return Ok(path);
         }
     }
@@ -550,10 +545,18 @@ fn collect_files(base: &Path, dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
 
 // --- session wiring -----------------------------------------------------------
 
+/// A manifest of the skill dirs [`write_into_session`] wrote last turn, so it can
+/// prune ones the user has since deleted without touching built-in `orx-*` or
+/// repo-committed skills. Lives inside the (git-excluded) session skills dir; a
+/// dotfile, so the harness never treats it as a skill.
+const MANAGED_MANIFEST: &str = ".orx-user-skills";
+
 /// Copy every applicable skill folder (globals first, then the project's, so a
 /// project skill shadows a global of the same name) into the session worktree's
-/// native skills dir, beside the built-in `orx-*` skills. Called fresh each
-/// turn from `ensure_playbook`, mirroring the built-ins' zero-drift semantics.
+/// native skills dir, beside the built-in `orx-*` skills. Called fresh each turn
+/// from `ensure_playbook`: each managed dir is fully replaced, and any skill the
+/// user deleted since last turn is removed — so a session's skills track the
+/// store with no drift.
 pub fn write_into_session(worktree: &Path, skills_dir_rel: &str, project_id: &str) -> Result<()> {
     write_into_session_in(&root(), worktree, skills_dir_rel, project_id)
 }
@@ -565,6 +568,7 @@ fn write_into_session_in(
     project_id: &str,
 ) -> Result<()> {
     let base = worktree.join(skills_dir_rel);
+    let mut managed: Vec<String> = Vec::new();
     for (scope, pid) in [(Scope::Global, None), (Scope::Project, Some(project_id))] {
         let Ok(src_base) = scope_dir(root, scope, pid) else {
             continue;
@@ -577,9 +581,29 @@ fn write_into_session_in(
             if !src.is_dir() {
                 continue;
             }
-            let dest = base.join(entry.file_name());
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let dest = base.join(&name);
+            // Replace, don't merge: a re-upload with fewer files, or a project
+            // skill shadowing a global, must not keep stale siblings.
+            if dest.exists() {
+                let _ = fs::remove_dir_all(&dest);
+            }
             copy_dir_all(&src, &dest)?;
+            if !managed.contains(&name) {
+                managed.push(name);
+            }
         }
+    }
+    // Prune skills we wrote before but that no longer apply (deleted or renamed).
+    if let Ok(prev) = fs::read_to_string(base.join(MANAGED_MANIFEST)) {
+        for name in prev.lines().filter(|n| !n.is_empty()) {
+            if !managed.iter().any(|m| m == name) {
+                let _ = fs::remove_dir_all(base.join(name));
+            }
+        }
+    }
+    if base.exists() {
+        let _ = fs::write(base.join(MANAGED_MANIFEST), managed.join("\n"));
     }
     Ok(())
 }
@@ -892,24 +916,113 @@ mod tests {
     }
 
     #[test]
-    fn locate_harness_skill_matches_frontmatter_and_dir_name() {
+    fn locate_harness_skill_matches_frontmatter_name() {
         let skills = temp_root();
-        // Dir name differs from the frontmatter name — match on frontmatter.
+        // Match on the frontmatter name even when the dir name differs, and
+        // never on the dir name alone.
         fs::create_dir_all(skills.join("weird-dir")).unwrap();
         fs::write(skills.join("weird-dir/SKILL.md"), skill_md("canonical")).unwrap();
-        // Dir name matches, frontmatter is the same.
-        fs::create_dir_all(skills.join("byname")).unwrap();
-        fs::write(skills.join("byname/SKILL.md"), skill_md("byname")).unwrap();
 
         assert_eq!(
             locate_harness_skill(&skills, "canonical").unwrap(),
             skills.join("weird-dir")
         );
-        assert_eq!(
-            locate_harness_skill(&skills, "byname").unwrap(),
-            skills.join("byname")
-        );
+        assert!(locate_harness_skill(&skills, "weird-dir").is_err());
         assert!(locate_harness_skill(&skills, "missing").is_err());
         let _ = fs::remove_dir_all(&skills);
+    }
+
+    #[test]
+    fn write_into_session_prunes_deleted_skills() {
+        let root = temp_root();
+        let wt = temp_root();
+        let rel = ".claude/skills";
+        save_skill_md_in(&root, skill_md("keep").as_bytes(), Scope::Global, None).unwrap();
+        save_skill_md_in(&root, skill_md("gone").as_bytes(), Scope::Global, None).unwrap();
+        write_into_session_in(&root, &wt, rel, "p1").unwrap();
+        assert!(wt.join(rel).join("keep/SKILL.md").exists());
+        assert!(wt.join(rel).join("gone/SKILL.md").exists());
+
+        // Delete one skill from the store, re-run: it must leave the worktree.
+        delete_in(&root, "gone", Scope::Global, None).unwrap();
+        write_into_session_in(&root, &wt, rel, "p1").unwrap();
+        assert!(wt.join(rel).join("keep/SKILL.md").exists());
+        assert!(
+            !wt.join(rel).join("gone").exists(),
+            "deleted skill must be pruned"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn write_into_session_shadow_replaces_not_merges() {
+        let root = temp_root();
+        let wt = temp_root();
+        let rel = ".agents/skills";
+        // Global `dup` carries an extra file the project version lacks.
+        write_skill(
+            &root,
+            Scope::Global,
+            None,
+            "dup",
+            vec![
+                (
+                    "SKILL.md".into(),
+                    skill_md_desc("dup", "GLOBAL").into_bytes(),
+                ),
+                ("extra.txt".into(), b"global-only".to_vec()),
+            ],
+        )
+        .unwrap();
+        save_skill_md_in(
+            &root,
+            skill_md_desc("dup", "PROJECT").as_bytes(),
+            Scope::Project,
+            Some("p1"),
+        )
+        .unwrap();
+        write_into_session_in(&root, &wt, rel, "p1").unwrap();
+        let md = fs::read_to_string(wt.join(rel).join("dup/SKILL.md")).unwrap();
+        assert!(md.contains("PROJECT"));
+        assert!(
+            !wt.join(rel).join("dup/extra.txt").exists(),
+            "shadowing project skill must not keep the global's files"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn save_zip_rejects_oversized_and_too_many_files() {
+        let root = temp_root();
+        // One entry whose declared uncompressed size exceeds the cap (zeros
+        // compress tiny, so the archive itself stays small).
+        let big = make_zip(&[
+            ("s/SKILL.md", skill_md("s").as_bytes()),
+            ("s/big.bin", &vec![0u8; (MAX_TOTAL_BYTES + 1) as usize]),
+        ]);
+        assert!(save_zip_in(&root, &big, Scope::Global, None).is_err());
+
+        let skill = skill_md("s");
+        let many: Vec<(String, Vec<u8>)> = (0..MAX_FILES + 1)
+            .map(|i| (format!("s/f{i}.txt"), b"x".to_vec()))
+            .collect();
+        let mut entries: Vec<(&str, &[u8])> = vec![("s/SKILL.md", skill.as_bytes())];
+        for (n, b) in &many {
+            entries.push((n.as_str(), b.as_slice()));
+        }
+        assert!(save_zip_in(&root, &make_zip(&entries), Scope::Global, None).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn quoted_frontmatter_name_is_accepted() {
+        let root = temp_root();
+        let md =
+            "---\nname: \"data-cleaner\"\ndescription: Clean CSVs. Use when asked.\n---\nbody\n";
+        let saved = save_skill_md_in(&root, md.as_bytes(), Scope::Global, None).unwrap();
+        assert_eq!(saved.name, "data-cleaner");
+        let _ = fs::remove_dir_all(&root);
     }
 }

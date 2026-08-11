@@ -1,4 +1,4 @@
-import { Blocks, Download, FileUp, Trash2, Upload } from "lucide-react";
+import { Download, FileUp, Trash2, Upload } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   deleteUserSkill,
@@ -6,6 +6,7 @@ import {
   importHarnessSkill,
   listHarnessSkills,
   listUserSkills,
+  timeAgo,
   uploadUserSkill,
   type HarnessSkill,
   type Project,
@@ -56,10 +57,12 @@ function SkillRow({
   skill,
   projectId,
   onDeleted,
+  onError,
 }: {
   skill: UserSkill;
   projectId?: string;
   onDeleted: () => void;
+  onError: (message: string) => void;
 }) {
   const [busy, setBusy] = useState(false);
   return (
@@ -68,9 +71,12 @@ function SkillRow({
         <code className={SKILL_NAME_CLASS_NAME}>/{skill.name}</code>
         <p className={SKILL_DESC_CLASS_NAME}>{skill.description}</p>
       </div>
-      <span className="shrink-0 text-2xs text-subtext pt-0.5 whitespace-nowrap">
-        {fmtBytes(skill.bytes)}
-      </span>
+      <div className="shrink-0 text-right whitespace-nowrap pt-0.5">
+        <div className="text-2xs text-subtext">{fmtBytes(skill.bytes)}</div>
+        {skill.updatedAt > 0 && (
+          <div className="text-2xs text-muted">{timeAgo(skill.updatedAt)}</div>
+        )}
+      </div>
       <button
         className={ICON_BUTTON_CLASS_NAME}
         data-tip="Delete skill"
@@ -86,7 +92,10 @@ function SkillRow({
             projectId: skill.scope === "project" ? projectId : undefined,
           })
             .then(onDeleted)
-            .catch(() => setBusy(false));
+            .catch((e) => {
+              setBusy(false);
+              onError(e instanceof Error ? e.message : String(e));
+            });
         }}
       >
         <Trash2 size={13} />
@@ -101,12 +110,14 @@ function SkillList({
   skills,
   projectId,
   onChanged,
+  onError,
 }: {
   title: string;
   hint: string;
   skills: UserSkill[];
   projectId?: string;
   onChanged: () => void;
+  onError: (message: string) => void;
 }) {
   return (
     <section className={CARD_CLASS_NAME}>
@@ -117,7 +128,13 @@ function SkillList({
       ) : (
         <div className="flex flex-col">
           {skills.map((s) => (
-            <SkillRow key={s.name} skill={s} projectId={projectId} onDeleted={onChanged} />
+            <SkillRow
+              key={s.name}
+              skill={s}
+              projectId={projectId}
+              onDeleted={onChanged}
+              onError={onError}
+            />
           ))}
         </div>
       )}
@@ -201,8 +218,10 @@ export function SkillsTab({ project }: { project: Project | null }) {
     if (!project && scope === "project") setScope("global");
   }, [project, scope]);
 
+  const busyRef = useRef(false);
   const upload = useCallback(
     async (file: File) => {
+      if (busyRef.current) return; // ignore a second drop/pick mid-upload
       setError(null);
       if (!isAcceptedName(file.name)) {
         setError("Upload a SKILL.md file or a .zip of a skill folder.");
@@ -212,6 +231,7 @@ export function SkillsTab({ project }: { project: Project | null }) {
         setError("File too large (max 20 MB).");
         return;
       }
+      busyRef.current = true;
       setBusy(true);
       try {
         const contentBase64 = await fileToBase64(file);
@@ -225,6 +245,7 @@ export function SkillsTab({ project }: { project: Project | null }) {
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       } finally {
+        busyRef.current = false;
         setBusy(false);
       }
     },
@@ -284,12 +305,18 @@ export function SkillsTab({ project }: { project: Project | null }) {
         <h3>Add a skill</h3>
 
         <div className="flex gap-2 mb-3.5" role="group" aria-label="Skill scope">
-          <button type="button" className={scopeBtn(scope === "global")} onClick={() => setScope("global")}>
+          <button
+            type="button"
+            aria-pressed={scope === "global"}
+            className={scopeBtn(scope === "global")}
+            onClick={() => setScope("global")}
+          >
             Global
             <span className="text-2xs font-normal text-muted">Every project</span>
           </button>
           <button
             type="button"
+            aria-pressed={scope === "project"}
             className={scopeBtn(scope === "project")}
             disabled={!project}
             title={project ? undefined : "Open a project to add a project skill"}
@@ -320,7 +347,10 @@ export function SkillsTab({ project }: { project: Project | null }) {
           role="button"
           tabIndex={0}
           onKeyDown={(e) => {
-            if (e.key === "Enter" || e.key === " ") inputRef.current?.click();
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              inputRef.current?.click();
+            }
           }}
         >
           <input
@@ -390,6 +420,7 @@ export function SkillsTab({ project }: { project: Project | null }) {
             hint="Available to the agent in every project."
             skills={globalSkills}
             onChanged={refresh}
+            onError={setError}
           />
           {project && (
             <SkillList
@@ -398,16 +429,10 @@ export function SkillsTab({ project }: { project: Project | null }) {
               skills={projectSkills}
               projectId={project.id}
               onChanged={refresh}
+              onError={setError}
             />
           )}
         </>
-      )}
-
-      {skills !== null && skills.length === 0 && (
-        <div className="flex flex-col items-center gap-2 py-6 text-muted text-sm text-center">
-          <Blocks size={22} strokeWidth={1.5} />
-          <span>No skills uploaded yet. Add one above to get started.</span>
-        </div>
       )}
     </div>
   );

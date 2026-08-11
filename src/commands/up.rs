@@ -607,7 +607,16 @@ async fn list_skills(Query(q): Query<SkillsQ>) -> Json<Value> {
             })
         })
         .collect();
+    // One `/name` per skill: a project skill shadows a same-named global
+    // (list_for_project returns globals first, then the project's own).
+    let mut user: Vec<crate::local::user_skills::UserSkill> = Vec::new();
     for s in crate::local::user_skills::list_for_project(q.project.as_deref()) {
+        match user.iter_mut().find(|e| e.name == s.name) {
+            Some(existing) => *existing = s,
+            None => user.push(s),
+        }
+    }
+    for s in user {
         skills.push(json!({
             "name": s.name,
             "description": s.description,
