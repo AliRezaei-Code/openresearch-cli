@@ -392,6 +392,10 @@ fn router(state: AppState) -> Router {
         .route("/api/chat/sessions/{id}/worktree", get(session_worktree))
         .route("/api/chat/sessions/{id}/message", post(send_chat_message))
         .route("/api/chat/sessions/{id}/interrupt", post(interrupt_chat))
+        .route(
+            "/api/chat/sessions/{id}/queue/{itemId}",
+            axum::routing::delete(cancel_queued_chat),
+        )
         .route("/api/chat/sessions/{id}/respond", post(respond_chat))
         // Internal: the `orx mcp-gate` permission bridge's long-poll (plan
         // mode). Token-authenticated in the handler; blocks until the surfaced
@@ -1427,6 +1431,7 @@ async fn delete_project(State(state): State<AppState>, Path(id): Path<String>) -
         );
     }
     for session in &sessions {
+        state.chat.clear_queue(&session.id);
         let _ = state.chat.interrupt(&session.id).await;
         state.chat.opencode.kill_session(&session.id).await;
         state.chat.codex.kill_session(&session.id).await;
@@ -3876,12 +3881,15 @@ async fn update_chat_session(
     ))
 }
 
-async fn chat_messages(Path(id): Path<String>) -> ApiResult {
+async fn chat_messages(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
     Store::open()?
         .get_chat_session(&id)?
         .ok_or_else(|| not_found("chat session"))?;
     let messages = local::chat::list_messages(&id)?;
-    Ok(Json(json!({ "messages": messages })))
+    // Parked messages are in-memory, so a reload mid-turn recovers them here
+    // rather than from the store.
+    let queued = state.chat.queued_items(&id);
+    Ok(Json(json!({ "messages": messages, "queued": queued })))
 }
 
 #[derive(Deserialize)]
@@ -3951,6 +3959,15 @@ async fn chat_attachment(Path(name): Path<String>) -> std::result::Result<Respon
 async fn interrupt_chat(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
     state.chat.interrupt_by_user(&id).await?;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// Cancel one message parked behind a running turn (the ✕ on a queued chip).
+async fn cancel_queued_chat(
+    State(state): State<AppState>,
+    Path((id, item_id)): Path<(String, String)>,
+) -> ApiResult {
+    let removed = state.chat.cancel_queued(&id, &item_id);
+    Ok(Json(json!({ "ok": true, "removed": removed })))
 }
 
 #[derive(Deserialize)]

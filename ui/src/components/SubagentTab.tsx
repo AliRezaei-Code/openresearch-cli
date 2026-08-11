@@ -32,7 +32,7 @@ export function SubagentTab({
   useEffect(() => {
     let live = true;
     getChatMessages(sessionId)
-      .then((m) => live && setMessages(m))
+      .then(({ messages }) => live && setMessages(messages))
       .catch(() => live && setMessages([]));
     // Live updates: replace the message the event carries (assistant turns
     // re-broadcast the whole message on every flush).
