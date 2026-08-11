@@ -283,7 +283,9 @@ pub async fn stage_source(
     ssh_run(
         target,
         &format!(
-            "mkdir -p \"$HOME/{dir}/repo\" && tar -xf \"$HOME/{cache}\" -C \"$HOME/{dir}/repo\""
+            "umask 077; mkdir -p \"$HOME/.orx/runs\" \"$HOME/{dir}/repo\"; \
+             chmod 700 \"$HOME/.orx/runs\" \"$HOME/{dir}\" \"$HOME/{dir}/repo\"; \
+             tar -xf \"$HOME/{cache}\" -C \"$HOME/{dir}/repo\""
         ),
         None,
     )

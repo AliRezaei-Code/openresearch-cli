@@ -26,13 +26,37 @@ impl std::fmt::Display for RepositoryNameExists {
 impl std::error::Error for RepositoryNameExists {}
 
 pub async fn create_project_repo(repo: &str) -> Result<(String, String, String)> {
-    match create_repo_api(repo, false).await {
-        Err(error) if error.downcast_ref::<RepositoryNameExists>().is_some() => {
-            let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
-            create_repo_api(&format!("{repo}-{suffix}"), false).await
+    for suffix in 1..=100 {
+        let candidate = if suffix == 1 {
+            repo.to_string()
+        } else {
+            format!("{repo}-{suffix}")
+        };
+        match create_repo_api(&candidate, false).await {
+            Err(error) if error.downcast_ref::<RepositoryNameExists>().is_some() => continue,
+            result => return result,
         }
-        result => result,
     }
+    Err(anyhow!(
+        "Could not find an available GitHub repository name for '{repo}'."
+    ))
+}
+
+pub async fn available_project_repo_name(repo: &str) -> String {
+    let Some(owner) = viewer_login().await else {
+        return repo.to_string();
+    };
+    for suffix in 1..=100 {
+        let candidate = if suffix == 1 {
+            repo.to_string()
+        } else {
+            format!("{repo}-{suffix}")
+        };
+        if repo_meta(&owner, &candidate).await.is_none() {
+            return candidate;
+        }
+    }
+    repo.to_string()
 }
 
 async fn authed_get(url: &str) -> Option<reqwest::Response> {

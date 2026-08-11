@@ -5,12 +5,14 @@ import {
   runDisplayStatus,
   timeAgo,
   type Experiment,
+  type Project,
   type Run,
 } from "../api";
 import { ExperimentOverview } from "./ExperimentOverview";
 import type { CodeView } from "./CodeTab";
 import { LogTerminal } from "./LogTerminal";
 import { StatusBadge } from "./StatusBadge";
+import { SMALL_BUTTON_CLASS_NAME } from "../styleClasses";
 
 export type ExperimentView = "overview" | "terminal";
 
@@ -18,6 +20,7 @@ export type ExperimentView = "overview" | "terminal";
  *  keyed by `${experiment.id}:${view}` so per-view state resets on switch. */
 export function DetailDrawer({
   experiment,
+  project,
   view,
   runs,
   selectedRunId,
@@ -27,6 +30,8 @@ export function DetailDrawer({
   onOpenCode,
 }: {
   experiment: Experiment;
+  /** Owning project — supplies owner/repo for the GitHub branch link. */
+  project: Project;
   view: ExperimentView;
   runs: Run[];
   selectedRunId: string | null;
@@ -44,6 +49,7 @@ export function DetailDrawer({
       <ExperimentOverview
         experiment={experiment}
         parentExperiment={parentExperiment}
+        project={project}
         runs={expRuns}
         onOpenLogs={(runId) => onOpenView("terminal", runId)}
         onOpenCode={() => onOpenCode("files")}
@@ -130,9 +136,9 @@ function TerminalView({
   }
 
   return (
-    <div className="term-view">
-      <div className="term-bar">
-        <div className="term-title" title={experiment.title || experiment.slug}>
+    <div className="term-view absolute inset-0 flex flex-col bg-background z-20">
+      <div className="term-bar flex items-center gap-2 h-10 py-0 px-2.5 border-b border-b-border shrink-0 [&_.error]:text-sm [&_.error]:text-accent-red [&_.btn]:inline-flex [&_.btn]:items-center [&_.btn]:gap-[5px]">
+        <div className="term-title min-w-0 text-md font-semibold text-text overflow-hidden text-ellipsis whitespace-nowrap" title={experiment.title || experiment.slug}>
           {experiment.title || experiment.slug}
         </div>
         <span style={{ flex: 1 }} />
@@ -142,15 +148,15 @@ function TerminalView({
           </span>
         )}
         {live && (
-          <button className="btn sm ghost" disabled={cancelling} onClick={() => void stop()}>
+          <button className={`${SMALL_BUTTON_CLASS_NAME} ghost`} disabled={cancelling} onClick={() => void stop()}>
             <CircleStop size={13} />
             {cancelling ? "Cancelling…" : "Stop"}
           </button>
         )}
         {expRuns.length > 0 && selectedRun && (
-          <div className="run-history" ref={historyRef}>
+          <div className="run-history relative shrink-0" ref={historyRef}>
             <button
-              className="run-picker"
+              className="run-picker inline-flex items-center gap-2 pt-1 pr-1.5 pb-1 pl-2.5 border border-border rounded-md bg-background text-text [&:hover]:bg-surface [&_.run-label]:text-sm [&_.run-label]:font-semibold"
               title="Switch run"
               onClick={() => setHistoryOpen((v) => !v)}
             >
@@ -158,14 +164,14 @@ function TerminalView({
               <StatusBadge
                 status={cancelling ? "cancelling" : runDisplayStatus(selectedRun)}
               />
-              <ChevronDown size={14} className="run-picker-chev" />
+              <ChevronDown size={14} className="run-picker-chev text-muted shrink-0" />
             </button>
             {historyOpen && (
-              <div className="history-menu">
+              <div className="history-menu absolute top-[calc(100%_+_6px)] right-0 min-w-57.5 max-h-80 overflow-y-auto bg-background border border-border rounded-lg shadow-[0_12px_32px_rgba(0,_0,_0,_0.18)] p-[5px] z-50">
                 {expRuns.map((r) => (
                   <button
                     key={r.id}
-                    className={`history-item ${r.id === selectedRun?.id ? "active" : ""}`}
+                    className={`history-item flex items-center gap-2 w-full text-left py-1.5 px-2 text-sm rounded-sm [&:hover]:bg-surface [&.active]:bg-surface [&_.run-label]:font-semibold [&_.when]:ml-auto [&_.when]:text-xs [&_.when]:text-muted ${r.id === selectedRun?.id ? "active" : ""}`}
                     onClick={() => {
                       onSelectRun(r.id);
                       setHistoryOpen(false);
@@ -182,13 +188,13 @@ function TerminalView({
         )}
       </div>
 
-      <div className="term-fill">
+      <div className="term-fill flex-1 min-h-0 bg-[var(--term-bg)] pt-1 pr-0 pb-1 pl-1.5">
         {selectedRun ? (
           // Key by run id so switching runs in the history dropdown remounts
           // the terminal with the selected run's output.
           <LogTerminal key={selectedRun.id} runId={selectedRun.id} />
         ) : (
-          <div className="term-empty">No runs yet — ask the agent to launch one.</div>
+          <div className="term-empty h-full flex items-center justify-center p-6 text-center text-md text-muted">No runs yet — ask the agent to launch one.</div>
         )}
       </div>
     </div>

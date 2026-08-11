@@ -3,8 +3,13 @@
 //! `~/.cache/openresearch/repos/<owner>/<repo>`, the same convention SKILL.md
 //! documents for manual diffing.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use crate::error::{anyhow, Result};
 
@@ -815,6 +820,24 @@ pub fn reroot_shallow_repository(
     Ok(())
 }
 
+pub fn prepare_shallow_repository_for_publication(repo_path: &Path) -> Result<bool> {
+    if !is_shallow_repository(repo_path)? {
+        return Ok(false);
+    }
+    if local_branches(repo_path)?
+        .iter()
+        .any(|branch| branch.starts_with("orx/"))
+    {
+        let remote = ["upstream", "origin"]
+            .into_iter()
+            .find(|remote| git(Some(repo_path), &["remote", "get-url", remote]).is_ok())
+            .ok_or_else(|| anyhow!("The shallow project has no source remote to deepen."))?;
+        git(Some(repo_path), &["fetch", "--unshallow", remote])?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 const GITHUB_CREDENTIAL_HELPER: &str =
     "!f() { host=; while IFS='=' read key value; do [ \"$key\" = host ] && host=$value; done; [ \"$host\" = github.com ] || exit 0; echo username=x-access-token; echo \"password=$ORX_GITHUB_TOKEN\"; }; f";
 
@@ -832,7 +855,7 @@ fn redact_remote_urls(text: &str) -> String {
         .join(" ")
 }
 
-fn authenticated_git(repo_path: &Path, args: &[&str]) -> Result<String> {
+fn authenticated_git(repo_path: &Path, args: &[&str], timeout: Duration) -> Result<String> {
     let mut command = Command::new("git");
     command
         .current_dir(repo_path)
@@ -852,12 +875,56 @@ fn authenticated_git(repo_path: &Path, args: &[&str]) -> Result<String> {
             .env("GIT_CONFIG_VALUE_2", "/dev/null")
             .env("ORX_GITHUB_TOKEN", token);
     }
-    let output = command
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
         .args(args)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|error| anyhow!("Could not run git: {error}"))?;
-    if !output.status.success() {
-        let mut error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("Could not capture git stdout"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("Could not capture git stderr"))?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).map(|_| output)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        stderr.read_to_end(&mut output).map(|_| output)
+    });
+    let deadline = Instant::now() + timeout;
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait()? {
+            break (status, false);
+        }
+        if Instant::now() >= deadline {
+            terminate_git_process_tree(&mut child);
+            break (child.wait()?, true);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow!("Could not collect git stdout"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("Could not collect git stderr"))??;
+    if timed_out {
+        return Err(anyhow!(
+            "git {} timed out after {} seconds",
+            args.first().copied().unwrap_or("command"),
+            timeout.as_secs()
+        ));
+    }
+    if !status.success() {
+        let mut error = String::from_utf8_lossy(&stderr).trim().to_string();
         if let Some(token) = token {
             error = error.replace(&token, "[redacted]");
         }
@@ -867,13 +934,23 @@ fn authenticated_git(repo_path: &Path, args: &[&str]) -> Result<String> {
             redact_remote_urls(&error)
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+}
+
+fn terminate_git_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    unsafe {
+        // Git owns this process group, including credential-bearing transport children.
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
 }
 
 fn push(repo_path: &Path, args: &[&str]) -> Result<()> {
     let mut command = vec!["push"];
     command.extend_from_slice(args);
-    authenticated_git(repo_path, &command)?;
+    authenticated_git(repo_path, &command, Duration::from_secs(600))?;
     Ok(())
 }
 
@@ -929,6 +1006,75 @@ pub fn push_all(repo_path: &Path, baseline_branch: &str, owner: &str, repo: &str
 pub fn push_branch(repo_path: &Path, branch: &str, owner: &str, repo: &str) -> Result<()> {
     let remote = publication_remote(repo_path, owner, repo)?;
     push(repo_path, &["-u", &remote, branch])
+}
+
+pub fn spawn_branch_publication(
+    repo_path: &Path,
+    branch: &str,
+    owner: &str,
+    repo: &str,
+) -> Result<()> {
+    let executable = std::env::current_exe()?;
+    let mut command = Command::new(executable);
+    command
+        .arg("publish-branch")
+        .arg(repo_path)
+        .arg(branch)
+        .arg(owner)
+        .arg(repo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .map_err(|error| anyhow!("Could not start GitHub publication worker: {error}"))?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+pub fn publication_sync_status(
+    repo_path: &Path,
+    baseline_branch: &str,
+    owner: &str,
+    repo: &str,
+) -> &'static str {
+    let Ok(remote) = publication_remote(repo_path, owner, repo) else {
+        return "not configured";
+    };
+    let Ok(remote_refs) = authenticated_git(
+        repo_path,
+        &["ls-remote", "--heads", &remote],
+        Duration::from_secs(30),
+    ) else {
+        return "unknown";
+    };
+    let Ok(branches) = local_branches(repo_path) else {
+        return "unknown";
+    };
+    for branch in branches
+        .into_iter()
+        .filter(|branch| branch == baseline_branch || branch.starts_with("orx/"))
+    {
+        let Ok(local) = local_head_sha(repo_path, &branch) else {
+            return "unknown";
+        };
+        let reference = format!("refs/heads/{branch}");
+        if !remote_refs
+            .lines()
+            .any(|line| line == format!("{local}\t{reference}"))
+        {
+            return if remote_refs.lines().any(|line| line.ends_with(&reference)) {
+                "local changes to push"
+            } else {
+                "not pushed"
+            };
+        }
+    }
+    "synced"
 }
 
 /// Create `new_branch` from `parent_branch`'s local tip.

@@ -4,7 +4,7 @@ description: "Launch experiment runs with `orx exp run`: backends (hf, modal, k8
 ---
 
 Commit the experiment before launching. `orx` archives that exact revision and
-transfers the immutable snapshot directly to the selected backend. No push,
+transfers the immutable source snapshot directly to the selected backend. No push,
 repository clone, GitHub token, or public repository is required.
 
 In local mode (`orx up`) every run launches with `orx exp run <expId>` onto a

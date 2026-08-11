@@ -65,6 +65,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
         claude: claude.clone(),
         harnesses: Arc::new(tokio::sync::Mutex::new(None)),
         project_lifecycle: Arc::new(ProjectLifecycle::default()),
+        publication_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         data_dir_move_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     // Plan-mode turns hand this port to the `orx mcp-gate` permission bridge.
@@ -147,10 +148,25 @@ struct AppState {
     /// limited to once per TTL unless the UI asks for a refresh.
     harnesses: Arc<tokio::sync::Mutex<Option<(std::time::Instant, Value)>>>,
     project_lifecycle: Arc<ProjectLifecycle>,
+    publication_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Set while a data-dir move is running. New chat turns and run launches
     /// check it and refuse (409) so nothing starts writing the store mid-move —
     /// closing the window between the move's in-flight check and its completion.
     data_dir_move_in_progress: Arc<std::sync::atomic::AtomicBool>,
+}
+
+async fn project_publication_lock(
+    state: &AppState,
+    project_id: &str,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = {
+        let mut locks = state.publication_locks.lock().await;
+        locks
+            .entry(project_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    lock.lock_owned().await
 }
 
 #[derive(Default)]
@@ -252,7 +268,17 @@ fn router(state: AppState) -> Router {
         .route("/api/projects/{id}/open", post(open_project))
         .route("/api/projects/{id}/git", get(project_git_status))
         .route("/api/projects/{id}/git/init", post(initialize_project_git))
+        .route("/api/projects/{id}/github", post(enable_project_github))
+        .route(
+            "/api/projects/{id}/github/disable",
+            post(disable_project_github),
+        )
+        .route("/api/projects/{id}/github/push", post(push_project_github))
         .route("/api/github/account", get(github_account))
+        .route(
+            "/api/github/project-repo-preview",
+            get(github_project_repo_preview),
+        )
         .route("/api/github/repo-access", get(github_repo_access))
         .route("/api/projects/{id}/experiments", get(list_experiments))
         .route("/api/projects/{id}/runs", get(list_project_runs))
@@ -304,6 +330,14 @@ fn router(state: AppState) -> Router {
             get(git_settings).post(set_git_settings),
         )
         .route(
+            "/api/settings/git/token",
+            post(set_git_token).delete(delete_git_token),
+        )
+        .route(
+            "/api/settings/projects",
+            get(project_defaults).post(set_project_defaults),
+        )
+        .route(
             "/api/settings/telemetry",
             get(telemetry_settings).post(set_telemetry_settings),
         )
@@ -338,6 +372,14 @@ fn router(state: AppState) -> Router {
         )
         .route("/api/harnesses", get(list_harnesses))
         .route("/api/skills", get(list_skills))
+        .route(
+            "/api/user-skills",
+            get(list_user_skills)
+                .post(upload_user_skill)
+                .delete(delete_user_skill),
+        )
+        .route("/api/user-skills/import", post(import_user_skill))
+        .route("/api/harness-skills", get(list_harness_skills))
         .route(
             "/api/chat/sessions",
             get(list_chat_sessions).post(create_chat_session),
@@ -552,19 +594,183 @@ async fn complete_onboarding(
     })))
 }
 
-/// Slash-skills the composer's `/` dropdown offers (expanded server-side).
-async fn list_skills() -> Json<Value> {
-    let skills: Vec<Value> = crate::local::skills::CATALOG
+#[derive(Deserialize)]
+struct SkillsQ {
+    /// Include the project's own uploaded skills (plus globals) in the menu.
+    project: Option<String>,
+}
+
+/// Slash-skills the composer's `/` dropdown offers (expanded server-side): the
+/// built-in catalog plus any user-uploaded skills that apply (globals, and the
+/// named project's own).
+async fn list_skills(Query(q): Query<SkillsQ>) -> Json<Value> {
+    let mut skills: Vec<Value> = crate::local::skills::CATALOG
         .iter()
         .map(|s| {
             json!({
                 "name": s.name,
                 "description": s.description,
                 "argHint": s.arg_hint,
+                "source": "builtin",
             })
         })
         .collect();
+    // One `/name` per skill: a project skill shadows a same-named global
+    // (list_for_project returns globals first, then the project's own).
+    let mut user: Vec<crate::local::user_skills::UserSkill> = Vec::new();
+    for s in crate::local::user_skills::list_for_project(q.project.as_deref()) {
+        match user.iter_mut().find(|e| e.name == s.name) {
+            Some(existing) => *existing = s,
+            None => user.push(s),
+        }
+    }
+    for s in user {
+        skills.push(json!({
+            "name": s.name,
+            "description": s.description,
+            "argHint": "",
+            "source": "user",
+        }));
+    }
     Json(json!({ "skills": skills }))
+}
+
+// --- user-uploaded skills -----------------------------------------------------
+
+fn parse_scope(scope: &str) -> std::result::Result<crate::local::user_skills::Scope, ApiError> {
+    match scope {
+        "global" => Ok(crate::local::user_skills::Scope::Global),
+        "project" => Ok(crate::local::user_skills::Scope::Project),
+        other => Err(bad_request(format!("unknown scope `{other}`"))),
+    }
+}
+
+fn user_skill_json(s: &crate::local::user_skills::UserSkill) -> Value {
+    json!({
+        "name": s.name,
+        "description": s.description,
+        "scope": s.scope,
+        "bytes": s.bytes,
+        "updatedAt": s.updated_at,
+    })
+}
+
+/// Resolve the target scope and validate the project exists for project scope.
+fn resolve_skill_scope(
+    scope: crate::local::user_skills::Scope,
+    project_id: Option<&str>,
+) -> std::result::Result<Option<String>, ApiError> {
+    match scope {
+        crate::local::user_skills::Scope::Global => Ok(None),
+        crate::local::user_skills::Scope::Project => {
+            let id = project_id
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| bad_request("project scope requires a projectId"))?;
+            Store::open()?
+                .get_local_project(id)?
+                .ok_or_else(|| not_found("project"))?;
+            Ok(Some(id.to_string()))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct UserSkillsListQ {
+    project: Option<String>,
+}
+
+/// Both scopes for the Skills tab: globals plus the project's own.
+async fn list_user_skills(Query(q): Query<UserSkillsListQ>) -> ApiResult {
+    let skills: Vec<Value> = crate::local::user_skills::list_for_project(q.project.as_deref())
+        .iter()
+        .map(user_skill_json)
+        .collect();
+    Ok(Json(json!({ "skills": skills })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadSkillReq {
+    scope: String,
+    project_id: Option<String>,
+    /// Original upload filename — its extension picks `.zip` vs single file.
+    filename: String,
+    /// The file bytes, base64 (same convention as chat attachments).
+    content_base64: String,
+}
+
+async fn upload_user_skill(Json(req): Json<UploadSkillReq>) -> ApiResult {
+    let scope = parse_scope(&req.scope)?;
+    let project = resolve_skill_scope(scope, req.project_id.as_deref())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(req.content_base64.trim())
+        .map_err(|e| bad_request(format!("invalid file data: {e}")))?;
+
+    let lower = req.filename.to_ascii_lowercase();
+    let saved = if lower.ends_with(".zip") {
+        crate::local::user_skills::save_zip(&bytes, scope, project.as_deref())
+    } else if lower.ends_with(".md") || lower.ends_with(".markdown") {
+        crate::local::user_skills::save_skill_md(&bytes, scope, project.as_deref())
+    } else {
+        return Err(bad_request(
+            "upload a SKILL.md file or a .zip of a skill folder",
+        ));
+    }
+    .map_err(bad_request)?;
+
+    Ok(Json(json!({ "skill": user_skill_json(&saved) })))
+}
+
+#[derive(Deserialize)]
+struct DeleteSkillQ {
+    scope: String,
+    name: String,
+    project: Option<String>,
+}
+
+async fn delete_user_skill(Query(q): Query<DeleteSkillQ>) -> ApiResult {
+    let scope = parse_scope(&q.scope)?;
+    let project = resolve_skill_scope(scope, q.project.as_deref())?;
+    crate::local::user_skills::delete(&q.name, scope, project.as_deref()).map_err(bad_request)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Skills already installed in the user's coding agents, offered for import.
+async fn list_harness_skills() -> ApiResult {
+    let skills: Vec<Value> = crate::local::user_skills::list_harness_skills()
+        .iter()
+        .map(|s| {
+            json!({
+                "harnessId": s.harness_id,
+                "harnessName": s.harness_name,
+                "name": s.name,
+                "description": s.description,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "skills": skills })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportSkillReq {
+    harness: String,
+    name: String,
+    scope: String,
+    project_id: Option<String>,
+}
+
+async fn import_user_skill(Json(req): Json<ImportSkillReq>) -> ApiResult {
+    let scope = parse_scope(&req.scope)?;
+    let project = resolve_skill_scope(scope, req.project_id.as_deref())?;
+    let saved = crate::local::user_skills::import_from_harness(
+        &req.harness,
+        &req.name,
+        scope,
+        project.as_deref(),
+    )
+    .map_err(bad_request)?;
+    Ok(Json(json!({ "skill": user_skill_json(&saved) })))
 }
 
 /// Serialize a project for the UI, injecting the absolute artifacts directory
@@ -704,8 +910,7 @@ struct CreateProjectReq {
     create_folder: bool,
     #[serde(default)]
     initialize_git: bool,
-    #[serde(default)]
-    github_sync_enabled: bool,
+    github_sync_enabled: Option<bool>,
 }
 
 async fn create_project(
@@ -732,7 +937,9 @@ async fn create_project(
             "A paper project requires a linked public code repository.",
         ));
     }
-    let github_sync_enabled = req.github_sync_enabled;
+    let github_sync_enabled = req
+        .github_sync_enabled
+        .unwrap_or_else(crate::config::github_for_new_projects);
     let repo_size_kb = match clone_url.as_deref() {
         Some(url) => local::github::public_repo_size_kb(url).await,
         None => None,
@@ -790,6 +997,16 @@ async fn get_project(Path(id): Path<String>) -> ApiResult {
     Ok(Json(json!({ "project": project_json(&project) })))
 }
 
+fn github_token_source() -> Option<&'static str> {
+    if std::env::var("GITHUB_TOKEN").is_ok_and(|token| !token.trim().is_empty()) {
+        Some("env")
+    } else if crate::config::synced_env_var("GITHUB_TOKEN").is_some() {
+        Some("stored")
+    } else {
+        local::git::resolve_github_token().map(|_| "gh")
+    }
+}
+
 fn project_git_json(project: &local::model::LocalProject) -> Value {
     let path = std::path::Path::new(&project.repo_path);
     let initialized = local::git::is_repository(path);
@@ -813,6 +1030,14 @@ fn project_git_json(project: &local::model::LocalProject) -> Value {
     } else {
         (None, None, None, None)
     };
+    let sync_status = project.github_enabled().then(|| {
+        local::git::publication_sync_status(
+            path,
+            &project.baseline_branch,
+            &project.github_owner,
+            &project.github_repo,
+        )
+    });
     json!({
         "path": project.repo_path,
         "gitVersion": local::git::version(),
@@ -826,6 +1051,15 @@ fn project_git_json(project: &local::model::LocalProject) -> Value {
             "email": email,
             "nameSource": name_source,
             "emailSource": email_source,
+        },
+        "github": {
+            "authenticated": github_token_source().is_some(),
+            "tokenSource": github_token_source(),
+            "enabled": project.github_enabled(),
+            "owner": project.github_owner,
+            "repo": project.github_repo,
+            "url": project.github_url(),
+            "syncStatus": sync_status,
         },
     })
 }
@@ -851,6 +1085,7 @@ async fn initialize_project_git(
         .admit(&id)
         .ok_or_else(|| bad_request("project deletion is in progress"))?;
     reject_if_moving(&state)?;
+    let _lock = project_publication_lock(&state, &id).await;
     tokio::task::spawn_blocking(move || {
         let store = Store::open()?;
         let mut project = store
@@ -910,8 +1145,11 @@ async fn create_independent_project_repository(
     let source_repository = project
         .has_github_repository()
         .then(|| (project.github_owner.clone(), project.github_repo.clone()));
+    let reroot_shallow = local::git::prepare_shallow_repository_for_publication(
+        std::path::Path::new(&project.repo_path),
+    )?;
     let (owner, repo, _) = local::github::create_project_repo(&project.slug).await?;
-    if local::git::is_shallow_repository(std::path::Path::new(&project.repo_path))? {
+    if reroot_shallow {
         local::git::reroot_shallow_repository(
             std::path::Path::new(&project.repo_path),
             &project.baseline_branch,
@@ -971,10 +1209,87 @@ async fn push_project_for_sync(
     Ok(project)
 }
 
+async fn enable_project_github(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    reject_if_moving(&state)?;
+    let _admission = state
+        .project_lifecycle
+        .admit(&id)
+        .ok_or_else(|| bad_request("project deletion is in progress"))?;
+    reject_if_moving(&state)?;
+    let _lock = project_publication_lock(&state, &id).await;
+    let store = Store::open()?;
+    let project = store
+        .get_local_project(&id)?
+        .ok_or_else(|| not_found("project"))?;
+    let project = push_project_for_sync(project).await.map_err(bad_request)?;
+    let git_status = project_git_json(&project);
+    Ok(Json(
+        json!({ "project": project_json(&project), "git": git_status }),
+    ))
+}
+
+async fn disable_project_github(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    let _admission = state
+        .project_lifecycle
+        .admit(&id)
+        .ok_or_else(|| bad_request("project deletion is in progress"))?;
+    reject_if_moving(&state)?;
+    let _lock = project_publication_lock(&state, &id).await;
+    let store = Store::open()?;
+    let mut project = store
+        .get_local_project(&id)?
+        .ok_or_else(|| not_found("project"))?;
+    project.github_sync_enabled = false;
+    store.update_local_project(&project)?;
+    Ok(Json(json!({
+        "project": project_json(&project),
+        "git": project_git_json(&project),
+    })))
+}
+
+async fn push_project_github(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    reject_if_moving(&state)?;
+    let _admission = state
+        .project_lifecycle
+        .admit(&id)
+        .ok_or_else(|| bad_request("project deletion is in progress"))?;
+    reject_if_moving(&state)?;
+    let _lock = project_publication_lock(&state, &id).await;
+    let project = Store::open()?
+        .get_local_project(&id)?
+        .ok_or_else(|| not_found("project"))?;
+    let project_for_push = project.clone();
+    let git_status = tokio::task::spawn_blocking(move || -> Result<Value> {
+        push_project(&project_for_push)?;
+        Ok(project_git_json(&project_for_push))
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow!("git task failed: {error}")))?
+    .map_err(bad_request)?;
+    Ok(Json(
+        json!({ "project": project_json(&project), "git": git_status }),
+    ))
+}
+
 async fn github_account() -> ApiResult {
     Ok(Json(
         json!({ "login": local::github::viewer_login().await }),
     ))
+}
+
+#[derive(Deserialize)]
+struct ProjectRepoPreviewQuery {
+    name: String,
+}
+
+async fn github_project_repo_preview(Query(q): Query<ProjectRepoPreviewQuery>) -> ApiResult {
+    let candidate = local::projects::project_slug_preview(&Store::open()?, q.name.trim())?;
+    let repo = local::github::available_project_repo_name(&candidate).await;
+    Ok(Json(json!({ "repo": repo })))
 }
 
 #[derive(Deserialize)]
@@ -2368,11 +2683,95 @@ fn git_out(args: &[&str]) -> Option<String> {
 }
 
 fn git_settings_json() -> Value {
+    let gh_installed = std::process::Command::new("gh")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
     json!({
         "gitVersion": git_out(&["--version"]),
         "userName": git_out(&["config", "--global", "user.name"]),
         "userEmail": git_out(&["config", "--global", "user.email"]),
+        "ghInstalled": gh_installed,
+        "githubTokenSource": github_token_source(),
     })
+}
+
+fn project_defaults_json() -> Value {
+    let token_source = github_token_source();
+    json!({
+        "githubForNewProjects": crate::config::github_for_new_projects(),
+        "githubDefaultPromptSeen": crate::config::github_default_prompt_seen(),
+        "githubAuthenticated": token_source.is_some(),
+        "githubTokenSource": token_source,
+    })
+}
+
+async fn project_defaults() -> ApiResult {
+    Ok(Json(project_defaults_json()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetProjectDefaultsReq {
+    github_for_new_projects: bool,
+    #[serde(default)]
+    github_default_prompt_seen: Option<bool>,
+}
+
+async fn set_project_defaults(Json(req): Json<SetProjectDefaultsReq>) -> ApiResult {
+    if req.github_for_new_projects && github_token_source().is_none() {
+        return Err(bad_request(
+            "Connect GitHub before enabling it by default for new projects.",
+        ));
+    }
+    crate::config::set_github_for_new_projects(req.github_for_new_projects)?;
+    if let Some(seen) = req.github_default_prompt_seen {
+        crate::config::set_github_default_prompt_seen(seen)?;
+    }
+    Ok(Json(project_defaults_json()))
+}
+
+#[derive(Deserialize)]
+struct SetGitTokenReq {
+    token: String,
+}
+
+async fn set_git_token(Json(req): Json<SetGitTokenReq>) -> ApiResult {
+    let token = req.token.trim().to_string();
+    if token.is_empty() {
+        return Err(bad_request("token is required"));
+    }
+    let response = reqwest::Client::new()
+        .get("https://api.github.com/user")
+        .header("User-Agent", "orx")
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|error| bad_request(format!("Could not reach api.github.com: {error}")))?;
+    if !response.status().is_success() {
+        return Err(bad_request(format!(
+            "GitHub rejected the token ({}).",
+            response.status()
+        )));
+    }
+    let scopes = response
+        .headers()
+        .get("x-oauth-scopes")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !scopes.trim().is_empty() && !scopes.split(',').any(|scope| scope.trim() == "repo") {
+        return Err(bad_request(
+            "Token is valid but lacks the `repo` scope needed for private repositories.",
+        ));
+    }
+    crate::config::write_synced_env_var("GITHUB_TOKEN", &token)?;
+    Ok(Json(git_settings_json()))
+}
+
+async fn delete_git_token() -> ApiResult {
+    crate::config::remove_synced_env_var("GITHUB_TOKEN")?;
+    Ok(Json(git_settings_json()))
 }
 
 async fn git_settings() -> ApiResult {

@@ -178,6 +178,18 @@ enum Command {
     /// an approval card and blocks until answered. Not a user command.
     #[command(name = "mcp-gate", hide = true)]
     McpGate,
+
+    /// Internal: detached worker for optional local-project publication.
+    #[command(name = "publish-branch", hide = true)]
+    PublishBranch(PublishBranchArgs),
+}
+
+#[derive(Args, Debug)]
+struct PublishBranchArgs {
+    repo_path: std::path::PathBuf,
+    branch: String,
+    owner: String,
+    repo: String,
 }
 
 #[derive(Args, Debug)]
@@ -898,6 +910,15 @@ async fn main() {
         }
         return;
     }
+    if let Command::PublishBranch(args) = &command {
+        if let Err(err) =
+            local::git::push_branch(&args.repo_path, &args.branch, &args.owner, &args.repo)
+        {
+            eprintln!("orx publish-branch: {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     let warning = (!matches!(
         command,
@@ -965,6 +986,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Telemetry(_) => "telemetry",
         Command::PlanGate => "plan-gate",
         Command::McpGate => "mcp-gate",
+        Command::PublishBranch(_) => "publish-branch",
     }
 }
 
@@ -1020,6 +1042,7 @@ async fn dispatch(command: Command) -> error::Result<()> {
         // Handled before dispatch (fast path, no telemetry/update check).
         Command::PlanGate => commands::plan_gate::run().await,
         Command::McpGate => commands::mcp_gate::run().await,
+        Command::PublishBranch(_) => unreachable!("handled before dispatch"),
     }
 }
 
@@ -1036,5 +1059,6 @@ fn command_uses_lifecycle_lock(command: &Command) -> bool {
             | Command::Telemetry(_)
             | Command::PlanGate
             | Command::McpGate
+            | Command::PublishBranch(_)
     )
 }

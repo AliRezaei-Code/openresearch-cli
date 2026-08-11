@@ -430,7 +430,7 @@ backend_adapter!(
     preflight | _args | ready(),
     submit | args,
     source,
-    run_id | { crate::local::localrun::submit_local_run_with_source(args, source, run_id).await }
+    run_id | crate::local::localrun::submit_local_run_with_source(args, source, run_id).await
 );
 
 backend_adapter!(
@@ -452,7 +452,7 @@ backend_adapter!(
     },
     submit | args,
     source,
-    run_id | { crate::local::hf::submit_local_hf_with_source(args, source, run_id).await }
+    run_id | crate::local::hf::submit_local_hf_with_source(args, source, run_id).await
 );
 
 backend_adapter!(
@@ -473,7 +473,7 @@ backend_adapter!(
     },
     submit | args,
     source,
-    run_id | { crate::local::modal::submit_local_modal_with_source(args, source, run_id).await }
+    run_id | crate::local::modal::submit_local_modal_with_source(args, source, run_id).await
 );
 
 backend_adapter!(
@@ -499,7 +499,7 @@ backend_adapter!(
     },
     submit | args,
     source,
-    run_id | { crate::local::k8s::submit_local_k8s_with_source(args, source, run_id).await }
+    run_id | crate::local::k8s::submit_local_k8s_with_source(args, source, run_id).await
 );
 
 backend_adapter!(
@@ -529,7 +529,7 @@ backend_adapter!(
     },
     submit | args,
     source,
-    run_id | { crate::local::ssh::submit_local_ssh_with_source(args, source, run_id).await }
+    run_id | crate::local::ssh::submit_local_ssh_with_source(args, source, run_id).await
 );
 
 backend_adapter!(
@@ -558,7 +558,7 @@ backend_adapter!(
     },
     submit | args,
     source,
-    run_id | { crate::local::slurm::submit_local_slurm_with_source(args, source, run_id).await }
+    run_id | crate::local::slurm::submit_local_slurm_with_source(args, source, run_id).await
 );
 
 backend_adapter!(
@@ -577,7 +577,7 @@ backend_adapter!(
     },
     submit | args,
     source,
-    run_id | { crate::local::ray::submit_local_ray_with_source(args, source, run_id).await }
+    run_id | crate::local::ray::submit_local_ray_with_source(args, source, run_id).await
 );
 
 backend_adapter!(
@@ -600,10 +600,9 @@ backend_adapter!(
     },
     submit | args,
     source,
-    run_id | {
-        crate::local::openresearch::submit_local_openresearch_with_source(args, source, run_id)
+    run_id
+        | crate::local::openresearch::submit_local_openresearch_with_source(args, source, run_id)
             .await
-    }
 );
 
 pub fn backend(id: &str) -> Result<Box<dyn ComputeBackend>> {
@@ -699,27 +698,15 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     match backend.submit(args, source, run_id.clone()).await {
         Ok(run) => {
             if project.github_enabled() {
-                let repo_path = project.repo_path.clone();
-                let branch = experiment.branch_name.clone();
-                let owner = project.github_owner.clone();
-                let repo = project.github_repo.clone();
-                match tokio::task::spawn_blocking(move || {
-                    crate::local::git::push_branch(
-                        Path::new(&repo_path),
-                        &branch,
-                        &owner,
-                        &repo,
-                    )
-                })
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => eprintln!(
-                        "GitHub sync failed; compute is already running from the source snapshot: {error}"
-                    ),
-                    Err(error) => eprintln!(
-                        "GitHub sync task failed; compute is already running from the source snapshot: {error}"
-                    ),
+                if let Err(error) = crate::local::git::spawn_branch_publication(
+                    Path::new(&project.repo_path),
+                    &experiment.branch_name,
+                    &project.github_owner,
+                    &project.github_repo,
+                ) {
+                    eprintln!(
+                        "GitHub sync could not start; compute is already running from the source snapshot: {error}"
+                    );
                 }
             }
             Ok(run)

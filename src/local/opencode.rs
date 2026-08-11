@@ -346,7 +346,9 @@ pub fn ensure_playbook(
     // Modular skills, written fresh beside the playbook (same freshness
     // semantics) so this session's agent discovers them natively.
     if let Some(dir) = session_skills_dir {
-        super::agent_skills::ensure_session_skills(&workdir, dir)?;
+        super::agent_skills::ensure_session_skills(&workdir, dir, project.github_enabled())?;
+        // User-uploaded skills land beside the built-ins, same freshness.
+        super::user_skills::write_into_session(&workdir, dir, &project.id)?;
     }
     // One shared exclude covers every worktree.
     exclude_agent_files(Path::new(&project.repo_path));

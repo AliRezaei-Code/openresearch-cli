@@ -33,6 +33,10 @@ fn unique_project_slug(store: &Store, base: &str) -> Result<String> {
     }
 }
 
+pub fn project_slug_preview(store: &Store, name: &str) -> Result<String> {
+    unique_project_slug(store, &slugify(name))
+}
+
 pub(crate) fn expand_path(path: &str) -> Result<PathBuf> {
     let trimmed = path.trim();
     if trimmed.is_empty() {

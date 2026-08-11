@@ -38,6 +38,7 @@ import { SubagentTab } from "./components/SubagentTab";
 import { CodeTab, type CodeView } from "./components/CodeTab";
 import { WorktreeTab, type WorktreeView } from "./components/WorktreeTab";
 import { ArtifactsTab } from "./components/ArtifactsTab";
+import { SkillsTab } from "./components/SkillsTab";
 import { ClosableTab } from "./components/ClosableTab";
 import { DetailDrawer, type ExperimentView } from "./components/DetailDrawer";
 import { FileViewer } from "./components/FileViewer";
@@ -52,6 +53,16 @@ import { Tour } from "./components/Tour";
 import { clearReadDemoSessions } from "./demoSessionState";
 import { TreeView } from "./components/TreeView";
 import { useOrxEvents } from "./events";
+import { CODE_TAB_BODY_CLASS_NAME, ICON_BUTTON_BASE_CLASS_NAME, ICON_BUTTON_CLASS_NAME, MODEL_ITEM_CLASS_NAME, PRIMARY_BUTTON_CLASS_NAME, SPINNER_CLASS_NAME, TAB_BODY_CLASS_NAME } from "./styleClasses";
+
+const EMPTY_STATE_CLASS_NAME = [
+  "empty-state absolute inset-0 flex flex-col items-center",
+  "justify-center gap-2.5 p-6 text-center text-subtext",
+  "[&_p]:max-w-[46ch] [&_p]:m-0 [&_p]:text-md [&_p]:leading-normal",
+  "[&_p]:text-balance [&_p.empty-state-title]:text-2xl",
+  "[&_p.empty-state-title]:font-normal [&_p.empty-state-title]:text-text",
+  "[&_p.empty-state-hint]:text-lg [&_p.empty-state-hint]:text-subtext",
+].join(" ");
 
 /** An experiment view open as a right-panel tab. */
 interface ExpViewDef {
@@ -76,6 +87,10 @@ interface FileViewDef {
   /** Branch whose committed copy to show (code browser in branch mode);
    * overrides the live checkout. */
   ref?: string;
+  /** 1-based line to scroll to and highlight on open (from a `file:line`
+   * evidence chip). Not part of tab identity — reopening at a new line updates
+   * the same tab. */
+  line?: number;
 }
 
 const sameFileTab = (a: FileViewDef, b: FileViewDef) =>
@@ -267,6 +282,15 @@ function parseFilePath(
   return path ? { path, sessionId } : null;
 }
 
+/** The git branch a code file tab is showing, for the header pill — a cited
+ * experiment's branch (or any ref view) names that branch, and a worktree/clone
+ * file falls back to the baseline branch, so a code tab always says which
+ * branch its contents came from. Artifacts have no branch. */
+function fileBranchLabel(tab: FileViewDef, baselineBranch?: string): string | undefined {
+  if (tab.source === "artifacts") return undefined;
+  return tab.ref ?? baselineBranch;
+}
+
 const PANEL_WIDTH_KEY = "orx:panel-width";
 const EXPERIMENTS_VIEW_KEY = "orx:experiments-view";
 
@@ -325,6 +349,13 @@ export default function App() {
   const [projectId, setProjectId] = useState<string | null>(null);
   const [experiments, setExperiments] = useState<Experiment[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
+  // Latest runs/experiments, read by the stable openRunLogs/openFileTab so
+  // evidence chips resolve ids without re-creating the callbacks on every poll
+  // (they feed the memoized transcript, which needs stable props).
+  const runsRef = useRef(runs);
+  runsRef.current = runs;
+  const experimentsRef = useRef(experiments);
+  experimentsRef.current = experiments;
   const [artifacts, setArtifacts] = useState<ProjectArtifacts | null>(null);
   const [view, setView] = useState<ExperimentsView>(initialExperimentsView);
   // Experiments pane scope: "agent" narrows to the open chat session's work.
@@ -377,8 +408,11 @@ export default function App() {
   const [railOpen, setRailOpen] = useState(true);
   const [homeOpen, setHomeOpen] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
-  // What the middle pane shows: the agent chat or one settings section.
-  const [mainView, setMainView] = useState<"chat" | SettingsTab>("chat");
+  const [mainView, setMainView] = useState<"chat" | "skills" | SettingsTab>("chat");
+  const [githubPublicationError, setGithubPublicationError] = useState<{
+    projectId: string;
+    message: string;
+  } | null>(null);
   const rightPaneStatesRef = useRef(new Map<string, RightPaneSessionState>());
   const currentRightPaneStateRef = useRef<RightPaneSessionState>(initialRightPaneSessionState());
   const activeSessionIdRef = useRef<string | null>(null);
@@ -639,6 +673,19 @@ export default function App() {
     setPanelOpen(true);
   }, [selectRightTab]);
 
+  // A `<run>` evidence chip in chat opens that run's logs — the only evidence
+  // channel for a metric. Run ids are globally unique, so resolve the run to its
+  // experiment and open the terminal view focused on it.
+  const openRunLogs = useCallback(
+    (runId: string) => {
+      const run = runsRef.current.find((r) => r.id === runId);
+      if (!run) return;
+      setSelectedRunId(runId);
+      openExperimentTab(run.experimentId, "terminal");
+    },
+    [openExperimentTab],
+  );
+
   const closeExperimentTab = useCallback(
     (tab: ExpViewDef) => {
       const idx = expTabs.findIndex((t) => sameExpTab(t, tab));
@@ -653,7 +700,7 @@ export default function App() {
   // session (or viewed file's session) the click came from — see
   // parseFilePath for how it resolves against the reported path.
   const openFileTab = useCallback(
-    (rawPath: string, contextSessionId?: string, ref?: string) => {
+    (rawPath: string, contextSessionId?: string, ref?: string, line?: number, exp?: string) => {
       const project = projects?.find((p) => p.id === projectId);
       const tab = parseFilePath(
         rawPath,
@@ -663,13 +710,36 @@ export default function App() {
         project?.slug,
       );
       if (!tab) return;
+      // A cited experiment pins the file to that node's committed branch, so the
+      // tab shows (and labels) the version behind the claim. Agents cite the
+      // short id (`orx` prints an 8-char prefix), so match the full id or prefix.
+      const experiment = exp
+        ? experimentsRef.current.find(
+            (e) => e.id === exp || (exp.length >= 6 && e.id.startsWith(exp)),
+          )
+        : undefined;
+      const effectiveRef = ref ?? experiment?.branchName;
       // A branch ref only applies to repo files; artifacts have no branch.
-      if (ref && tab.source !== "artifacts") tab.ref = ref;
+      if (effectiveRef && tab.source !== "artifacts") tab.ref = effectiveRef;
+      if (line != null) tab.line = line;
+      // Line is not part of tab identity: reopening a file at a new line reuses
+      // the tab but makes the new (line-carrying) def the active one so the
+      // viewer re-scrolls.
       setFileTabs((prev) => (prev.some((t) => sameFileTab(t, tab)) ? prev : [...prev, tab]));
       selectRightTab(tab);
       setPanelOpen(true);
     },
     [projects, projectId, selectRightTab],
+  );
+
+  // Chat file chips carry an optional target line (`file:line`) and cited
+  // experiment (`exp`), never a branch ref — adapt to openFileTab's
+  // (path, session, ref, line, exp) shape while staying referentially stable
+  // for ChatPanel's memoized transcript.
+  const openChatFile = useCallback(
+    (path: string, sessionId?: string, line?: number, exp?: string) =>
+      openFileTab(path, sessionId, undefined, line, exp),
+    [openFileTab],
   );
 
   const closeFileTab = useCallback(
@@ -827,10 +897,14 @@ export default function App() {
     window.addEventListener("pointercancel", stop);
   };
 
-  const onProjectCreated = (project: Project) => {
+  const onProjectCreated = (project: Project, publicationError: string | null) => {
     setProjects((cur) => (cur ? upsert(cur, project) : [project]));
     setProjectId(project.id);
     setHomeOpen(false);
+    if (publicationError) {
+      setGithubPublicationError({ projectId: project.id, message: publicationError });
+      setMainView("git");
+    }
   };
 
   const onProjectDeleted = (id: string) => {
@@ -863,10 +937,10 @@ export default function App() {
 
   if (startupError) {
     return (
-      <div className="app">
-        <div className="empty-state">
+      <div className="app flex flex-col h-full">
+        <div className={EMPTY_STATE_CLASS_NAME}>
           <p>{startupError}</p>
-          <button className="btn primary" onClick={loadInitialState}>Retry</button>
+          <button className={PRIMARY_BUTTON_CLASS_NAME} onClick={loadInitialState}>Retry</button>
         </div>
       </div>
     );
@@ -874,9 +948,9 @@ export default function App() {
 
   if (projects === null || uiState === null) {
     return (
-      <div className="app">
-        <div className="empty-state">
-          <span className="spinner" />
+      <div className="app flex flex-col h-full">
+        <div className={EMPTY_STATE_CLASS_NAME}>
+          <span className={SPINNER_CLASS_NAME} />
         </div>
       </div>
     );
@@ -885,7 +959,7 @@ export default function App() {
   // First boot: the walkthrough installs and opens the embedded demo project.
   if (projects.length === 0) {
     return (
-      <div className="app">
+      <div className="app flex flex-col h-full">
         {onboarded ? (
           <ProjectsHome
             projects={projects}
@@ -924,7 +998,7 @@ export default function App() {
   );
 
   return (
-    <div className="app">
+    <div className="app flex flex-col h-full">
       {homeOpen ? (
         <ProjectsHome
           projects={projects}
@@ -936,7 +1010,7 @@ export default function App() {
           onDeleted={onProjectDeleted}
         />
       ) : (
-      <div className="app-body">
+      <div className="app-body flex flex-1 min-h-0 py-0 px-3.5">
         {projectId && (
           <ChatPanel
             projectId={projectId}
@@ -954,7 +1028,8 @@ export default function App() {
             artifactsActive={mainView === "chat" && panelOpen && rightTab === "artifacts"}
             onOpenExperiments={openExperimentsTab}
             onOpenArtifacts={openArtifactsTab}
-            onOpenFile={openFileTab}
+            onOpenFile={openChatFile}
+            onOpenRun={openRunLogs}
             onOpenPlan={openPlanTab}
             onOpenSubagent={openSubagentTab}
             onOpenWorktree={openWorktreeTab}
@@ -963,24 +1038,35 @@ export default function App() {
             preferredAgent={uiState.preferredAgent}
             onPreferredAgentChange={persistPreferredAgent}
           >
-            {mainView !== "chat" && (
+            {mainView === "skills" ? (
+              <SkillsTab project={activeProject} />
+            ) : mainView !== "chat" ? (
               <SettingsView
                 tab={mainView}
                 project={activeProject}
+                githubPublicationError={
+                  githubPublicationError && githubPublicationError.projectId === activeProject?.id
+                    ? githubPublicationError.message
+                    : null
+                }
+                onProjectUpdate={(project) => {
+                  setProjects((current) => (current ? upsert(current, project) : [project]));
+                  if (project.githubEnabled) setGithubPublicationError(null);
+                }}
                 onSelectTab={setMainView}
               />
-            )}
+            ) : null}
           </ChatPanel>
         )}
         {mainView === "chat" && panelOpen && (
         <aside
-          className={`right-pane floating-panel ${panelMax ? "max" : ""}`}
+          className={`right-pane relative shrink-0 min-w-0 flex flex-col mt-2.5 mr-0 mb-2.5 ml-3.5 bg-canvas [&.max]:fixed [&.max]:inset-2.5 [&.max]:m-0 [&.max]:z-60 [&.max]:shadow-[0_12px_40px_color-mix(in_oklab,_var(--text)_22%,_transparent)] floating-panel border border-border rounded-lg shadow-[0_6px_24px_color-mix(in_oklab,_var(--text)_5%,_transparent),_0_1px_4px_color-mix(in_oklab,_var(--text)_4%,_transparent)] overflow-hidden ${panelMax ? "max" : ""}`}
           style={panelMax ? undefined : { width: panelWidth }}
           data-onboarding="experiments"
         >
-          {!panelMax && <div className="panel-resizer" onPointerDown={resizePanel} />}
-          <div className="tabs">
-            <div className="tab-strip">
+          {!panelMax && <div className="panel-resizer absolute left-0 top-0 bottom-0 w-1.5 cursor-col-resize z-30 [&:hover]:bg-[color-mix(in_oklab,_var(--text)_12%,_transparent)] [&:active]:bg-[color-mix(in_oklab,_var(--text)_12%,_transparent)]" onPointerDown={resizePanel} />}
+          <div className="tabs flex items-end gap-0 pt-1 pr-1.5 pb-0 pl-2 h-10 border-b border-b-border bg-background shrink-0">
+            <div className="tab-strip flex items-end gap-0.5 flex-1 min-w-0 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
               {artifactsTabOpen && (
                 <ClosableTab
                   active={rightTab === "artifacts"}
@@ -1071,9 +1157,9 @@ export default function App() {
                 );
               })}
             </div>
-            <div className="panel-controls">
+            <div className="panel-controls inline-flex items-center gap-0.5 self-center py-0 px-1.5 shrink-0">
               <button
-                className="icon-btn"
+                className={ICON_BUTTON_CLASS_NAME}
                 title={panelMax ? "Restore panel" : "Expand panel"}
                 aria-label={panelMax ? "Restore panel" : "Expand panel"}
                 onClick={() => setPanelMax((m) => !m)}
@@ -1081,7 +1167,7 @@ export default function App() {
                 {panelMax ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
               </button>
               <button
-                className="icon-btn"
+                className={ICON_BUTTON_CLASS_NAME}
                 title="Close panel"
                 aria-label="Close panel"
                 onClick={() => {
@@ -1094,7 +1180,7 @@ export default function App() {
             </div>
           </div>
           {rightTab === "artifacts" ? (
-            <div className="tab-body">
+            <div className={TAB_BODY_CLASS_NAME}>
               {activeProject && (
                 <ArtifactsTab
                   key={activeProject.id}
@@ -1106,14 +1192,14 @@ export default function App() {
               )}
             </div>
           ) : rightTab === "experiments" ? (
-            <div className="tab-body">
-              <div className={`pane-toolbar${view === "table" ? " table-view" : ""}`}>
+            <div className={TAB_BODY_CLASS_NAME}>
+              <div className={`pane-toolbar flex items-center gap-2 flex-wrap pt-2.5 px-3 pb-0 shrink-0 bg-background [&.table-view]:pb-3${view === "table" ? " table-view" : ""}`}>
                 <span style={{ flex: 1 }} />
-                <div className="experiments-toolbar-controls">
-                  <div className="option-picker" ref={scopeMenuRef}>
+                <div className="experiments-toolbar-controls inline-flex items-center gap-[5px]">
+                  <div className="option-picker relative inline-flex" ref={scopeMenuRef}>
                     <button
                       ref={scopeTriggerRef}
-                      className={`icon-btn experiment-scope-trigger${effectiveScope === "agent" ? " active" : ""}`}
+                      className={`${ICON_BUTTON_BASE_CLASS_NAME} experiment-scope-trigger w-6.5 h-6.5 rounded-sm${effectiveScope === "agent" ? " active" : ""}`}
                       title={`Experiment filter: ${effectiveScope === "agent" ? "Current task" : "Entire project"}`}
                       aria-label="Filter experiments"
                       aria-expanded={scopeMenuOpen}
@@ -1122,9 +1208,9 @@ export default function App() {
                       <Filter size={16} strokeWidth={2.5} />
                     </button>
                     {scopeMenuOpen && (
-                      <div className="option-menu drop-down align-right experiment-scope-menu">
+                      <div className="option-menu absolute bottom-[calc(100%_+_8px)] left-0 max-h-95 flex flex-col bg-background border border-border rounded-lg shadow-[0_12px_32px_rgba(0,_0,_0,_0.18)] z-50 overflow-hidden min-w-47.5 p-1.5 [&.align-right]:left-auto [&.align-right]:right-0 [&.drop-down]:bottom-auto [&.drop-down]:top-[calc(100%_+_4px)] [&.session-menu]:left-auto [&.session-menu]:right-1.5 [&.session-menu]:top-[calc(100%_-_2px)] [&.session-menu]:min-w-35 drop-down align-right experiment-scope-menu [&_.model-item]:whitespace-nowrap [&_.model-item:disabled]:text-muted [&_.model-item:disabled]:cursor-default [&_.model-item:disabled:hover]:bg-transparent">
                         <button
-                          className="model-item"
+                          className={MODEL_ITEM_CLASS_NAME}
                           aria-pressed={effectiveScope === "agent"}
                           disabled={!activeSessionId || !allExperimentsAttributed}
                           title={
@@ -1143,7 +1229,7 @@ export default function App() {
                           {effectiveScope === "agent" && <Check size={13} />}
                         </button>
                         <button
-                          className="model-item"
+                          className={MODEL_ITEM_CLASS_NAME}
                           aria-pressed={effectiveScope === "project"}
                           onClick={() => {
                             setScope("project");
@@ -1157,7 +1243,7 @@ export default function App() {
                     )}
                   </div>
                   <div
-                    className="seg experiments-view-toggle"
+                    className="seg inline-flex items-center gap-0.5 rounded-md bg-[color-mix(in_oklab,_var(--text)_10%,_transparent)] [&_button]:font-semibold [&_button]:text-text [&_button]:rounded-sm [&_button:not(:disabled):hover]:text-text [&_button.active]:bg-background [&_button.active]:shadow-[0_1px_3px_color-mix(in_oklab,_var(--text)_25%,_transparent)] [&_button:disabled]:text-muted [&_button:disabled]:cursor-default experiments-view-toggle p-0.5 [&_button]:py-0.5 [&_button]:px-2 [&_button]:text-sm"
                     role="group"
                     aria-label="Experiment view"
                   >
@@ -1178,12 +1264,13 @@ export default function App() {
                   </div>
                 </div>
               </div>
-              <div className="pane-content">
+              <div className="pane-content flex-1 min-h-0 relative bg-background">
                 {view === "tree" ? (
                   activeProject && (
                     <TreeView
                       experiments={experiments}
                       runs={scopedRuns}
+                      project={activeProject}
                       onOpenView={openExperimentTab}
                       onOpenCode={openCodeTabForExperiment}
                       agentSessionId={effectiveScope === "agent" ? activeSessionId : null}
@@ -1217,7 +1304,7 @@ export default function App() {
               </div>
             </div>
           ) : rightTab === "files" ? (
-            <div className="tab-body">
+            <div className={TAB_BODY_CLASS_NAME}>
               {activeProject ? (
                 <WorktreeTab
                   key={`files:${activeSessionId ?? `project:${activeProject.id}`}`}
@@ -1230,9 +1317,9 @@ export default function App() {
                   onOpenFile={openFileTab}
                 />
               ) : (
-                <div className="code-tab wt-tab">
-                  <div className="code-tab-body">
-                    <div className="wt-empty">
+                <div className="code-tab flex flex-col h-full min-h-0 wt-tab">
+                  <div className={CODE_TAB_BODY_CLASS_NAME}>
+                    <div className="wt-empty flex flex-col items-center gap-2.5 py-12 px-6 text-center text-muted [&_>_svg]:text-subtext [&_p]:m-0 [&_p]:max-w-80 [&_p]:text-sm">
                       <FolderGit2 size={22} />
                       <p>Select a project to browse its files.</p>
                     </div>
@@ -1241,7 +1328,7 @@ export default function App() {
               )}
             </div>
           ) : fileTab ? (
-            <div className="tab-body">
+            <div className={TAB_BODY_CLASS_NAME}>
               {projectId && (
                 <FileViewer
                   key={fileTabKey(fileTab)}
@@ -1250,15 +1337,17 @@ export default function App() {
                   source={fileTab.source}
                   sessionId={fileTab.sessionId}
                   gitRef={fileTab.ref}
+                  line={fileTab.line}
+                  branchLabel={fileBranchLabel(fileTab, activeProject?.baselineBranch)}
                   onOpenFile={openFileTab}
                 />
               )}
             </div>
           ) : planTab ? (
-            <div className="tab-body">
+            <div className={TAB_BODY_CLASS_NAME}>
               {/* The plan markdown is already client-side — render directly,
                   file links resolve against the plan's session worktree. */}
-              <div className="pane-content plan-tab-content">
+              <div className="pane-content flex-1 min-h-0 relative plan-tab-content overflow-y-auto bg-background py-4.5 px-6 [&_.md]:max-w-readable">
                 <Md
                   text={planTab.plan}
                   onOpenFile={(path) => openFileTab(path, planTab.sessionId)}
@@ -1272,14 +1361,16 @@ export default function App() {
               sessionId={subagentTab.sessionId}
               spawnPartId={subagentTab.spawnPartId}
               onOpenFile={(path) => openFileTab(path, subagentTab.sessionId)}
+              onOpenRun={openRunLogs}
               onOpenSubagent={(pid) => openSubagentTab(subagentTab.sessionId, pid)}
             />
           ) : codeTab ? (
-            <div className="tab-body">
+            <div className={TAB_BODY_CLASS_NAME}>
               {projectId && activeProject && codeTab && codeExperiment && (
                 <CodeTab
                   key={`code:${codeTab.branch}`}
                   projectId={projectId}
+                  project={activeProject}
                   experiment={codeExperiment}
                   view={codeTab.view}
                   toggled={codeTab.toggled}
@@ -1290,11 +1381,12 @@ export default function App() {
               )}
             </div>
           ) : (
-            <div className="tab-body">
+            <div className={TAB_BODY_CLASS_NAME}>
               {expTab && tabExperiment && activeProject && (
                 <DetailDrawer
                   key={`${expTab.id}:${expTab.view}`}
                   experiment={tabExperiment}
+                  project={activeProject}
                   view={expTab.view}
                   runs={runs}
                   selectedRunId={selectedRunId}
@@ -1326,9 +1418,9 @@ export default function App() {
       {newProjectOpen && (
         <NewProjectDialog
           onClose={() => setNewProjectOpen(false)}
-          onCreated={(project) => {
+          onCreated={(project, publicationError) => {
             setNewProjectOpen(false);
-            onProjectCreated(project);
+            onProjectCreated(project, publicationError);
           }}
         />
       )}
