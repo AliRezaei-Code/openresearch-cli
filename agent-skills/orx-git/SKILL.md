@@ -1,20 +1,18 @@
 ---
 name: orx-git
-description: "Read, edit, and diff a node's code with plain git: sync, commit, and push before running. Use whenever you touch experiment code — before editing any branch, when a checkout or push fails, when comparing two nodes' code, or when a run seems to have picked up stale code."
+description: "Read, edit, commit, and diff experiment code with Git. Use whenever you touch a branch, compare nodes, prepare a run, diagnose stale code, or publish changes."
 ---
 
-Every experiment node **is a git branch** (`orx/<slug>`) on the project's GitHub
-repo — `orx create-experiment` prints it. There is no dev box and no `orx` code
-command: the **local clone in the cache dir is the standard way to interface
-with code** — reading a node's files, diffing what a run changed, and editing —
-all with plain git and your own tools.
+Every experiment node is a git branch (`orx/<slug>`), but source transport
+depends on the project type:
 
-(In a local `orx up` session you already sit in a private git worktree of the
-project repo, so you can edit the checked-out branch in place — `git fetch origin
-&& git checkout <branch>`, edit, commit, push. The cache-dir clone below is the
-flow for everything outside a live session, and for cloud/full-set contexts.)
+- For a local project, work in its session worktree, check out the branch, edit,
+  and commit. Every compute backend receives an immutable snapshot of that local
+  commit. A GitHub push is optional publication and is never required to run.
+- For a managed server project, GitHub remains the source of record. Use the
+  cache-dir clone flow below and push the branch before running.
 
-**Clone into the openresearch cache dir, not your cwd.** The canonical location,
+**For managed server projects, clone into the openresearch cache dir, not your cwd.** The canonical location,
 keyed by repo so the same clone is reused across all of a project's experiments:
 
 ```
@@ -25,7 +23,7 @@ keyed by repo so the same clone is reused across all of a project's experiments:
 directory or the user's project folders — clones accreting in `~/projects` is the
 failure mode this avoids.
 
-This is how you **realize a child's hypothesis**: after `create-experiment
+For a managed server project, this is how you **realize a child's hypothesis**: after `create-experiment
 --parent`, check out the child's branch and make the specific code/config edits
 its description calls for — then commit, push, and run. Edit only the files that
 idea touches, and **don't touch the run command** (it's inherited; see the
@@ -63,9 +61,9 @@ Rules and notes:
   already has — the repo lives under your account or your org, so access is the
   same as any of your repos. If a clone or push fails on auth, authenticate git
   for github.com (e.g. `gh auth login` or an SSH key) and retry.
-- **Push before you run.** `orx exp run` launches from the branch's pushed tip on
-  GitHub — uncommitted or unpushed edits won't be in the run. Commit and push
-  first.
+- **Push before managed server runs.** Local projects run committed snapshots
+  directly and do not require a push. Managed server projects launch from the
+  pushed GitHub tip, so commit and push those branches first.
 - **Never merge or rebase a branch once its node is frozen** (cardinal rule):
   its history is the code those results came from. Bring changes in on a
   **child** instead. On a *provisional* node a plain `git merge

@@ -86,7 +86,7 @@ import { GitTokenForm } from "./GitTokenForm";
 import { BackendBadge, BackendLogo } from "./BackendLogos";
 import { ProgressBar } from "./ProgressBar";
 import { StatusBadge } from "./StatusBadge";
-import { BADGE_CLASS_NAME, BUTTON_CLASS_NAME, ERROR_BADGE_CLASS_NAME, ICON_BUTTON_CLASS_NAME, MONO_CLASS_NAME, PRIMARY_BUTTON_CLASS_NAME, SETTINGS_LOADING_CLASS_NAME, SMALL_BUTTON_CLASS_NAME, SMALL_PRIMARY_BUTTON_CLASS_NAME, SPINNER_CLASS_NAME, SUCCESS_BADGE_CLASS_NAME, WARNING_BADGE_CLASS_NAME } from "../styleClasses";
+import { BADGE_CLASS_NAME, BUTTON_CLASS_NAME, ERROR_BADGE_CLASS_NAME, ICON_BUTTON_CLASS_NAME, MONO_CLASS_NAME, PRIMARY_BUTTON_CLASS_NAME, SETTINGS_LOADING_CLASS_NAME, SMALL_BUTTON_CLASS_NAME, SPINNER_CLASS_NAME, SUCCESS_BADGE_CLASS_NAME, WARNING_BADGE_CLASS_NAME } from "../styleClasses";
 
 const SETTINGS_CARD_CLASS_NAME = [
   "settings-card [&_>_.error]:text-accent-red [&_>_.error]:text-md",
@@ -578,8 +578,8 @@ function HostTestCell({ test }: { test: HostTest | undefined }) {
   if (test === "testing") return <span className={SPINNER_CLASS_NAME} />;
   const badge = !test.reachable ? (
     <span className={ERROR_BADGE_CLASS_NAME} title={test.error ?? undefined}>Unreachable</span>
-  ) : !test.gitFound ? (
-    <span className={ERROR_BADGE_CLASS_NAME}>No git</span>
+  ) : !test.toolsFound ? (
+    <span className={ERROR_BADGE_CLASS_NAME}>Missing bash/tar</span>
   ) : (
     <span className={SUCCESS_BADGE_CLASS_NAME}>Ready</span>
   );
@@ -611,7 +611,7 @@ function SshSection() {
         ...t,
         [host]: {
           reachable: false,
-          gitFound: false,
+          toolsFound: false,
           error: err instanceof Error ? err.message : String(err),
           testedAt: Date.now(),
         },
@@ -688,7 +688,7 @@ function SlurmTestBadge({ test }: { test: "testing" | SlurmPreflight | null }) {
       </span>
     );
   if (!test.slurmFound) return <span className={ERROR_BADGE_CLASS_NAME}>No Slurm CLI</span>;
-  if (!test.gitFound) return <span className={ERROR_BADGE_CLASS_NAME}>No git</span>;
+  if (!test.toolsFound) return <span className={ERROR_BADGE_CLASS_NAME}>Missing bash/tar</span>;
   return <span className={SUCCESS_BADGE_CLASS_NAME}>Ready</span>;
 }
 
@@ -754,7 +754,7 @@ function SlurmSection() {
       setTest({
         reachable: false,
         slurmFound: false,
-        gitFound: false,
+        toolsFound: false,
         partitions: [],
         error: err instanceof Error ? err.message : String(err),
       });
@@ -1377,11 +1377,9 @@ function TargetRow({
 
 function ComputeTab({
   project,
-  onOpenGit,
   onViewHistory,
 }: {
   project: Project | null;
-  onOpenGit: () => void;
   onViewHistory: () => void;
 }) {
   const [settings, setSettings] = useState<ComputeSettings | null>(null);
@@ -1438,14 +1436,6 @@ function ComputeTab({
     settings.configuredDefaultBackend !== null &&
     settings.configuredDefaultBackend !== undefined &&
     settings.configuredDefaultBackend !== "local";
-  const githubBlocksRemoteCompute = Boolean(
-    targets?.some(
-      (target) =>
-        target.id !== "local" &&
-        !target.enabled &&
-        target.disabledReason === "Connect GitHub to enable",
-    ),
-  );
   const renderTarget = (target: ComputeTargetSummary) => (
     <TargetRow
       key={`${project?.id ?? "none"}:${target.id}`}
@@ -1481,25 +1471,11 @@ function ComputeTab({
           {error && <div className="error">{error}</div>}
           <div className="compute-list flex flex-col gap-2.5 mb-3.5">
             {targets.filter((target) => target.id === "local").map(renderTarget)}
-            {githubBlocksRemoteCompute && (
-              <div className="compute-github-gate flex items-center justify-between gap-6 mt-5.5 mx-0.5 mb-0.5 [&_h3]:m-0 [&_h3]:text-md [&_h3]:font-semibold [&_p]:mt-[3px] [&_p]:mx-0 [&_p]:mb-0 [&_p]:text-subtext [&_p]:text-sm [&_.btn]:flex-none [@media((max-width:_640px))]:items-stretch [@media((max-width:_640px))]:flex-col [@media((max-width:_640px))]:gap-3">
-                <div>
-                  <h3>Remote targets</h3>
-                  <p>
-                    Enable GitHub syncing for this project to push experiment branches and run
-                    them on remote compute.
-                  </p>
-                </div>
-                <button type="button" className={SMALL_PRIMARY_BUTTON_CLASS_NAME} onClick={onOpenGit}>
-                  Enable GitHub syncing
-                </button>
-              </div>
-            )}
             {targets.filter((target) => target.id !== "local").map(renderTarget)}
           </div>
           {fallbackDefault && (
             <p className={SETTINGS_NOTE_CLASS_NAME}>
-              Using this machine while the project is local-only. Your saved {settings?.configuredDefaultBackend} default will return after GitHub is enabled.
+              Using this machine because the saved {settings?.configuredDefaultBackend} default is not currently configured.
             </p>
           )}
           <p className="compute-footnote flex items-start gap-1.5 mt-0.5 mx-0 mb-0 text-sm text-muted [&_svg]:flex-none [&_svg]:mt-px">
@@ -2056,7 +2032,8 @@ function ProjectDefaultsTab() {
               <div className="project-default-title text-md font-semibold">Enable GitHub syncing for new projects</div>
               <p>
                 When enabled, each new project gets a private GitHub repository. Experiment
-                branches are pushed automatically so their code can run on remote compute.
+                branches are pushed automatically for collaborator visibility. Compute always
+                uses direct source snapshots.
               </p>
             </div>
             <button
@@ -2203,7 +2180,7 @@ function GitTab({
             {!status.github.authenticated && (
               <>
                 <p className="git-card-helper text-muted text-sm mt-3.5 mx-0 mb-0">
-                  GitHub is optional. Connect only when you want remote compute or a hosted copy.
+                  GitHub is optional. Connect only when you want a hosted copy for collaboration.
                 </p>
                 <GitTokenForm onSaved={() => load()} />
               </>
@@ -2212,8 +2189,8 @@ function GitTab({
               <>
                 <p className="git-card-helper text-muted text-sm mt-3.5 mx-0 mb-0">
                   {hasGithubRepository
-                    ? "Use this repository for automatic experiment-branch pushes when your connected account can write to it. Otherwise, OpenResearch creates a separate private repository for syncing and remote compute."
-                    : "Create a private repository for this project and automatically push experiment branches so they can run on remote compute."}
+                    ? "Use this repository for automatic experiment-branch pushes when your connected account can write to it. Otherwise, OpenResearch creates a separate private repository for collaboration."
+                    : "Create a private repository and automatically push experiment branches for collaborator visibility."}
                 </p>
                 <div className={GIT_CARD_ACTIONS_CLASS_NAME}>
                   {hasGithubRepository && status.github.url && <a className={BUTTON_CLASS_NAME} href={status.github.url} target="_blank" rel="noreferrer">Open on GitHub <ExternalLink size={12} /></a>}
@@ -2224,8 +2201,8 @@ function GitTab({
             {status.github.enabled && (
               <>
                 <p className="git-card-helper text-muted text-sm mt-3.5 mx-0 mb-0">
-                  Disabling syncing stops automatic pushes and remote compute. It does not delete
-                  the GitHub repository or any code already pushed there.
+                  Disabling syncing stops automatic pushes. Compute continues to use direct source
+                  snapshots. This does not delete the GitHub repository or code already pushed.
                 </p>
                 <div className={GIT_CARD_ACTIONS_CLASS_NAME}>
                   {status.github.url && <a className={BUTTON_CLASS_NAME} href={status.github.url} target="_blank" rel="noreferrer">Open on GitHub <ExternalLink size={12} /></a>}
@@ -2249,9 +2226,9 @@ function GitTab({
           >
             <h2 id="github-default-title">Make GitHub syncing the default?</h2>
             <p>
-              This is useful if you expect to regularly run projects on remote compute. New
-              projects will enable GitHub syncing automatically, creating a private repository
-              when needed and pushing experiment branches for remote runs.
+              This is useful when collaborators follow project changes on GitHub. New projects
+              will enable syncing automatically, creating a private repository when needed and
+              pushing experiment branches for visibility.
             </p>
             {defaultPromptError && <div className="error">{defaultPromptError}</div>}
             <div className="github-default-actions flex justify-end gap-2.5 mt-5.5">
@@ -2754,7 +2731,6 @@ export function SettingsView({
       {tab === "compute" && (
         <ComputeTab
           project={project}
-          onOpenGit={() => onSelectTab("git")}
           onViewHistory={() => onSelectTab("instances")}
         />
       )}

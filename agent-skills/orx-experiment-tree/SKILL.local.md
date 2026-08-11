@@ -85,7 +85,7 @@ To drive a project toward a goal (e.g. "best convergence for d=8"), this is the
 intended flow — do **not** edit a frozen node or rewrite the run command:
 
 1. **Read the baseline's code.** You already sit in a private git worktree of the
-   project's repo — `git fetch origin && git checkout <branch>` and read it with
+   project's repo — `git checkout <branch>` and read it with
    your normal tools (see the `orx-git` skill). See the node's run command with
    `orx exp status <expId>` and find where the knobs live (config files,
    hyperparameters, model defs).
@@ -117,10 +117,9 @@ intended flow — do **not** edit a frozen node or rewrite the run command:
 4. **Implement each child's change on its git branch** — `orx create-experiment`
    prints the child's branch (`orx/<slug>`); in your worktree:
    ```sh
-   git fetch origin && git checkout orx/<child-slug>
-   git merge --ff-only origin/orx/<child-slug>
+   git checkout orx/<child-slug>
    #   …edit only the files that idea touches…
-   git commit -am "cosine LR + warmup" && git push
+   git commit -am "cosine LR + warmup"
    ```
    **Leave the run command alone.** While you're in the code, **make the run
    print the evidence you'll need to judge it** — final metrics, a compact
