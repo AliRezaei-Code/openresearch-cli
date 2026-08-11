@@ -1,5 +1,6 @@
 import {
   ArrowUpRight,
+  Blocks,
   BookOpen,
   ChartSpline,
   Check,
@@ -1299,8 +1300,8 @@ export function ChatPanel({
   /** Reopen the rail (from the chat header's sidebar icon). */
   onShowRail: () => void;
   /** Settings sections replace chat; Artifacts remains a right-panel tool. */
-  mainView: "chat" | SettingsTab;
-  onSelectMainView: (view: "chat" | SettingsTab) => void;
+  mainView: "chat" | "skills" | SettingsTab;
+  onSelectMainView: (view: "chat" | "skills" | SettingsTab) => void;
   experimentsActive: boolean;
   filesActive: boolean;
   artifactsActive: boolean;
@@ -1409,9 +1410,11 @@ export function ChatPanel({
   }
   // IME guard: mid-composition text can transiently look like a full command.
   const composingRef = useRef(false);
+  // Refetch when navigating (esp. back to chat after a Skills-tab upload) so
+  // freshly uploaded skills appear in the `/` menu without a reload.
   useEffect(() => {
-    getSkills().then(setSkills).catch(() => {});
-  }, []);
+    getSkills(projectId).then(setSkills).catch(() => {});
+  }, [projectId, mainView]);
   const slashToken =
     !pickedSkill && draft.startsWith("/") && !/\s/.test(draft) ? draft.slice(1) : null;
   const skillMatches =
@@ -2215,10 +2218,17 @@ export function ChatPanel({
           <Package size={15} />
           Artifacts
         </button>
+        <button
+          className={`rail-nav-item flex items-center gap-2.5 py-[7px] px-2.5 text-base text-text rounded-md text-left [&:hover]:bg-surface [&.active]:bg-panel [&.active]:font-semibold ${mainView === "skills" ? "active" : ""}`}
+          onClick={() => onSelectMainView("skills")}
+        >
+          <Blocks size={15} />
+          Skills
+        </button>
         {SETTINGS_NAV.map((item) => (
           <button
             key={item.id}
-            className={`rail-nav-item flex items-center gap-2.5 py-[7px] px-2.5 text-base text-text rounded-md text-left [&:hover]:bg-surface [&.active]:bg-panel [&.active]:font-semibold ${mainView !== "chat" && item.activeTabs.includes(mainView) ? "active" : ""}`}
+            className={`rail-nav-item flex items-center gap-2.5 py-[7px] px-2.5 text-base text-text rounded-md text-left [&:hover]:bg-surface [&.active]:bg-panel [&.active]:font-semibold ${mainView !== "chat" && mainView !== "skills" && item.activeTabs.includes(mainView) ? "active" : ""}`}
             data-onboarding={item.id === "compute" ? "nav-compute" : undefined}
             onClick={() => onSelectMainView(item.id)}
           >
