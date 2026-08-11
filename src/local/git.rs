@@ -3,8 +3,13 @@
 //! `~/.cache/openresearch/repos/<owner>/<repo>`, the same convention SKILL.md
 //! documents for manual diffing.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use crate::error::{anyhow, Result};
 
@@ -170,7 +175,15 @@ pub fn initialize_repository(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn clone_public(url: &str, path: &Path) -> Result<()> {
+fn public_clone_history_args(shallow: bool) -> &'static [&'static str] {
+    if shallow {
+        &["--depth=1", "--single-branch"]
+    } else {
+        &[]
+    }
+}
+
+pub fn clone_public(url: &str, path: &Path, shallow: bool) -> Result<()> {
     let url = public_clone_url(url)?;
     let empty_config = std::env::temp_dir().join(format!(
         "orx-public-clone-{}.gitconfig",
@@ -180,7 +193,8 @@ pub fn clone_public(url: &str, path: &Path) -> Result<()> {
         .write(true)
         .create_new(true)
         .open(&empty_config)?;
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .current_dir(std::env::temp_dir())
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "")
@@ -197,16 +211,11 @@ pub fn clone_public(url: &str, path: &Path) -> Result<()> {
         .env_remove("GIT_OBJECT_DIRECTORY")
         .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .env("GIT_SSH_COMMAND", "false")
-        .args([
-            "-c",
-            "credential.helper=",
-            "-c",
-            "core.askPass=",
-            "clone",
-            &url,
-            &path.to_string_lossy(),
-        ])
-        .output();
+        .args(["-c", "credential.helper=", "-c", "core.askPass=", "clone"])
+        .args(public_clone_history_args(shallow))
+        .arg(&url)
+        .arg(path);
+    let output = command.output();
     let _ = std::fs::remove_file(&empty_config);
     let out = output.map_err(|error| anyhow!("Could not run git clone: {error}"))?;
     if !out.status.success() {
@@ -276,7 +285,14 @@ pub fn validate_project_repository(path: &Path) -> Result<()> {
 }
 
 pub fn local_head_sha(path: &Path, branch: &str) -> Result<String> {
-    git(Some(path), &["rev-parse", &format!("{branch}^{{commit}}")])
+    git(
+        Some(path),
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("refs/heads/{branch}^{{commit}}"),
+        ],
+    )
 }
 
 pub fn remotes(path: &Path) -> Result<Vec<(String, String)>> {
@@ -315,11 +331,13 @@ fn sanitize_remote_url(url: &str) -> String {
 }
 
 pub fn github_publication(path: &Path) -> Option<(String, String)> {
-    [GITHUB_REMOTE, "origin"].into_iter().find_map(|remote| {
-        let url = git(Some(path), &["remote", "get-url", remote]).ok()?;
-        let (owner, repo) = parse_github_url(&url)?;
-        remote_matches_publication(path, remote, &owner, &repo).then_some((owner, repo))
-    })
+    [GITHUB_REMOTE, "origin", "upstream"]
+        .into_iter()
+        .find_map(|remote| {
+            let url = git(Some(path), &["remote", "get-url", remote]).ok()?;
+            let (owner, repo) = parse_github_url(&url)?;
+            remote_matches_publication(path, remote, &owner, &repo).then_some((owner, repo))
+        })
 }
 
 fn parse_github_url(url: &str) -> Option<(String, String)> {
@@ -347,6 +365,10 @@ fn parse_github_url(url: &str) -> Option<(String, String)> {
     let repo = repo.trim_end_matches(".git");
     (!owner.is_empty() && !repo.is_empty() && !repo.contains('/'))
         .then(|| (owner.to_string(), repo.to_string()))
+}
+
+pub fn github_repository(url: &str) -> Option<(String, String)> {
+    parse_github_url(url)
 }
 
 fn github_repository_matches(url: &str, owner: &str, repo: &str) -> bool {
@@ -413,24 +435,22 @@ pub fn identity(
     (name, email, name_source, email_source)
 }
 
-/// `GITHUB_TOKEN` env, else the synced env file (UI-pasted token), else
-/// `gh auth token`, else None (public-repo fallback).
 pub fn resolve_github_token() -> Option<String> {
-    if let Ok(t) = std::env::var("GITHUB_TOKEN") {
-        let t = t.trim().to_string();
-        if !t.is_empty() {
-            return Some(t);
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            return Some(token);
         }
     }
-    if let Some(t) = crate::config::synced_env_var("GITHUB_TOKEN") {
-        return Some(t);
+    if let Some(token) = crate::config::synced_env_var("GITHUB_TOKEN") {
+        return Some(token);
     }
-    let out = Command::new("gh").args(["auth", "token"]).output().ok()?;
-    if !out.status.success() {
+    let output = Command::new("gh").args(["auth", "token"]).output().ok()?;
+    if !output.status.success() {
         return None;
     }
-    let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!t.is_empty()).then_some(t)
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!token.is_empty()).then_some(token)
 }
 
 /// Fail early on a typo'd baseline branch — otherwise it only surfaces much
@@ -738,8 +758,19 @@ fn seed_copy_in(
     Ok(())
 }
 
+pub fn local_branches(repo_path: &Path) -> Result<Vec<String>> {
+    Ok(git(
+        Some(repo_path),
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+    )?
+    .lines()
+    .filter(|branch| !branch.is_empty())
+    .map(str::to_string)
+    .collect())
+}
+
 fn publication_remote(repo_path: &Path, owner: &str, repo: &str) -> Result<String> {
-    for remote in [GITHUB_REMOTE, "origin"] {
+    for remote in [GITHUB_REMOTE, "origin", "upstream"] {
         if remote_matches_publication(repo_path, remote, owner, repo) {
             return Ok(remote.to_string());
         }
@@ -749,10 +780,82 @@ fn publication_remote(repo_path: &Path, owner: &str, repo: &str) -> Result<Strin
     ))
 }
 
+pub fn is_shallow_repository(repo_path: &Path) -> Result<bool> {
+    Ok(git(Some(repo_path), &["rev-parse", "--is-shallow-repository"])? == "true")
+}
+
+pub fn reroot_shallow_repository(
+    repo_path: &Path,
+    baseline_branch: &str,
+    source: Option<&(String, String)>,
+) -> Result<()> {
+    if !is_shallow_repository(repo_path)? {
+        return Ok(());
+    }
+    if !is_clean(repo_path)? {
+        return Err(anyhow!(
+            "Cannot prepare a shallow paper import for publication because the working tree has changes."
+        ));
+    }
+    let temporary = format!("orx-import-{}", uuid::Uuid::new_v4().simple());
+    git(Some(repo_path), &["checkout", "--orphan", &temporary])?;
+    git(Some(repo_path), &["add", "-A"])?;
+    let source_name = source
+        .map(|(owner, repo)| format!("{owner}/{repo}"))
+        .unwrap_or_else(|| "paper repository".to_string());
+    git(
+        Some(repo_path),
+        &[
+            "-c",
+            "user.name=OpenResearch",
+            "-c",
+            "user.email=local@openresearch.sh",
+            "commit",
+            "--allow-empty",
+            "-m",
+            &format!("Import snapshot from {source_name}"),
+        ],
+    )?;
+    git(Some(repo_path), &["branch", "-M", baseline_branch])?;
+    Ok(())
+}
+
+pub fn prepare_shallow_repository_for_publication(repo_path: &Path) -> Result<bool> {
+    if !is_shallow_repository(repo_path)? {
+        return Ok(false);
+    }
+    if local_branches(repo_path)?
+        .iter()
+        .any(|branch| branch.starts_with("orx/"))
+    {
+        let remote = ["upstream", "origin"]
+            .into_iter()
+            .find(|remote| git(Some(repo_path), &["remote", "get-url", remote]).is_ok())
+            .ok_or_else(|| anyhow!("The shallow project has no source remote to deepen."))?;
+        git(Some(repo_path), &["fetch", "--unshallow", remote])?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 const GITHUB_CREDENTIAL_HELPER: &str =
     "!f() { host=; while IFS='=' read key value; do [ \"$key\" = host ] && host=$value; done; [ \"$host\" = github.com ] || exit 0; echo username=x-access-token; echo \"password=$ORX_GITHUB_TOKEN\"; }; f";
 
-fn authenticated_git(repo_path: &Path, args: &[&str]) -> Result<String> {
+fn redact_remote_urls(text: &str) -> String {
+    text.split_whitespace()
+        .map(|word| {
+            let bare = word.trim_matches(|ch: char| "'\"`()[]{}<>,".contains(ch));
+            if bare.to_ascii_lowercase().contains("://") {
+                word.replace(bare, &sanitize_remote_url(bare))
+            } else {
+                word.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn authenticated_git(repo_path: &Path, args: &[&str], timeout: Duration) -> Result<String> {
     let mut command = Command::new("git");
     command
         .current_dir(repo_path)
@@ -772,93 +875,82 @@ fn authenticated_git(repo_path: &Path, args: &[&str]) -> Result<String> {
             .env("GIT_CONFIG_VALUE_2", "/dev/null")
             .env("ORX_GITHUB_TOKEN", token);
     }
-    let output = command
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
         .args(args)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|error| anyhow!("Could not run git: {error}"))?;
-    if !output.status.success() {
-        let mut error = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if let Some(token) = token {
-            error = error.replace(&token, "[redacted]");
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("Could not capture git stdout"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("Could not capture git stderr"))?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).map(|_| output)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        stderr.read_to_end(&mut output).map(|_| output)
+    });
+    let deadline = Instant::now() + timeout;
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait()? {
+            break (status, false);
         }
-        error = redact_remote_urls(&error);
+        if Instant::now() >= deadline {
+            terminate_git_process_tree(&mut child);
+            break (child.wait()?, true);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow!("Could not collect git stdout"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("Could not collect git stderr"))??;
+    if timed_out {
         return Err(anyhow!(
-            "git {} failed: {error}",
-            args.first().copied().unwrap_or("command")
+            "git {} timed out after {} seconds",
+            args.first().copied().unwrap_or("command"),
+            timeout.as_secs()
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn isolated_github_refs(url: &str, branch: &str) -> Result<String> {
-    let scratch =
-        std::env::temp_dir().join(format!("orx-github-preflight-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir(&scratch)?;
-    let empty_config = scratch.join("global.gitconfig");
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&empty_config)?;
-    let token = resolve_github_token();
-    let mut command = Command::new("git");
-    command
-        .current_dir(&scratch)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "")
-        .env("SSH_ASKPASS", "")
-        .env("SSH_ASKPASS_REQUIRE", "never")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", &empty_config)
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_COMMON_DIR")
-        .env("GIT_SSH_COMMAND", "false");
-    if let Some(token) = &token {
-        command
-            .env("GIT_CONFIG_COUNT", "2")
-            .env("GIT_CONFIG_KEY_0", "credential.helper")
-            .env("GIT_CONFIG_VALUE_0", "")
-            .env("GIT_CONFIG_KEY_1", "credential.helper")
-            .env("GIT_CONFIG_VALUE_1", GITHUB_CREDENTIAL_HELPER)
-            .env("ORX_GITHUB_TOKEN", token);
-    } else {
-        command.env_remove("GIT_CONFIG_COUNT");
-    }
-    let output = command.args(["ls-remote", "--heads", url, branch]).output();
-    let _ = std::fs::remove_dir_all(&scratch);
-    let output = output.map_err(|error| anyhow!("Could not run GitHub preflight: {error}"))?;
-    if !output.status.success() {
-        let mut error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !status.success() {
+        let mut error = String::from_utf8_lossy(&stderr).trim().to_string();
         if let Some(token) = token {
             error = error.replace(&token, "[redacted]");
         }
         return Err(anyhow!(
-            "GitHub HTTPS preflight failed: {}",
+            "git {} failed: {}",
+            args.first().copied().unwrap_or("command"),
             redact_remote_urls(&error)
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
-fn redact_remote_urls(text: &str) -> String {
-    text.split_whitespace()
-        .map(|word| {
-            let bare = word.trim_matches(|ch: char| "'\"`()[]{}<>,".contains(ch));
-            if bare.to_ascii_lowercase().contains("://") {
-                word.replace(bare, &sanitize_remote_url(bare))
-            } else {
-                word.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+fn terminate_git_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    unsafe {
+        // Git owns this process group, including credential-bearing transport children.
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
 }
 
 fn push(repo_path: &Path, args: &[&str]) -> Result<()> {
     let mut command = vec!["push"];
     command.extend_from_slice(args);
-    authenticated_git(repo_path, &command)?;
+    authenticated_git(repo_path, &command, Duration::from_secs(600))?;
     Ok(())
 }
 
@@ -900,31 +992,48 @@ pub fn add_github_remote(repo_path: &Path, owner: &str, repo: &str) -> Result<()
 
 pub fn push_all(repo_path: &Path, baseline_branch: &str, owner: &str, repo: &str) -> Result<()> {
     let remote = publication_remote(repo_path, owner, repo)?;
-    push_all_to(repo_path, baseline_branch, &remote)
-}
-
-fn push_all_to(repo_path: &Path, baseline_branch: &str, remote: &str) -> Result<()> {
-    let mut branches = local_branches(repo_path)?;
-    if let Some(index) = branches.iter().position(|branch| branch == baseline_branch) {
-        let baseline = branches.remove(index);
-        branches.insert(0, baseline);
-    }
+    let mut branches = local_branches(repo_path)?
+        .into_iter()
+        .filter(|branch| branch == baseline_branch || branch.starts_with("orx/"))
+        .collect::<Vec<_>>();
+    branches.sort_by_key(|branch| branch != baseline_branch);
     for branch in branches {
-        push(repo_path, &["-u", remote, &branch])?;
+        push(repo_path, &["-u", &remote, &branch])?;
     }
-    push(repo_path, &[remote, "--tags"])?;
     Ok(())
 }
 
-pub fn local_branches(repo_path: &Path) -> Result<Vec<String>> {
-    Ok(git(
-        Some(repo_path),
-        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
-    )?
-    .lines()
-    .filter(|branch| !branch.is_empty())
-    .map(str::to_string)
-    .collect())
+pub fn push_branch(repo_path: &Path, branch: &str, owner: &str, repo: &str) -> Result<()> {
+    let remote = publication_remote(repo_path, owner, repo)?;
+    push(repo_path, &["-u", &remote, branch])
+}
+
+pub fn spawn_branch_publication(
+    repo_path: &Path,
+    branch: &str,
+    owner: &str,
+    repo: &str,
+) -> Result<()> {
+    let executable = std::env::current_exe()?;
+    let mut command = Command::new(executable);
+    command
+        .arg("publish-branch")
+        .arg(repo_path)
+        .arg(branch)
+        .arg(owner)
+        .arg(repo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .map_err(|error| anyhow!("Could not start GitHub publication worker: {error}"))?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 pub fn publication_sync_status(
@@ -936,18 +1045,20 @@ pub fn publication_sync_status(
     let Ok(remote) = publication_remote(repo_path, owner, repo) else {
         return "not configured";
     };
+    let Ok(remote_refs) = authenticated_git(
+        repo_path,
+        &["ls-remote", "--heads", &remote],
+        Duration::from_secs(30),
+    ) else {
+        return "unknown";
+    };
     let Ok(branches) = local_branches(repo_path) else {
         return "unknown";
     };
-    if !branches.iter().any(|branch| branch == baseline_branch) {
-        return "unknown";
-    }
-    let Ok(remote_refs) =
-        authenticated_git(repo_path, &["ls-remote", "--heads", "--tags", &remote])
-    else {
-        return "unknown";
-    };
-    for branch in branches {
+    for branch in branches
+        .into_iter()
+        .filter(|branch| branch == baseline_branch || branch.starts_with("orx/"))
+    {
         let Ok(local) = local_head_sha(repo_path, &branch) else {
             return "unknown";
         };
@@ -963,70 +1074,20 @@ pub fn publication_sync_status(
             };
         }
     }
-    let Ok(local_tags) = git(Some(repo_path), &["tag", "--list"]) else {
-        return "unknown";
-    };
-    if local_tags.lines().all(|tag| {
-        let Ok(sha) = git(
-            Some(repo_path),
-            &["rev-parse", &format!("{tag}^{{commit}}")],
-        ) else {
-            return false;
-        };
-        let direct = format!("refs/tags/{tag}");
-        let peeled = format!("{direct}^{{}}");
-        remote_refs.lines().any(|remote_line| {
-            remote_line == format!("{sha}\t{direct}") || remote_line == format!("{sha}\t{peeled}")
-        })
-    }) {
-        "synced"
-    } else {
-        "local changes to push"
-    }
+    "synced"
 }
 
-/// Create `new_branch` from `parent_branch`'s local tip and optionally publish it.
+/// Create `new_branch` from `parent_branch`'s local tip.
 pub fn create_experiment_branch(
     repo_path: &Path,
     parent_branch: &str,
     new_branch: &str,
-    publication: Option<(&str, &str)>,
 ) -> Result<()> {
     git(
         Some(repo_path),
         &["branch", "--no-track", new_branch, parent_branch],
     )?;
-    let Some((owner, repo)) = publication else {
-        return Ok(());
-    };
-    if let Err(err) = push_branch(repo_path, new_branch, owner, repo) {
-        // Leave nothing behind — a retry re-picks the same slug.
-        let _ = git(Some(repo_path), &["branch", "-D", new_branch]);
-        return Err(err);
-    }
     Ok(())
-}
-
-/// Head SHA of a branch — the *remote* tip when it exists (that's what a job
-/// clones), the local ref otherwise. The opposite preference of
-/// `resolve_branch_commit`, which serves the code browser and wants the
-/// agent's not-yet-pushed local work.
-pub fn branch_head_sha(repo_path: &Path, branch: &str, owner: &str, repo: &str) -> Result<String> {
-    let remote = format!(
-        "refs/remotes/{}/{branch}",
-        publication_remote(repo_path, owner, repo)?
-    );
-    if let Ok(sha) = git(Some(repo_path), &["rev-parse", &remote]) {
-        return Ok(sha);
-    }
-    git(Some(repo_path), &["rev-parse", branch])
-}
-
-/// Whether origin already has the branch (a cheap network check).
-pub fn branch_on_remote(repo_path: &Path, branch: &str, owner: &str, repo: &str) -> Result<bool> {
-    let remote = publication_remote(repo_path, owner, repo)?;
-    let out = git(Some(repo_path), &["ls-remote", "--heads", &remote, branch])?;
-    Ok(!out.is_empty())
 }
 
 /// A file's content at a specific commit (`git show <sha>:<path>`), i.e.
@@ -1042,56 +1103,6 @@ pub fn is_tracked(repo_path: &Path, path: &str) -> bool {
         &["ls-files", "--error-unmatch", "--", path],
     )
     .is_ok()
-}
-
-pub fn push_branch(repo_path: &Path, branch: &str, owner: &str, repo: &str) -> Result<()> {
-    let remote = publication_remote(repo_path, owner, repo)?;
-    push(repo_path, &["-u", &remote, branch])?;
-    Ok(())
-}
-
-pub fn publish_branch_commit(
-    project: &crate::local::model::LocalProject,
-    branch: &str,
-) -> Result<String> {
-    if !project.github_enabled() {
-        return Err(anyhow!(
-            "Remote compute requires this project's GitHub repository. Enable GitHub syncing for this project, then retry."
-        ));
-    }
-    let repo_path = Path::new(&project.repo_path);
-    if !is_repository(repo_path) {
-        return Err(anyhow!("{} is not a Git repository", repo_path.display()));
-    }
-    push_branch(
-        repo_path,
-        branch,
-        &project.github_owner,
-        &project.github_repo,
-    )?;
-    let commit_sha = branch_head_sha(
-        repo_path,
-        branch,
-        &project.github_owner,
-        &project.github_repo,
-    )?;
-    let url = format!(
-        "https://github.com/{}/{}.git",
-        project.github_owner, project.github_repo
-    );
-    let remote = isolated_github_refs(&url, branch)?;
-    let reference = format!("refs/heads/{branch}");
-    if !remote
-        .lines()
-        .any(|line| line == format!("{commit_sha}\t{reference}"))
-    {
-        return Err(anyhow!(
-            "The recorded commit cannot be cloned through the HTTPS credentials used by remote jobs. Connect a GitHub token with access to {}/{}.",
-            project.github_owner,
-            project.github_repo
-        ));
-    }
-    Ok(commit_sha)
 }
 
 // --- diffs ------------------------------------------------------------------
@@ -1689,38 +1700,6 @@ mod tests {
     }
 
     #[test]
-    fn push_all_publishes_every_branch_and_tag() {
-        let repo = temp_repo();
-        run(&repo, &["branch", "orx/experiment"]);
-        run(&repo, &["branch", "notes"]);
-        run(&repo, &["tag", "v1"]);
-        let remote = repo.with_extension("bare.git");
-        let remote_string = remote.to_string_lossy().into_owned();
-        run(&repo, &["init", "--bare", &remote_string]);
-        run(&repo, &["remote", "add", GITHUB_REMOTE, &remote_string]);
-
-        push_all_to(&repo, "main", GITHUB_REMOTE).unwrap();
-
-        let heads = run(&repo, &["ls-remote", "--heads", GITHUB_REMOTE]);
-        assert!(heads.contains("refs/heads/main"));
-        assert!(heads.contains("refs/heads/orx/experiment"));
-        assert!(heads.contains("refs/heads/notes"));
-        assert_eq!(run(&repo, &["config", "branch.main.remote"]), GITHUB_REMOTE);
-        assert_eq!(
-            run(&repo, &["config", "branch.orx/experiment.remote"]),
-            GITHUB_REMOTE
-        );
-        assert_eq!(
-            run(&repo, &["config", "branch.notes.remote"]),
-            GITHUB_REMOTE
-        );
-        let tags = run(&repo, &["ls-remote", "--tags", GITHUB_REMOTE]);
-        assert!(tags.contains("refs/tags/v1"));
-        let _ = std::fs::remove_dir_all(&repo);
-        let _ = std::fs::remove_dir_all(&remote);
-    }
-
-    #[test]
     fn experiment_branch_collision_never_rewrites_existing_work() {
         let repo = temp_repo();
         run(&repo, &["branch", "orx/existing"]);
@@ -1729,49 +1708,8 @@ mod tests {
         run(&repo, &["add", "later.txt"]);
         run(&repo, &["commit", "-q", "-m", "later"]);
 
-        assert!(create_experiment_branch(&repo, "main", "orx/existing", None).is_err());
+        assert!(create_experiment_branch(&repo, "main", "orx/existing").is_err());
         assert_eq!(run(&repo, &["rev-parse", "orx/existing"]), before);
-        let _ = std::fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn publication_remote_must_match_exact_repository() {
-        let repo = temp_repo();
-        run(
-            &repo,
-            &[
-                "remote",
-                "add",
-                GITHUB_REMOTE,
-                "https://github.com/owner/project-backup.git",
-            ],
-        );
-        run(
-            &repo,
-            &[
-                "remote",
-                "add",
-                "origin",
-                "git@github.com:owner/project.git",
-            ],
-        );
-        assert_eq!(
-            publication_remote(&repo, "owner", "project").unwrap(),
-            "origin"
-        );
-        run(
-            &repo,
-            &[
-                "remote",
-                "set-url",
-                "--add",
-                "--push",
-                "origin",
-                "https://github.com/owner/elsewhere.git",
-            ],
-        );
-        assert!(publication_remote(&repo, "owner", "project").is_err());
-        assert!(publication_remote(&repo, "owner", "missing").is_err());
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -1788,5 +1726,14 @@ mod tests {
             sanitize_remote_url("SSH://user:password@example.com/repo.git"),
             "SSH://example.com/repo.git"
         );
+    }
+
+    #[test]
+    fn public_clone_history_is_shallow_only_when_requested() {
+        assert_eq!(
+            public_clone_history_args(true),
+            &["--depth=1", "--single-branch"]
+        );
+        assert!(public_clone_history_args(false).is_empty());
     }
 }

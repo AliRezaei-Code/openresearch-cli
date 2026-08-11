@@ -274,13 +274,23 @@ fn router(state: AppState) -> Router {
             post(disable_project_github),
         )
         .route("/api/projects/{id}/github/push", post(push_project_github))
+        .route("/api/github/account", get(github_account))
+        .route(
+            "/api/github/project-repo-preview",
+            get(github_project_repo_preview),
+        )
+        .route("/api/github/repo-access", get(github_repo_access))
         .route("/api/projects/{id}/experiments", get(list_experiments))
         .route("/api/projects/{id}/runs", get(list_project_runs))
         .route("/api/papers/search", get(search_papers_api))
         .route("/api/papers/resolve", get(resolve_paper_api))
+        .route("/api/compute/backends", get(compute_backends))
+        .route("/api/runs", post(create_run))
+        .route("/api/runs/{id}", get(get_run))
         .route("/api/instances", get(list_instances))
         .route("/api/runs/{id}/cancel", post(cancel_run))
         .route("/api/runs/{id}/log", get(run_log))
+        .route("/api/runs/{id}/logs", get(run_logs))
         .route("/api/runs/{id}/diff", get(run_diff))
         .route("/api/experiments/{id}/diff", get(experiment_diff))
         .route("/api/experiments/{id}/commits", get(experiment_commits))
@@ -315,8 +325,6 @@ fn router(state: AppState) -> Router {
         )
         .route("/api/settings/data-dir/validate", post(validate_data_dir))
         .route("/api/settings/data-dir/move", post(move_data_dir))
-        .route("/api/github/repo-access", get(github_repo_access))
-        .route("/api/github/account", get(github_account))
         .route(
             "/api/settings/git",
             get(git_settings).post(set_git_settings),
@@ -827,6 +835,9 @@ async fn project_path_status(Query(q): Query<ProjectPathStatusQ>) -> ApiResult {
         };
         let initialized =
             git_version.is_some() && directory && local::git::is_repository(&resolved);
+        let github_publication = initialized
+            .then(|| local::git::github_publication(&resolved))
+            .flatten();
         Ok(Json(json!({
             "gitVersion": git_version,
             "resolvedPath": resolved.to_string_lossy(),
@@ -834,6 +845,8 @@ async fn project_path_status(Query(q): Query<ProjectPathStatusQ>) -> ApiResult {
             "directory": directory,
             "empty": empty,
             "initialized": initialized,
+            "githubOwner": github_publication.as_ref().map(|(owner, _)| owner),
+            "githubRepo": github_publication.as_ref().map(|(_, repo)| repo),
         })))
     })
     .await
@@ -897,6 +910,7 @@ struct CreateProjectReq {
     create_folder: bool,
     #[serde(default)]
     initialize_git: bool,
+    github_sync_enabled: Option<bool>,
 }
 
 async fn create_project(
@@ -916,9 +930,22 @@ async fn create_project(
     let path = req.path;
     let create_folder = req.create_folder;
     let initialize_git = req.initialize_git;
-    let clone_url = req.clone_url;
+    let clone_url = req.clone_url.filter(|url| !url.trim().is_empty());
+    let paper_id = req.paper_id.filter(|paper_id| !paper_id.trim().is_empty());
+    if paper_id.is_some() && clone_url.is_none() {
+        return Err(bad_request(
+            "A paper project requires a linked public code repository.",
+        ));
+    }
+    let github_sync_enabled = req
+        .github_sync_enabled
+        .unwrap_or_else(crate::config::github_for_new_projects);
+    let repo_size_kb = match clone_url.as_deref() {
+        Some(url) => local::github::public_repo_size_kb(url).await,
+        None => None,
+    };
+    let shallow_clone = local::github::should_shallow_clone(repo_size_kb);
     let run_command = req.run_command;
-    let paper_id = req.paper_id.filter(|p| !p.trim().is_empty());
     let result = tokio::task::spawn_blocking(move || {
         let store = Store::open()?;
         local::projects::create_project(
@@ -929,6 +956,7 @@ async fn create_project(
                 create_folder,
                 initialize_git,
                 clone_url,
+                shallow_clone,
                 run_command,
                 paper_id,
             },
@@ -942,7 +970,19 @@ async fn create_project(
         .admit(&project.id)
         .ok_or_else(|| bad_request("project deletion is in progress"))?;
     drop(create_admission);
-    let (project, github_publication_error) = publish_project_by_default(project).await;
+    let (project, github_publication_error) = if github_sync_enabled {
+        match push_project_for_sync(project.clone()).await {
+            Ok(project) => (project, None),
+            Err(error) => {
+                let project = Store::open()?
+                    .get_local_project(&project.id)?
+                    .unwrap_or(project);
+                (project, Some(error.to_string()))
+            }
+        }
+    } else {
+        (project, None)
+    };
     crate::telemetry::capture_project_created(true);
     Ok(Json(json!({
         "project": project_json(&project),
@@ -1066,7 +1106,9 @@ async fn initialize_project_git(
 
 fn push_project(project: &local::model::LocalProject) -> Result<()> {
     if !project.github_enabled() {
-        return Err(anyhow!("Connect GitHub for this project before pushing."));
+        return Err(anyhow!(
+            "Enable GitHub syncing for this project before pushing."
+        ));
     }
     let path = std::path::Path::new(&project.repo_path);
     local::git::add_github_remote(path, &project.github_owner, &project.github_repo)?;
@@ -1100,7 +1142,20 @@ async fn create_independent_project_repository(
         .map(|session| session.id)
         .collect::<Vec<_>>();
     local::git::migrate_legacy_project_worktrees(&project, &session_ids)?;
+    let source_repository = project
+        .has_github_repository()
+        .then(|| (project.github_owner.clone(), project.github_repo.clone()));
+    let reroot_shallow = local::git::prepare_shallow_repository_for_publication(
+        std::path::Path::new(&project.repo_path),
+    )?;
     let (owner, repo, _) = local::github::create_project_repo(&project.slug).await?;
+    if reroot_shallow {
+        local::git::reroot_shallow_repository(
+            std::path::Path::new(&project.repo_path),
+            &project.baseline_branch,
+            source_repository.as_ref(),
+        )?;
+    }
     project.github_owner = owner;
     project.github_repo = repo;
     project.github_sync_enabled = false;
@@ -1113,19 +1168,18 @@ async fn push_project_for_sync(
 ) -> Result<local::model::LocalProject> {
     if local::git::resolve_github_token().is_none() {
         return Err(anyhow!(
-            "Connect GitHub first with gh auth login or a GitHub token."
+            "Connect GitHub first with `gh auth login` or a GitHub token."
         ));
     }
 
     let mut using_existing_repository = project.has_github_repository();
     if using_existing_repository {
-        if let Some(meta) =
-            local::github::repo_meta(&project.github_owner, &project.github_repo).await
-        {
-            if !meta.can_push || meta.archived {
-                project = create_independent_project_repository(project).await?;
-                using_existing_repository = false;
-            }
+        let can_push = local::github::repo_meta(&project.github_owner, &project.github_repo)
+            .await
+            .is_some_and(|meta| meta.can_push && !meta.archived);
+        if !can_push {
+            project = create_independent_project_repository(project).await?;
+            using_existing_repository = false;
         }
     } else {
         project = create_independent_project_repository(project).await?;
@@ -1133,11 +1187,10 @@ async fn push_project_for_sync(
     }
 
     let push_once = |project: &local::model::LocalProject| {
-        let mut project_for_push = project.clone();
-        project_for_push.github_sync_enabled = true;
-        tokio::task::spawn_blocking(move || push_project(&project_for_push))
+        let mut project = project.clone();
+        project.github_sync_enabled = true;
+        tokio::task::spawn_blocking(move || push_project(&project))
     };
-
     let first_push = push_once(&project)
         .await
         .map_err(|error| anyhow!("Git push task failed: {error}"))?;
@@ -1156,25 +1209,6 @@ async fn push_project_for_sync(
     Ok(project)
 }
 
-async fn publish_project_by_default(
-    project: local::model::LocalProject,
-) -> (local::model::LocalProject, Option<String>) {
-    if !crate::config::github_for_new_projects() || project.github_enabled() {
-        return (project, None);
-    }
-    match push_project_for_sync(project.clone()).await {
-        Ok(project) => (project, None),
-        Err(error) => {
-            let project = Store::open()
-                .and_then(|store| store.get_local_project(&project.id))
-                .ok()
-                .flatten()
-                .unwrap_or(project);
-            (project, Some(error.to_string()))
-        }
-    }
-}
-
 async fn enable_project_github(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
     reject_if_moving(&state)?;
     let _admission = state
@@ -1184,16 +1218,11 @@ async fn enable_project_github(State(state): State<AppState>, Path(id): Path<Str
     reject_if_moving(&state)?;
     let _lock = project_publication_lock(&state, &id).await;
     let store = Store::open()?;
-    let mut project = store
+    let project = store
         .get_local_project(&id)?
         .ok_or_else(|| not_found("project"))?;
-    project = push_project_for_sync(project).await.map_err(bad_request)?;
-    let git_status = tokio::task::spawn_blocking({
-        let project = project.clone();
-        move || project_git_json(&project)
-    })
-    .await
-    .map_err(|error| ApiError::from(anyhow!("git task failed: {error}")))?;
+    let project = push_project_for_sync(project).await.map_err(bad_request)?;
+    let git_status = project_git_json(&project);
     Ok(Json(
         json!({ "project": project_json(&project), "git": git_status }),
     ))
@@ -1244,6 +1273,41 @@ async fn push_project_github(State(state): State<AppState>, Path(id): Path<Strin
     Ok(Json(
         json!({ "project": project_json(&project), "git": git_status }),
     ))
+}
+
+async fn github_account() -> ApiResult {
+    Ok(Json(
+        json!({ "login": local::github::viewer_login().await }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct ProjectRepoPreviewQuery {
+    name: String,
+}
+
+async fn github_project_repo_preview(Query(q): Query<ProjectRepoPreviewQuery>) -> ApiResult {
+    let candidate = local::projects::project_slug_preview(&Store::open()?, q.name.trim())?;
+    let repo = local::github::available_project_repo_name(&candidate).await;
+    Ok(Json(json!({ "repo": repo })))
+}
+
+#[derive(Deserialize)]
+struct RepoAccessQuery {
+    owner: String,
+    repo: String,
+}
+
+async fn github_repo_access(Query(q): Query<RepoAccessQuery>) -> ApiResult {
+    let owner = q.owner.trim();
+    let repo = q.repo.trim();
+    if owner.is_empty() || repo.is_empty() {
+        return Err(bad_request("owner and repo are required"));
+    }
+    let meta = local::github::repo_meta(owner, repo).await;
+    Ok(Json(json!({
+        "canPush": meta.is_some_and(|meta| meta.can_push && !meta.archived),
+    })))
 }
 
 /// Mark a project visited: bumps updated_at, which drives the recency sort
@@ -1314,7 +1378,7 @@ async fn update_project(
 /// Delete a project and everything hanging off it. Refuses while runs are in
 /// flight (deleting their rows would strand the supervisor mid-job) — but
 /// requests their cancellation, so a retry shortly after goes through. The
-/// GitHub repo and the cache clone are left untouched.
+/// The registered repository folder is left untouched.
 async fn delete_project(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
     reject_if_moving(&state)?;
     let _deleting_project = state
@@ -1397,6 +1461,87 @@ async fn list_project_runs(Path(id): Path<String>) -> ApiResult {
     Ok(Json(json!({ "runs": runs })))
 }
 
+async fn compute_backends() -> Json<Value> {
+    Json(json!({ "backends": crate::compute::capabilities() }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateRunReq {
+    experiment_id: String,
+    backend: Option<String>,
+    flavor: Option<String>,
+    host: Option<String>,
+    manifest: Option<String>,
+    image: Option<String>,
+    timeout: Option<String>,
+    org: Option<String>,
+    provider: Option<String>,
+    disk: Option<i64>,
+    #[serde(default)]
+    force: bool,
+}
+
+async fn create_run(State(state): State<AppState>, Json(req): Json<CreateRunReq>) -> ApiResult {
+    reject_if_moving(&state)?;
+    let store = Store::open()?;
+    let experiment = store
+        .get_local_experiment(&req.experiment_id)?
+        .ok_or_else(|| not_found("experiment"))?;
+    let _admission = state
+        .project_lifecycle
+        .admit(&experiment.project_id)
+        .ok_or_else(|| bad_request("project deletion is in progress"))?;
+    let mut backend = req.backend;
+    let mut flavor = req.flavor;
+    local::apply_compute_default(&mut backend, &mut flavor);
+    let args = crate::ExpRunArgs {
+        exp_id: req.experiment_id,
+        gpu: None,
+        count: None,
+        disk: req.disk,
+        provider: req.provider,
+        cpu: None,
+        vcpus: None,
+        sandbox: None,
+        backend: Some(backend.unwrap_or_else(|| "local".to_string())),
+        flavor,
+        org: req.org,
+        host: req.host,
+        manifest: req.manifest,
+        image: req.image,
+        timeout: req.timeout,
+        force: req.force,
+    };
+    let run = crate::compute::submit(&args).await.map_err(bad_request)?;
+    Ok(Json(json!({ "run": ApiRun::from(&run) })))
+}
+
+fn backend_for_run(
+    run: &StoredRun,
+) -> std::result::Result<Box<dyn crate::compute::ComputeBackend>, ApiError> {
+    let descriptor =
+        crate::jobs::BackendDescriptor::parse(&run.backend_json).map_err(bad_request)?;
+    let id = descriptor
+        .kind
+        .strip_suffix("_job")
+        .unwrap_or(&descriptor.kind);
+    let id = if id == "k8s" { "k8s" } else { id };
+    crate::compute::backend(id).map_err(bad_request)
+}
+
+async fn get_run(Path(id): Path<String>) -> ApiResult {
+    let run = Store::open()?
+        .get_run(&id)?
+        .ok_or_else(|| not_found("run"))?;
+    let backend = backend_for_run(&run)?;
+    let run = backend.status(&run).await.map_err(bad_request)?;
+    if is_terminal(&run.status) {
+        backend.cleanup(&run).await.map_err(bad_request)?;
+    }
+    Ok(Json(json!({ "run": ApiRun::from(&run) })))
+}
+
 /// Newest-first cap for the cross-project instances list. Generous: the store
 /// is a local single-user SQLite db, so this only bounds pathological history.
 const INSTANCES_LIMIT: usize = 500;
@@ -1433,8 +1578,25 @@ async fn cancel_run(Path(id): Path<String>) -> ApiResult {
     if is_terminal(&run.status) {
         return Err(bad_request(format!("run already {}", run.status)));
     }
-    crate::commands::exp::request_local_run_cancel(&store, &run.id)?;
+    let backend = backend_for_run(&run)?;
+    backend.cancel(&run).await.map_err(bad_request)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct LogsQuery {
+    cursor: Option<u64>,
+}
+
+async fn run_logs(Path(id): Path<String>, Query(q): Query<LogsQuery>) -> ApiResult {
+    let run = Store::open()?
+        .get_run(&id)?
+        .ok_or_else(|| not_found("run"))?;
+    let batch = backend_for_run(&run)?
+        .logs(&run, crate::compute::LogCursor(q.cursor.unwrap_or(0)))
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(json!(batch)))
 }
 
 #[derive(Deserialize)]
@@ -2271,36 +2433,6 @@ fn data_dir_json() -> Value {
     })
 }
 
-/// The signed-in GitHub login, so "creates github.com/you/x" can name the real
-/// account. `null` when there's no usable token — the UI keeps saying "you".
-async fn github_account() -> ApiResult {
-    Ok(Json(
-        json!({ "login": local::github::viewer_login().await }),
-    ))
-}
-
-#[derive(Deserialize)]
-struct RepoAccessQuery {
-    owner: String,
-    repo: String,
-}
-
-/// Whether the stored credentials can push to `owner/repo`, so the New project
-/// form can drop the fork choice when it isn't one. Mirrors the create path:
-/// unknown (no token / API hiccup) counts as access, so the UI never nags about
-/// a fork the server wouldn't make.
-async fn github_repo_access(Query(q): Query<RepoAccessQuery>) -> ApiResult {
-    let owner = q.owner.trim().to_string();
-    let repo = q.repo.trim().to_string();
-    if owner.is_empty() || repo.is_empty() {
-        return Err(bad_request("owner and repo are required"));
-    }
-    let meta = local::github::repo_meta(&owner, &repo).await;
-    Ok(Json(json!({
-        "canPush": meta.map(|m| m.can_push && !m.archived).unwrap_or(true),
-    })))
-}
-
 async fn data_dir_settings() -> ApiResult {
     tokio::task::spawn_blocking(|| Ok(Json(data_dir_json())))
         .await
@@ -2551,25 +2683,16 @@ fn git_out(args: &[&str]) -> Option<String> {
 }
 
 fn git_settings_json() -> Value {
-    // Spawn failure means gh isn't installed — distinct from installed-but-
-    // signed-out, so the UI can lead with the right fix.
-    let gh = std::process::Command::new("gh")
-        .args(["auth", "token"])
-        .output();
-    let gh_installed = gh.is_ok();
-    let github_source = if std::env::var("GITHUB_TOKEN").is_ok_and(|t| !t.trim().is_empty()) {
-        Some("env")
-    } else if crate::config::synced_env_var("GITHUB_TOKEN").is_some() {
-        Some("stored")
-    } else {
-        matches!(gh, Ok(out) if out.status.success() && !out.stdout.is_empty()).then_some("gh")
-    };
+    let gh_installed = std::process::Command::new("gh")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
     json!({
         "gitVersion": git_out(&["--version"]),
         "userName": git_out(&["config", "--global", "user.name"]),
         "userEmail": git_out(&["config", "--global", "user.email"]),
         "ghInstalled": gh_installed,
-        "githubTokenSource": github_source,
+        "githubTokenSource": github_token_source(),
     })
 }
 
@@ -2584,9 +2707,7 @@ fn project_defaults_json() -> Value {
 }
 
 async fn project_defaults() -> ApiResult {
-    tokio::task::spawn_blocking(|| Ok(Json(project_defaults_json())))
-        .await
-        .map_err(|error| ApiError::from(anyhow!("project defaults task failed: {error}")))?
+    Ok(Json(project_defaults_json()))
 }
 
 #[derive(Deserialize)]
@@ -2598,21 +2719,16 @@ struct SetProjectDefaultsReq {
 }
 
 async fn set_project_defaults(Json(req): Json<SetProjectDefaultsReq>) -> ApiResult {
-    tokio::task::spawn_blocking(move || -> Result<Json<Value>> {
-        if req.github_for_new_projects && github_token_source().is_none() {
-            return Err(anyhow!(
-                "Connect GitHub before enabling it by default for new projects."
-            ));
-        }
-        crate::config::set_github_for_new_projects(req.github_for_new_projects)?;
-        if let Some(seen) = req.github_default_prompt_seen {
-            crate::config::set_github_default_prompt_seen(seen)?;
-        }
-        Ok(Json(project_defaults_json()))
-    })
-    .await
-    .map_err(|error| ApiError::from(anyhow!("project defaults task failed: {error}")))?
-    .map_err(bad_request)
+    if req.github_for_new_projects && github_token_source().is_none() {
+        return Err(bad_request(
+            "Connect GitHub before enabling it by default for new projects.",
+        ));
+    }
+    crate::config::set_github_for_new_projects(req.github_for_new_projects)?;
+    if let Some(seen) = req.github_default_prompt_seen {
+        crate::config::set_github_default_prompt_seen(seen)?;
+    }
+    Ok(Json(project_defaults_json()))
 }
 
 #[derive(Deserialize)]
@@ -2620,60 +2736,42 @@ struct SetGitTokenReq {
     token: String,
 }
 
-/// Validate a pasted GitHub token against the API, then persist it to the
-/// synced env file — the same store job launches already read, so local git
-/// ops and remote compute both pick it up.
 async fn set_git_token(Json(req): Json<SetGitTokenReq>) -> ApiResult {
     let token = req.token.trim().to_string();
     if token.is_empty() {
         return Err(bad_request("token is required"));
     }
-    let resp = reqwest::Client::new()
+    let response = reqwest::Client::new()
         .get("https://api.github.com/user")
         .header("User-Agent", "orx")
-        .header("Authorization", format!("Bearer {token}"))
+        .bearer_auth(&token)
         .send()
         .await
-        .map_err(|e| bad_request(format!("Could not reach api.github.com: {e}")))?;
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(bad_request(
-            "GitHub rejected the token — check it was copied fully.",
-        ));
-    }
-    if !resp.status().is_success() {
+        .map_err(|error| bad_request(format!("Could not reach api.github.com: {error}")))?;
+    if !response.status().is_success() {
         return Err(bad_request(format!(
-            "GitHub returned {} validating the token.",
-            resp.status()
+            "GitHub rejected the token ({}).",
+            response.status()
         )));
     }
-    // Classic PATs list scopes; fine-grained tokens send an empty header, so
-    // only enforce when scopes are reported.
-    let scopes = resp
+    let scopes = response
         .headers()
         .get("x-oauth-scopes")
-        .and_then(|v| v.to_str().ok())
+        .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
-    if !scopes.trim().is_empty() && !scopes.split(',').any(|s| s.trim() == "repo") {
+    if !scopes.trim().is_empty() && !scopes.split(',').any(|scope| scope.trim() == "repo") {
         return Err(bad_request(
-            "Token is valid but lacks the `repo` scope — private clones and branch pushes would fail.",
+            "Token is valid but lacks the `repo` scope needed for private repositories.",
         ));
     }
-    tokio::task::spawn_blocking(move || {
-        crate::config::write_synced_env_var("GITHUB_TOKEN", &token)?;
-        Ok(Json(git_settings_json()))
-    })
-    .await
-    .map_err(|e| ApiError::from(anyhow!("git task failed: {e}")))?
+    crate::config::write_synced_env_var("GITHUB_TOKEN", &token)?;
+    Ok(Json(git_settings_json()))
 }
 
 async fn delete_git_token() -> ApiResult {
-    tokio::task::spawn_blocking(|| {
-        crate::config::remove_synced_env_var("GITHUB_TOKEN")?;
-        Ok(Json(git_settings_json()))
-    })
-    .await
-    .map_err(|e| ApiError::from(anyhow!("git task failed: {e}")))?
+    crate::config::remove_synced_env_var("GITHUB_TOKEN")?;
+    Ok(Json(git_settings_json()))
 }
 
 async fn git_settings() -> ApiResult {
@@ -3002,7 +3100,7 @@ struct SshPreflightReq {
     host: String,
 }
 
-/// Live check for one host: can we reach it (BatchMode ssh), and is `git` there?
+/// Live check for one host: can we reach it and run bash/tar snapshots?
 async fn ssh_preflight(Json(req): Json<SshPreflightReq>) -> ApiResult {
     let host = req.host.trim().to_string();
     if host.is_empty() {
@@ -3012,7 +3110,7 @@ async fn ssh_preflight(Json(req): Json<SshPreflightReq>) -> ApiResult {
     let test = SshHostTest {
         host,
         reachable: p.reachable,
-        git_found: p.git_found,
+        tools_found: p.tools_found,
         error: p.error,
         tested_at: now_ms(),
     };
@@ -3099,7 +3197,7 @@ struct SlurmPreflightReq {
     host: String,
 }
 
-/// Live check for one login node: reachable, Slurm CLI + git present, and
+/// Live check for one login node: reachable, Slurm CLI + snapshot tools, and
 /// which partitions exist (feeds the partition picker).
 async fn slurm_preflight(Json(req): Json<SlurmPreflightReq>) -> ApiResult {
     let host = req.host.trim().to_string();
@@ -3110,7 +3208,7 @@ async fn slurm_preflight(Json(req): Json<SlurmPreflightReq>) -> ApiResult {
     Ok(Json(json!({
         "reachable": p.reachable,
         "slurmFound": p.slurm_found,
-        "gitFound": p.git_found,
+        "toolsFound": p.tools_found,
         "partitions": p.partitions,
         "error": p.error,
     })))
@@ -3262,7 +3360,7 @@ fn openresearch_summary(logged_in: bool, ssh: &SshReadiness) -> String {
     }
 }
 
-fn compute_settings_json(ssh: SshReadiness, github_enabled: bool) -> Value {
+fn compute_settings_json(ssh: SshReadiness) -> Value {
     let default = crate::config::compute_default();
     let (default_backend, default_flavor) = match &default {
         Some((b, f)) => (Some(b.as_str()), f.as_deref()),
@@ -3369,30 +3467,15 @@ fn compute_settings_json(ssh: SshReadiness, github_enabled: bool) -> Value {
     ]);
     if let Some(targets) = targets.as_array_mut() {
         for target in targets {
-            let local_target = target.get("id").and_then(Value::as_str) == Some("local");
-            let enabled = local_target || github_enabled;
             if let Some(target) = target.as_object_mut() {
-                target.insert("enabled".to_string(), Value::Bool(enabled));
-                target.insert(
-                    "disabledReason".to_string(),
-                    if enabled {
-                        Value::Null
-                    } else {
-                        Value::String("Connect GitHub to enable".to_string())
-                    },
-                );
+                target.insert("enabled".to_string(), Value::Bool(true));
+                target.insert("disabledReason".to_string(), Value::Null);
             }
         }
     }
-    let effective_backend = if github_enabled {
-        default_backend.unwrap_or("local")
-    } else {
-        "local"
-    };
-    let effective_flavor = github_enabled.then_some(default_flavor).flatten();
     json!({
-        "defaultBackend": effective_backend,
-        "defaultFlavor": effective_flavor,
+        "defaultBackend": default_backend.unwrap_or("local"),
+        "defaultFlavor": default_flavor,
         "configuredDefaultBackend": default_backend,
         "configuredDefaultFlavor": default_flavor,
         "targets": targets,
@@ -3405,26 +3488,14 @@ struct ComputeSettingsQuery {
     project_id: Option<String>,
 }
 
-fn project_github_enabled(project_id: Option<&str>) -> Result<bool> {
-    let Some(project_id) = project_id else {
-        return Ok(false);
-    };
-    Ok(Store::open()?
-        .get_local_project(project_id)?
-        .ok_or_else(|| anyhow!("project not found"))?
-        .github_enabled())
-}
-
 async fn compute_settings(Query(query): Query<ComputeSettingsQuery>) -> ApiResult {
     let ssh = openresearch_ssh_readiness().await;
-    let project_id = query.project_id;
+    let _project_id = query.project_id;
     // fs/env probes only, but keep them off the async runtime anyway.
-    let payload = tokio::task::spawn_blocking(move || -> Result<Value> {
-        let github_enabled = project_github_enabled(project_id.as_deref())?;
-        Ok(compute_settings_json(ssh, github_enabled))
-    })
-    .await
-    .map_err(|e| ApiError::from(anyhow!("compute settings task failed: {e}")))??;
+    let payload =
+        tokio::task::spawn_blocking(move || -> Result<Value> { Ok(compute_settings_json(ssh)) })
+            .await
+            .map_err(|e| ApiError::from(anyhow!("compute settings task failed: {e}")))??;
     Ok(Json(payload))
 }
 
@@ -3441,7 +3512,7 @@ struct SetComputeDefaultReq {
 /// (config state fluctuates outside orx; the UI warns instead) — only unknown
 /// backends and meaningless flavors are rejected.
 async fn set_compute_default(Json(req): Json<SetComputeDefaultReq>) -> ApiResult {
-    let github_enabled = project_github_enabled(req.project_id.as_deref())?;
+    let _project_id = req.project_id;
     let backend = req
         .backend
         .map(|b| b.trim().to_string())
@@ -3452,11 +3523,6 @@ async fn set_compute_default(Json(req): Json<SetComputeDefaultReq>) -> ApiResult
         .filter(|f| !f.is_empty());
     if let Some(b) = &backend {
         local::validate_compute_default(b, flavor.as_deref()).map_err(bad_request)?;
-        if b != "local" && !github_enabled {
-            return Err(bad_request(
-                "Connect GitHub for this project before selecting remote compute.",
-            ));
-        }
     }
     // Picking openresearch as the default is the moment to answer "will this
     // actually work?", so the row that comes back is honest about the SSH key.
@@ -3466,7 +3532,7 @@ async fn set_compute_default(Json(req): Json<SetComputeDefaultReq>) -> ApiResult
     // the plain ApiError conversion, not as a 400 blaming the request.
     let payload = tokio::task::spawn_blocking(move || -> Result<Value> {
         crate::config::set_compute_default(backend, flavor)?;
-        Ok(compute_settings_json(ssh, github_enabled))
+        Ok(compute_settings_json(ssh))
     })
     .await
     .map_err(|e| ApiError::from(anyhow!("compute default task failed: {e}")))??;

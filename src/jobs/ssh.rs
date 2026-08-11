@@ -7,7 +7,7 @@
 //! polls reuse one TCP session instead of a handshake apiece.
 //!
 //! The handle is a remote run directory `~/.orx/runs/<run_id>/` holding:
-//!   run.sh      the launcher (exported env + clone-and-run payload)
+//!   run.sh      the launcher (exported env + snapshot-and-run payload)
 //!   log         merged stdout/stderr
 //!   pid         the detached process-group leader
 //!   exit_code   written when the payload finishes
@@ -22,9 +22,47 @@ use tokio::process::Command;
 
 use crate::error::{anyhow, Result};
 
-/// Where ssh keeps its ControlMaster sockets. Created on first use.
+/// Keep sockets out of config paths, which can exceed macOS's 104-byte limit.
+#[cfg(unix)]
+fn control_dir() -> PathBuf {
+    use std::hash::{Hash as _, Hasher as _};
+
+    let uid = unsafe { libc::geteuid() };
+    let mut namespace = std::collections::hash_map::DefaultHasher::new();
+    crate::config::config_dir().hash(&mut namespace);
+    PathBuf::from("/tmp").join(format!("orx-ssh-{uid}-{:08x}", namespace.finish() as u32))
+}
+
+#[cfg(not(unix))]
 fn control_dir() -> PathBuf {
     crate::config::config_dir().join("ssh-cm")
+}
+
+fn prepare_control_dir() -> Result<()> {
+    let dir = control_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        anyhow!(
+            "Could not create SSH control directory {}: {e}",
+            dir.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let metadata = std::fs::symlink_metadata(&dir)?;
+        let uid = unsafe { libc::geteuid() };
+        if !metadata.file_type().is_dir() || metadata.uid() != uid {
+            return Err(anyhow!(
+                "SSH control path {} is not an owner-controlled directory.",
+                dir.display()
+            ));
+        }
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&dir, permissions)?;
+    }
+    Ok(())
 }
 
 /// An ssh endpoint. The classic ssh backend connects by `~/.ssh/config` alias
@@ -96,12 +134,8 @@ impl SshTarget {
 /// Shared ssh options: BatchMode (never hang on a prompt) + connection
 /// multiplexing so repeated polls are cheap.
 fn ssh_opts(target: &SshTarget) -> Vec<String> {
-    // Not ssh's %C token: the expanded path must fit in sun_path (104 bytes
-    // on macOS) and `<config dir>/ssh-cm/<40-hex>.<12-char tmp suffix>`
-    // overflows it for ordinary home dirs — ssh then fails outright rather
-    // than skip multiplexing. A 16-hex hash keeps it short. It folds in the
-    // extra opts (where %C folds in user/host/port) so `user@host -p 2222`
-    // and `user@host -p 2223` never share a control socket.
+    // A 16-hex hash leaves room for ssh's temporary bind suffix. It folds in
+    // the extra opts so different ports never share a control socket.
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     target.dest.hash(&mut h);
@@ -132,7 +166,15 @@ pub(crate) async fn ssh_run(
     remote_cmd: &str,
     stdin: Option<&str>,
 ) -> Result<String> {
-    let _ = std::fs::create_dir_all(control_dir());
+    ssh_run_bytes(target, remote_cmd, stdin.map(str::as_bytes)).await
+}
+
+async fn ssh_run_bytes(
+    target: &SshTarget,
+    remote_cmd: &str,
+    stdin: Option<&[u8]>,
+) -> Result<String> {
+    prepare_control_dir()?;
     let mut cmd = Command::new("ssh");
     cmd.args(ssh_opts(target))
         .arg("--")
@@ -155,7 +197,7 @@ pub(crate) async fn ssh_run(
     if let Some(input) = stdin {
         use tokio::io::AsyncWriteExt as _;
         if let Some(mut pipe) = child.stdin.take() {
-            let _ = pipe.write_all(input.as_bytes()).await;
+            let _ = pipe.write_all(input).await;
             drop(pipe); // EOF
         }
     }
@@ -179,6 +221,78 @@ pub(crate) async fn ssh_run(
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+async fn ssh_run_file(
+    target: &SshTarget,
+    remote_cmd: &str,
+    source: &std::path::Path,
+) -> Result<String> {
+    prepare_control_dir()?;
+    let mut child = Command::new("ssh")
+        .args(ssh_opts(target))
+        .arg("--")
+        .arg(&target.dest)
+        .arg(remote_cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow!("Could not run ssh: {e}"))?;
+    let mut file = tokio::fs::File::open(source).await?;
+    if let Some(mut pipe) = child.stdin.take() {
+        tokio::io::copy(&mut file, &mut pipe).await?;
+        drop(pipe);
+    }
+    let out = child
+        .wait_with_output()
+        .await
+        .map_err(|e| anyhow!("ssh wait failed: {e}"))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "ssh {} failed: {}",
+            target.dest,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Upload a content-addressed tar once, then materialize it into this run's
+/// private `repo/` directory. Both the cache write and extraction are safe to
+/// repeat after a client or supervisor restart.
+pub async fn stage_source(
+    target: &SshTarget,
+    run_id: &str,
+    archive: &std::path::Path,
+    digest: &str,
+) -> Result<String> {
+    let dir = format!(".orx/runs/{run_id}");
+    let cache = format!(".orx/source/{digest}.tar");
+    let present = ssh_run(
+        target,
+        &format!("test -f \"$HOME/{cache}\" && echo present || true"),
+        None,
+    )
+    .await?;
+    if present.trim() != "present" {
+        let upload = format!(
+            "umask 077; mkdir -p \"$HOME/.orx/source\"; \
+             tmp=\"$HOME/{cache}.tmp.$$\"; cat > \"$tmp\" && mv \"$tmp\" \"$HOME/{cache}\""
+        );
+        ssh_run_file(target, &upload, archive).await?;
+    }
+    ssh_run(
+        target,
+        &format!(
+            "umask 077; mkdir -p \"$HOME/.orx/runs\" \"$HOME/{dir}/repo\"; \
+             chmod 700 \"$HOME/.orx/runs\" \"$HOME/{dir}\" \"$HOME/{dir}/repo\"; \
+             tar -xf \"$HOME/{cache}\" -C \"$HOME/{dir}/repo\""
+        ),
+        None,
+    )
+    .await?;
+    Ok(dir)
+}
+
 /// Single-quote a value for safe embedding in the remote bash script.
 pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -189,7 +303,7 @@ pub struct SshJobSpec {
     pub target: SshTarget,
     /// Names the remote run dir `~/.orx/runs/<run_id>`.
     pub run_id: String,
-    /// The shared clone-and-run payload (`bash` script body).
+    /// The shared snapshot-and-run payload (`bash` script body).
     pub script: String,
     /// Exported inside run.sh on the remote (tokens, synced env).
     pub env: HashMap<String, String>,
@@ -320,29 +434,30 @@ pub async fn cancel_job(target: &SshTarget, dir: &str) -> Result<()> {
     Ok(())
 }
 
-/// Per-host readiness for the Settings UI: can we reach it, and is `git` there?
+/// Per-host readiness for the Settings UI: can we reach it and execute snapshots?
 pub struct SshPreflight {
     pub reachable: bool,
-    pub git_found: bool,
+    pub tools_found: bool,
     pub error: Option<String>,
 }
 
 pub async fn preflight(target: &SshTarget) -> SshPreflight {
     match ssh_run(
         target,
-        "command -v git >/dev/null 2>&1 && echo GIT_OK || echo NO_GIT",
+        "command -v bash >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 \
+         && echo TOOLS_OK || echo NO_TOOLS",
         None,
     )
     .await
     {
         Ok(out) => SshPreflight {
             reachable: true,
-            git_found: out.contains("GIT_OK"),
+            tools_found: out.contains("TOOLS_OK"),
             error: None,
         },
         Err(e) => SshPreflight {
             reachable: false,
-            git_found: false,
+            tools_found: false,
             error: Some(e.to_string()),
         },
     }
@@ -409,5 +524,22 @@ mod tests {
         };
         assert_ne!(control_path(&mk("22022")), control_path(&mk("22023")));
         assert_eq!(control_path(&mk("22022")), control_path(&mk("22022")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_path_fits_macos_unix_socket_limit() {
+        let option = ssh_opts(&SshTarget::host_port(
+            "root@ssh3.vast.ai".into(),
+            22,
+            HostKeyPolicy::Ephemeral,
+        ))
+        .into_iter()
+        .find(|o| o.starts_with("ControlPath="))
+        .unwrap();
+        let path = option.strip_prefix("ControlPath=").unwrap();
+
+        assert!(path.starts_with("/tmp/orx-ssh-"));
+        assert!(path.len() + 17 < 104, "{path}");
     }
 }
