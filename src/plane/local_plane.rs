@@ -137,12 +137,6 @@ impl ControlPlane for LocalPlane {
         println!("  id:      {}", project.id);
         println!("  repo:    {}", project.repo_path);
         println!("  branch:  {} (baseline)", project.baseline_branch);
-        if project.github_enabled() {
-            println!(
-                "  GitHub:  {}/{}",
-                project.github_owner, project.github_repo
-            );
-        }
         match project
             .run_command
             .as_deref()
@@ -296,29 +290,9 @@ impl ControlPlane for LocalPlane {
         // BEFORE the flag validations below, so e.g. `--host box1` with a default
         // of `ssh` is a valid launch, and before `backend_label` is captured, so
         // telemetry records the resolved backend.
-        let project_id = &self.experiment()?.project_id;
-        let github_enabled = self
-            .store
-            .get_local_project(project_id)?
-            .ok_or_else(|| anyhow!("Local project {project_id} not found."))?
-            .github_enabled();
-        if !github_enabled {
-            match args.backend.as_deref() {
-                None => {
-                    args.backend = Some("local".to_string());
-                }
-                Some("local") => {}
-                Some(_) => {
-                    return Err(anyhow!(
-                        "Remote compute requires this project's GitHub repository. Enable GitHub syncing for this project, then retry."
-                    ));
-                }
-            }
-        } else {
-            crate::local::apply_compute_default(&mut args.backend, &mut args.flavor);
-            if args.backend.is_none() {
-                args.backend = Some("local".to_string());
-            }
+        crate::local::apply_compute_default(&mut args.backend, &mut args.flavor);
+        if args.backend.is_none() {
+            args.backend = Some("local".to_string());
         }
         if args.manifest.is_some() && args.backend.as_deref() != Some("k8s") {
             return Err(anyhow!("--manifest only applies with --backend k8s."));
@@ -527,6 +501,19 @@ impl ControlPlane for LocalPlane {
             run_command,
         )?;
 
+        if project.github_enabled() {
+            if let Err(error) = crate::local::git::spawn_branch_publication(
+                std::path::Path::new(&project.repo_path),
+                &experiment.branch_name,
+                &project.github_owner,
+                &project.github_repo,
+            ) {
+                eprintln!(
+                    "  warning: experiment created locally, but GitHub sync could not start: {error}"
+                );
+            }
+        }
+
         println!("\u{2713} Created local {} experiment", kind);
         if defaulted_to_root {
             let root = parent_exp.as_ref().unwrap();
@@ -555,11 +542,7 @@ impl ControlPlane for LocalPlane {
         println!("  cd {}", project.repo_path);
         println!("  git checkout {}", experiment.branch_name);
         println!("  # …edit, then…");
-        if project.github_enabled() {
-            println!("  git commit -am \"<msg>\" && git push");
-        } else {
-            println!("  git commit -am \"<msg>\"");
-        }
+        println!("  git commit -am \"<msg>\"");
         Ok(())
     }
 

@@ -135,6 +135,8 @@ export interface ProjectPathStatus {
   directory: boolean | null;
   empty: boolean | null;
   initialized: boolean | null;
+  githubOwner?: string | null;
+  githubRepo?: string | null;
 }
 
 export const getProjectPathStatus = (path = "") => {
@@ -153,6 +155,7 @@ export interface NewProject {
   cloneUrl?: string;
   createFolder?: boolean;
   initializeGit?: boolean;
+  githubSyncEnabled?: boolean;
 }
 
 export interface CreateProjectResult {
@@ -185,9 +188,10 @@ export const searchPapers = (q: string) =>
  * `login` is null when there's no usable token. */
 export const githubAccount = () => get<{ login: string | null }>("/api/github/account");
 
-/** Whether the stored credentials can push to a repo. An unanswerable check
- * (no token / API hiccup) reports `true`, matching the server's own fallback,
- * so an outage never shows a fork choice the server wouldn't honour. */
+export const githubProjectRepoPreview = (name: string) =>
+  get<{ repo: string }>(`/api/github/project-repo-preview?name=${encodeURIComponent(name)}`);
+
+/** Whether the stored credentials are explicitly confirmed to push to a repo. */
 export const repoAccess = (owner: string, repo: string) =>
   get<{ canPush: boolean }>(
     `/api/github/repo-access?owner=${encodeURIComponent(owner)}&repo=${encodeURIComponent(repo)}`,
@@ -478,13 +482,13 @@ export const getSshHosts = () =>
 
 export interface SshPreflight {
   reachable: boolean;
-  gitFound: boolean;
+  toolsFound: boolean;
   error: string | null;
   /** Unix millis. */
   testedAt: number;
 }
 
-/** Live-test a host: reachable over ssh (BatchMode) and has `git`. */
+/** Live-test a host: reachable over ssh and has bash + tar for snapshots. */
 export const sshPreflight = (host: string) =>
   post<SshPreflight>("/api/settings/ssh/preflight", { host });
 
@@ -514,12 +518,12 @@ export const saveSlurmSettings = (body: {
 export interface SlurmPreflight {
   reachable: boolean;
   slurmFound: boolean;
-  gitFound: boolean;
+  toolsFound: boolean;
   partitions: string[];
   error: string | null;
 }
 
-/** Live-test a login node: reachable, Slurm CLI + git present, partitions. */
+/** Live-test a login node: reachable, Slurm CLI + snapshot tools present. */
 export const slurmPreflight = (host: string) =>
   post<SlurmPreflight>("/api/settings/slurm/preflight", { host });
 

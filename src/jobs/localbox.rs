@@ -141,10 +141,28 @@ pub fn inspect_job(dir: &Path) -> JobState {
         },
         // Dead pid: run.sh may have written exit_code and exited between the
         // check above and the ps probe — re-read before calling it killed.
-        Ok(_) => exit_code_state(dir).unwrap_or(JobState {
-            stage: "ERROR".into(),
-            message: Some("process died without an exit code (killed?)".into()),
-        }),
+        Ok(_) => {
+            for _ in 0..3 {
+                if let Some(state) = exit_code_state(dir) {
+                    return state;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if std::fs::metadata(dir.join("pid"))
+                .and_then(|metadata| metadata.modified())
+                .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
+                .is_ok_and(|age| age < std::time::Duration::from_secs(1))
+            {
+                return JobState {
+                    stage: "RUNNING".into(),
+                    message: None,
+                };
+            }
+            JobState {
+                stage: "ERROR".into(),
+                message: Some("process died without an exit code (killed?)".into()),
+            }
+        }
         // pid not written yet — just starting.
         Err(_) => JobState {
             stage: "RUNNING".into(),
