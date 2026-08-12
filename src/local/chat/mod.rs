@@ -3320,9 +3320,9 @@ pub fn set_chat_session_env(cmd: &mut tokio::process::Command, session_id: &str)
          ZDOTDIR=$_ORX_CHAT_SHIM_ZDOTDIR\n\
          export ORX_CHAT_TOOL_SCOPE=\"zsh-$$\"\n\
          export ORX_CHAT_TOOL_COMMAND=\"$ZSH_EXECUTION_STRING\"\n\
-         if [[ -z \"$ORX_CHAT_TARGET_FILE\" && -r \"$ORX_CHAT_TARGET_POINTER\" ]]; then\n\
+         if [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" && -r \"$ORX_CHAT_TARGET_POINTER\" ]]; then\n\
            export ORX_CHAT_TARGET_FILE=$(<\"$ORX_CHAT_TARGET_POINTER\")\n\
-         elif [[ -z \"$ORX_CHAT_TARGET_FILE\" ]]; then\n\
+         elif [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" ]]; then\n\
            unset ORX_CHAT_TARGET_FILE\n\
          fi\n",
         shell_single_quote(&original_zdotdir)
@@ -3346,7 +3346,7 @@ pub fn set_chat_session_env(cmd: &mut tokio::process::Command, session_id: &str)
         .map(|value| {
             format!(
                 "_ORX_CHAT_USER_BASH_ENV={}\n\
-                 _ORX_CHAT_USER_BASH_ENV=$(eval printf '%s' \"$_ORX_CHAT_USER_BASH_ENV\")\n\
+                 eval \"_ORX_CHAT_USER_BASH_ENV=\\\"$_ORX_CHAT_USER_BASH_ENV\\\"\"\n\
                  [[ -r \"$_ORX_CHAT_USER_BASH_ENV\" ]] && source \"$_ORX_CHAT_USER_BASH_ENV\"\n",
                 shell_single_quote(std::path::Path::new(&value))
             )
@@ -3356,9 +3356,9 @@ pub fn set_chat_session_env(cmd: &mut tokio::process::Command, session_id: &str)
         "{original_bash_env}\
          export ORX_CHAT_TOOL_SCOPE=\"bash-$$\"\n\
          export ORX_CHAT_TOOL_COMMAND=\"$BASH_EXECUTION_STRING\"\n\
-         if [[ -z \"$ORX_CHAT_TARGET_FILE\" && -r \"$ORX_CHAT_TARGET_POINTER\" ]]; then\n\
+         if [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" && -r \"$ORX_CHAT_TARGET_POINTER\" ]]; then\n\
            export ORX_CHAT_TARGET_FILE=$(<\"$ORX_CHAT_TARGET_POINTER\")\n\
-         elif [[ -z \"$ORX_CHAT_TARGET_FILE\" ]]; then\n\
+         elif [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" ]]; then\n\
            unset ORX_CHAT_TARGET_FILE\n\
          fi\n"
     );
