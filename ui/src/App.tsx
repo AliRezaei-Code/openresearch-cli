@@ -341,6 +341,14 @@ function upsert<T extends { id: string }>(list: T[], item: T): T[] {
   return next;
 }
 
+function useStableStringMap(next: Map<string, string>): Map<string, string> {
+  const current = useRef(next);
+  const unchanged = current.current.size === next.size
+    && [...next].every(([key, value]) => current.current.get(key) === value);
+  if (!unchanged) current.current = next;
+  return current.current;
+}
+
 export default function App() {
   const [projects, setProjects] = useState<Project[] | null>(null);
   const [uiState, setUiState] = useState<UiState | null>(null);
@@ -678,13 +686,49 @@ export default function App() {
   // experiment and open the terminal view focused on it.
   const openRunLogs = useCallback(
     (runId: string) => {
-      const run = runsRef.current.find((r) => r.id === runId);
+      const matches = runsRef.current.filter((run) => run.id === runId || run.id.startsWith(runId));
+      const run = matches.length === 1 ? matches[0] : null;
       if (!run) return;
-      setSelectedRunId(runId);
+      setSelectedRunId(run.id);
       openExperimentTab(run.experimentId, "terminal");
     },
     [openExperimentTab],
   );
+
+  const nextExperimentNames = useMemo(
+    () => new Map(experiments.map((experiment) => [experiment.id, experiment.title?.trim() || experiment.slug || "Experiment"])),
+    [experiments],
+  );
+  const experimentNames = useStableStringMap(nextExperimentNames);
+  const nextRunExperimentNames = useMemo(() => {
+    const names = new Map<string, string>();
+    for (const run of runs) {
+      names.set(run.id, experimentNames.get(run.experimentId) ?? "Experiment");
+    }
+    return names;
+  }, [experimentNames, runs]);
+  const runExperimentNames = useStableStringMap(nextRunExperimentNames);
+
+  const runExperimentName = useCallback((runId: string) => {
+    const exact = runExperimentNames.get(runId);
+    if (exact) return exact;
+    const matches = [...runExperimentNames].filter(([id]) => id.startsWith(runId));
+    return matches.length === 1 ? matches[0][1] : "";
+  }, [runExperimentNames]);
+
+  const experimentName = useCallback((experimentId: string) => {
+    const exact = experimentNames.get(experimentId);
+    if (exact) return exact;
+    const matches = [...experimentNames].filter(([id]) => id.startsWith(experimentId));
+    return matches.length === 1 ? matches[0][1] : "";
+  }, [experimentNames]);
+
+  const openExperimentNotes = useCallback((experimentId: string) => {
+    const matches = experimentsRef.current.filter(
+      (experiment) => experiment.id === experimentId || experiment.id.startsWith(experimentId),
+    );
+    if (matches.length === 1) openExperimentTab(matches[0].id, "overview");
+  }, [openExperimentTab]);
 
   const closeExperimentTab = useCallback(
     (tab: ExpViewDef) => {
@@ -732,13 +776,11 @@ export default function App() {
     [projects, projectId, selectRightTab],
   );
 
-  // Chat file chips carry an optional target line (`file:line`) and cited
-  // experiment (`exp`), never a branch ref — adapt to openFileTab's
-  // (path, session, ref, line, exp) shape while staying referentially stable
-  // for ChatPanel's memoized transcript.
+  // Chat file chips may carry a target line, cited experiment, or an exact Git
+  // ref from a `git show ref:path` tool call.
   const openChatFile = useCallback(
-    (path: string, sessionId?: string, line?: number, exp?: string) =>
-      openFileTab(path, sessionId, undefined, line, exp),
+    (path: string, sessionId?: string, line?: number, exp?: string, ref?: string) =>
+      openFileTab(path, sessionId, ref, line, exp),
     [openFileTab],
   );
 
@@ -1030,6 +1072,9 @@ export default function App() {
             onOpenArtifacts={openArtifactsTab}
             onOpenFile={openChatFile}
             onOpenRun={openRunLogs}
+            runExperimentName={runExperimentName}
+            onOpenExperiment={openExperimentNotes}
+            experimentName={experimentName}
             onOpenPlan={openPlanTab}
             onOpenSubagent={openSubagentTab}
             onOpenWorktree={openWorktreeTab}
@@ -1362,6 +1407,9 @@ export default function App() {
               spawnPartId={subagentTab.spawnPartId}
               onOpenFile={(path) => openFileTab(path, subagentTab.sessionId)}
               onOpenRun={openRunLogs}
+              runExperimentName={runExperimentName}
+              onOpenExperiment={openExperimentNotes}
+              experimentName={experimentName}
               onOpenSubagent={(pid) => openSubagentTab(subagentTab.sessionId, pid)}
             />
           ) : codeTab ? (

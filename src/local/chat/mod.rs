@@ -9,6 +9,8 @@
 //! the message and broadcasts it as a `chat.message` SSE event.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,32 +27,603 @@ use crate::store::{now_ms, Store, StoredChatMessage, StoredChatSession};
 
 /// Min interval between mid-turn persist+broadcast flushes (streaming parts
 /// can update many times a second; the final flush is always unconditional).
-const FLUSH_INTERVAL: Duration = Duration::from_millis(150);
+const FLUSH_INTERVAL: Duration = Duration::from_millis(75);
 
 /// Max chars of a tool part's `output`/`error` kept on the wire and in the
 /// store. Every flush re-broadcasts (and re-persists) the FULL assistant
-/// message, so uncapped tool outputs make each 150ms SSE frame O(total tool
+/// message, so uncapped tool outputs make each 75ms SSE frame O(total tool
 /// output) for the whole turn. The UI never shows more than 20k chars of a
 /// tool output anyway (ToolRow slices); capping below that keeps the
 /// truncation marker visible under the UI's own slice.
 const TOOL_TEXT_CAP: usize = 16_000;
 const TOOL_TEXT_TRUNCATION_MARKER: &str = "\n… [output truncated]";
+const TOOL_TARGET_CAP: usize = 256;
+const TOOL_TARGET_INSPECTION_CAP: usize = 1_024;
+const TOOL_TARGET_SCAN_BYTES: usize = 256_000;
+const CHAT_TARGET_FILE_ENV: &str = "ORX_CHAT_TARGET_FILE";
+const CHAT_TARGET_POINTER_ENV: &str = "ORX_CHAT_TARGET_POINTER";
 
-/// Truncate `text` to [`TOOL_TEXT_CAP`] chars (on a char boundary), marking
-/// the cut. Idempotent — an already-capped string is left alone.
+/// Keep the head and tail of `text` within [`TOOL_TEXT_CAP`] chars, marking
+/// the omitted middle. Idempotent — an already-capped string is left alone.
 fn cap_tool_text(text: &mut String) {
     // Bytes >= chars, so a string within the cap in bytes needs no scan.
-    if text.len() <= TOOL_TEXT_CAP || text.chars().count() <= TOOL_TEXT_CAP {
+    if text.len() <= TOOL_TEXT_CAP {
         return;
     }
-    let keep = TOOL_TEXT_CAP - TOOL_TEXT_TRUNCATION_MARKER.chars().count();
-    let cut = text
+    let char_count = text.chars().count();
+    if char_count <= TOOL_TEXT_CAP {
+        return;
+    }
+    let retained = TOOL_TEXT_CAP - TOOL_TEXT_TRUNCATION_MARKER.chars().count();
+    let head_chars = retained / 2;
+    let tail_chars = retained - head_chars;
+    let head_end = text
         .char_indices()
-        .nth(keep)
+        .nth(head_chars)
         .map(|(i, _)| i)
         .unwrap_or(text.len());
-    text.truncate(cut);
-    text.push_str(TOOL_TEXT_TRUNCATION_MARKER);
+    let tail_start = text
+        .char_indices()
+        .nth(char_count - tail_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    let mut capped = String::with_capacity(text.len().min(TOOL_TEXT_CAP));
+    capped.push_str(&text[..head_end]);
+    capped.push_str(TOOL_TEXT_TRUNCATION_MARKER);
+    capped.push_str(&text[tail_start..]);
+    *text = capped;
+}
+
+fn bounded_tool_scan_windows(text: &str) -> Vec<&str> {
+    if text.len() <= TOOL_TARGET_SCAN_BYTES {
+        return vec![text];
+    }
+    let window_bytes = TOOL_TARGET_SCAN_BYTES / 2;
+    let mut end = window_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut start = text.len() - window_bytes;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    vec![&text[..end], &text[start..]]
+}
+
+fn valid_tool_target(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (bytes.len() == 8 && bytes.iter().all(u8::is_ascii_hexdigit))
+        || (bytes.len() == 36
+            && bytes.iter().enumerate().all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    *byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            }))
+}
+
+fn tool_command(input: &serde_json::Map<String, Value>) -> &str {
+    let arguments = input.get("arguments").and_then(Value::as_object);
+    [
+        input.get("command"),
+        input.get("cmd"),
+        arguments.and_then(|a| a.get("command")),
+        arguments.and_then(|a| a.get("cmd")),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_str)
+    .unwrap_or("")
+}
+
+fn push_tool_target(targets: &mut Vec<String>, seen: &mut HashSet<String>, value: &str) {
+    if targets.len() >= TOOL_TARGET_CAP {
+        return;
+    }
+    let candidate = value.trim_matches(|char: char| !char.is_ascii_hexdigit() && char != '-');
+    if valid_tool_target(candidate) {
+        let normalized = candidate.to_ascii_lowercase();
+        if seen.insert(normalized.clone()) {
+            targets.push(normalized);
+        }
+    }
+}
+
+fn marker_tool_targets(
+    text: &str,
+    resource: &str,
+    targets: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    let marker = if resource == "runs" {
+        "[orx-run:"
+    } else {
+        "[orx-experiment:"
+    };
+    for line in text.lines() {
+        if targets.len() >= TOOL_TARGET_CAP {
+            break;
+        }
+        let trimmed = line.trim();
+        if let Some(start) = trimmed.find(marker) {
+            if let Some(value) = trimmed[start + marker.len()..].split(']').next() {
+                push_tool_target(targets, seen, value);
+            }
+        }
+    }
+}
+
+fn heuristic_tool_targets(
+    text: &str,
+    resource: &str,
+    targets: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    let endpoint = format!("/{resource}/");
+    for line in text.lines() {
+        if targets.len() >= TOOL_TARGET_CAP {
+            break;
+        }
+        let trimmed = line.trim();
+        if let Some(start) = trimmed.find(&endpoint) {
+            if let Some(value) = trimmed[start + endpoint.len()..]
+                .split(|char: char| !char.is_ascii_hexdigit() && char != '-')
+                .next()
+            {
+                push_tool_target(targets, seen, value);
+            }
+        }
+        if resource == "runs" {
+            let lower = trimmed.to_ascii_lowercase();
+            if let Some(value) = lower.strip_prefix("run id:") {
+                push_tool_target(targets, seen, value);
+            }
+        } else if let Some(value) = trimmed.strip_prefix("id:") {
+            push_tool_target(targets, seen, value);
+        }
+    }
+}
+
+fn strip_tool_target_markers(text: &mut String) {
+    if !text.contains("[orx-") {
+        return;
+    }
+    let filtered = text
+        .split_inclusive('\n')
+        .filter(|line| {
+            let trimmed = line.trim();
+            !(trimmed.starts_with("[orx-run:") || trimmed.starts_with("[orx-experiment:"))
+                || !trimmed.ends_with(']')
+        })
+        .collect::<String>();
+    *text = filtered;
+}
+
+fn preserve_tool_targets(state: &mut WireToolState) {
+    let Some(input) = state.input.as_mut().and_then(Value::as_object_mut) else {
+        return;
+    };
+    let normalized_command = tool_command(input)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let resource = if normalized_command.contains("orx logs") {
+        "runs"
+    } else if normalized_command.contains("orx exp status")
+        || normalized_command.contains("orx exp desc")
+    {
+        "experiments"
+    } else {
+        return;
+    };
+    let key = if resource == "runs" {
+        "runTargetIds"
+    } else {
+        "experimentTargetIds"
+    };
+    let authority_key = format!("{key}Authoritative");
+    let texts = [state.output.as_deref(), state.error.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let mut marker_targets = Vec::new();
+    let mut marker_seen = HashSet::new();
+    for text in &texts {
+        for window in bounded_tool_scan_windows(text) {
+            marker_tool_targets(window, resource, &mut marker_targets, &mut marker_seen);
+        }
+    }
+    let previously_authoritative = input
+        .get(&authority_key)
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let authoritative = !marker_targets.is_empty() || previously_authoritative;
+    let existing = input
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .take(TOOL_TARGET_INSPECTION_CAP)
+        .collect::<Vec<_>>();
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    if !marker_targets.is_empty() {
+        if previously_authoritative {
+            for target in existing {
+                push_tool_target(&mut targets, &mut seen, target);
+            }
+        }
+        for target in marker_targets {
+            push_tool_target(&mut targets, &mut seen, &target);
+        }
+    } else {
+        for target in existing {
+            push_tool_target(&mut targets, &mut seen, target);
+        }
+        if !authoritative {
+            for text in &texts {
+                for window in bounded_tool_scan_windows(text) {
+                    heuristic_tool_targets(window, resource, &mut targets, &mut seen);
+                }
+            }
+        }
+    }
+    if !targets.is_empty() {
+        input.insert(key.into(), json!(targets));
+    }
+    if authoritative {
+        input.insert(authority_key, Value::Bool(true));
+    }
+    if let Some(legacy) = input.get("targetIds").and_then(Value::as_array) {
+        let mut normalized = Vec::new();
+        let mut legacy_seen = HashSet::new();
+        for target in legacy
+            .iter()
+            .take(TOOL_TARGET_INSPECTION_CAP)
+            .filter_map(Value::as_str)
+        {
+            push_tool_target(&mut normalized, &mut legacy_seen, target);
+        }
+        input.insert("targetIds".into(), json!(normalized));
+    }
+    if let Some(output) = state.output.as_mut() {
+        cap_tool_text(output);
+    }
+    if let Some(error) = state.error.as_mut() {
+        cap_tool_text(error);
+    }
+    if let Some(output) = state.output.as_mut() {
+        strip_tool_target_markers(output);
+    }
+    if let Some(error) = state.error.as_mut() {
+        strip_tool_target_markers(error);
+    }
+}
+
+fn safe_session_name(session_id: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(session_id.len() * 2);
+    for byte in session_id.as_bytes() {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn target_event_path(session_id: &str, message_id: &str) -> PathBuf {
+    let safe = safe_session_name(session_id);
+    let message = safe_session_name(message_id);
+    crate::store::data_dir()
+        .join("chat-targets")
+        .join(format!("{safe}-{message}.events"))
+}
+
+fn target_event_pointer(session_id: &str) -> PathBuf {
+    crate::store::data_dir()
+        .join("chat-targets")
+        .join(format!("{}.current", safe_session_name(session_id)))
+}
+
+fn shell_hook_dir(session_id: &str) -> PathBuf {
+    crate::store::data_dir()
+        .join("chat-shell")
+        .join(safe_session_name(session_id))
+}
+
+fn target_event_start(session_id: &str, message_id: &str) -> (PathBuf, u64) {
+    let path = target_event_path(session_id, message_id);
+    let _ = std::fs::remove_file(&path);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::File::create(&path);
+    let _ = std::fs::write(
+        target_event_pointer(session_id),
+        path.to_string_lossy().as_bytes(),
+    );
+    (path, 0)
+}
+
+pub fn record_chat_target(resource: &str, target: &str) {
+    let Some(path) = std::env::var_os(CHAT_TARGET_FILE_ENV).map(PathBuf::from) else {
+        return;
+    };
+    if !matches!(resource, "runs" | "experiments") || !valid_tool_target(target) {
+        return;
+    }
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(path)
+    {
+        let scope = std::env::var("ORX_CHAT_TOOL_SCOPE").unwrap_or_default();
+        let command = std::env::var("ORX_CHAT_TOOL_COMMAND").unwrap_or_default();
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let event = json!({
+            "scope": scope.to_string(),
+            "command": command,
+            "cwd": cwd,
+            "resource": resource,
+            "target": target,
+        });
+        if let Ok(mut encoded) = serde_json::to_vec(&event) {
+            encoded.push(b'\n');
+            let mut lock = fd_lock::RwLock::new(file);
+            if let Ok(mut guard) = lock.write() {
+                let _ = guard.write_all(&encoded);
+            };
+        }
+    }
+}
+
+fn target_command_matches(command: &str, command_hint: &str, resource: &str) -> bool {
+    let resource_matches = if resource == "runs" {
+        command.contains("orx logs")
+    } else {
+        command.contains("orx exp status") || command.contains("orx exp desc")
+    };
+    resource_matches
+        && (command_hint.is_empty()
+            || command.contains(command_hint)
+            || command_hint.contains(command))
+}
+
+fn target_candidates(
+    parts: &[WirePart],
+    command_hint: &str,
+    resource: &str,
+    candidates: &mut Vec<(String, String, Option<String>)>,
+) {
+    for part in parts.iter().rev() {
+        target_candidates(&part.children, command_hint, resource, candidates);
+        let Some(input) = part
+            .state
+            .as_ref()
+            .and_then(|state| state.input.as_ref())
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        let command = tool_command(input)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        if target_command_matches(&command, command_hint, resource) {
+            let cwd = input
+                .get("cwd")
+                .or_else(|| input.get("workdir"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            candidates.push((part.id.clone(), command, cwd));
+        }
+    }
+}
+
+fn attach_target_to_ids(
+    parts: &mut [WirePart],
+    part_ids: &HashSet<String>,
+    resource: &str,
+    target: &str,
+) {
+    for part in parts {
+        attach_target_to_ids(&mut part.children, part_ids, resource, target);
+        if !part_ids.contains(&part.id) {
+            continue;
+        }
+        let Some(input) = part
+            .state
+            .as_mut()
+            .and_then(|state| state.input.as_mut())
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        let key = if resource == "runs" {
+            "runTargetIds"
+        } else {
+            "experimentTargetIds"
+        };
+        let mut targets = input
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .take(TOOL_TARGET_INSPECTION_CAP)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let mut seen = targets
+            .iter()
+            .map(|value| value.to_ascii_lowercase())
+            .collect();
+        push_tool_target(&mut targets, &mut seen, target);
+        input.insert(key.into(), json!(targets));
+        input.insert(format!("{key}Authoritative"), Value::Bool(true));
+    }
+}
+
+fn attach_target_event(
+    parts: &mut [WirePart],
+    bound_part_ids: Option<&[String]>,
+    claimed_part_ids: &HashSet<String>,
+    command_hint: &str,
+    cwd_hint: &str,
+    resource: &str,
+    target: &str,
+) -> Vec<String> {
+    let ids = if let Some(bound) = bound_part_ids {
+        bound.iter().cloned().collect::<HashSet<_>>()
+    } else {
+        let normalized_hint = command_hint
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        let mut candidates = Vec::new();
+        target_candidates(parts, &normalized_hint, resource, &mut candidates);
+        if !cwd_hint.is_empty()
+            && candidates
+                .iter()
+                .any(|(_, _, cwd)| cwd.as_deref() == Some(cwd_hint))
+        {
+            candidates.retain(|(_, _, cwd)| cwd.as_deref() == Some(cwd_hint));
+        }
+        candidates.retain(|(id, _, _)| !claimed_part_ids.contains(id));
+        let Some((_, selected_command, _)) = candidates.first() else {
+            return Vec::new();
+        };
+        let selected_command = selected_command.clone();
+        let ids = candidates
+            .into_iter()
+            .filter(|(_, command, _)| command == &selected_command)
+            .map(|(id, _, _)| id)
+            .collect::<HashSet<_>>();
+        if ids.len() != 1 {
+            return Vec::new();
+        }
+        ids
+    };
+    attach_target_to_ids(parts, &ids, resource, target);
+    ids.into_iter().collect()
+}
+
+fn reconcile_target_file(session_id: &str, message_id: &str) -> Option<WireMessage> {
+    let path = target_event_path(session_id, message_id);
+    let mut contents = String::new();
+    if let Ok(file) = std::fs::File::open(&path) {
+        let _ = file
+            .take(TOOL_TARGET_SCAN_BYTES as u64)
+            .read_to_string(&mut contents);
+    }
+    let Ok(store) = Store::open() else {
+        return None;
+    };
+    let Ok(messages) = store.list_chat_messages(session_id) else {
+        return None;
+    };
+    let stored = messages.iter().find(|message| message.id == message_id)?;
+    let mut message = stored_to_wire(stored);
+    let mut bindings = HashMap::new();
+    let mut claimed = HashSet::new();
+    for line in contents.lines().take(TOOL_TARGET_INSPECTION_CAP) {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let (Some(scope), Some(command), Some(resource), Some(target)) = (
+            event.get("scope").and_then(Value::as_str),
+            event.get("command").and_then(Value::as_str),
+            event.get("resource").and_then(Value::as_str),
+            event.get("target").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let cwd = event.get("cwd").and_then(Value::as_str).unwrap_or_default();
+        let bound = bindings.get(scope).map(Vec::as_slice);
+        let part_ids = attach_target_event(
+            &mut message.parts,
+            bound,
+            &claimed,
+            command,
+            cwd,
+            resource,
+            target,
+        );
+        if part_ids.is_empty() {
+            continue;
+        }
+        bindings
+            .entry(scope.to_string())
+            .or_insert_with(|| part_ids.clone());
+        claimed.extend(part_ids);
+    }
+    settle_interrupted_tool_parts(&mut message.parts);
+    if store
+        .upsert_chat_message(&StoredChatMessage {
+            id: message.id.clone(),
+            session_id: session_id.to_string(),
+            role: message.role.clone(),
+            parts_json: serde_json::to_string(&message.parts).unwrap_or_default(),
+            created_at: message.created_at,
+        })
+        .is_err()
+    {
+        return None;
+    }
+    let _ = std::fs::remove_file(path);
+    remove_target_pointer_if_matches(session_id, message_id);
+    Some(message)
+}
+
+fn settle_interrupted_tool_parts(parts: &mut [WirePart]) {
+    for part in parts {
+        settle_interrupted_tool_parts(&mut part.children);
+        if let Some(state) = part.state.as_mut() {
+            if state.status == "running" {
+                state.status = "interrupted".into();
+            }
+        }
+    }
+}
+
+fn remove_target_pointer_if_matches(session_id: &str, message_id: &str) {
+    let pointer = target_event_pointer(session_id);
+    let expected = target_event_path(session_id, message_id);
+    if std::fs::read_to_string(&pointer)
+        .ok()
+        .is_some_and(|path| path == expected.to_string_lossy())
+    {
+        let _ = std::fs::remove_file(pointer);
+    }
+}
+
+pub fn cleanup_session_transcript_artifacts(session_id: &str) {
+    let directory = crate::store::data_dir().join("chat-targets");
+    let prefix = format!("{}-", safe_session_name(session_id));
+    if let Ok(entries) = std::fs::read_dir(&directory) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with(&prefix) && name.ends_with(".events") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let _ = std::fs::remove_file(target_event_pointer(session_id));
+    let _ = std::fs::remove_dir_all(shell_hook_dir(session_id));
 }
 
 /// Find a part by id anywhere in the tree (depth-first), returning `&mut` to it.
@@ -78,20 +651,38 @@ pub fn upsert_preserving_children(parts: &mut Vec<WirePart>, mut part: WirePart)
             if part.children.is_empty() {
                 part.children = std::mem::take(&mut existing.children);
             }
+            if let (Some(incoming), Some(previous)) = (part.state.as_mut(), existing.state.as_ref())
+            {
+                if let (Some(incoming_input), Some(previous_input)) =
+                    (incoming.input.as_mut(), previous.input.as_ref())
+                {
+                    for key in [
+                        "runTargetIds",
+                        "runTargetIdsAuthoritative",
+                        "experimentTargetIds",
+                        "experimentTargetIdsAuthoritative",
+                        "targetIds",
+                    ] {
+                        if incoming_input.get(key).is_none() {
+                            if let Some(value) = previous_input.get(key) {
+                                incoming_input[key] = value.clone();
+                            }
+                        }
+                    }
+                }
+            }
             *existing = part;
         }
         None => parts.push(part),
     }
 }
 
-/// Cap every tool part's `output`/`error` in place. Applied on each flush —
-/// this covers every adapter (they all land parts on the turn's
-/// `assistant.parts`, some by direct mutation); an adapter that re-upserts a
-/// part with the full output just gets re-capped on the next flush. Recurses
-/// into `children` so a nested sub-agent transcript's output is bounded too.
+/// Bound every live tool part's `output`/`error` before persistence. The
+/// head-and-tail cap keeps accepting new tail output without growing memory.
 fn cap_tool_parts(parts: &mut [WirePart]) {
     for part in parts.iter_mut() {
         if let Some(state) = part.state.as_mut() {
+            preserve_tool_targets(state);
             if let Some(output) = state.output.as_mut() {
                 cap_tool_text(output);
             }
@@ -101,6 +692,26 @@ fn cap_tool_parts(parts: &mut [WirePart]) {
         }
         cap_tool_parts(&mut part.children);
     }
+}
+
+fn tool_state_signature(parts: &[WirePart]) -> Vec<(String, String)> {
+    fn collect(parts: &[WirePart], parent: &str, states: &mut Vec<(String, String)>) {
+        for part in parts {
+            let path = if parent.is_empty() {
+                part.id.clone()
+            } else {
+                format!("{parent}/{}", part.id)
+            };
+            if let Some(state) = &part.state {
+                states.push((path.clone(), state.status.clone()));
+            }
+            collect(&part.children, &path, states);
+        }
+    }
+
+    let mut states = Vec::new();
+    collect(parts, "", &mut states);
+    states
 }
 
 /// How long a bridge approval card may sit unanswered before it's denied and
@@ -470,12 +1081,14 @@ fn message_json(m: &WireMessage, session_id: &str) -> Value {
 }
 
 fn stored_to_wire(m: &StoredChatMessage) -> WireMessage {
-    WireMessage {
+    let mut message = WireMessage {
         id: m.id.clone(),
         role: m.role.clone(),
         parts: serde_json::from_str(&m.parts_json).unwrap_or_default(),
         created_at: m.created_at,
-    }
+    };
+    cap_tool_parts(&mut message.parts);
+    message
 }
 
 fn is_initial_chat_message(transcript_text: Option<&str>, has_messages: bool) -> bool {
@@ -639,10 +1252,10 @@ pub struct ChatHost {
     pub claude: Arc<crate::local::claude::ClaudeHost>,
     http: reqwest::Client,
     events: broadcast::Sender<(&'static str, Value)>,
-    /// Sessions with a turn in flight. A key present means busy; the value is
-    /// the running task's abort handle, or `None` while a turn is being set up
-    /// (reserved but not yet spawned — see `TurnGuard`).
-    turns: Mutex<HashMap<String, Option<tokio::task::AbortHandle>>>,
+    /// Sessions with a turn reserved, running, or settling after interruption.
+    /// A key remains present throughout the lifecycle, so a replacement turn
+    /// cannot race native shutdown for the preceding one.
+    turns: Mutex<HashMap<String, TurnState>>,
     deleting_sessions: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Per-session serialization for `respond`. Answering a prompt reads the
     /// card, delivers the answer (a non-idempotent POST for inline harnesses),
@@ -682,6 +1295,17 @@ pub struct ChatHost {
     /// a user Stop clears the whole queue. In-memory and uncommitted — a queued
     /// message only becomes a transcript bubble once it actually runs.
     queued: std::sync::Mutex<HashMap<String, VecDeque<QueuedMessage>>>,
+}
+
+struct ActiveTurn {
+    handle: tokio::task::JoinHandle<()>,
+    message_id: String,
+}
+
+enum TurnState {
+    Reserved,
+    Active(ActiveTurn),
+    Cancelling,
 }
 
 /// A user message parked while the session was busy, replayed verbatim through
@@ -738,7 +1362,7 @@ impl TurnGuard {
         {
             return None;
         }
-        turns.insert(session_id.to_string(), None);
+        turns.insert(session_id.to_string(), TurnState::Reserved);
         Some(Self {
             host: host.clone(),
             session_id: session_id.to_string(),
@@ -750,6 +1374,28 @@ impl TurnGuard {
     fn defuse(mut self) {
         self.armed = false;
     }
+
+    async fn release(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let removed = {
+            let mut turns = self.host.turns.lock().await;
+            if matches!(turns.get(&self.session_id), Some(TurnState::Reserved)) {
+                turns.remove(&self.session_id);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            self.host.emit(
+                "chat.busy",
+                json!({ "sessionId": &self.session_id, "busy": false }),
+            );
+        }
+    }
 }
 
 impl Drop for TurnGuard {
@@ -757,21 +1403,26 @@ impl Drop for TurnGuard {
         if !self.armed {
             return;
         }
-        // Setup failed before a turn was spawned: release the reservation. Only
-        // remove if it's still the unspawned reservation (None), never a live
-        // handle (some other path may have taken over).
-        //
-        // `try_lock` is safe here rather than a leak risk: an armed guard only
-        // drops on an early return from send_message's prologue, which never
-        // holds the `turns` lock (claim releases it immediately, and it's only
-        // re-acquired at the final upgrade after the guard is defused). So the
-        // lock is always free when an armed guard drops — the fallible lock can't
-        // actually fail in this path.
-        if let Ok(mut turns) = self.host.turns.try_lock() {
-            if matches!(turns.get(&self.session_id), Some(None)) {
-                turns.remove(&self.session_id);
+        let host = self.host.clone();
+        let session_id = self.session_id.clone();
+        tokio::spawn(async move {
+            let removed = {
+                let mut turns = host.turns.lock().await;
+                if matches!(turns.get(&session_id), Some(TurnState::Reserved)) {
+                    turns.remove(&session_id);
+                    true
+                } else {
+                    false
+                }
+            };
+            if removed {
+                host.emit(
+                    "chat.busy",
+                    json!({ "sessionId": &session_id, "busy": false }),
+                );
+                host.drain_queue(&session_id).await;
             }
-        }
+        });
     }
 }
 
@@ -1177,6 +1828,12 @@ impl ChatHost {
                 .send_message_showing(session_id, text, None, overrides, images, false)
                 .await
             {
+                while matches!(
+                    self.turns.lock().await.get(session_id),
+                    Some(TurnState::Reserved)
+                ) {
+                    tokio::task::yield_now().await;
+                }
                 // Re-park only for the genuine race: a fresh send claimed the
                 // slot in the gap after `finish_turn` freed it (session busy
                 // again), so restore the messages up front and let that turn
@@ -1232,24 +1889,34 @@ impl ChatHost {
         // reservation happen under one lock so two concurrent sends (or a
         // send racing a /respond resume) can't both spawn a turn against the
         // same session. `_guard` releases the reservation on any early error.
-        let _guard = match TurnGuard::claim(self, session_id).await {
+        let mut guard = match TurnGuard::claim(self, session_id).await {
             Some(guard) => guard,
             // Busy: park a genuine user send (Claude-desktop steering) so it
             // runs when the turn ends, instead of rejecting it. System/resume
             // sends pass `queue_if_busy = false` and keep the old rejection.
             None if queue_if_busy && !(text.trim().is_empty() && images.is_empty()) => {
-                self.queued
-                    .lock()
-                    .unwrap()
-                    .entry(session_id.to_string())
-                    .or_default()
-                    .push_back(QueuedMessage {
-                        id: format!("q_{}", uuid::Uuid::new_v4()),
-                        text,
-                        overrides,
-                        images,
-                    });
+                let idle = {
+                    let turns = self.turns.lock().await;
+                    if matches!(turns.get(session_id), Some(TurnState::Cancelling)) {
+                        return Err(anyhow!("session is stopping — send again once it is idle"));
+                    }
+                    self.queued
+                        .lock()
+                        .unwrap()
+                        .entry(session_id.to_string())
+                        .or_default()
+                        .push_back(QueuedMessage {
+                            id: format!("q_{}", uuid::Uuid::new_v4()),
+                            text,
+                            overrides,
+                            images,
+                        });
+                    !turns.contains_key(session_id)
+                };
                 self.emit_queued(session_id);
+                if idle {
+                    self.drain_queue(session_id).await;
+                }
                 return Ok(());
             }
             None => return Err(anyhow!("session is busy — interrupt it first")),
@@ -1408,6 +2075,7 @@ impl ChatHost {
         }
 
         let sid = session.id.clone();
+        let assistant_message_id = format!("msg_{}", uuid::Uuid::new_v4());
         let mut ctx = TurnCtx {
             host: self.clone(),
             session_id: session.id.clone(),
@@ -1423,7 +2091,7 @@ impl ChatHost {
             project,
             text: turn_text,
             assistant: WireMessage {
-                id: format!("msg_{}", uuid::Uuid::new_v4()),
+                id: assistant_message_id,
                 role: "assistant".into(),
                 parts: Vec::new(),
                 created_at: now_ms(),
@@ -1436,19 +2104,31 @@ impl ChatHost {
                 .as_deref()
                 .and_then(|json| serde_json::from_str(json).ok()),
             last_flush: Instant::now() - FLUSH_INTERVAL,
+            last_flushed_tool_states: Vec::new(),
+            last_attempted_tool_states: Vec::new(),
+            target_event_path: None,
+            target_event_offset: 0,
+            pending_target_events: Vec::new(),
+            target_event_bindings: HashMap::new(),
         };
-        // Upgrade the reservation None→Some(handle), atomically re-checking that
+        // Upgrade the reservation to a live handle, atomically re-checking that
         // it's still ours: an `interrupt` racing the prologue above may have
         // removed the reservation, while deletion also closes admission before
         // it interrupts. In either case no harness task may start.
         {
             let mut turns = self.turns.lock().await;
             if self.deleting_sessions.lock().unwrap().contains(&sid)
-                || !matches!(turns.get(&sid), Some(None))
+                || !matches!(turns.get(&sid), Some(TurnState::Reserved))
             {
-                _guard.defuse();
+                drop(turns);
+                guard.release().await;
                 return Ok(());
             }
+            let (target_path, target_event_offset) =
+                target_event_start(&session.id, &ctx.assistant.id);
+            ctx.target_event_path = Some(target_path);
+            ctx.target_event_offset = target_event_offset;
+            let message_id = ctx.assistant.id.clone();
             let task = tokio::spawn(async move {
                 let result = match crate::local::harness::chat_harness(&ctx.harness) {
                     Some(harness) => harness.run_turn(&mut ctx).await,
@@ -1458,29 +2138,59 @@ impl ChatHost {
                     ctx.push_error(format!("{err}"));
                 }
                 let _ = ctx.flush();
+                if let Some(path) = ctx.target_event_path.as_ref() {
+                    let _ = std::fs::remove_file(path);
+                }
+                remove_target_pointer_if_matches(&ctx.session_id, &ctx.assistant.id);
                 if let Some(usage) = &ctx.context_usage {
                     if let (Ok(store), Ok(json)) = (Store::open(), serde_json::to_string(usage)) {
                         let _ = store.set_chat_session_context_usage(&ctx.session_id, &json);
                     }
                 }
-                ctx.host.finish_turn(&ctx.session_id).await;
+                ctx.host
+                    .finish_turn(&ctx.session_id, Some(&ctx.assistant.id))
+                    .await;
                 // Natural completion only: a user Stop aborts this task before
                 // it reaches here (and clears the queue itself), so an
                 // interrupted turn never drains.
                 ctx.host.drain_queue(&ctx.session_id).await;
             });
-            turns.insert(sid, Some(task.abort_handle()));
+            turns.insert(
+                sid,
+                TurnState::Active(ActiveTurn {
+                    handle: task,
+                    message_id,
+                }),
+            );
             if let Some(seed) = title_seed {
                 self.spawn_title_generation(session.id.clone(), session.harness.clone(), seed);
             }
-            _guard.defuse();
+            guard.defuse();
         }
         Ok(())
     }
 
     /// Turn cleanup: drop the handle, bump the session, broadcast idle.
-    async fn finish_turn(&self, session_id: &str) {
-        self.turns.lock().await.remove(session_id);
+    async fn finish_turn(&self, session_id: &str, message_id: Option<&str>) {
+        let should_finish = {
+            let mut turns = self.turns.lock().await;
+            let matches = match (turns.get(session_id), message_id) {
+                (Some(TurnState::Active(active)), Some(message_id)) => {
+                    active.message_id == message_id
+                }
+                (Some(TurnState::Cancelling), None) => true,
+                _ => false,
+            };
+            if matches {
+                turns.remove(session_id);
+                true
+            } else {
+                false
+            }
+        };
+        if !should_finish {
+            return;
+        }
         // Any bridge card still pending belongs to the turn that just ended —
         // deny it so the (dying) bridge child's long-poll unblocks.
         self.cancel_pending_permissions(session_id);
@@ -1499,47 +2209,64 @@ impl ChatHost {
         );
     }
 
+    async fn finish_interruption(self: &Arc<Self>, session_id: &str) {
+        self.finish_turn(session_id, None).await;
+    }
+
     /// Abort an in-flight turn. Child processes die via kill_on_drop; the
     /// opencode adapter additionally gets a native abort so the serve process
     /// stops generating. Returns whether a turn (or a reservation) was
     /// actually aborted — `false` means the session was already idle.
-    pub async fn interrupt(&self, session_id: &str) -> Result<bool> {
-        // Outer None: not busy. Inner None: reserved but not yet spawned — the
-        // reservation is now cleared, so send_message's guard will abort setup.
-        let Some(handle) = self.turns.lock().await.remove(session_id) else {
-            return Ok(false);
-        };
-        if let Ok(store) = Store::open() {
-            if let Ok(Some(session)) = store.get_chat_session(session_id) {
-                if session.harness == "opencode" {
-                    if let (Some(nid), Some(port)) = (
-                        &session.native_session_id,
-                        self.opencode.port_for(session_id).await,
-                    ) {
-                        let url = format!("http://127.0.0.1:{port}/session/{nid}/abort");
-                        let _ = self.http.post(url).body("{}").send().await;
-                    }
-                } else if session.harness == "codex" {
-                    // Native turn/interrupt so the app-server stops generating
-                    // (and settles the turn as "interrupted" in its rollout)
-                    // instead of only losing its orx-side listener.
-                    self.codex.interrupt_session(session_id).await;
-                } else if session.harness == "claude-code" {
-                    // The load-bearing change: a resident claude child survives
-                    // task-abort/kill_on_drop, so aborting the turn task leaves
-                    // it generating with no listener. Kill it — v1 has no
-                    // reliable native interrupt (the control request gave no
-                    // response). The next turn respawns with `--resume`,
-                    // recovering this session's context (today-identical
-                    // semantics).
-                    self.claude.kill_session(session_id).await;
-                }
+    pub async fn interrupt(self: &Arc<Self>, session_id: &str) -> Result<bool> {
+        let active = {
+            let mut turns = self.turns.lock().await;
+            let Some(state) = turns.get_mut(session_id) else {
+                return Ok(false);
+            };
+            match std::mem::replace(state, TurnState::Cancelling) {
+                TurnState::Active(active) => Some(active),
+                TurnState::Reserved => None,
+                TurnState::Cancelling => return Ok(false),
             }
-        }
-        if let Some(handle) = handle {
-            handle.abort();
-        }
-        self.finish_turn(session_id).await;
+        };
+        let host = self.clone();
+        let session_id = session_id.to_string();
+        let settlement = tokio::spawn(async move {
+            host.cancel_pending_permissions(&session_id);
+            let native_shutdown = async {
+                if let Ok(store) = Store::open() {
+                    if let Ok(Some(session)) = store.get_chat_session(&session_id) {
+                        if session.harness == "opencode" {
+                            if let (Some(nid), Some(port)) = (
+                                &session.native_session_id,
+                                host.opencode.port_for(&session_id).await,
+                            ) {
+                                let url = format!("http://127.0.0.1:{port}/session/{nid}/abort");
+                                let _ = host.http.post(url).body("{}").send().await;
+                            }
+                        } else if session.harness == "codex" {
+                            host.codex.interrupt_session(&session_id).await;
+                        } else if session.harness == "claude-code" {
+                            host.claude.kill_session(&session_id).await;
+                        }
+                    }
+                }
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(10), native_shutdown).await;
+            if let Some(active) = active.as_ref() {
+                active.handle.abort();
+            }
+            if let Some(active) = active {
+                let _ = active.handle.await;
+                if let Some(message) = reconcile_target_file(&session_id, &active.message_id) {
+                    host.emit("chat.message", message_json(&message, &session_id));
+                }
+                let _ = std::fs::remove_file(target_event_path(&session_id, &active.message_id));
+                remove_target_pointer_if_matches(&session_id, &active.message_id);
+            }
+            host.finish_interruption(&session_id).await;
+        });
+        let _ = settlement.await;
         Ok(true)
     }
 
@@ -1551,7 +2278,7 @@ impl ChatHost {
     /// Internal interrupts (plan-approval resume, session/project delete) stay
     /// markerless on purpose: their stories are told elsewhere (the resolved
     /// card, the row disappearing).
-    pub async fn interrupt_by_user(&self, session_id: &str) -> Result<()> {
+    pub async fn interrupt_by_user(self: &Arc<Self>, session_id: &str) -> Result<()> {
         // Stamped before the abort: a fast resend can claim the freed slot and
         // persist its user message before this runs, and a later timestamp
         // would sort the marker after that new bubble. (The live broadcast can
@@ -1564,6 +2291,7 @@ impl ChatHost {
         if !self.interrupt(session_id).await? {
             return Ok(());
         }
+        self.clear_queue(session_id);
         let msg = WireMessage {
             id: format!("msg_{}", uuid::Uuid::new_v4()),
             role: "assistant".into(),
@@ -1823,7 +2551,7 @@ impl ChatHost {
         Ok(self.emit_session(store.get_chat_session(session_id)?).await)
     }
 
-    pub async fn delete_session(&self, session_id: &str) -> Result<()> {
+    pub async fn delete_session(self: &Arc<Self>, session_id: &str) -> Result<()> {
         let _deleting = self
             .begin_session_delete(session_id)
             .ok_or_else(|| anyhow!("session deletion is already in progress"))?;
@@ -1841,6 +2569,7 @@ impl ChatHost {
         store.delete_chat_session(session_id)?;
         self.emit("chat.session.deleted", json!({ "sessionId": session_id }));
         if let Some(session) = session {
+            cleanup_session_transcript_artifacts(&session.id);
             if let Ok(Some(project)) = store.get_local_project(&session.project_id) {
                 cleanup_session_worktree(&project, session_id);
             }
@@ -2110,6 +2839,12 @@ pub struct TurnCtx {
     /// turn end; `report_usage` also streams it live over `chat.usage`.
     pub context_usage: Option<ContextUsage>,
     last_flush: Instant,
+    last_flushed_tool_states: Vec<(String, String)>,
+    last_attempted_tool_states: Vec<(String, String)>,
+    target_event_path: Option<PathBuf>,
+    target_event_offset: u64,
+    pending_target_events: Vec<(String, String, String, String, String)>,
+    target_event_bindings: HashMap<String, Vec<String>>,
 }
 
 impl TurnCtx {
@@ -2158,7 +2893,94 @@ impl TurnCtx {
             },
             context_usage: None,
             last_flush: Instant::now(),
+            last_flushed_tool_states: Vec::new(),
+            last_attempted_tool_states: Vec::new(),
+            target_event_path: None,
+            target_event_offset: 0,
+            pending_target_events: Vec::new(),
+            target_event_bindings: HashMap::new(),
         }
+    }
+
+    fn apply_target_events(&mut self) {
+        if let Some(path) = self.target_event_path.as_ref() {
+            if let Ok(mut file) = std::fs::File::open(path) {
+                if let Ok(length) = file.metadata().map(|metadata| metadata.len()) {
+                    if length < self.target_event_offset {
+                        self.target_event_offset = 0;
+                    }
+                    if file.seek(SeekFrom::Start(self.target_event_offset)).is_ok() {
+                        let mut pending = String::new();
+                        if file
+                            .take(TOOL_TARGET_SCAN_BYTES as u64)
+                            .read_to_string(&mut pending)
+                            .is_ok()
+                        {
+                            if let Some(complete_end) = pending.rfind('\n').map(|index| index + 1) {
+                                for line in pending[..complete_end].lines() {
+                                    let Ok(event) = serde_json::from_str::<Value>(line) else {
+                                        continue;
+                                    };
+                                    let (Some(scope), Some(command), Some(resource), Some(target)) = (
+                                        event.get("scope").and_then(Value::as_str),
+                                        event.get("command").and_then(Value::as_str),
+                                        event.get("resource").and_then(Value::as_str),
+                                        event.get("target").and_then(Value::as_str),
+                                    ) else {
+                                        continue;
+                                    };
+                                    let cwd = event
+                                        .get("cwd")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default();
+                                    if self.pending_target_events.len() < TOOL_TARGET_INSPECTION_CAP
+                                    {
+                                        self.pending_target_events.push((
+                                            scope.to_string(),
+                                            command.to_string(),
+                                            cwd.to_string(),
+                                            resource.to_string(),
+                                            target.to_string(),
+                                        ));
+                                    }
+                                }
+                                self.target_event_offset += complete_end as u64;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut claimed = self
+            .target_event_bindings
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut remaining = Vec::new();
+        for (scope, command, cwd, resource, target) in
+            std::mem::take(&mut self.pending_target_events)
+        {
+            let bound = self.target_event_bindings.get(&scope).map(Vec::as_slice);
+            let part_ids = attach_target_event(
+                &mut self.assistant.parts,
+                bound,
+                &claimed,
+                &command,
+                &cwd,
+                &resource,
+                &target,
+            );
+            if part_ids.is_empty() {
+                remaining.push((scope, command, cwd, resource, target));
+                continue;
+            }
+            self.target_event_bindings
+                .entry(scope)
+                .or_insert_with(|| part_ids.clone());
+            claimed.extend(part_ids);
+        }
+        self.pending_target_events = remaining;
     }
 
     /// Record the harness's own session id (CLIs mint/rotate them per turn).
@@ -2216,10 +3038,7 @@ impl TurnCtx {
 
     /// Insert or replace a part by id, preserving arrival order.
     pub fn upsert_part(&mut self, part: WirePart) {
-        match self.assistant.parts.iter_mut().find(|p| p.id == part.id) {
-            Some(existing) => *existing = part,
-            None => self.assistant.parts.push(part),
-        }
+        upsert_preserving_children(&mut self.assistant.parts, part);
     }
 
     /// Like `upsert_part`, but carries forward an existing part's `children` when
@@ -2277,7 +3096,11 @@ impl TurnCtx {
 
     /// Persist + broadcast the assistant message, rate-limited mid-turn.
     pub fn maybe_flush(&mut self) {
-        if self.last_flush.elapsed() >= FLUSH_INTERVAL {
+        let tool_states = tool_state_signature(&self.assistant.parts);
+        let unattempted_state = tool_states != self.last_flushed_tool_states
+            && tool_states != self.last_attempted_tool_states;
+        if unattempted_state || self.last_flush.elapsed() >= FLUSH_INTERVAL {
+            self.last_attempted_tool_states = tool_states;
             let _ = self.flush();
         }
     }
@@ -2287,6 +3110,7 @@ impl TurnCtx {
         if self.assistant.parts.is_empty() {
             return Ok(());
         }
+        self.apply_target_events();
         cap_tool_parts(&mut self.assistant.parts);
         let store = Store::open()?;
         // A prompt card the harness surfaced mid-turn (opencode's inline
@@ -2299,7 +3123,7 @@ impl TurnCtx {
         // (else that reconcile-then-clobber is a lost update). Only pay the lock
         // when this message actually carries a prompt part.
         let has_prompt = self.assistant.parts.iter().any(|p| p.prompt.is_some());
-        {
+        let wire_assistant = {
             // Clone the host handle so the guard borrows it, not `self` — the
             // reconcile below needs `&mut self`.
             let host = self.host.clone();
@@ -2307,18 +3131,23 @@ impl TurnCtx {
             if has_prompt {
                 self.adopt_resolved_prompts(&store);
             }
+            let mut wire_assistant = self.assistant.clone();
+            cap_tool_parts(&mut wire_assistant.parts);
             store.upsert_chat_message(&StoredChatMessage {
-                id: self.assistant.id.clone(),
+                id: wire_assistant.id.clone(),
                 session_id: self.session_id.clone(),
-                role: "assistant".into(),
-                parts_json: serde_json::to_string(&self.assistant.parts)?,
-                created_at: self.assistant.created_at,
+                role: wire_assistant.role.clone(),
+                parts_json: serde_json::to_string(&wire_assistant.parts)?,
+                created_at: wire_assistant.created_at,
             })?;
-        }
+            wire_assistant
+        };
         self.host.emit(
             "chat.message",
-            message_json(&self.assistant, &self.session_id),
+            message_json(&wire_assistant, &self.session_id),
         );
+        self.last_flushed_tool_states = tool_state_signature(&self.assistant.parts);
+        self.last_attempted_tool_states = self.last_flushed_tool_states.clone();
         Ok(())
     }
 
@@ -2476,12 +3305,115 @@ pub const CHAT_SESSION_ENV: &str = "ORX_CHAT_SESSION_ID";
 /// attribution — presence of a session id alone no longer implies local.
 pub const LOCAL_SESSION_ENV: &str = "ORX_LOCAL_SESSION";
 
+fn shell_single_quote(path: &std::path::Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+fn zsh_startup_wrapper(name: &str) -> String {
+    format!(
+        "_ORX_CHAT_SHIM_ZDOTDIR=$ZDOTDIR\n\
+         ZDOTDIR=$_ORX_CHAT_USER_ZDOTDIR\n\
+         [[ -r \"$ZDOTDIR/{name}\" ]] && source \"$ZDOTDIR/{name}\"\n\
+         _ORX_CHAT_USER_ZDOTDIR=$ZDOTDIR\n\
+         ZDOTDIR=$_ORX_CHAT_SHIM_ZDOTDIR\n"
+    )
+}
+
+fn zshenv_hook(original_zdotdir: &std::path::Path) -> String {
+    format!(
+        "_ORX_CHAT_SHIM_ZDOTDIR=$ZDOTDIR\n\
+         _ORX_CHAT_USER_ZDOTDIR={}\n\
+         ZDOTDIR=$_ORX_CHAT_USER_ZDOTDIR\n\
+         [[ -r \"$ZDOTDIR/.zshenv\" ]] && source \"$ZDOTDIR/.zshenv\"\n\
+         _ORX_CHAT_USER_ZDOTDIR=$ZDOTDIR\n\
+         ZDOTDIR=$_ORX_CHAT_SHIM_ZDOTDIR\n\
+         export ORX_CHAT_TOOL_SCOPE=\"zsh-$$\"\n\
+         export ORX_CHAT_TOOL_COMMAND=\"${{ZSH_EXECUTION_STRING-}}\"\n\
+         if [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" && -r \"${{ORX_CHAT_TARGET_POINTER-}}\" ]]; then\n\
+           export ORX_CHAT_TARGET_FILE=$(<\"$ORX_CHAT_TARGET_POINTER\")\n\
+         elif [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" ]]; then\n\
+           unset ORX_CHAT_TARGET_FILE\n\
+         fi\n",
+        shell_single_quote(original_zdotdir)
+    )
+}
+
+fn bash_env_hook(original: Option<String>) -> String {
+    let source = original
+        .map(|value| {
+            format!(
+                "_ORX_CHAT_USER_BASH_ENV={}\n\
+                 eval \"_ORX_CHAT_USER_BASH_ENV=\\\"$_ORX_CHAT_USER_BASH_ENV\\\"\"\n\
+                 [[ -r \"$_ORX_CHAT_USER_BASH_ENV\" ]] && source \"$_ORX_CHAT_USER_BASH_ENV\"\n",
+                shell_single_quote(std::path::Path::new(&value))
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "{source}\
+         export ORX_CHAT_TOOL_SCOPE=\"bash-$$\"\n\
+         export ORX_CHAT_TOOL_COMMAND=\"${{BASH_EXECUTION_STRING-}}\"\n\
+         if [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" && -r \"${{ORX_CHAT_TARGET_POINTER-}}\" ]]; then\n\
+           export ORX_CHAT_TARGET_FILE=$(<\"$ORX_CHAT_TARGET_POINTER\")\n\
+         elif [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" ]]; then\n\
+           unset ORX_CHAT_TARGET_FILE\n\
+         fi\n"
+    )
+}
+
+fn child_env_value(key: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(key).or_else(|| {
+        crate::config::list_synced_env()
+            .into_iter()
+            .find_map(|(candidate, value)| (candidate == key).then(|| value.into()))
+    })
+}
+
 /// Stamp the launching session id onto a harness child's env. Call *after*
 /// `prepare_env` so a dashboard-synced value can't shadow it. Harness children
 /// are one-per-session, so this is unambiguous.
 pub fn set_chat_session_env(cmd: &mut tokio::process::Command, session_id: &str) {
     cmd.env(CHAT_SESSION_ENV, session_id);
     cmd.env(LOCAL_SESSION_ENV, "1");
+    cmd.env_remove(CHAT_TARGET_FILE_ENV);
+    cmd.env_remove(CHAT_TARGET_POINTER_ENV);
+
+    let shell_dir = shell_hook_dir(session_id);
+    if std::fs::create_dir_all(&shell_dir).is_err() {
+        return;
+    }
+    let original_zdotdir = child_env_value("ZDOTDIR")
+        .map(PathBuf::from)
+        .or_else(|| child_env_value("HOME").map(PathBuf::from));
+    let Some(original_zdotdir) = original_zdotdir else {
+        return;
+    };
+    let pointer = target_event_pointer(session_id);
+    let zshenv = zshenv_hook(&original_zdotdir);
+    let mut hooks = vec![(".zshenv", zshenv)];
+    hooks.extend(
+        [".zprofile", ".zshrc", ".zlogin", ".zlogout"]
+            .into_iter()
+            .map(|name| (name, zsh_startup_wrapper(name))),
+    );
+    if hooks
+        .iter()
+        .any(|(name, contents)| std::fs::write(shell_dir.join(name), contents).is_err())
+    {
+        return;
+    }
+
+    let bash_env = shell_dir.join("bash_env");
+    let original_bash_env =
+        child_env_value("BASH_ENV").map(|value| value.to_string_lossy().into_owned());
+    let bash_hook = bash_env_hook(original_bash_env);
+    if std::fs::write(&bash_env, bash_hook).is_err() {
+        return;
+    }
+
+    cmd.env(CHAT_TARGET_POINTER_ENV, pointer);
+    cmd.env("ZDOTDIR", shell_dir);
+    cmd.env("BASH_ENV", bash_env);
 }
 
 /// The chat session that launched this run, read from the env the harness child
@@ -2581,6 +3513,77 @@ mod cap_tests {
     use super::*;
 
     #[test]
+    fn session_path_names_are_injective_for_punctuation() {
+        assert_ne!(safe_session_name("a/b"), safe_session_name("ab"));
+        assert!(!safe_session_name("...").is_empty());
+    }
+
+    #[test]
+    fn shell_hooks_tolerate_nounset_and_preserve_spaced_bash_env() {
+        let root = std::env::temp_dir().join(format!("orx-shell-hook-{}", uuid::Uuid::new_v4()));
+        let hook_dir = root.join("path with space");
+        std::fs::create_dir_all(&hook_dir).unwrap();
+        let user_hook = hook_dir.join("user_hook");
+        std::fs::write(&user_hook, "set -u\nexport ORX_USER_HOOK_LOADED=yes\n").unwrap();
+        let shim = root.join("bash_env");
+        std::fs::write(
+            &shim,
+            bash_env_hook(Some("$ORX_TEST_HOME/path with space/user_hook".into())),
+        )
+        .unwrap();
+
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("printf '%s' \"$ORX_USER_HOOK_LOADED\"")
+            .env("BASH_ENV", &shim)
+            .env("ORX_TEST_HOME", &root)
+            .env_remove(CHAT_TARGET_FILE_ENV)
+            .env_remove(CHAT_TARGET_POINTER_ENV)
+            .output()
+            .unwrap();
+
+        let _ = std::fs::remove_dir_all(root);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "yes");
+        assert!(zshenv_hook(std::path::Path::new("/tmp")).contains("${ORX_CHAT_TARGET_FILE-}"));
+        assert!(bash_env_hook(None).contains("${BASH_EXECUTION_STRING-}"));
+        assert!(zshenv_hook(std::path::Path::new("/tmp")).contains("${ZSH_EXECUTION_STRING-}"));
+    }
+
+    #[tokio::test]
+    async fn failed_setup_releases_reservation_after_lock_contention() {
+        let host = Arc::new(ChatHost::new(
+            Arc::new(AgentHost::new(None)),
+            Arc::new(crate::local::codex::CodexHost::new()),
+            Arc::new(crate::local::claude::ClaudeHost::new()),
+        ));
+        host.turns
+            .lock()
+            .await
+            .insert("session".into(), TurnState::Reserved);
+        let guard = TurnGuard {
+            host: host.clone(),
+            session_id: "session".into(),
+            armed: true,
+        };
+        let turns = host.turns.lock().await;
+        drop(guard);
+        drop(turns);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while host.turns.lock().await.contains_key("session") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
     fn cap_tool_text_truncates_and_is_idempotent() {
         let mut short = "hello".to_string();
         cap_tool_text(&mut short);
@@ -2589,18 +3592,26 @@ mod cap_tests {
         let mut long = "x".repeat(TOOL_TEXT_CAP + 1);
         cap_tool_text(&mut long);
         assert_eq!(long.chars().count(), TOOL_TEXT_CAP);
-        assert!(long.ends_with(TOOL_TEXT_TRUNCATION_MARKER));
+        assert!(long.contains(TOOL_TEXT_TRUNCATION_MARKER));
+        assert!(long.starts_with('x'));
+        assert!(long.ends_with('x'));
 
         // Re-capping a capped string must not shave it further.
         let capped = long.clone();
         cap_tool_text(&mut long);
         assert_eq!(long, capped);
 
+        long.push_str("terminal error");
+        cap_tool_text(&mut long);
+        assert_eq!(long.chars().count(), TOOL_TEXT_CAP);
+        assert!(long.ends_with("terminal error"));
+
         // Multi-byte chars: truncation lands on a char boundary.
         let mut wide = "é".repeat(TOOL_TEXT_CAP * 2);
         cap_tool_text(&mut wide);
         assert_eq!(wide.chars().count(), TOOL_TEXT_CAP);
-        assert!(wide.ends_with(TOOL_TEXT_TRUNCATION_MARKER));
+        assert!(wide.contains(TOOL_TEXT_TRUNCATION_MARKER));
+        assert!(wide.ends_with('é'));
     }
 
     /// The per-flush pass caps `output` and `error` on tool parts and leaves
@@ -2645,6 +3656,333 @@ mod cap_tests {
         assert_eq!(
             child_state.output.as_ref().unwrap().chars().count(),
             TOOL_TEXT_CAP
+        );
+    }
+
+    #[test]
+    fn cap_tool_parts_preserves_semantic_targets() {
+        let first = "11111111-1111-1111-1111-111111111111";
+        let middle = "22222222-2222-2222-2222-222222222222";
+        let last = "33333333-3333-3333-3333-333333333333";
+        let output = format!(
+            "[orx-run:{first}]\n{}\n[orx-run:{middle}]\n{}\n[orx-run:{last}]",
+            "x".repeat(20_000),
+            "y".repeat(20_000)
+        );
+        let mut parts = vec![WirePart {
+            id: "logs".into(),
+            kind: "tool".into(),
+            text: None,
+            tool: Some("bash".into()),
+            state: Some(WireToolState {
+                status: "completed".into(),
+                input: Some(json!({ "command": "orx logs $id" })),
+                output: Some(output),
+                error: None,
+                title: None,
+            }),
+            prompt: None,
+            children: Vec::new(),
+        }];
+
+        cap_tool_parts(&mut parts);
+
+        let state = parts[0].state.as_ref().unwrap();
+        let output = state.output.as_ref().unwrap();
+        assert!(output.chars().count() <= TOOL_TEXT_CAP);
+        assert!(output.contains(TOOL_TEXT_TRUNCATION_MARKER));
+        assert_eq!(
+            state.input.as_ref().unwrap()["runTargetIds"],
+            json!([first, middle, last])
+        );
+    }
+
+    #[test]
+    fn semantic_targets_are_resource_specific_and_bounded() {
+        let parent = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let latest_run = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let mut output = format!(
+            "id: 11111111-1111-1111-1111-111111111111\nparent: {parent}\nlast run: {latest_run}\n"
+        );
+        for index in 0..300 {
+            output.push_str(&format!(
+                "[orx-experiment:{index:08x}-1111-1111-1111-111111111111]\n"
+            ));
+        }
+        let mut state = WireToolState {
+            status: "completed".into(),
+            input: Some(json!({ "arguments": { "cmd": "orx exp status $id" } })),
+            output: Some(output),
+            error: None,
+            title: None,
+        };
+
+        preserve_tool_targets(&mut state);
+
+        let targets = state.input.as_ref().unwrap()["experimentTargetIds"]
+            .as_array()
+            .unwrap();
+        assert_eq!(targets.len(), TOOL_TARGET_CAP);
+        assert!(!targets.iter().any(|value| value == parent));
+        assert!(!targets.iter().any(|value| value == latest_run));
+    }
+
+    #[test]
+    fn semantic_markers_are_authoritative_and_preserve_newlines() {
+        let target = "11111111-1111-1111-1111-111111111111";
+        let mentioned = "22222222-2222-2222-2222-222222222222";
+        let mut state = WireToolState {
+            status: "error".into(),
+            input: Some(json!({ "command": "orx logs $id" })),
+            output: Some(format!(
+                "[orx-run:{target}]\nfirst line\n/runs/{mentioned}\n"
+            )),
+            error: None,
+            title: None,
+        };
+
+        preserve_tool_targets(&mut state);
+
+        assert_eq!(
+            state.input.as_ref().unwrap()["runTargetIds"],
+            json!([target])
+        );
+        let expected = format!("first line\n/runs/{mentioned}\n");
+        assert_eq!(state.output.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn semantic_markers_beyond_legacy_scan_limit_are_preserved() {
+        let target = "11111111-1111-1111-1111-111111111111";
+        let mut state = WireToolState {
+            status: "completed".into(),
+            input: Some(json!({ "command": "orx logs $id" })),
+            output: Some(format!(
+                "{}\n[orx-run:{target}]\n",
+                "x".repeat(TOOL_TARGET_SCAN_BYTES + 1)
+            )),
+            error: None,
+            title: None,
+        };
+
+        preserve_tool_targets(&mut state);
+
+        assert_eq!(
+            state.input.as_ref().unwrap()["runTargetIds"],
+            json!([target])
+        );
+        assert!(!state.output.as_ref().unwrap().contains("[orx-run:"));
+    }
+
+    #[test]
+    fn out_of_band_target_attaches_to_latest_matching_tool() {
+        let target = "11111111-1111-1111-1111-111111111111";
+        let mut parts = vec![WirePart {
+            id: "logs".into(),
+            kind: "tool".into(),
+            text: None,
+            tool: Some("bash".into()),
+            state: Some(WireToolState {
+                status: "completed".into(),
+                input: Some(json!({ "command": "id=$(lookup); orx logs \"$id\"" })),
+                output: Some("ordinary log content".into()),
+                error: None,
+                title: None,
+            }),
+            prompt: None,
+            children: Vec::new(),
+        }];
+
+        assert!(!attach_target_event(
+            &mut parts,
+            None,
+            &HashSet::new(),
+            "id=$(lookup); orx logs \"$id\"",
+            "",
+            "runs",
+            target,
+        )
+        .is_empty());
+        let input = parts[0].state.as_ref().unwrap().input.as_ref().unwrap();
+        assert_eq!(input["runTargetIds"], json!([target]));
+        assert_eq!(input["runTargetIdsAuthoritative"], true);
+    }
+
+    #[test]
+    fn identical_parallel_commands_are_left_unattributed() {
+        let target = "11111111-1111-1111-1111-111111111111";
+        let make_part = |id: &str| WirePart {
+            id: id.into(),
+            kind: "tool".into(),
+            text: None,
+            tool: Some("bash".into()),
+            state: Some(WireToolState {
+                status: "completed".into(),
+                input: Some(json!({ "command": "orx logs \"$id\"" })),
+                output: None,
+                error: None,
+                title: None,
+            }),
+            prompt: None,
+            children: Vec::new(),
+        };
+        let mut parts = vec![make_part("one"), make_part("two")];
+        let claimed = HashSet::new();
+        let ids = attach_target_event(
+            &mut parts,
+            None,
+            &claimed,
+            "orx logs \"$id\"",
+            "",
+            "runs",
+            target,
+        );
+        assert!(ids.is_empty());
+
+        for part in parts {
+            let input = part.state.unwrap().input.unwrap();
+            assert!(input["runTargetIds"].is_null());
+        }
+    }
+
+    #[test]
+    fn target_cwd_disambiguates_parallel_commands() {
+        let target = "11111111-1111-1111-1111-111111111111";
+        let make_part = |id: &str, cwd: &str| WirePart {
+            id: id.into(),
+            kind: "tool".into(),
+            text: None,
+            tool: Some("bash".into()),
+            state: Some(WireToolState {
+                status: "completed".into(),
+                input: Some(json!({ "command": "orx logs \"$id\"", "cwd": cwd })),
+                output: None,
+                error: None,
+                title: None,
+            }),
+            prompt: None,
+            children: Vec::new(),
+        };
+        let mut parts = vec![make_part("one", "/one"), make_part("two", "/two")];
+        let mut ids = attach_target_event(
+            &mut parts,
+            None,
+            &HashSet::new(),
+            "orx logs \"$id\"",
+            "/one",
+            "runs",
+            target,
+        );
+
+        ids.sort();
+        assert_eq!(ids, vec!["one"]);
+        assert_eq!(
+            parts[0].state.as_ref().unwrap().input.as_ref().unwrap()["runTargetIds"],
+            json!([target])
+        );
+        assert!(parts[1].state.as_ref().unwrap().input.as_ref().unwrap()["runTargetIds"].is_null());
+    }
+
+    #[test]
+    fn interrupted_reconciliation_settles_running_tools() {
+        let mut parts = vec![WirePart {
+            id: "running".into(),
+            kind: "tool".into(),
+            text: None,
+            tool: Some("bash".into()),
+            state: Some(WireToolState {
+                status: "running".into(),
+                input: None,
+                output: None,
+                error: None,
+                title: None,
+            }),
+            prompt: None,
+            children: Vec::new(),
+        }];
+
+        settle_interrupted_tool_parts(&mut parts);
+
+        assert_eq!(parts[0].state.as_ref().unwrap().status, "interrupted");
+    }
+
+    #[test]
+    fn tool_upsert_preserves_out_of_band_targets() {
+        let target = "11111111-1111-1111-1111-111111111111";
+        let mut parts = vec![WirePart {
+            id: "logs".into(),
+            kind: "tool".into(),
+            text: None,
+            tool: Some("bash".into()),
+            state: Some(WireToolState {
+                status: "running".into(),
+                input: Some(json!({
+                    "command": "orx logs $id",
+                    "runTargetIds": [target],
+                    "runTargetIdsAuthoritative": true
+                })),
+                output: None,
+                error: None,
+                title: None,
+            }),
+            prompt: None,
+            children: Vec::new(),
+        }];
+        let replacement = WirePart {
+            id: "logs".into(),
+            kind: "tool".into(),
+            text: None,
+            tool: Some("bash".into()),
+            state: Some(WireToolState {
+                status: "completed".into(),
+                input: Some(json!({ "command": "orx logs $id" })),
+                output: Some("done".into()),
+                error: None,
+                title: None,
+            }),
+            prompt: None,
+            children: Vec::new(),
+        };
+
+        upsert_preserving_children(&mut parts, replacement);
+
+        let input = parts[0].state.as_ref().unwrap().input.as_ref().unwrap();
+        assert_eq!(input["runTargetIds"], json!([target]));
+        assert_eq!(input["runTargetIdsAuthoritative"], true);
+    }
+
+    #[test]
+    fn later_marker_replaces_heuristic_targets() {
+        let target = "11111111-1111-1111-1111-111111111111";
+        let mentioned = "22222222-2222-2222-2222-222222222222";
+        let mut state = WireToolState {
+            status: "running".into(),
+            input: Some(json!({ "command": "orx logs $id" })),
+            output: Some(format!("/runs/{mentioned}\n")),
+            error: None,
+            title: None,
+        };
+
+        preserve_tool_targets(&mut state);
+        assert_eq!(
+            state.input.as_ref().unwrap()["runTargetIds"],
+            json!([mentioned])
+        );
+
+        state
+            .output
+            .as_mut()
+            .unwrap()
+            .push_str(&format!("[orx-run:{target}]\n"));
+        preserve_tool_targets(&mut state);
+
+        assert_eq!(
+            state.input.as_ref().unwrap()["runTargetIds"],
+            json!([target])
+        );
+        assert_eq!(
+            state.input.as_ref().unwrap()["runTargetIdsAuthoritative"],
+            true
         );
     }
 }

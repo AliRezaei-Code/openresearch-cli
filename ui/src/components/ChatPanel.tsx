@@ -5,19 +5,24 @@ import {
   ChartSpline,
   Check,
   ChevronRight,
+  CircleX,
   Clock,
   CornerDownLeft,
   FileText,
   FlaskConical,
   FolderOpen,
   GitBranch,
+  Globe,
   HelpCircle,
   MoreHorizontal,
   PanelLeft,
   Paperclip,
   Package,
+  Pencil,
   Plus,
+  Search,
   SlidersHorizontal,
+  SquareTerminal,
   ToggleRight,
   Users,
   X,
@@ -84,12 +89,15 @@ import { ICON_BUTTON_BASE_CLASS_NAME, ICON_BUTTON_CLASS_NAME, MODEL_ITEM_CLASS_N
 
 const TOOL_LINE_CLASS_NAME = [
   "tool-line flex-1 min-w-0 overflow-hidden text-ellipsis whitespace-nowrap",
-  "text-md text-subtext",
+  "text-lg",
 ].join(" ");
+const TOOL_TARGET_LIMIT = 256;
+const TOOL_TARGET_INSPECTION_LIMIT = 1_024;
+const TOOL_OUTPUT_SCAN_LIMIT = 20_000;
 
 const PROMPT_COLLAPSED_CLASS_NAME = [
-  "prompt-collapsed text-muted text-md my-1 mx-0 [&_summary]:flex",
-  "[&_summary]:items-baseline [&_summary]:gap-2 [&_summary]:cursor-pointer",
+  "prompt-collapsed text-muted text-lg font-[375] my-3.5 mx-0 [&_summary]:flex",
+  "[&_summary]:items-center [&_summary]:gap-2 [&_summary]:cursor-pointer",
   "[&_summary]:list-none [&_summary]:select-none [&_summary::-webkit-details-marker]:hidden",
   "[&_summary::after]:content-['›'] [&_summary::after]:text-muted",
   "[&_summary::after]:transition-transform [&_summary::after]:duration-80 [&_summary::after]:ease-standard [&[open]_summary::after]:rotate-90",
@@ -98,6 +106,16 @@ const PROMPT_COLLAPSED_CLASS_NAME = [
 const PROMPT_COLLAPSED_BODY_CLASS_NAME = [
   "prompt-collapsed-body mt-1.5 pl-3 border-l-2 border-l-border",
   "text-md text-subtext",
+].join(" ");
+
+const PLAN_RESOLVED_CLASS_NAME = [
+  "prompt-collapsed plan-resolved text-subtext my-3.5 mx-0",
+  "[&_summary]:flex [&_summary]:items-center [&_summary]:gap-2 [&_summary]:w-fit [&_summary]:max-w-full",
+  "[&_summary]:py-[3px] [&_summary]:px-1 [&_summary]:cursor-pointer [&_summary]:rounded-sm",
+  "[&_summary]:list-none [&_summary]:select-none [&_summary:hover]:bg-surface",
+  "[&_summary::-webkit-details-marker]:hidden",
+  "[&_summary_.plan-chevron]:transition-transform [&_summary_.plan-chevron]:duration-120",
+  "[&_summary_.plan-chevron]:ease-standard [&[open]_summary_.plan-chevron]:rotate-90",
 ].join(" ");
 
 const PROMPT_HEAD_CLASS_NAME = [
@@ -255,13 +273,6 @@ function reducer(state: ChatState, action: Action): ChatState {
 
 // --- rendering ---------------------------------------------------------------
 
-function toolStatusClass(status: string | undefined): string {
-  const base = "tool-status w-1.5 h-1.5 rounded-full shrink-0";
-  if (status === "error") return `${base} error bg-accent-red`;
-  if (status === "completed") return `${base} bg-muted`;
-  return `${base} running bg-accent-amber animate-[or-pulse_1.2s_ease-in-out_infinite]`;
-}
-
 function relTime(ts: number | undefined): string {
   if (!ts) return "";
   const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
@@ -279,105 +290,894 @@ function baseName(path: string): string {
   return trimmed.slice(trimmed.lastIndexOf("/") + 1) || trimmed;
 }
 
-/** Claude-desktop-style one-liner: a verb + target, e.g. "Read hello.py",
- * "Ran echo hello". Falls back to the raw tool name. */
-function toolLine(part: ChatPart): string {
-  const tool = part.tool ?? "tool";
-  const input = part.state?.input ?? {};
-  const cmd = typeof input.command === "string" ? input.command : null;
-  const fp = typeof input.filePath === "string" ? input.filePath : null;
-  const desc = typeof input.description === "string" ? input.description : null;
-  switch (tool) {
-    case "Bash":
-    case "bash":
-      return cmd ? `Ran ${cmd}` : "Ran command";
-    case "Read":
-      return fp ? `Read ${baseName(fp)}` : "Read file";
-    case "Edit":
-    case "Write":
-    case "NotebookEdit":
-      return fp ? `Edited ${baseName(fp)}` : "Edited file";
-    case "Grep":
-      return typeof input.pattern === "string" ? `Searched “${input.pattern}”` : "Searched";
-    case "Glob":
-      return typeof input.pattern === "string" ? `Found ${input.pattern}` : "Listed files";
-    case "WebSearch": {
-      // Codex web-tool actions: search {query}, openPage {url},
-      // findInPage {pattern, url} — query is empty for the latter two.
-      if (typeof input.query === "string" && input.query)
-        return `Searched the web: “${input.query}”`;
-      const url = typeof input.url === "string" ? input.url : null;
-      if (typeof input.pattern === "string" && input.pattern && url)
-        return `Searched “${input.pattern}” in ${url}`;
-      if (url) return `Opened ${url}`;
-      // codex reports page visits as an opaque {type:"other"} action —
-      // "searched" would be wrong, all we know is the web tool ran.
-      if (input.type === "other") return "Browsed the web";
-      return desc ?? "Searched the web";
-    }
-    case "WebFetch":
-      if (typeof input.url === "string") return `Fetched ${input.url}`;
-      return desc ?? "Fetched a page";
-    case "Task":
-      return desc ?? "Ran a subagent";
-    case "subagent":
-      return subagentLine(input);
-    case "error":
-      return "Error";
-    case "interrupted":
-      return "Interrupted";
-    default: {
-      const detail = desc ?? fp ?? cmd ?? part.state?.title ?? "";
-      return detail ? `${tool}: ${detail}` : tool;
-    }
-  }
+type ToolActivityKind = "read" | "search" | "edit" | "web" | "agent" | "project" | "command";
+
+interface ToolActivity {
+  kind: ToolActivityKind;
+  label: string;
+  searchPattern?: string;
+  filePath?: string;
+  fileRef?: string;
+  labelPrefix?: string;
+  labelTarget?: string;
+  litCall?: NonNullable<ReturnType<typeof parseOrxLit>>;
+  runIds?: string[];
+  experimentIds?: string[];
 }
 
-/** Richer summary for the tool row: `orx lit`/`orx paper` Bash calls render as a
- * real search (source logo + natural language) instead of raw shell output.
- * Everything else falls back to the plain `toolLine` string. */
-function toolSummary(part: ChatPart): React.ReactNode {
-  if (part.tool === "Bash" || part.tool === "bash") {
-    const cmd = part.state?.input?.command;
-    const call = typeof cmd === "string" ? parseOrxLit(cmd) : null;
-    if (call) {
-      // The logo already names the source, so the text doesn't repeat it.
-      const text =
-        call.kind === "lit"
-          ? call.query
-            ? `Searching for “${call.query}”`
-            : "Searching"
-          : call.id
-            ? `Reading ${call.id}`
-            : "Reading a paper";
-      // A fetched paper links out to its page on the source (with an external-link
-      // affordance so it reads as clickable); the search rows are plain text. The
-      // anchor is the click's activation target, so it navigates without toggling
-      // the row open — stopPropagation just guards against any future row handler.
-      const body =
-        call.kind === "paper" && call.id ? (
-          <a
-            className="tool-lit-link inline-flex items-center gap-1 min-w-0 text-inherit no-underline [&:hover]:text-primary [&:hover_.tool-lit-text]:underline [&:hover_.tool-lit-ext]:opacity-100"
-            href={paperUrl(call.source, call.id)}
-            target="_blank"
-            rel="noopener noreferrer"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <span className="tool-lit-text min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">{text}</span>
-            <ArrowUpRight className="tool-lit-ext flex-none opacity-50" size={13} aria-hidden="true" />
-          </a>
-        ) : (
-          <span className="tool-lit-text min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">{text}</span>
-        );
-      return (
-        <span className="tool-lit inline-flex items-center gap-2 min-w-0 max-w-full align-bottom">
-          <LitSourceLogo source={call.source} />
-          {body}
-        </span>
-      );
+type OpenTranscriptFile = (path: string, line?: number, exp?: string, ref?: string) => void;
+
+function inputString(input: Record<string, unknown>, ...keys: string[]): string | null {
+  for (const key of keys) {
+    const value = input[key];
+    if (typeof value === "string" && value) return value;
+  }
+  return null;
+}
+
+function arrayInputString(input: Record<string, unknown>, key: string, field: string): string | null {
+  const values = input[key];
+  if (!Array.isArray(values)) return null;
+  for (const value of values) {
+    if (!value || typeof value !== "object" || !(field in value)) continue;
+    const candidate = value[field];
+    if (typeof candidate === "string" && candidate) return candidate;
+  }
+  return null;
+}
+
+function inputStringArray(input: Record<string, unknown>, key: string): string[] {
+  const values = input[key];
+  if (!Array.isArray(values)) return [];
+  const strings: string[] = [];
+  for (let index = 0; index < Math.min(values.length, TOOL_TARGET_INSPECTION_LIMIT); index++) {
+    if (typeof values[index] === "string") strings.push(values[index]);
+    if (strings.length >= TOOL_TARGET_LIMIT) break;
+  }
+  return strings;
+}
+
+function normalizedTargetIds(...collections: string[][]): string[] {
+  const ids = new Set<string>();
+  const target = new RegExp(`^${RUN_TARGET_PATTERN}$`, "i");
+  let inspected = 0;
+  for (const collection of collections) {
+    for (const value of collection) {
+      if (ids.size >= TOOL_TARGET_LIMIT || inspected++ >= TOOL_TARGET_INSPECTION_LIMIT) return [...ids];
+      if (target.test(value)) ids.add(value.toLowerCase());
     }
   }
-  return toolLine(part);
+  return [...ids];
+}
+
+function cleanToolError(value: string): string {
+  return value
+    .replace(/^Exit code \d+\s*/i, "")
+    .split("\n")
+    .filter((line) => !/^\s*\[orx-(?:run|experiment):[^\]]+\]\s*$/.test(line))
+    .join("\n")
+    .trim();
+}
+
+function editChange(input: Record<string, unknown>): { path: string; type: string | null } | null {
+  const changes = input.changes;
+  if (!Array.isArray(changes)) return null;
+  for (const change of changes) {
+    if (!change || typeof change !== "object" || !("path" in change) || typeof change.path !== "string") {
+      continue;
+    }
+    const kind = "kind" in change ? change.kind : null;
+    const type = kind && typeof kind === "object" && "type" in kind && typeof kind.type === "string"
+      ? kind.type
+      : null;
+    return { path: change.path, type };
+  }
+  return null;
+}
+
+/** Codex reports shell commands as `/bin/zsh -lc <script>`. That wrapper is
+ * execution plumbing, not useful transcript content. */
+function meaningfulCommand(command: string): string {
+  const trimmed = command.trim();
+  const wrapped = trimmed.match(/^\/bin\/(?:ba|z)?sh\s+-lc\s+([\s\S]+)$/);
+  let body = (wrapped?.[1] ?? trimmed).trim();
+  const first = body[0];
+  if ((first === "\"" || first === "'") && body[body.length - 1] === first) {
+    body = body.slice(1, -1);
+  }
+  return stripHeredocBodies(body).replace(/[\t\r ]+/g, " ").trim();
+}
+
+function heredocMarker(line: string): { delimiter: string; stripTabs: boolean } | null {
+  let quote: "\"" | "'" | null = null;
+  let escaped = false;
+  for (let index = 0; index < line.length - 1; index++) {
+    const char = line[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char !== "<" || line[index + 1] !== "<" || line[index + 2] === "<") continue;
+    index += 2;
+    const stripTabs = line[index] === "-";
+    if (stripTabs) index++;
+    while (/\s/.test(line[index] ?? "")) index++;
+    const delimiterQuote = line[index] === "\"" || line[index] === "'" ? line[index++] : null;
+    let delimiter = "";
+    while (index < line.length) {
+      const current = line[index];
+      if (delimiterQuote ? current === delimiterQuote : /\s|[;|&]/.test(current)) break;
+      delimiter += current;
+      index++;
+    }
+    if (delimiter) return { delimiter, stripTabs };
+  }
+  return null;
+}
+
+function stripHeredocBodies(command: string): string {
+  const lines = command.split("\n");
+  const kept: string[] = [];
+  let marker: { delimiter: string; stripTabs: boolean } | null = null;
+  for (const line of lines) {
+    if (marker) {
+      const candidate = marker.stripTabs ? line.replace(/^\t+/, "") : line;
+      if (candidate.trimEnd() === marker.delimiter) marker = null;
+      continue;
+    }
+    kept.push(line);
+    marker = heredocMarker(line);
+  }
+  return kept.join("\n");
+}
+
+function shellWords(input: string): string[] {
+  const words: string[] = [];
+  let word = "";
+  let quote: "\"" | "'" | null = null;
+  let escaped = false;
+  const push = () => {
+    if (word) words.push(word);
+    word = "";
+  };
+
+  for (const char of input) {
+    if (escaped) {
+      word += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = null;
+      else word += char;
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) push();
+    else word += char;
+  }
+  push();
+  return words;
+}
+
+function validReadTarget(value: string | undefined): string | null {
+  const target = value?.replace(/[)'\"]+$/, "");
+  if (!target || target === "-" || /^\d+$/.test(target) || /[$`]/.test(target)) return null;
+  return target;
+}
+
+function likelyPathReadTarget(value: string | undefined): string | null {
+  const target = validReadTarget(value);
+  if (!target) return null;
+  const name = baseName(target);
+  if (
+    target.includes("/")
+    || target.startsWith(".")
+    || /\.[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name)
+    || /^(?:Dockerfile|Makefile|README|LICENSE|NOTICE|CHANGELOG)$/i.test(name)
+  ) {
+    return target;
+  }
+  return null;
+}
+
+interface ShellInvocation {
+  name: string;
+  args: string[];
+}
+
+interface GitShowTarget {
+  ref: string;
+  path: string;
+}
+
+function shellInvocation(command: string): ShellInvocation | null {
+  const words = shellWords(command);
+  let index = 0;
+  while (["do", "then", "else", "if", "while", "until"].includes(words[index])) index++;
+  while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index] ?? "")) index++;
+  if (words[index] === "command") {
+    index++;
+    while (words[index]?.startsWith("-")) index++;
+  }
+  if (words[index] === "env") {
+    index++;
+    while (words[index]?.startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index] ?? "")) index++;
+  }
+  const executable = words[index];
+  if (!executable) return null;
+  return { name: executable.split("/").pop() ?? executable, args: words.slice(index + 1) };
+}
+
+function commandReadTarget(invocation: ShellInvocation): string | null {
+  const { name, args } = invocation;
+
+  if (name === "sed") {
+    let index = 0;
+    let scriptProvidedByOption = false;
+    while (index < args.length && args[index].startsWith("-")) {
+      const option = args[index++];
+      if (option === "-e" || option === "--expression" || option === "-f" || option === "--file") {
+        scriptProvidedByOption = true;
+        index++;
+      }
+    }
+    if (!scriptProvidedByOption) index++;
+    for (const arg of args.slice(index)) {
+      if (arg.startsWith("-")) continue;
+      const target = likelyPathReadTarget(arg);
+      if (target) return target;
+    }
+    return null;
+  }
+
+  const files: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === "--") {
+      files.push(...args.slice(index + 1));
+      break;
+    }
+    if (name !== "cat" && ["-n", "--lines", "-c", "--bytes", "--pid"].includes(arg)) {
+      index++;
+      continue;
+    }
+    if (arg.startsWith("-")) continue;
+    files.push(arg);
+  }
+  return validReadTarget(files[0]);
+}
+
+function commandGitShowTarget(invocation: ShellInvocation | null): GitShowTarget | null {
+  if (invocation?.name !== "git" || invocation.args[0] !== "show") return null;
+  const object = invocation.args.slice(1).find((arg) => !arg.startsWith("-") && arg.includes(":"));
+  if (!object) return null;
+  const separator = object.indexOf(":");
+  const ref = object.slice(0, separator);
+  const path = object.slice(separator + 1);
+  return ref && likelyPathReadTarget(path) ? { ref, path } : null;
+}
+
+function commandSearchPattern(command: string): string | null {
+  const search = command.match(/\b(?:rg|grep)\b(?:\s+-[^\s]+)*\s+(?:"([^"]+)"|'([^']+)'|([^\s]+))/);
+  return search?.[1] ?? search?.[2] ?? search?.[3] ?? null;
+}
+
+function resolvePosixPath(base: string, target: string): string | null {
+  if (/[$`~]/.test(base) || /[$`~]/.test(target)) return null;
+  const absolute = target.startsWith("/") || (!target.startsWith("/") && base.startsWith("/"));
+  const parts = target.startsWith("/") ? [] : base.split("/").filter(Boolean);
+  for (const part of target.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (parts.length > 0 && parts[parts.length - 1] !== "..") parts.pop();
+      else if (!absolute) parts.push(part);
+      continue;
+    }
+    parts.push(part);
+  }
+  const resolved = `${absolute ? "/" : ""}${parts.join("/")}`;
+  return resolved || (absolute ? "/" : null);
+}
+
+function commandFilePath(
+  target: string,
+  segments: ShellCommandSegment[],
+  segmentIndex: number,
+  declaredWorkdir: string | null,
+): string | null {
+  if (target.startsWith("/")) return target;
+  let directory = declaredWorkdir ?? "";
+  for (let index = 0; index < segmentIndex; index++) {
+    const invocation = shellInvocation(segments[index].raw);
+    if (invocation?.name !== "cd") continue;
+    const next = invocation.args.find((arg) => !arg.startsWith("-"));
+    if (!next) return null;
+    const resolved = resolvePosixPath(directory, next);
+    if (!resolved) return null;
+    directory = resolved;
+  }
+  return directory ? resolvePosixPath(directory, target) : target;
+}
+
+const UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const RUN_TARGET_PATTERN = `(?:${UUID_PATTERN}|[0-9a-f]{8})`;
+
+interface ShellCommandSegment {
+  raw: string;
+  code: string;
+}
+
+function shellCommandSegments(command: string): ShellCommandSegment[] {
+  const segments: ShellCommandSegment[] = [];
+  let raw = "";
+  let code = "";
+  let quote: "\"" | "'" | null = null;
+  let escaped = false;
+  const push = () => {
+    if (raw.trim() || code.trim()) segments.push({ raw: raw.trim(), code: code.trim() });
+    raw = "";
+    code = "";
+  };
+  const scanSubstitution = (start: number): number => {
+    let depth = 1;
+    let nestedQuote: "\"" | "'" | null = null;
+    let nestedEscaped = false;
+    for (let index = start; index < command.length; index++) {
+      const char = command[index];
+      if (nestedEscaped) {
+        nestedEscaped = false;
+        continue;
+      }
+      if (char === "\\" && nestedQuote !== "'") {
+        nestedEscaped = true;
+        continue;
+      }
+      if (nestedQuote) {
+        if (char === nestedQuote) nestedQuote = null;
+        continue;
+      }
+      if (char === "\"" || char === "'") {
+        nestedQuote = char;
+        continue;
+      }
+      if (char === "(") depth++;
+      if (char === ")" && --depth === 0) return index;
+    }
+    return command.length - 1;
+  };
+  const scanBackticks = (start: number): number => {
+    let nestedEscaped = false;
+    for (let index = start; index < command.length; index++) {
+      const char = command[index];
+      if (nestedEscaped) {
+        nestedEscaped = false;
+        continue;
+      }
+      if (char === "\\") {
+        nestedEscaped = true;
+        continue;
+      }
+      if (char === "`") return index;
+    }
+    return command.length - 1;
+  };
+
+  for (let index = 0; index < command.length; index++) {
+    const char = command[index];
+    if (escaped) {
+      raw += char;
+      if (!quote) code += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\" && quote !== "'") {
+      raw += char;
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (quote === "\"" && char === "$" && command[index + 1] === "(") {
+        const end = scanSubstitution(index + 2);
+        segments.push(...shellCommandSegments(command.slice(index + 2, end)));
+        raw += command.slice(index, end + 1);
+        index = end;
+        continue;
+      }
+      if (quote === "\"" && char === "`") {
+        const end = scanBackticks(index + 1);
+        segments.push(...shellCommandSegments(command.slice(index + 1, end)));
+        raw += command.slice(index, end + 1);
+        index = end;
+        continue;
+      }
+      raw += char;
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      raw += char;
+      quote = char;
+      continue;
+    }
+    if (char === "`") {
+      const end = scanBackticks(index + 1);
+      segments.push(...shellCommandSegments(command.slice(index + 1, end)));
+      raw += command.slice(index, end + 1);
+      index = end;
+      continue;
+    }
+    if (char === ";" || char === "|" || char === "&" || char === "(" || char === ")" || char === "\n") {
+      push();
+      continue;
+    }
+    raw += char;
+    code += char;
+  }
+  push();
+  return segments;
+}
+
+function orxCommandSegments(command: string, args: string): ShellCommandSegment[] {
+  const invocation = new RegExp(`(?:^|\\b(?:do|then|else|if|while|until)\\s+)(?:[A-Za-z_][A-Za-z0-9_]*=[^\\s]+\\s+)*orx\\s+${args}\\b`, "i");
+  return shellCommandSegments(command).filter((segment) => invocation.test(segment.code));
+}
+
+function commandInvokesOrx(command: string, args: string): boolean {
+  if (orxCommandSegments(command, args).length > 0) return true;
+  return new RegExp(`(?:^|[\\s($;])orx\\s+${args}\\b`, "i").test(command);
+}
+
+function idsFromToolOutput(output: string | undefined, resource: "runs" | "experiments"): string[] {
+  if (!output) return [];
+  const ids = new Set<string>();
+  const boundedOutput = output.slice(0, TOOL_OUTPUT_SCAN_LIMIT);
+  const patterns = resource === "runs"
+    ? [
+        new RegExp(`/runs/(${UUID_PATTERN})`, "gi"),
+        new RegExp(`\\brun(?:_|\\s+)id:\\s*(${UUID_PATTERN})`, "gi"),
+        new RegExp(`^\\s*RUN\\s+(${UUID_PATTERN})\\b`, "gim"),
+        new RegExp(`={3,}\\s*(${UUID_PATTERN})\\s*={3,}`, "gi"),
+      ]
+    : [
+        new RegExp(`/experiments/(${UUID_PATTERN})`, "gi"),
+        new RegExp(`^\\s*id:\\s*(${UUID_PATTERN})`, "gim"),
+        new RegExp(`={3,}\\s*(${UUID_PATTERN})\\s*={3,}`, "gi"),
+      ];
+  for (const pattern of patterns) {
+    for (const match of boundedOutput.matchAll(pattern)) {
+      ids.add(match[1]);
+      if (ids.size >= TOOL_TARGET_LIMIT) return [...ids];
+    }
+  }
+  const bareIdLine = new RegExp(`^\\s*(${UUID_PATTERN})(?:\\s|$)`, "gim");
+  for (const match of boundedOutput.matchAll(bareIdLine)) {
+    ids.add(match[1]);
+    if (ids.size >= TOOL_TARGET_LIMIT) break;
+  }
+  return [...ids];
+}
+
+function invocationOffsets(command: string, invocations: ShellCommandSegment[]): Array<{ invocation: ShellCommandSegment; offset: number }> {
+  let cursor = 0;
+  return invocations.map((invocation) => {
+    const next = command.indexOf(invocation.raw, cursor);
+    const offset = next === -1 ? command.indexOf(invocation.raw) : next;
+    cursor = Math.max(cursor, offset + invocation.raw.length);
+    return { invocation, offset: Math.max(0, offset) };
+  });
+}
+
+function assignedIdsBefore(command: string, variable: string, before: number, idPattern: string): string[] {
+  const assignment = new RegExp(
+    `(?:^|[\\s;])(?:export\\s+)?${variable}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s;]+))`,
+    "gi",
+  );
+  let resolved = "";
+  for (const match of command.matchAll(assignment)) {
+    if ((match.index ?? 0) >= before) break;
+    resolved = match[1] ?? match[2] ?? match[3] ?? "";
+  }
+  return [...resolved.matchAll(new RegExp(idPattern, "gi"))].map((match) => match[0]);
+}
+
+function loopIdsBefore(command: string, variable: string, before: number, idPattern: string): string[] {
+  const loop = new RegExp(`\\bfor\\s+${variable}\\s+in\\s+([\\s\\S]*?)(?:;|\\n)\\s*do\\b`, "gi");
+  let values = "";
+  for (const match of command.matchAll(loop)) {
+    const start = match.index ?? 0;
+    if (start >= before) break;
+    const headerEnd = start + match[0].length;
+    if (headerEnd <= before && /\bdone\b/.test(command.slice(headerEnd, before))) continue;
+    values = match[1];
+  }
+  if (/\$\(|`/.test(values)) return [];
+  return [...values.matchAll(new RegExp(idPattern, "gi"))].map((match) => match[0]);
+}
+
+function commandRunIds(command: string, output?: string, preservedIds: string[] = [], legacyIds: string[] = []): string[] {
+  const invocations = orxCommandSegments(command, "logs");
+  const ids = new Set<string>();
+  if (invocations.length === 0) {
+    if (!commandInvokesOrx(command, "logs")) return [];
+    const outputIds = preservedIds.length > 0 ? [] : idsFromToolOutput(output, "runs");
+    for (const id of preservedIds.length > 0 ? preservedIds : outputIds.length > 0 ? outputIds : legacyIds) {
+      ids.add(id);
+      if (ids.size >= TOOL_TARGET_LIMIT) break;
+    }
+    return normalizedTargetIds([...ids]);
+  }
+  let hasUnresolvedTarget = false;
+  for (const { invocation, offset } of invocationOffsets(command, invocations)) {
+    const logs = /\borx\s+logs\b/i.exec(invocation.raw);
+    if (!logs) continue;
+    const words = shellWords(invocation.raw.slice(logs.index + logs[0].length));
+    let target: string | null = null;
+    for (let index = 0; index < words.length; index++) {
+      const word = words[index];
+      if (word === "--head") continue;
+      if (word === "--bytes" || word === "--range") {
+        index++;
+        continue;
+      }
+      if (word.startsWith("--bytes=") || word.startsWith("--range=")) continue;
+      target = word;
+      break;
+    }
+    if (!target) {
+      hasUnresolvedTarget = true;
+      continue;
+    }
+    if (new RegExp(`^${RUN_TARGET_PATTERN}$`, "i").test(target)) {
+      ids.add(target);
+      continue;
+    }
+    const variableMatch = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(target);
+    if (!variableMatch) {
+      hasUnresolvedTarget = true;
+      continue;
+    }
+    const variable = variableMatch[1];
+    const assignmentIds = assignedIdsBefore(command, variable, offset, RUN_TARGET_PATTERN);
+    for (const id of assignmentIds) ids.add(id);
+    const loopIds = loopIdsBefore(command, variable, offset, RUN_TARGET_PATTERN);
+    for (const id of loopIds) ids.add(id);
+    if (assignmentIds.length === 0 && loopIds.length === 0) hasUnresolvedTarget = true;
+  }
+  if (ids.size === 0 || hasUnresolvedTarget) {
+    const outputIds = preservedIds.length > 0 ? [] : idsFromToolOutput(output, "runs");
+    const fallback = preservedIds.length > 0 ? preservedIds : outputIds.length > 0 ? outputIds : legacyIds;
+    for (const id of fallback) {
+      ids.add(id);
+      if (ids.size >= TOOL_TARGET_LIMIT) break;
+    }
+  }
+  return normalizedTargetIds([...ids]);
+}
+
+function commandExperimentIds(command: string, output?: string, preservedIds: string[] = [], legacyIds: string[] = []): string[] {
+  const invocations = orxCommandSegments(command, "exp\\s+(?:status|desc)");
+  if (invocations.length === 0) return [];
+  const ids = new Set<string>();
+  let hasUnresolvedTarget = false;
+  for (const { invocation, offset } of invocationOffsets(command, invocations)) {
+    let resolved = false;
+    for (const match of invocation.raw.matchAll(new RegExp(`\\borx\\s+exp\\s+(?:status|desc)\\s+["']?(${RUN_TARGET_PATTERN})`, "gi"))) {
+      ids.add(match[1]);
+      resolved = true;
+    }
+    const match = /\borx\s+exp\s+(?:status|desc)\s+["']?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/.exec(invocation.raw);
+    if (match) {
+      const variable = match[1];
+      const assignmentIds = assignedIdsBefore(command, variable, offset, RUN_TARGET_PATTERN);
+      if (assignmentIds.length > 0) {
+        for (const id of assignmentIds) ids.add(id);
+        resolved = true;
+      }
+      const loopIds = loopIdsBefore(command, variable, offset, RUN_TARGET_PATTERN);
+      for (const id of loopIds) ids.add(id);
+      if (loopIds.length > 0) resolved = true;
+    }
+    if (!resolved) hasUnresolvedTarget = true;
+  }
+  if (ids.size === 0 || hasUnresolvedTarget) {
+    const outputIds = preservedIds.length > 0 ? [] : idsFromToolOutput(output, "experiments");
+    const fallback = preservedIds.length > 0 ? preservedIds : outputIds.length > 0 ? outputIds : legacyIds;
+    for (const id of fallback) {
+      ids.add(id);
+      if (ids.size >= TOOL_TARGET_LIMIT) break;
+    }
+  }
+  return normalizedTargetIds([...ids]);
+}
+
+/** User-facing activity inferred from the structured tool input. Shell calls
+ * get a small set of realistic recognizers; unknown commands keep their actual
+ * command after the shell wrapper is removed. */
+function toolActivity(part: ChatPart): ToolActivity {
+  const tool = part.tool ?? "tool";
+  const input = part.state?.input ?? {};
+  const argumentsValue = input.arguments;
+  const argumentsInput = argumentsValue && typeof argumentsValue === "object" && !Array.isArray(argumentsValue)
+    ? Object.fromEntries(Object.entries(argumentsValue))
+    : {};
+  const normalizedInput = { ...input, ...argumentsInput };
+  const rawCommand = inputString(normalizedInput, "command", "cmd");
+  const toolOutput = part.state?.output || part.state?.error;
+  const legacyTargetIds = normalizedTargetIds(inputStringArray(normalizedInput, "targetIds"));
+  const resourceRunIds = normalizedTargetIds(inputStringArray(normalizedInput, "runTargetIds"));
+  const resourceExperimentIds = normalizedTargetIds(inputStringArray(normalizedInput, "experimentTargetIds"));
+  const filePath = inputString(normalizedInput, "filePath", "file_path", "notebookPath", "notebook_path", "path");
+  const description = inputString(normalizedInput, "description");
+  const toolSegments = tool.toLowerCase().split(/(?::|\.|__)+/);
+  const baseTool = toolSegments.at(-1) ?? tool.toLowerCase();
+  if (baseTool === "run" && toolSegments.includes("web")) {
+    const query = arrayInputString(normalizedInput, "search_query", "q");
+    const imageQuery = arrayInputString(normalizedInput, "image_query", "q");
+    const pattern = arrayInputString(normalizedInput, "find", "pattern");
+    if (query) return { kind: "web", label: `Searched the web for “${query}”` };
+    if (imageQuery) return { kind: "web", label: `Searched images for “${imageQuery}”` };
+    if (pattern) return { kind: "web", label: `Searched a web page for “${pattern}”` };
+    if (Array.isArray(normalizedInput.open)) return { kind: "web", label: "Opened web pages" };
+    if (Array.isArray(normalizedInput.weather)) return { kind: "web", label: "Checked the weather" };
+    if (Array.isArray(normalizedInput.finance)) return { kind: "web", label: "Checked market data" };
+    if (Array.isArray(normalizedInput.sports)) return { kind: "web", label: "Checked sports data" };
+    if (Array.isArray(normalizedInput.time)) return { kind: "web", label: "Checked local times" };
+    return { kind: "web", label: "Browsed the web" };
+  }
+  const normalizedTool = new Map([
+    ["read_file", "read"],
+    ["write_file", "write"],
+    ["edit_file", "edit"],
+    ["exec", "bash"],
+    ["exec_command", "bash"],
+    ["run_command", "bash"],
+    ["agent", "task"],
+    ["collabagenttoolcall", "subagent"],
+    ["subagentactivity", "subagent"],
+  ]).get(baseTool) ?? baseTool;
+  switch (normalizedTool) {
+    case "bash": {
+      if (!rawCommand) return { kind: "command", label: "Ran a command" };
+      const command = meaningfulCommand(rawCommand);
+      const litSegment = orxCommandSegments(command, "(?:lit|paper)")[0];
+      const litCall = litSegment ? parseOrxLit(litSegment.raw) : null;
+      if (litCall) {
+        const label = litCall.kind === "lit"
+          ? litCall.query ? `Searched for “${litCall.query}”` : "Searched the literature"
+          : litCall.id ? `Read ${litCall.id}` : "Read a paper";
+        return { kind: litCall.kind === "lit" ? "search" : "read", label, litCall };
+      }
+
+      const shellSegments = shellCommandSegments(command);
+      const shellInvocations = shellSegments.map((segment) => shellInvocation(segment.raw));
+      const readsExperimentStatus = commandInvokesOrx(command, "exp\\s+status");
+      const readsExperimentNotes = commandInvokesOrx(command, "exp\\s+desc");
+      const updatesExperimentNotes = orxCommandSegments(command, "exp\\s+desc").some((segment) =>
+        /(?:^|\s)--(?:set(?:=|\s)|stdin\b)/.test(segment.raw),
+      );
+      const notesLabel = updatesExperimentNotes ? "Updated experiment notes" : "Read experiment notes";
+      const combinedLabel = updatesExperimentNotes
+        ? "Checked experiment status and updated notes"
+        : "Reviewed experiment status and notes";
+      if (commandInvokesOrx(command, "logs")) {
+        const runIds = commandRunIds(command, toolOutput, resourceRunIds, legacyTargetIds);
+        const label = runIds.length === 1 ? "Reviewed run log" : "Reviewed run logs";
+        return { kind: "project", label, runIds };
+      }
+      if (commandInvokesOrx(command, "exp\\s+run")) {
+        return { kind: "project", label: "Started an experiment run" };
+      }
+      if (commandInvokesOrx(command, "exp\\s+wait")) {
+        return { kind: "project", label: "Waited for an experiment run" };
+      }
+      if (commandInvokesOrx(command, "exp\\s+cancel")) {
+        return { kind: "project", label: "Cancelled an experiment run" };
+      }
+      const readsProject = commandInvokesOrx(command, "project\\s+view");
+      if (readsProject && readsExperimentStatus && readsExperimentNotes) {
+        return {
+          kind: "project",
+          label: combinedLabel,
+          experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+        };
+      }
+      if (readsProject && readsExperimentNotes) {
+        return {
+          kind: "project",
+          label: notesLabel,
+          experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+        };
+      }
+      if (readsProject && readsExperimentStatus) {
+        return {
+          kind: "project",
+          label: "Checked experiment status",
+          experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+        };
+      }
+      if (readsProject) {
+        return { kind: "project", label: "Read project details" };
+      }
+      if (readsExperimentStatus && readsExperimentNotes) {
+        return {
+          kind: "project",
+          label: combinedLabel,
+          experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+        };
+      }
+      if (readsExperimentStatus) {
+        return {
+          kind: "project",
+          label: "Checked experiment status",
+          experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+        };
+      }
+      if (readsExperimentNotes) {
+        return {
+          kind: "project",
+          label: notesLabel,
+          experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+        };
+      }
+      if (commandInvokesOrx(command, "runs?")) {
+        return { kind: "project", label: "Listed project runs" };
+      }
+
+      const gitShowTarget = shellInvocations
+        .map(commandGitShowTarget)
+        .find((target) => target != null);
+      if (gitShowTarget) {
+        return {
+          kind: "read",
+          label: `Read ${baseName(gitShowTarget.path)}`,
+          filePath: gitShowTarget.path,
+          fileRef: gitShowTarget.ref,
+          labelPrefix: "Read ",
+          labelTarget: baseName(gitShowTarget.path),
+        };
+      }
+
+      const readSegmentIndex = shellInvocations.findIndex((invocation) =>
+        invocation != null && ["sed", "cat", "head", "tail"].includes(invocation.name),
+      );
+      const readInvocation = readSegmentIndex >= 0 ? shellInvocations[readSegmentIndex] : null;
+      const readTarget = readInvocation ? commandReadTarget(readInvocation) : null;
+      const readPath = readTarget
+        ? commandFilePath(
+            readTarget,
+            shellSegments,
+            readSegmentIndex,
+            inputString(normalizedInput, "cwd", "workdir"),
+          )
+        : null;
+      if (readTarget && readPath) {
+        return {
+          kind: "read",
+          label: `Read ${baseName(readTarget)}`,
+          filePath: readPath,
+          labelPrefix: "Read ",
+          labelTarget: baseName(readTarget),
+        };
+      }
+      if (shellInvocations.some((invocation) =>
+        invocation?.name === "find"
+        || invocation?.name === "ls"
+        || (invocation?.name === "rg" && invocation.args.includes("--files")),
+      )) {
+        return { kind: "search", label: "Listed files" };
+      }
+      const searchSegmentIndex = shellInvocations.findIndex((invocation) =>
+        invocation?.name === "rg" || invocation?.name === "grep",
+      );
+      if (searchSegmentIndex >= 0) {
+        const pattern = commandSearchPattern(shellSegments[searchSegmentIndex].raw);
+        return {
+          kind: "search",
+          label: pattern ? `Searched code for “${pattern}”` : "Searched code",
+          searchPattern: pattern ?? undefined,
+        };
+      }
+      const gitInvocation = shellInvocations.find((invocation) => invocation?.name === "git");
+      const gitAction = gitInvocation?.args[0];
+      if (gitAction === "grep") {
+        const pattern = gitInvocation?.args.slice(1).find((arg) => !arg.startsWith("-"));
+        return {
+          kind: "search",
+          label: pattern ? `Searched code for “${pattern}”` : "Searched code",
+          searchPattern: pattern,
+        };
+      }
+      if (readInvocation) return { kind: "read", label: "Read a file" };
+      if (gitAction === "status") return { kind: "command", label: "Checked Git status" };
+      if (gitAction === "diff") return { kind: "command", label: "Reviewed code changes" };
+      if (gitAction === "log") return { kind: "command", label: "Read Git history" };
+      const packageAction = (action: string) => shellInvocations.some((invocation) => {
+        if (!invocation || !["cargo", "pnpm", "npm", "yarn"].includes(invocation.name)) return false;
+        return invocation.args[0] === action || (invocation.args[0] === "run" && invocation.args[1] === action);
+      });
+      if (packageAction("test")) return { kind: "command", label: "Ran tests" };
+      if (shellInvocations.some((invocation) => invocation?.name === "tsc") || packageAction("typecheck")) {
+        return { kind: "command", label: "Checked types" };
+      }
+      if (packageAction("lint")) return { kind: "command", label: "Checked code style" };
+      if (packageAction("build")) return { kind: "command", label: "Built the project" };
+      return { kind: "command", label: `Ran ${command}` };
+    }
+    case "read": {
+      const target = filePath ? baseName(filePath) : null;
+      return target
+        ? { kind: "read", label: `Read ${target}`, filePath: filePath ?? undefined, labelPrefix: "Read ", labelTarget: target }
+        : { kind: "read", label: "Read a file" };
+    }
+    case "edit":
+    case "write":
+    case "notebookedit": {
+      const change = editChange(normalizedInput);
+      const resolvedPath = filePath ?? change?.path ?? null;
+      const target = resolvedPath ? baseName(resolvedPath) : null;
+      const verb = change?.type === "add" ? "Created" : change?.type === "delete" ? "Deleted" : "Edited";
+      return target
+        ? { kind: "edit", label: `${verb} ${target}`, filePath: resolvedPath ?? undefined, labelPrefix: `${verb} `, labelTarget: target }
+        : { kind: "edit", label: "Edited a file" };
+    }
+    case "grep": {
+      const pattern = inputString(normalizedInput, "pattern");
+      return {
+        kind: "search",
+        label: pattern ? `Searched code for “${pattern}”` : "Searched code",
+        searchPattern: pattern ?? undefined,
+      };
+    }
+    case "glob": {
+      const pattern = inputString(normalizedInput, "pattern");
+      return { kind: "search", label: pattern ? `Listed files matching ${pattern}` : "Listed files" };
+    }
+    case "websearch": {
+      const query = inputString(normalizedInput, "query");
+      const url = inputString(normalizedInput, "url");
+      const pattern = inputString(normalizedInput, "pattern");
+      if (query) return { kind: "web", label: `Searched the web for “${query}”` };
+      if (pattern && url) return { kind: "web", label: `Searched “${pattern}” on a page` };
+      if (url) return { kind: "web", label: `Opened ${url}` };
+      return { kind: "web", label: description ?? "Browsed the web" };
+    }
+    case "webfetch": {
+      const url = inputString(normalizedInput, "url");
+      return { kind: "web", label: url ? `Read ${url}` : description ?? "Read a web page" };
+    }
+    case "task":
+      return { kind: "agent", label: description ?? "Ran a subagent" };
+    case "subagent":
+      return { kind: "agent", label: subagentLine(normalizedInput) };
+    case "error":
+      return { kind: "command", label: "Tool failed" };
+    case "interrupted":
+      return { kind: "command", label: "Tool was interrupted" };
+    default: {
+      const detail = description ?? filePath ?? rawCommand ?? part.state?.title ?? "";
+      return { kind: "command", label: detail ? `${tool}: ${detail}` : tool };
+    }
+  }
 }
 
 /** Readable one-liner for a Codex sub-agent spawn/activity row, from the
@@ -409,88 +1209,585 @@ function subagentLine(input: Record<string, unknown>): string {
   return "Sub-agent";
 }
 
-/** One expandable tool row inside a group: gray summary line, click to reveal
- * the input + output. */
-function ToolRow({ part, onOpenFile }: { part: ChatPart; onOpenFile?: (path: string) => void }) {
-  const state = part.state;
-  const output = state?.error || state?.output || "";
-  const cmd = typeof state?.input?.command === "string" ? state.input.command : null;
-  const filePath = typeof state?.input?.filePath === "string" ? state.input.filePath : null;
-  const hasDetail = Boolean(output || cmd || filePath);
+function ToolActivityIcon({ activity, className = "" }: { activity: ToolActivity; className?: string }) {
+  if (activity.litCall) return <LitSourceLogo source={activity.litCall.source} size={16} />;
+  const props = { size: 16, strokeWidth: 1.75, className: `tool-kind-icon shrink-0 ${className}` };
+  switch (activity.kind) {
+    case "read":
+    case "project":
+      return <BookOpen {...props} />;
+    case "search":
+      return <Search {...props} />;
+    case "edit":
+      return <Pencil {...props} />;
+    case "web":
+      return <Globe {...props} />;
+    case "agent":
+      return <Users {...props} />;
+    case "command":
+      return <SquareTerminal {...props} />;
+  }
+}
+
+function ToolTargetOverflow({
+  items,
+  onOpen,
+  targetType,
+}: {
+  items: Array<{ id: string; label: string }>;
+  onOpen?: (id: string) => void;
+  targetType: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const revealRef = useRef<HTMLSpanElement>(null);
+  const focusReveal = useRef(false);
+
+  useEffect(() => {
+    if (!open || !focusReveal.current) return;
+    focusReveal.current = false;
+    revealRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+  }, [open]);
+
   return (
-    <details className="tool-row flex flex-col [&_summary]:flex [&_summary]:items-center [&_summary]:gap-2 [&_summary]:py-[3px] [&_summary]:px-1 [&_summary]:cursor-pointer [&_summary]:list-none [&_summary]:select-none [&_summary]:min-w-0 [&_summary]:rounded-sm [&_summary:hover]:bg-surface [&_summary::-webkit-details-marker]:hidden" open={false}>
-      <summary>
-        <span className={toolStatusClass(state?.status)} />
-        <span className={TOOL_LINE_CLASS_NAME}>{toolSummary(part)}</span>
-        {filePath && onOpenFile && (
-          <button
-            className="tool-open shrink-0 text-xs text-primary [&:hover]:underline file-link"
-            title={`Open ${filePath}`}
-            onClick={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              onOpenFile(filePath);
-            }}
-          >
-            open
-          </button>
-        )}
-      </summary>
-      {hasDetail && (
-        <div className="tool-detail mt-0.5 mr-0 mb-1 ml-3.5">
-          {cmd && <div className="tool-cmd-full py-1.5 px-2.5 font-mono text-xs text-text bg-surface rounded-sm whitespace-pre-wrap wrap-anywhere">{cmd}</div>}
-          {/* Safety net for pre-cap stored transcripts; the backend caps live
-              tool output at 16k (TOOL_TEXT_CAP), so this slice must stay
-              above that or it clips the truncation marker. */}
-          {output && <div className="tool-output mt-[3px] py-1.5 px-2.5 font-mono text-xs text-subtext whitespace-pre-wrap wrap-anywhere max-h-65 overflow-y-auto bg-background border border-border-variant rounded-sm">{output.slice(0, 20000)}</div>}
-        </div>
+    <span className="tool-target-overflow inline">
+      {open && (
+        <span className="tool-target-reveal" ref={revealRef}>
+          {items.map((item, index) => (
+            <span key={item.id}>
+              {index > 0 && ", "}
+              {onOpen ? (
+                <button
+                  className="tool-target"
+                  onClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    onOpen(item.id);
+                  }}
+                >
+                  {item.label}
+                </button>
+              ) : (
+                <span>{item.label}</span>
+              )}
+            </span>
+          ))}
+        </span>
       )}
-    </details>
+      {open && ", "}
+      <button
+        className="tool-target-more"
+        aria-expanded={open}
+        aria-label={open ? `Hide additional ${targetType}` : `Show ${items.length} more ${targetType}`}
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          focusReveal.current = !open && event.detail === 0;
+          setOpen((value) => !value);
+        }}
+      >
+        {open ? "show less" : `+ ${items.length} more`}
+      </button>
+    </span>
   );
 }
 
-/** A run of consecutive tool calls. A single call renders as its own row
- * (click reveals input/output); several collapse behind one "Used N tools"
- * line that expands to every row, auto-expanded while one is still running. */
-function ToolGroup({ parts, onOpenFile }: { parts: ChatPart[]; onOpenFile?: (path: string) => void }) {
-  const running = parts.some((p) => p.state?.status === "running");
-  const errored = parts.some((p) => p.state?.status === "error");
-  const [open, setOpen] = useState(false);
-
-  // A single tool needs no group wrapper: its ToolRow already shows the same
-  // line (dot + toolLine) and expands to the input/output directly. The
-  // summary-plus-rows shape would paint the identical line twice. A running
-  // lone row stays collapsed by design — the old auto-expand only revealed a
-  // duplicate line whose detail was collapsed anyway.
-  if (parts.length === 1) {
+function ToolActivityLabel({
+  activity,
+  onOpenFile,
+  onOpenRun,
+  runExperimentName,
+  onOpenExperiment,
+  experimentName,
+}: {
+  activity: ToolActivity;
+  onOpenFile?: OpenTranscriptFile;
+  onOpenRun?: (runId: string) => void;
+  runExperimentName?: (runId: string) => string;
+  onOpenExperiment?: (experimentId: string) => void;
+  experimentName?: (experimentId: string) => string;
+}) {
+  if (activity.searchPattern) {
+    const patternStart = activity.label.indexOf(activity.searchPattern);
+    const prefix = patternStart >= 0 ? activity.label.slice(0, patternStart) : "Searched code for “";
+    const suffix = patternStart >= 0
+      ? activity.label.slice(patternStart + activity.searchPattern.length)
+      : "”";
     return (
-      <div className={`tool-group my-0.5 mx-0 [&.has-error_.tool-group-summary]:text-accent-red [&.has-error_>_.tool-row_.tool-line]:text-accent-red ${errored ? "has-error" : ""}`}>
-        <ToolRow part={parts[0]} onOpenFile={onOpenFile} />
+      <>
+        {prefix}
+        {activity.searchPattern.split(/([|/_-])/).map((segment, index) => (
+          <span key={`${index}-${segment}`}>
+            {segment}
+            {/^[|/_-]$/.test(segment) && <wbr />}
+          </span>
+        ))}
+        {suffix}
+      </>
+    );
+  }
+  if (activity.litCall?.kind === "paper" && activity.litCall.id) {
+    return (
+      <a
+        className="tool-target"
+        href={paperUrl(activity.litCall.source, activity.litCall.id)}
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        {activity.label}
+        <ArrowUpRight className="inline ml-1 opacity-50" size={13} aria-hidden="true" />
+      </a>
+    );
+  }
+  if (activity.filePath && activity.labelTarget && onOpenFile) {
+    const filePath = activity.filePath;
+    return (
+      <>
+        {activity.labelPrefix}
+        <button
+          className="tool-target"
+          onClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            onOpenFile(filePath, undefined, undefined, activity.fileRef);
+          }}
+        >
+          {activity.labelTarget}
+        </button>
+      </>
+    );
+  }
+  if (activity.runIds?.length) {
+    const runIds = runExperimentName
+      ? activity.runIds.filter((runId) => Boolean(runExperimentName(runId)))
+      : activity.runIds;
+    if (runIds.length === 0) return activity.label;
+    const multiple = runIds.length > 1;
+    const visibleRunIds = runIds.slice(0, 3);
+    const hiddenRuns = runIds.slice(visibleRunIds.length).map((runId) => ({
+      id: runId,
+      label: runExperimentName?.(runId) || "Experiment",
+    }));
+    return (
+      <>
+        {multiple ? "Reviewed run logs for " : "Reviewed run log "}
+        {visibleRunIds.map((runId, index) => (
+          <span key={runId}>
+            {index > 0 && ", "}
+            {onOpenRun ? (
+              <button
+                className="tool-target"
+                title={`Open logs for run ${runId}`}
+                onClick={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  onOpenRun(runId);
+                }}
+              >
+                {runExperimentName?.(runId) || "Experiment"}
+              </button>
+            ) : (
+              <span>{runExperimentName?.(runId) || "Experiment"}</span>
+            )}
+          </span>
+        ))}
+        {hiddenRuns.length > 0 && (
+          <>
+            {", "}
+            <ToolTargetOverflow items={hiddenRuns} onOpen={onOpenRun} targetType="run logs" />
+          </>
+        )}
+      </>
+    );
+  }
+  if (activity.experimentIds?.length) {
+    const experimentIds = experimentName
+      ? activity.experimentIds.filter((experimentId) => Boolean(experimentName(experimentId)))
+      : activity.experimentIds;
+    if (experimentIds.length === 0) return activity.label;
+    const visibleExperimentIds = experimentIds.slice(0, 3);
+    const hiddenExperiments = experimentIds.slice(visibleExperimentIds.length).map((experimentId) => ({
+      id: experimentId,
+      label: experimentName?.(experimentId) || "Experiment",
+    }));
+    return (
+      <>
+        {activity.label} for {visibleExperimentIds.map((experimentId, index) => (
+          <span key={experimentId}>
+            {index > 0 && ", "}
+            {onOpenExperiment ? (
+              <button
+                className="tool-target"
+                title={`Open experiment ${experimentName?.(experimentId) || ""}`.trim()}
+                onClick={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  onOpenExperiment(experimentId);
+                }}
+              >
+                {experimentName?.(experimentId) || "Experiment"}
+              </button>
+            ) : (
+              <span>{experimentName?.(experimentId) || "Experiment"}</span>
+            )}
+          </span>
+        ))}
+        {hiddenExperiments.length > 0 && (
+          <>
+            {", "}
+            <ToolTargetOverflow items={hiddenExperiments} onOpen={onOpenExperiment} targetType="experiments" />
+          </>
+        )}
+      </>
+    );
+  }
+  return activity.label;
+}
+
+function summarizeToolGroup(activities: ToolActivity[]): string {
+  const count = (kind: ToolActivityKind) => activities.filter((activity) => activity.kind === kind).length;
+  const clauses: string[] = [];
+  const reads = count("read");
+  const searches = count("search");
+  const edits = count("edit");
+  const projects = count("project");
+  const web = count("web");
+  const commands = count("command");
+  const agents = count("agent");
+
+  if (reads) clauses.push(reads === 1 ? "Read a file" : "Read files");
+  if (searches) clauses.push("searched code");
+  if (edits) clauses.push(edits === 1 ? "edited a file" : "edited files");
+  if (projects) clauses.push("reviewed project data");
+  if (web) clauses.push("browsed the web");
+  if (commands) clauses.push(commands === 1 ? "ran a command" : "ran commands");
+  if (agents) clauses.push(agents === 1 ? "worked with a subagent" : "worked with subagents");
+  const summary = clauses.join(", ");
+  return summary ? `${summary[0].toUpperCase()}${summary.slice(1)}` : "Used tools";
+}
+
+function activityInProgress(activity: ToolActivity): ToolActivity {
+  const replacements: Array<[RegExp, string]> = [
+    [/^Reviewed run logs?/, activity.label.startsWith("Reviewed run logs") ? "Reading run logs" : "Reading run log"],
+    [/^Reviewed /, "Reviewing "],
+    [/^Read /, "Reading "],
+    [/^Searched /, "Searching "],
+    [/^Listed /, "Listing "],
+    [/^Edited /, "Editing "],
+    [/^Updated /, "Updating "],
+    [/^Created /, "Creating "],
+    [/^Deleted /, "Deleting "],
+    [/^Ran /, "Running "],
+    [/^Started /, "Starting "],
+    [/^Waited /, "Waiting "],
+    [/^Checked /, "Checking "],
+    [/^Built /, "Building "],
+    [/^Cancelled /, "Cancelling "],
+  ];
+  let label = activity.label;
+  for (const [pattern, replacement] of replacements) {
+    if (!pattern.test(label)) continue;
+    label = label.replace(pattern, replacement);
+    break;
+  }
+  return { ...activity, label };
+}
+
+function resolvedActivityLabel(
+  activity: ToolActivity,
+  runExperimentName?: (runId: string) => string,
+  experimentName?: (experimentId: string) => string,
+): string {
+  const summarizedNames = (names: string[]) => {
+    const visible = names.slice(0, 3);
+    const remaining = names.length - visible.length;
+    return `${visible.join(", ")}${remaining > 0 ? `, + ${remaining} more` : ""}`;
+  };
+  if (activity.runIds?.length) {
+    const names = activity.runIds.map((runId) => runExperimentName?.(runId) || "").filter(Boolean);
+    if (names.length === 0) return activity.label;
+    return `${activity.label}${names.length > 1 ? " for " : " "}${summarizedNames(names)}`;
+  }
+  if (activity.experimentIds?.length) {
+    const names = activity.experimentIds.map((experimentId) => experimentName?.(experimentId) || "").filter(Boolean);
+    if (names.length === 0) return activity.label;
+    return `${activity.label} for ${summarizedNames(names)}`;
+  }
+  return activity.label;
+}
+
+const TOOL_TAIL_SHIMMER_DELAY_MS = 160;
+function useDelayedToolShimmer(active: boolean): boolean {
+  const [visible, setVisible] = useState(false);
+
+  useEffect(() => {
+    if (!active) {
+      setVisible(false);
+      return;
+    }
+    const timeout = window.setTimeout(
+      () => setVisible(true),
+      TOOL_TAIL_SHIMMER_DELAY_MS,
+    );
+    return () => window.clearTimeout(timeout);
+  }, [active]);
+
+  return active && visible;
+}
+
+function groupIconActivity(activities: ToolActivity[]): ToolActivity {
+  const priority: ToolActivityKind[] = ["read", "search", "edit", "project", "web", "command", "agent"];
+  for (const kind of priority) {
+    const activity = activities.find((candidate) => candidate.kind === kind);
+    if (activity) return activity;
+  }
+  return activities[0] ?? { kind: "command", label: "Used tools" };
+}
+
+interface SquashedToolPart {
+  part: ChatPart;
+  count: number;
+}
+
+function squashableToolPartKey(part: ChatPart): string | null {
+  if (part.state?.status !== "completed") return null;
+  const activity = toolActivity(part);
+  return JSON.stringify([
+    activity.kind,
+    activity.label,
+    activity.filePath ?? null,
+    activity.fileRef ?? null,
+    activity.litCall?.kind === "paper" ? activity.litCall.id ?? null : null,
+    activity.runIds ?? null,
+    activity.experimentIds ?? null,
+  ]);
+}
+
+function squashToolParts(parts: ChatPart[]): SquashedToolPart[] {
+  const squashed: SquashedToolPart[] = [];
+  for (const part of parts) {
+    const key = squashableToolPartKey(part);
+    const previous = squashed[squashed.length - 1];
+    if (key && previous && squashableToolPartKey(previous.part) === key) {
+      previous.count++;
+    } else {
+      squashed.push({ part, count: 1 });
+    }
+  }
+  return squashed;
+}
+
+/** Routine successful calls are static activity rows. Only failures disclose
+ * raw command/output, because that detail is useful for diagnosis. */
+function ToolRow({
+  part,
+  repeatCount = 1,
+  onOpenFile,
+  onOpenRun,
+  runExperimentName,
+  onOpenExperiment,
+  experimentName,
+}: {
+  part: ChatPart;
+  repeatCount?: number;
+  onOpenFile?: OpenTranscriptFile;
+  onOpenRun?: (runId: string) => void;
+  runExperimentName?: (runId: string) => string;
+  onOpenExperiment?: (experimentId: string) => void;
+  experimentName?: (experimentId: string) => string;
+}) {
+  const state = part.state;
+  const activity = toolActivity(part);
+  const failed = state?.status === "error";
+  const errorMessage = cleanToolError(state?.error || state?.output || "");
+  const hasDetail = failed && Boolean(errorMessage);
+  const [detailOpen, setDetailOpen] = useState(false);
+  const detailId = `tool-error-${part.id.replace(/[^A-Za-z0-9_-]/g, "-")}`;
+  const line = (
+    <>
+      {failed && <span className="sr-only">Failed: </span>}
+      {failed ? (
+        <CircleX size={16} strokeWidth={1.75} className="tool-kind-icon shrink-0 text-accent-red self-start mt-[5px]" aria-hidden="true" />
+      ) : (
+        <ToolActivityIcon activity={activity} className="text-muted self-start mt-[5px]" />
+      )}
+      <span className={`tool-line flex-1 min-w-0 whitespace-normal break-words text-lg ${failed ? "text-accent-red" : "text-subtext"}`}>
+        <ToolActivityLabel
+          activity={activity}
+          onOpenFile={onOpenFile}
+          onOpenRun={onOpenRun}
+          runExperimentName={runExperimentName}
+          onOpenExperiment={onOpenExperiment}
+          experimentName={experimentName}
+        />
+        {repeatCount > 1 && (
+          <span className="tool-repeat-count ml-1 text-muted font-normal" title={`${repeatCount} consecutive identical calls`}>
+            ×{repeatCount}
+          </span>
+        )}
+      </span>
+    </>
+  );
+
+  if (!hasDetail) {
+    return <div className="tool-row flex items-center gap-2 min-w-0 py-[3px] px-1">{line}</div>;
+  }
+
+  return (
+    <div className="tool-row tool-row-error flex flex-col min-w-0">
+      <div className="flex items-center gap-2 w-fit max-w-full py-[3px] px-1 min-w-0 rounded-sm">
+        {line}
+        <button
+          type="button"
+          className="tool-row-detail-toggle shrink-0 inline-flex items-center justify-center p-0.5 rounded-sm cursor-pointer hover:bg-surface"
+          aria-expanded={detailOpen}
+          aria-controls={detailId}
+          aria-label={`${detailOpen ? "Hide" : "Show"} error details for ${activity.label}`}
+          onClick={() => setDetailOpen((current) => !current)}
+        >
+          <ChevronRight size={12} className={`text-accent-red transition-transform duration-120 ease-standard ${detailOpen ? "rotate-90" : ""}`} />
+        </button>
+      </div>
+      {detailOpen && (
+        <div className="tool-detail mt-1 mr-0 mb-1 ml-6" id={detailId}>
+          <div className="tool-output py-1.5 px-2.5 font-mono text-xs text-subtext whitespace-pre-wrap wrap-anywhere max-h-65 overflow-y-auto bg-background border border-border-variant rounded-sm">
+            {errorMessage.slice(0, 20000)}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Consecutive calls render as one Codex-style activity group: a readable
+ * aggregate description and a collapsible list of semantic rows. */
+function ToolGroup({
+  parts,
+  pendingTail,
+  onOpenFile,
+  onOpenRun,
+  runExperimentName,
+  onOpenExperiment,
+  experimentName,
+}: {
+  parts: ChatPart[];
+  pendingTail?: boolean;
+  onOpenFile?: OpenTranscriptFile;
+  onOpenRun?: (runId: string) => void;
+  runExperimentName?: (runId: string) => string;
+  onOpenExperiment?: (experimentId: string) => void;
+  experimentName?: (experimentId: string) => string;
+}) {
+  const [open, setOpen] = useState(false);
+  const displayParts = squashToolParts(parts);
+  const activities = displayParts.map(({ part }) => toolActivity(part));
+  const tailPart = pendingTail ? parts.at(-1) : undefined;
+  const pendingActivity = tailPart?.state?.status !== "error"
+    ? tailPart && activityInProgress(toolActivity(tailPart))
+    : null;
+  const shimmering = useDelayedToolShimmer(pendingActivity != null);
+  const summary = summarizeToolGroup(activities);
+  const iconActivity = pendingActivity ?? groupIconActivity(activities);
+  const summaryLabel = pendingActivity
+    ? resolvedActivityLabel(pendingActivity, runExperimentName, experimentName)
+    : summary;
+  if (parts.length === 1) {
+    if (pendingActivity) {
+      return (
+        <div className="tool-group my-3.5 mx-0">
+          <div className="tool-row flex items-start gap-2 min-w-0 py-[3px] px-1 text-lg text-subtext">
+            <ToolActivityIcon activity={pendingActivity} className={`${shimmering ? "tool-running-shimmer-icon" : "text-muted"} self-start mt-[5px]`} />
+            <span
+              className={`${shimmering ? "tool-running-shimmer" : ""} tool-active-label min-w-0 whitespace-normal break-words`}
+              title={summaryLabel}
+            >
+              <ToolActivityLabel
+                activity={pendingActivity}
+                onOpenFile={onOpenFile}
+                onOpenRun={onOpenRun}
+                runExperimentName={runExperimentName}
+                onOpenExperiment={onOpenExperiment}
+                experimentName={experimentName}
+              />
+            </span>
+          </div>
+        </div>
+      );
+    }
+    return (
+      <div className="tool-group my-3.5 mx-0">
+        <ToolRow
+          part={parts[0]}
+          onOpenFile={onOpenFile}
+          onOpenRun={onOpenRun}
+          runExperimentName={runExperimentName}
+          onOpenExperiment={onOpenExperiment}
+          experimentName={experimentName}
+        />
       </div>
     );
   }
 
-  // While a tool is in flight, show the rows live; collapse once the run
-  // settles. Because a running group is always expanded, a summary echoing
-  // the running tool's line would sit directly above the identical row — the
-  // count never duplicates.
-  const expanded = open || running;
-  const summary = `Used ${parts.length} tools`;
-
+  const expanded = open;
   return (
-    <div className={`tool-group my-0.5 mx-0 [&.has-error_.tool-group-summary]:text-accent-red [&.has-error_>_.tool-row_.tool-line]:text-accent-red ${errored ? "has-error" : ""}`}>
-      <button className="tool-group-summary flex items-center gap-2 w-full py-[3px] px-0.5 cursor-pointer text-muted text-md text-left rounded-sm [&:hover]:text-subtext [&:hover]:bg-surface" onClick={() => setOpen((v) => !v)}>
-        <span className={toolStatusClass(running ? "running" : errored ? "error" : "completed")} />
-        <span className={TOOL_LINE_CLASS_NAME}>{summary}</span>
-        <ChevronRight size={12} className={`tool-chevron shrink-0 text-muted transition-transform duration-120 ease-standard [&.open]:rotate-90 ${expanded ? "open" : ""}`} />
-      </button>
-      {expanded && (
-        <div className="tool-group-rows flex flex-col gap-px mt-0.5 mr-0 mb-1 ml-[7px] pl-2.5 border-l border-l-border-variant [&_.tool-status]:hidden">
-          {parts.map((p) => (
-            <ToolRow key={p.id} part={p} onOpenFile={onOpenFile} />
-          ))}
+    <div className="tool-group my-3.5 mx-0">
+      <div className="tool-group-summary flex items-start gap-2 w-fit max-w-full py-[3px] px-1 text-lg text-subtext text-left">
+        <ToolActivityIcon activity={iconActivity} className={`${shimmering ? "tool-running-shimmer-icon" : "text-muted"} mt-[5px]`} />
+        {pendingActivity ? (
+          <span
+            className={`tool-group-label tool-active-label min-w-0 whitespace-normal break-words ${shimmering ? "tool-running-shimmer" : ""}`}
+            title={summaryLabel}
+          >
+            <ToolActivityLabel
+              activity={pendingActivity}
+              onOpenFile={onOpenFile}
+              onOpenRun={onOpenRun}
+              runExperimentName={runExperimentName}
+              onOpenExperiment={onOpenExperiment}
+              experimentName={experimentName}
+            />
+          </span>
+        ) : (
+          <button
+            type="button"
+            className="tool-group-label min-w-0 whitespace-normal break-words cursor-pointer text-left"
+            onClick={() => setOpen((value) => !value)}
+            aria-expanded={expanded}
+          >
+            {summaryLabel}
+          </button>
+        )}
+        <button
+          type="button"
+          className="tool-group-chevron-button inline-flex items-center justify-center self-center shrink-0 p-px cursor-pointer rounded-sm"
+          onClick={() => setOpen((value) => !value)}
+          aria-expanded={expanded}
+          aria-label={expanded ? "Collapse tool activity" : "Expand tool activity"}
+        >
+          <ChevronRight size={16} className={`tool-chevron text-muted transition-[transform,color] duration-120 ease-standard [&.open]:rotate-90 ${expanded ? "open" : ""}`} />
+        </button>
+      </div>
+      <div
+        className={`tool-group-disclosure ${expanded ? "open" : ""}`}
+        aria-hidden={!expanded}
+        inert={!expanded}
+      >
+        <div className="tool-group-disclosure-inner">
+          <div className="tool-group-rows flex flex-col gap-px mt-0.5 mr-0 mb-1 ml-6">
+            {displayParts.map(({ part, count }) => (
+              <ToolRow
+                key={part.id}
+                part={part}
+                repeatCount={count}
+                onOpenFile={onOpenFile}
+                onOpenRun={onOpenRun}
+                runExperimentName={runExperimentName}
+                onOpenExperiment={onOpenExperiment}
+                experimentName={experimentName}
+              />
+            ))}
+          </div>
         </div>
-      )}
+      </div>
     </div>
   );
 }
@@ -508,7 +1805,7 @@ function PromptCard({
 }: {
   part: ChatPart;
   onRespond?: (answer: PromptAnswer) => void;
-  onOpenFile?: (path: string, line?: number, exp?: string) => void;
+  onOpenFile?: OpenTranscriptFile;
   onOpenPlan?: (plan: string, promptId: string) => void;
 }) {
   const p = part.prompt as ChatPrompt;
@@ -524,34 +1821,25 @@ function PromptCard({
   if (p.resolved) {
     if (p.kind === "permission") return null;
     if (p.kind === "plan") {
-      // No echo (`approved` absent — stale-card cleanup, pre-echo history):
-      // neutral "Resolved", not a checkmark implying approval. A denial with
-      // a note asked for changes; without one it was a plain rejection.
-      const outcome =
-        p.approved === true
-          ? "Plan approved"
+      const outcome = p.approved === true
+        ? { label: "Plan approved", icon: Check, iconClass: "text-accent-green" }
+        : p.approved === false && p.note
+          ? { label: "Plan revision requested", icon: Pencil, iconClass: "text-accent-amber" }
           : p.approved === false
-            ? p.note
-              ? "Revision requested"
-              : "Rejected"
-            : "Resolved";
-      const outcomeClass =
-        p.approved === true
-          ? "approved"
-          : p.approved === false
-            ? p.note
-              ? "revised"
-              : "rejected"
-            : "";
+            ? { label: "Plan rejected", icon: X, iconClass: "text-accent-red" }
+            : { label: "Plan resolved", icon: FileText, iconClass: "text-muted" };
+      const OutcomeIcon = outcome.icon;
       return (
-        <details className={PROMPT_COLLAPSED_CLASS_NAME}>
+        <details className={PLAN_RESOLVED_CLASS_NAME}>
           <summary>
-            <span className="prompt-collapsed-title font-semibold wrap-anywhere">
+            <span className="plan-resolved-label text-lg font-[375] wrap-anywhere">
               {p.synthesized ? "Plan" : "Proposed plan"}
             </span>
-            <span className={`prompt-outcome text-sm text-subtext wrap-anywhere [&.approved]:text-accent-green [&.chosen]:text-accent-green [&.approved::before]:content-['✓_'] [&.chosen::before]:content-['✓_'] [&.revised]:text-accent-amber [&.rejected]:text-accent-amber ${outcomeClass}`}>{outcome}</span>
+            <OutcomeIcon size={17} strokeWidth={1.8} className={`shrink-0 ${outcome.iconClass}`} />
+            <span className="plan-resolved-label prompt-outcome text-lg font-[375] wrap-anywhere">{outcome.label}</span>
+            <ChevronRight size={12} className="plan-chevron shrink-0 text-muted" />
           </summary>
-          <div className={PROMPT_COLLAPSED_BODY_CLASS_NAME}>
+          <div className={`${PROMPT_COLLAPSED_BODY_CLASS_NAME} ml-6`}>
             <Md text={p.plan ?? ""} onOpenFile={onOpenFile} />
             {p.note && <div className="prompt-collapsed-note mt-1.5 italic">{p.note}</div>}
           </div>
@@ -565,8 +1853,8 @@ function PromptCard({
     return (
       <details className={PROMPT_COLLAPSED_CLASS_NAME}>
         <summary>
-          <span className="prompt-collapsed-title font-semibold wrap-anywhere">{p.header || p.question || "Question"}</span>
-          <span className={`prompt-outcome text-sm text-subtext wrap-anywhere [&.approved]:text-accent-green [&.chosen]:text-accent-green [&.approved::before]:content-['✓_'] [&.chosen::before]:content-['✓_'] [&.revised]:text-accent-amber [&.rejected]:text-accent-amber ${chosen ? "chosen" : ""}`}>{chosen || "Resolved"}</span>
+          <span className="prompt-collapsed-title font-[375] wrap-anywhere">{p.header || p.question || "Question"}</span>
+          <span className={`prompt-outcome font-[375] text-subtext wrap-anywhere [&.approved]:text-accent-green [&.chosen]:text-accent-green [&.approved::before]:content-['✓_'] [&.chosen::before]:content-['✓_'] [&.revised]:text-accent-amber [&.rejected]:text-accent-amber ${chosen ? "chosen" : ""}`}>{chosen || "Resolved"}</span>
         </summary>
         <div className={PROMPT_COLLAPSED_BODY_CLASS_NAME}>
           {/* The summary title already shows the question when there's no header. */}
@@ -724,7 +2012,7 @@ function messageHasVisibleContent(m: ChatMessage): boolean {
   return m.parts.some(partIsVisible);
 }
 
-/** Memoized: streaming re-broadcasts the whole updated message ~7x/sec, and
+/** Memoized: streaming re-broadcasts the whole updated message up to ~13x/sec, and
  * `upsertMessage` preserves object identity for every untouched message — so
  * only the message actually being streamed re-renders (and re-parses its
  * markdown/KaTeX), not the entire transcript. Callback props must stay
@@ -752,16 +2040,24 @@ function attachmentPartView(p: ChatPart): { src: string; isPdf: boolean; name: s
 
 const Message = memo(function Message({
   message,
+  pendingTailToolId,
   onOpenFile,
   onOpenRun,
+  runExperimentName,
+  onOpenExperiment,
+  experimentName,
   onRespond,
   onOpenPlan,
   onOpenSubagent,
   skills,
 }: {
   message: ChatMessage;
-  onOpenFile?: (path: string, line?: number, exp?: string) => void;
+  pendingTailToolId?: string | null;
+  onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
+  runExperimentName?: (runId: string) => string;
+  onOpenExperiment?: (experimentId: string) => void;
+  experimentName?: (experimentId: string) => string;
   onRespond?: (answer: PromptAnswer) => void;
   /** Open a plan's full markdown in the right pane (plan cards/strip). */
   onOpenPlan?: (plan: string, promptId: string) => void;
@@ -819,7 +2115,17 @@ const Message = memo(function Message({
   }
   return (
     <div className="msg-assistant text-lg leading-[1.62] text-text min-w-0">
-      {renderParts(message.parts, { onOpenFile, onOpenRun, onRespond, onOpenPlan, onOpenSubagent })}
+      {renderParts(message.parts, {
+        pendingTailToolId,
+        onOpenFile,
+        onOpenRun,
+        runExperimentName,
+        onOpenExperiment,
+        experimentName,
+        onRespond,
+        onOpenPlan,
+        onOpenSubagent,
+      })}
     </div>
   );
 });
@@ -832,20 +2138,43 @@ const Message = memo(function Message({
 function renderParts(
   parts: ChatPart[],
   opts: {
-    onOpenFile?: (path: string, line?: number, exp?: string) => void;
+    pendingTailToolId?: string | null;
+    onOpenFile?: OpenTranscriptFile;
     onOpenRun?: (runId: string) => void;
+    runExperimentName?: (runId: string) => string;
+    onOpenExperiment?: (experimentId: string) => void;
+    experimentName?: (experimentId: string) => string;
     onRespond?: (answer: PromptAnswer) => void;
     onOpenPlan?: (plan: string, promptId: string) => void;
     onOpenSubagent?: (spawnPartId: string) => void;
   },
 ): React.ReactNode[] {
-  const { onOpenFile, onOpenRun, onRespond, onOpenPlan, onOpenSubagent } = opts;
+  const {
+    pendingTailToolId,
+    onOpenFile,
+    onOpenRun,
+    runExperimentName,
+    onOpenExperiment,
+    experimentName,
+    onRespond,
+    onOpenPlan,
+    onOpenSubagent,
+  } = opts;
   const rendered: React.ReactNode[] = [];
   let toolRun: ChatPart[] = [];
   const flushTools = () => {
     if (toolRun.length === 0) return;
     rendered.push(
-      <ToolGroup key={`tg-${toolRun[0].id}`} parts={toolRun} onOpenFile={onOpenFile} />,
+      <ToolGroup
+        key={`tg-${toolRun[0].id}`}
+        parts={toolRun}
+        pendingTail={toolRun.some((part) => part.id === pendingTailToolId)}
+        onOpenFile={onOpenFile}
+        onOpenRun={onOpenRun}
+        runExperimentName={runExperimentName}
+        onOpenExperiment={onOpenExperiment}
+        experimentName={experimentName}
+      />,
     );
     toolRun = [];
   };
@@ -863,7 +2192,12 @@ function renderParts(
     if (part.type === "tool" && (part.tool === "subagent" || (part.children?.length ?? 0) > 0)) {
       flushTools();
       rendered.push(
-        <SubagentBlock key={part.id} part={part} onOpenSubagent={onOpenSubagent} />,
+        <SubagentBlock
+          key={part.id}
+          part={part}
+          pendingTail={part.id === pendingTailToolId}
+          onOpenSubagent={onOpenSubagent}
+        />,
       );
       continue;
     }
@@ -918,26 +2252,53 @@ export function SubagentTranscript({
   spawn,
   onOpenFile,
   onOpenRun,
+  runExperimentName,
+  onOpenExperiment,
+  experimentName,
   onOpenSubagent,
 }: {
   spawn: ChatPart;
-  onOpenFile?: (path: string, line?: number, exp?: string) => void;
+  onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
+  runExperimentName?: (runId: string) => string;
+  onOpenExperiment?: (experimentId: string) => void;
+  experimentName?: (experimentId: string) => string;
   onOpenSubagent?: (spawnPartId: string) => void;
 }) {
   const parts = spawn.children ?? [];
   const running = spawn.state?.status === "running";
+  const errored = spawn.state?.status === "error";
+  const errorMessage = errored
+    ? cleanToolError(spawn.state?.error || spawn.state?.output || "")
+    : "";
   // Gate the empty state on what actually renders, not the raw part count — a
   // stored transcript of nothing but invisible parts must still read as empty.
-  const rendered = renderParts(parts, { onOpenFile, onOpenRun, onOpenSubagent });
+  const rendered = renderParts(parts, {
+    onOpenFile,
+    onOpenRun,
+    runExperimentName,
+    onOpenExperiment,
+    experimentName,
+    onOpenSubagent,
+  });
+  const spawnActivity = running ? activityInProgress(toolActivity(spawn)) : toolActivity(spawn);
   return (
     <div className="msg-assistant text-lg leading-[1.62] text-text min-w-0">
       <div className="subagent-tab-header flex items-center gap-2 pb-2 mb-2 border-b border-b-border-variant">
-        <span className={toolStatusClass(spawn.state?.status)} />
-        <span className={TOOL_LINE_CLASS_NAME}>{toolLine(spawn)}</span>
-        {running && <span className="subagent-live shrink-0 text-xs text-accent-amber">live</span>}
+        {errored && <span className="sr-only">Failed: </span>}
+        {errored ? (
+          <CircleX size={16} strokeWidth={1.75} className="tool-kind-icon shrink-0 text-accent-red" aria-hidden="true" />
+        ) : (
+          <ToolActivityIcon activity={spawnActivity} className={running ? "tool-running-shimmer-icon" : "text-muted"} />
+        )}
+        <span className={`${TOOL_LINE_CLASS_NAME} ${running ? "tool-running-shimmer" : errored ? "text-accent-red" : ""}`}>{spawnActivity.label}</span>
       </div>
-      {rendered.length === 0 ? (
+      {errorMessage && (
+        <div className="tool-output py-1.5 px-2.5 font-mono text-xs text-subtext whitespace-pre-wrap wrap-anywhere max-h-65 overflow-y-auto bg-background border border-border-variant rounded-sm">
+          {errorMessage.slice(0, 20000)}
+        </div>
+      )}
+      {rendered.length === 0 && !errorMessage ? (
         <div className="subagent-empty py-[3px] px-1 text-md text-muted">{running ? "Working…" : "No activity"}</div>
       ) : (
         rendered
@@ -953,24 +2314,37 @@ export function SubagentTranscript({
  * running (pulsing dot) or done. */
 function SubagentBlock({
   part,
+  pendingTail,
   onOpenSubagent,
 }: {
   part: ChatPart;
+  pendingTail?: boolean;
   onOpenSubagent?: (spawnPartId: string) => void;
 }) {
   const errored = part.state?.status === "error";
+  const errorMessage = cleanToolError(part.state?.error || part.state?.output || "");
+  const activity = pendingTail && !errored
+    ? activityInProgress(toolActivity(part))
+    : toolActivity(part);
+  const shimmering = useDelayedToolShimmer(Boolean(pendingTail && !errored));
   return (
-    <button
-      className={`subagent-row flex items-center gap-2 w-full my-0.5 mx-0 py-[3px] px-1 cursor-pointer text-text text-base text-left rounded-sm [&:hover:not(:disabled)]:bg-surface [&:disabled]:cursor-default [&.has-error]:text-accent-red [&_.tool-line]:text-base [&_.tool-line]:text-text ${errored ? "has-error" : ""}`}
-      title="Open sub-agent transcript"
-      onClick={() => onOpenSubagent?.(part.id)}
-      disabled={!onOpenSubagent}
-    >
-      <Users size={12} className="subagent-icon shrink-0 text-muted" />
-      <span className={toolStatusClass(part.state?.status)} />
-      <span className={TOOL_LINE_CLASS_NAME}>{toolLine(part)}</span>
-      <ChevronRight size={12} className="subagent-row-chevron shrink-0 text-muted" />
-    </button>
+    <>
+      <button
+        className="subagent-row flex items-center gap-2 w-full my-3.5 mx-0 py-[3px] px-1 cursor-pointer text-text text-lg text-left rounded-sm [&:hover:not(:disabled)]:bg-surface [&:disabled]:cursor-default [&_.tool-line]:text-lg"
+        title={errored && errorMessage ? errorMessage : "Open sub-agent transcript"}
+        onClick={() => onOpenSubagent?.(part.id)}
+        disabled={!onOpenSubagent}
+      >
+        {errored && <span className="sr-only">Failed: </span>}
+        {errored ? (
+          <CircleX size={16} strokeWidth={1.75} className="subagent-icon shrink-0 text-accent-red" aria-hidden="true" />
+        ) : (
+          <ToolActivityIcon activity={activity} className={`subagent-icon shrink-0 ${shimmering ? "tool-running-shimmer-icon" : "text-muted"}`} />
+        )}
+        <span className={`${TOOL_LINE_CLASS_NAME} ${shimmering ? "tool-running-shimmer" : errored ? "text-accent-red" : "text-text"}`}>{activity.label}</span>
+        <ChevronRight size={12} className="subagent-row-chevron shrink-0 text-muted" />
+      </button>
+    </>
   );
 }
 
@@ -980,31 +2354,131 @@ function SubagentBlock({
  * referentially stable across keystrokes (memoized/useCallback, never inline)
  * or the boundary silently breaks — with that held, typing costs one shallow
  * compare instead of O(messages) work. */
+interface AnnouncedToolState {
+  status: string;
+  part: ChatPart;
+}
+
+function latestToolStates(messages: ChatMessage[]): { messageId: string; states: Map<string, AnnouncedToolState> } {
+  const states = new Map<string, AnnouncedToolState>();
+  let message: ChatMessage | undefined;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (messages[index].role !== "assistant") continue;
+    message = messages[index];
+    break;
+  }
+  if (!message) return { messageId: "", states };
+  const visit = (parts: ChatPart[], parent: string) => {
+    for (const part of parts) {
+      const path = `${parent}/${part.id}`;
+      if (part.type === "tool" && part.state?.status) {
+        states.set(path, { status: part.state.status, part });
+      }
+      if (part.children?.length) visit(part.children, path);
+    }
+  };
+  visit(message.parts, message.id);
+  return { messageId: message.id, states };
+}
+
+interface ToolAnnouncement {
+  text: string;
+  sequence: number;
+}
+
+function useToolActivityAnnouncement(messages: ChatMessage[]): ToolAnnouncement {
+  const [announcement, setAnnouncement] = useState<ToolAnnouncement>({ text: "", sequence: 0 });
+  const previous = useRef<{ transcript: string; messageId: string; states: Map<string, AnnouncedToolState> } | null>(null);
+  useEffect(() => {
+    const transcript = messages[0]?.id ?? "";
+    const { messageId, states } = latestToolStates(messages);
+    if (!previous.current || previous.current.transcript !== transcript) {
+      previous.current = { transcript, messageId, states };
+      setAnnouncement((current) => ({ text: "", sequence: current.sequence + 1 }));
+      return;
+    }
+    const previousStates = previous.current.messageId === messageId ? previous.current.states : new Map<string, AnnouncedToolState>();
+    const changes = [...states].filter(([path, state]) => previousStates.get(path)?.status !== state.status);
+    previous.current = { transcript, messageId, states };
+    const failures = changes.filter(([, state]) => state.status === "error");
+    if (failures.length > 0) {
+      const labels = failures.slice(0, 2).map(([, state]) => toolActivity(state.part).label).join(", ");
+      setAnnouncement((current) => ({
+        text: `${failures.length === 1 ? "Tool activity failed" : `${failures.length} tool activities failed`}: ${labels}`,
+        sequence: current.sequence + 1,
+      }));
+      return;
+    }
+    const running = changes.filter(([, state]) => state.status === "running");
+    if (running.length > 0) {
+      const part = running.at(-1)?.[1].part;
+      setAnnouncement((current) => ({
+        text: part ? activityInProgress(toolActivity(part)).label : "Running a tool",
+        sequence: current.sequence + 1,
+      }));
+      return;
+    }
+    if (changes.some(([, state]) => state.status === "completed")) {
+      setAnnouncement((current) => ({ text: "Tool activity completed", sequence: current.sequence + 1 }));
+    }
+  }, [messages]);
+  return announcement;
+}
+
+function streamTailTool(messages: ChatMessage[]): { messageId: string; toolId: string } | null {
+  const message = messages.at(-1);
+  if (message?.role !== "assistant") return null;
+  for (let index = message.parts.length - 1; index >= 0; index--) {
+    const part = message.parts[index];
+    if (!partIsVisible(part)) continue;
+    if (part.type !== "tool" || part.state?.status === "error") return null;
+    return { messageId: message.id, toolId: part.id };
+  }
+  return null;
+}
+
 const Transcript = memo(function Transcript({
   messages,
+  busy,
   onOpenFile,
   onOpenRun,
+  runExperimentName,
+  onOpenExperiment,
+  experimentName,
   onRespond,
   onOpenPlan,
   onOpenSubagent,
   skills,
 }: {
   messages: ChatMessage[];
-  onOpenFile?: (path: string, line?: number, exp?: string) => void;
+  busy: boolean;
+  onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
+  runExperimentName?: (runId: string) => string;
+  onOpenExperiment?: (experimentId: string) => void;
+  experimentName?: (experimentId: string) => string;
   onRespond?: (answer: PromptAnswer) => void;
   onOpenPlan?: (plan: string, promptId: string) => void;
   onOpenSubagent?: (spawnPartId: string) => void;
   skills?: SkillInfo[];
 }) {
+  const activityAnnouncement = useToolActivityAnnouncement(messages);
+  const pendingTailTool = busy ? streamTailTool(messages) : null;
   return (
     <>
+      <span className="sr-only" role="status" aria-live="polite">
+        <span key={activityAnnouncement.sequence}>{activityAnnouncement.text}</span>
+      </span>
       {messages.filter(messageHasVisibleContent).map((m) => (
         <Message
           key={m.id}
           message={m}
+          pendingTailToolId={pendingTailTool?.messageId === m.id ? pendingTailTool.toolId : null}
           onOpenFile={onOpenFile}
           onOpenRun={onOpenRun}
+          runExperimentName={runExperimentName}
+          onOpenExperiment={onOpenExperiment}
+          experimentName={experimentName}
           onRespond={onRespond}
           onOpenPlan={onOpenPlan}
           onOpenSubagent={onOpenSubagent}
@@ -1306,6 +2780,9 @@ export function ChatPanel({
   onOpenArtifacts,
   onOpenFile,
   onOpenRun,
+  runExperimentName,
+  onOpenExperiment,
+  experimentName,
   onOpenPlan,
   onOpenSubagent,
   onOpenWorktree,
@@ -1336,10 +2813,16 @@ export function ChatPanel({
   /** Open a project file in the right pane (chat tool rows are clickable).
    * `sessionId` is the chat session the click came from, so relative paths
    * can resolve against that session's worktree. */
-  onOpenFile?: (path: string, sessionId?: string, line?: number, exp?: string) => void;
+  onOpenFile?: (path: string, sessionId?: string, line?: number, exp?: string, ref?: string) => void;
   /** Open a run's logs in the right pane (agent-emitted `<run>` evidence chips).
    * Run ids are globally unique, so no session context is needed. */
   onOpenRun?: (runId: string) => void;
+  /** Resolve a run to the experiment name shown on tool activity links. */
+  runExperimentName?: (runId: string) => string;
+  /** Open an experiment overview, where its notes are displayed. */
+  onOpenExperiment?: (experimentId: string) => void;
+  /** Resolve an experiment id to the name shown on tool activity links. */
+  experimentName?: (experimentId: string) => string;
   /** Open a plan's markdown as a right-pane tab (plan strip / plan cards). */
   onOpenPlan?: (plan: string, sessionId: string, promptId: string) => void;
   /** Open a sub-agent's transcript as a right-pane tab (spawn-row "view").
@@ -1780,6 +3263,7 @@ export function ChatPanel({
 
   const messages = activeId ? (state.messagesBySession[activeId] ?? []) : [];
   const busy = activeId ? state.busySessions.has(activeId) : false;
+  const hasPendingTailTool = busy && streamTailTool(messages) != null;
   // Messages the user parked behind the running turn (oldest first). Populated
   // by chat.queued events and the seed snapshot; each runs when its turn ends.
   const queued = activeId ? (state.queuedBySession[activeId] ?? []) : [];
@@ -1900,8 +3384,8 @@ export function ChatPanel({
   const openFileInSession = useMemo(
     () =>
       onOpenFile &&
-      ((path: string, line?: number, exp?: string) =>
-        onOpenFile(path, activeId ?? undefined, line, exp)),
+      ((path: string, line?: number, exp?: string, ref?: string) =>
+        onOpenFile(path, activeId ?? undefined, line, exp, ref)),
     [onOpenFile, activeId],
   );
 
@@ -2524,8 +4008,12 @@ export function ChatPanel({
           <div className="chat-thread-inner max-w-readable my-0 mx-auto pt-4 px-4 pb-8 flex flex-col gap-4" ref={threadInnerRef}>
             <Transcript
               messages={messages}
+              busy={busy}
               onOpenFile={openFileInSession}
               onOpenRun={onOpenRun}
+              runExperimentName={runExperimentName}
+              onOpenExperiment={onOpenExperiment}
+              experimentName={experimentName}
               onRespond={respond}
               onOpenPlan={openPlan}
               onOpenSubagent={openSubagent}
@@ -2536,7 +4024,7 @@ export function ChatPanel({
                 <div className="working flex items-center gap-2 text-subtext text-md pt-0.5 px-0 pb-2 [&.awaiting]:italic awaiting">Waiting for your input…</div>
               ) : (
                 <div className="working flex items-center gap-2 text-subtext text-md pt-0.5 px-0 pb-2 [&.awaiting]:italic">
-                  <span className={SPINNER_CLASS_NAME} /> Working…
+                  <span className={SPINNER_CLASS_NAME} /> {hasPendingTailTool ? "Working…" : "Thinking…"}
                 </div>
               ))}
           </div>

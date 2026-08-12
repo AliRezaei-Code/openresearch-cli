@@ -1073,9 +1073,30 @@ fn item_to_part(item: &Value, completed: bool, prior: &[WirePart]) -> Option<Wir
                         .and_then(|p| p.state.as_ref())
                         .and_then(|s| s.output.clone())
                 });
-            let input = serde_json::json!({
+            let mut input = serde_json::json!({
                 "command": item.get("command").map(command_string).unwrap_or_default(),
             });
+            if let Some(cwd) = item.get("cwd").and_then(Value::as_str) {
+                input["cwd"] = Value::String(cwd.to_string());
+            }
+            if let Some(prior_input) = prior
+                .iter()
+                .find(|part| part.id == id)
+                .and_then(|part| part.state.as_ref())
+                .and_then(|state| state.input.as_ref())
+            {
+                for key in [
+                    "runTargetIds",
+                    "runTargetIdsAuthoritative",
+                    "experimentTargetIds",
+                    "experimentTargetIdsAuthoritative",
+                    "targetIds",
+                ] {
+                    if let Some(value) = prior_input.get(key) {
+                        input[key] = value.clone();
+                    }
+                }
+            }
             Some(tool_part(
                 id,
                 "bash",
@@ -1343,8 +1364,11 @@ fn apply_sub_notification(
         "item/started" | "item/completed" => {
             if let Some(item) = params.get("item") {
                 let completed = method == "item/completed";
-                if let Some(mut part) = item_to_part(item, completed, bucket) {
-                    part.id = namespaced_part_id(tid, &part.id);
+                let mut scoped_item = item.clone();
+                if let Some(id) = item.get("id").and_then(Value::as_str) {
+                    scoped_item["id"] = Value::String(namespaced_part_id(tid, id));
+                }
+                if let Some(part) = item_to_part(&scoped_item, completed, bucket) {
                     // A grandchild spawn: register its threads under this part.
                     if part.tool.as_deref() == Some("subagent") {
                         for gtid in subagent_thread_ids(item) {
@@ -2664,6 +2688,7 @@ fn handle_item(ctx: &mut TurnCtx, item: &Value, next_id: &mut impl FnMut(&str) -
                     status: if failed { "error" } else { "completed" }.into(),
                     input: Some(serde_json::json!({
                         "command": item.get("command").map(command_string).unwrap_or_default(),
+                        "cwd": item.get("cwd").and_then(Value::as_str),
                     })),
                     output: item
                         .get("aggregated_output")
@@ -2847,6 +2872,7 @@ requires_openai_auth = false
             state.input.as_ref().unwrap()["command"],
             "/bin/zsh -lc 'touch /outside/probe.txt'"
         );
+        assert_eq!(state.input.as_ref().unwrap()["cwd"], "/ws");
         // Agent message: the completed item's full text wins over the deltas.
         assert_eq!(parts[2].kind, "text");
         assert_eq!(
@@ -3066,6 +3092,41 @@ requires_openai_auth = false
         );
     }
 
+    #[test]
+    fn subagent_command_completion_preserves_streamed_state() {
+        let mut bucket = Vec::new();
+        apply_sub_notification(
+            &mut bucket,
+            "sub",
+            "item/started",
+            &json!({"item":{"type":"commandExecution","id":"c1","command":"orx logs $id","status":"inProgress"}}),
+        );
+        apply_sub_notification(
+            &mut bucket,
+            "sub",
+            "item/commandExecution/outputDelta",
+            &json!({"itemId":"c1","delta":"streamed\n"}),
+        );
+        let input = bucket[0].state.as_mut().unwrap().input.as_mut().unwrap();
+        input["runTargetIds"] = json!(["11111111-1111-1111-1111-111111111111"]);
+        input["runTargetIdsAuthoritative"] = json!(true);
+
+        apply_sub_notification(
+            &mut bucket,
+            "sub",
+            "item/completed",
+            &json!({"item":{"type":"commandExecution","id":"c1","command":"orx logs $id","status":"completed","exitCode":0}}),
+        );
+
+        let state = bucket[0].state.as_ref().unwrap();
+        assert_eq!(bucket[0].id, "sub:c1");
+        assert_eq!(state.output.as_deref(), Some("streamed\n"));
+        assert_eq!(
+            state.input.as_ref().unwrap()["runTargetIds"],
+            json!(["11111111-1111-1111-1111-111111111111"])
+        );
+    }
+
     /// A sub-agent that spawns its own sub-agent: the grandchild's transcript
     /// nests under the child spawn part (which itself lives in the parent's
     /// children), and orphan-settle stamps any still-running spawn part.
@@ -3187,6 +3248,17 @@ requires_openai_auth = false
                 &serde_json::json!({"itemId":"c1","delta":delta}),
             );
         }
+        {
+            let input = ctx.assistant.parts[0]
+                .state
+                .as_mut()
+                .unwrap()
+                .input
+                .as_mut()
+                .unwrap();
+            input["runTargetIds"] = serde_json::json!(["11111111-1111-1111-1111-111111111111"]);
+            input["runTargetIdsAuthoritative"] = serde_json::json!(true);
+        }
         // No aggregatedOutput on the completed item → streamed output survives.
         apply_notification(
             &mut ctx,
@@ -3196,6 +3268,14 @@ requires_openai_auth = false
         let state = ctx.assistant.parts[0].state.as_ref().unwrap();
         assert_eq!(state.status, "completed");
         assert_eq!(state.output.as_deref(), Some("a\nb\n"));
+        assert_eq!(
+            state.input.as_ref().unwrap()["runTargetIds"],
+            serde_json::json!(["11111111-1111-1111-1111-111111111111"])
+        );
+        assert_eq!(
+            state.input.as_ref().unwrap()["runTargetIdsAuthoritative"],
+            true
+        );
 
         // With aggregatedOutput present, it is authoritative.
         apply_notification(

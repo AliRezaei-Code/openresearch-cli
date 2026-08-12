@@ -19,12 +19,18 @@ export function SubagentTab({
   spawnPartId,
   onOpenFile,
   onOpenRun,
+  runExperimentName,
+  onOpenExperiment,
+  experimentName,
   onOpenSubagent,
 }: {
   sessionId: string;
   spawnPartId: string;
   onOpenFile?: (path: string) => void;
   onOpenRun?: (runId: string) => void;
+  runExperimentName?: (runId: string) => string;
+  onOpenExperiment?: (experimentId: string) => void;
+  experimentName?: (experimentId: string) => string;
   onOpenSubagent?: (spawnPartId: string) => void;
 }) {
   const [messages, setMessages] = useState<ChatMessage[] | null>(null);
@@ -77,6 +83,9 @@ export function SubagentTab({
             spawn={spawn}
             onOpenFile={onOpenFile}
             onOpenRun={onOpenRun}
+            runExperimentName={runExperimentName}
+            onOpenExperiment={onOpenExperiment}
+            experimentName={experimentName}
             onOpenSubagent={onOpenSubagent}
           />
         ) : (
