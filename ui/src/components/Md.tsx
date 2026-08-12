@@ -298,7 +298,6 @@ export const Md = memo(function Md({
         content={normalizeMarkdownForRendering(text, { predictMath: predict })}
         processor={markdownProcessor}
         components={components}
-        predict={predict}
       />
     </div>
   );
