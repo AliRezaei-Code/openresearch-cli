@@ -70,15 +70,20 @@ fn cap_tool_text(text: &mut String) {
     *text = capped;
 }
 
-fn bounded_tool_scan(text: &str) -> &str {
+fn bounded_tool_scan_windows(text: &str) -> Vec<&str> {
     if text.len() <= TOOL_TARGET_SCAN_BYTES {
-        return text;
+        return vec![text];
     }
-    let mut end = TOOL_TARGET_SCAN_BYTES;
+    let window_bytes = TOOL_TARGET_SCAN_BYTES / 2;
+    let mut end = window_bytes;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    &text[..end]
+    let mut start = text.len() - window_bytes;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    vec![&text[..end], &text[start..]]
 }
 
 fn valid_tool_target(value: &str) -> bool {
@@ -222,7 +227,9 @@ fn preserve_tool_targets(state: &mut WireToolState) {
     let mut marker_targets = Vec::new();
     let mut marker_seen = HashSet::new();
     for text in &texts {
-        marker_tool_targets(text, resource, &mut marker_targets, &mut marker_seen);
+        for window in bounded_tool_scan_windows(text) {
+            marker_tool_targets(window, resource, &mut marker_targets, &mut marker_seen);
+        }
     }
     let previously_authoritative = input
         .get(&authority_key)
@@ -254,7 +261,9 @@ fn preserve_tool_targets(state: &mut WireToolState) {
         }
         if !authoritative {
             for text in &texts {
-                heuristic_tool_targets(bounded_tool_scan(text), resource, &mut targets, &mut seen);
+                for window in bounded_tool_scan_windows(text) {
+                    heuristic_tool_targets(window, resource, &mut targets, &mut seen);
+                }
             }
         }
     }

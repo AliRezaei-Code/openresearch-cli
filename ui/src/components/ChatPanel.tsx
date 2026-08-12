@@ -1562,9 +1562,8 @@ function ToolGroup({
 }) {
   const running = parts.some((p) => p.state?.status === "running");
   const failedCount = parts.filter((part) => part.state?.status === "error").length;
-  const [open, setOpen] = useState(running || failedCount > 0);
+  const [open, setOpen] = useState(running);
   const wasRunning = useRef(running);
-  const previousFailedCount = useRef(failedCount);
   const displayParts = squashToolParts(parts);
   const activities = displayParts.map(({ part }) => toolActivity(part));
   const runningActivity = latestRunningActivity(parts);
@@ -1576,13 +1575,8 @@ function ToolGroup({
   useEffect(() => {
     if (running === wasRunning.current) return;
     wasRunning.current = running;
-    setOpen(running || failedCount > 0);
-  }, [failedCount, running]);
-
-  useEffect(() => {
-    if (failedCount > previousFailedCount.current) setOpen(true);
-    previousFailedCount.current = failedCount;
-  }, [failedCount]);
+    setOpen(running);
+  }, [running]);
 
   if (parts.length === 1) {
     if (runningActivity) {
