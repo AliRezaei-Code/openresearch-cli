@@ -43,6 +43,23 @@ Settings → Secrets and variables → Actions → New repository secret:
 Once all six exist, the next published release attaches a signed + notarized
 `OpenResearch.dmg` automatically.
 
+## Protecting the certificate (recommended for a public repo)
+
+The release job runs repo-controlled scripts with access to the Developer ID
+certificate, so guard what can reach it:
+
+1. **Required-reviewer environment.** The `macos-app` job declares
+   `environment: release-signing`. Create it under **Settings → Environments →
+   New environment → `release-signing`**, and add yourself (or a team) under
+   **Required reviewers**. The signing job then pauses for a human approval on
+   every release — so the cert is never used by an unreviewed change. (Until you
+   add reviewers the environment exists but doesn't gate anything.)
+2. **Branch protection + CODEOWNERS.** `.github/CODEOWNERS` marks the signing
+   scripts and workflows as owned; enable **Require a pull request** + **Require
+   review from Code Owners** on the `main` branch protection rule so signing-path
+   changes can't land unreviewed. Branch protection reviews the *code*; the
+   environment gates the *cert* — do both.
+
 ## Testing it locally (with your cert)
 
 ```bash

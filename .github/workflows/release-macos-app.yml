@@ -73,6 +73,11 @@ jobs:
     needs: check
     if: ${{ needs.check.outputs.ok == 'true' }}
     runs-on: macos-14 # Apple Silicon runner
+    # Gate the cert-using job behind the `release-signing` environment. Add
+    # required reviewers to it (Settings → Environments) so the Developer ID
+    # certificate is never used without a human approving the run — even if an
+    # unwanted change reaches main. See macos/DISTRIBUTION.md.
+    environment: release-signing
     steps:
       - uses: actions/checkout@v4
         with:
