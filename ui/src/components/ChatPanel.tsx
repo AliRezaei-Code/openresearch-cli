@@ -608,8 +608,18 @@ function commandRunIds(command: string, output?: string): string[] {
   if (invocations.length === 0) return [];
   const ids = new Set<string>();
   for (const invocation of invocations) {
-    for (const match of invocation.raw.matchAll(new RegExp(`\\borx\\s+logs\\s+["']?(${UUID_PATTERN})`, "gi"))) {
-      ids.add(match[1]);
+    const logs = /\borx\s+logs\b/i.exec(invocation.raw);
+    if (!logs) continue;
+    const words = shellWords(invocation.raw.slice(logs.index + logs[0].length));
+    for (let index = 0; index < words.length; index++) {
+      const word = words[index];
+      if (word === "--head") continue;
+      if (word === "--bytes" || word === "--range") {
+        index++;
+        continue;
+      }
+      if (new RegExp(`^${UUID_PATTERN}$`, "i").test(word)) ids.add(word);
+      break;
     }
   }
   for (const invocation of invocations) {
