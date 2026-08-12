@@ -665,6 +665,12 @@ pub struct Sandbox {
     pub created_by: Option<String>,
     pub updated_at: String,
     pub provision_warnings: Option<String>,
+    #[serde(default)]
+    pub failure_code: Option<String>,
+    #[serde(default)]
+    pub failure_message: Option<String>,
+    #[serde(default)]
+    pub failed_at: Option<String>,
     pub provider_name: Option<String>,
     pub provider_instance_id: Option<String>,
     pub price_per_hour: Option<f64>,
@@ -2180,6 +2186,48 @@ mod tests {
         assert_eq!(sb.ssh_hostname.as_deref(), Some("203.0.113.7"));
         assert_eq!(sb.ssh_port, Some(22022));
         assert_eq!(sb.ssh_username.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn deserializes_retained_sandbox_failure() {
+        let json = r#"{
+            "sandbox": {
+                "id": "sb_1",
+                "organizationId": "org_1",
+                "projectId": null,
+                "sshHostname": null,
+                "sshPort": null,
+                "sshUsername": null,
+                "status": "failed",
+                "machineType": "persistent",
+                "createdBy": "user_1",
+                "updatedAt": "2026-06-18T00:05:00Z",
+                "provisionWarnings": null,
+                "failureCode": "capacity_unavailable",
+                "failureMessage": "No capacity is available.",
+                "failedAt": "2026-06-18T00:05:00Z",
+                "providerName": "runpod",
+                "providerInstanceId": null,
+                "pricePerHour": 2.5,
+                "gpu": "RTX_4090",
+                "gpuCount": 2,
+                "vcpuCount": null
+            }
+        }"#;
+
+        let sandbox = serde_json::from_str::<SandboxEnvelope>(json)
+            .expect("failed sandbox should deserialize")
+            .sandbox;
+        assert_eq!(sandbox.status, "failed");
+        assert_eq!(
+            sandbox.failure_code.as_deref(),
+            Some("capacity_unavailable")
+        );
+        assert_eq!(
+            sandbox.failure_message.as_deref(),
+            Some("No capacity is available.")
+        );
+        assert_eq!(sandbox.failed_at.as_deref(), Some("2026-06-18T00:05:00Z"));
     }
 
     /// The api declares `chatSessionId` optional: a lost `rename_all` would send
