@@ -16,11 +16,40 @@ function isEscaped(text: string, index: number): boolean {
   return slashes % 2 === 1;
 }
 
-function fenceMarkerOffset(line: string): number {
-  const container = /^(?:(?: {0,3}>[ \t]?)|(?: {0,3}(?:[-+*]|\d+[.)])[ \t]+))*/.exec(line);
-  const containerLength = container?.[0].length ?? 0;
-  const indentation = /^ {0,3}/.exec(line.slice(containerLength));
-  return containerLength + (indentation?.[0].length ?? 0);
+interface FenceMarker {
+  hasListMarker: boolean;
+  indentation: number;
+  listIndent: number;
+  offset: number;
+  quoteDepth: number;
+}
+
+function fenceMarker(line: string): FenceMarker {
+  let hasListMarker = false;
+  let listIndent = 0;
+  let offset = 0;
+  let quoteDepth = 0;
+  while (offset < line.length) {
+    const quote = /^ {0,3}>[ \t]?/.exec(line.slice(offset));
+    if (quote) {
+      offset += quote[0].length;
+      quoteDepth += 1;
+      continue;
+    }
+    const list = /^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/.exec(line.slice(offset));
+    if (!list) break;
+    offset += list[0].length;
+    listIndent += list[0].length;
+    hasListMarker = true;
+  }
+  const indentation = /^[ \t]*/.exec(line.slice(offset))?.[0].length ?? 0;
+  return {
+    hasListMarker,
+    indentation,
+    listIndent,
+    offset: offset + indentation,
+    quoteDepth,
+  };
 }
 
 function isFenceStart(text: string, index: number): boolean {
@@ -31,12 +60,16 @@ function isFenceStart(text: string, index: number): boolean {
   const lineStart = text.lastIndexOf("\n", index - 1) + 1;
   const lineEnd = text.indexOf("\n", index);
   const line = text.slice(lineStart, lineEnd === -1 ? text.length : lineEnd);
-  return lineStart + fenceMarkerOffset(line) === index;
+  const marker = fenceMarker(line);
+  return marker.indentation <= 3 && lineStart + marker.offset === index;
 }
 
 function fencedRegionEnd(text: string, index: number): number {
   const character = text[index]!;
   const openingLength = runLength(text, index, character);
+  const openingLineStart = text.lastIndexOf("\n", index - 1) + 1;
+  const openingLineEnd = text.indexOf("\n", index);
+  const openingMarker = fenceMarker(text.slice(openingLineStart, openingLineEnd === -1 ? text.length : openingLineEnd));
   let lineStart = text.indexOf("\n", index + openingLength);
   if (lineStart === -1) return text.length;
   lineStart += 1;
@@ -45,9 +78,14 @@ function fencedRegionEnd(text: string, index: number): number {
     const lineEnd = text.indexOf("\n", lineStart);
     const end = lineEnd === -1 ? text.length : lineEnd;
     const line = text.slice(lineStart, end);
-    const marker = lineStart + fenceMarkerOffset(line);
+    const candidate = fenceMarker(line);
+    const marker = lineStart + candidate.offset;
     const closingLength = runLength(text, marker, character);
-    if (closingLength >= openingLength && /^[ \t\r]*$/.test(text.slice(marker + closingLength, end))) {
+    const compatibleContainer = candidate.quoteDepth === openingMarker.quoteDepth
+      && !candidate.hasListMarker
+      && candidate.indentation >= openingMarker.listIndent
+      && candidate.indentation <= openingMarker.listIndent + 3;
+    if (compatibleContainer && closingLength >= openingLength && /^[ \t\r]*$/.test(text.slice(marker + closingLength, end))) {
       return lineEnd === -1 ? text.length : lineEnd + 1;
     }
     if (lineEnd === -1) return text.length;
