@@ -231,9 +231,14 @@ export function normalizeCurrencyDollars(
 }
 
 function normalizeProse(text: string, options: NormalizationOptions): string {
-  const normalizedMath = text
+  let normalizedMath = text
     .replace(/\\\[([\s\S]+?)\\\]/g, (_, inner: string) => `$$${inner}$$`)
     .replace(/\\\(([\s\S]+?)\\\)/g, (_, inner: string) => `$$${inner}$$`);
+  if (options.predictMath) {
+    normalizedMath = normalizedMath
+      .replace(/\\\[([\s\S]*)$/, (_, inner: string) => `$$${inner}`)
+      .replace(/\\\(([\s\S]*)$/, (_, inner: string) => `$$${inner}`);
+  }
   return normalizeCurrencyDollars(normalizedMath, options);
 }
 
