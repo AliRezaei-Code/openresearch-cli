@@ -610,7 +610,7 @@ fn remove_target_pointer_if_matches(session_id: &str, message_id: &str) {
     }
 }
 
-fn remove_session_target_events(session_id: &str) {
+pub fn cleanup_session_transcript_artifacts(session_id: &str) {
     let directory = crate::store::data_dir().join("chat-targets");
     let prefix = format!("{}-", safe_session_name(session_id));
     if let Ok(entries) = std::fs::read_dir(&directory) {
@@ -623,6 +623,7 @@ fn remove_session_target_events(session_id: &str) {
         }
     }
     let _ = std::fs::remove_file(target_event_pointer(session_id));
+    let _ = std::fs::remove_dir_all(shell_hook_dir(session_id));
 }
 
 /// Find a part by id anywhere in the tree (depth-first), returning `&mut` to it.
@@ -2521,8 +2522,7 @@ impl ChatHost {
         store.delete_chat_session(session_id)?;
         self.emit("chat.session.deleted", json!({ "sessionId": session_id }));
         if let Some(session) = session {
-            remove_session_target_events(&session.id);
-            let _ = std::fs::remove_dir_all(shell_hook_dir(&session.id));
+            cleanup_session_transcript_artifacts(&session.id);
             if let Ok(Some(project)) = store.get_local_project(&session.project_id) {
                 cleanup_session_worktree(&project, session_id);
             }
