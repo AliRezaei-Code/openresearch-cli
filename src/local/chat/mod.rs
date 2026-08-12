@@ -3328,7 +3328,7 @@ fn zshenv_hook(original_zdotdir: &std::path::Path) -> String {
          _ORX_CHAT_USER_ZDOTDIR=$ZDOTDIR\n\
          ZDOTDIR=$_ORX_CHAT_SHIM_ZDOTDIR\n\
          export ORX_CHAT_TOOL_SCOPE=\"zsh-$$\"\n\
-         export ORX_CHAT_TOOL_COMMAND=\"$ZSH_EXECUTION_STRING\"\n\
+         export ORX_CHAT_TOOL_COMMAND=\"${{ZSH_EXECUTION_STRING-}}\"\n\
          if [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" && -r \"${{ORX_CHAT_TARGET_POINTER-}}\" ]]; then\n\
            export ORX_CHAT_TARGET_FILE=$(<\"$ORX_CHAT_TARGET_POINTER\")\n\
          elif [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" ]]; then\n\
@@ -3352,7 +3352,7 @@ fn bash_env_hook(original: Option<String>) -> String {
     format!(
         "{source}\
          export ORX_CHAT_TOOL_SCOPE=\"bash-$$\"\n\
-         export ORX_CHAT_TOOL_COMMAND=\"$BASH_EXECUTION_STRING\"\n\
+         export ORX_CHAT_TOOL_COMMAND=\"${{BASH_EXECUTION_STRING-}}\"\n\
          if [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" && -r \"${{ORX_CHAT_TARGET_POINTER-}}\" ]]; then\n\
            export ORX_CHAT_TARGET_FILE=$(<\"$ORX_CHAT_TARGET_POINTER\")\n\
          elif [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" ]]; then\n\
@@ -3550,6 +3550,8 @@ mod cap_tests {
         );
         assert_eq!(String::from_utf8_lossy(&output.stdout), "yes");
         assert!(zshenv_hook(std::path::Path::new("/tmp")).contains("${ORX_CHAT_TARGET_FILE-}"));
+        assert!(bash_env_hook(None).contains("${BASH_EXECUTION_STRING-}"));
+        assert!(zshenv_hook(std::path::Path::new("/tmp")).contains("${ZSH_EXECUTION_STRING-}"));
     }
 
     #[tokio::test]
