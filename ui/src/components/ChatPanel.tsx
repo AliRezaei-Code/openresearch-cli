@@ -324,6 +324,16 @@ function inputStringArray(input: Record<string, unknown>, key: string): string[]
   return Array.isArray(values) ? values.filter((value): value is string => typeof value === "string") : [];
 }
 
+function normalizedTargetIds(...collections: string[][]): string[] {
+  const ids = new Set<string>();
+  const target = new RegExp(`^${RUN_TARGET_PATTERN}$`, "i");
+  for (const value of collections.flat()) {
+    if (ids.size >= 256) break;
+    if (target.test(value)) ids.add(value.toLowerCase());
+  }
+  return [...ids];
+}
+
 function cleanToolError(value: string): string {
   return value
     .replace(/^Exit code \d+\s*/i, "")
@@ -797,19 +807,19 @@ function commandExperimentIds(command: string, output?: string, preservedIds: st
   let hasUnresolvedTarget = false;
   for (const { invocation, offset } of invocationOffsets(command, invocations)) {
     let resolved = false;
-    for (const match of invocation.raw.matchAll(new RegExp(`\\borx\\s+exp\\s+(?:status|desc)\\s+["']?(${UUID_PATTERN})`, "gi"))) {
+    for (const match of invocation.raw.matchAll(new RegExp(`\\borx\\s+exp\\s+(?:status|desc)\\s+["']?(${RUN_TARGET_PATTERN})`, "gi"))) {
       ids.add(match[1]);
       resolved = true;
     }
     const match = /\borx\s+exp\s+(?:status|desc)\s+["']?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/.exec(invocation.raw);
     if (match) {
       const variable = match[1];
-      const assignmentIds = assignedIdsBefore(command, variable, offset, UUID_PATTERN);
+      const assignmentIds = assignedIdsBefore(command, variable, offset, RUN_TARGET_PATTERN);
       if (assignmentIds.length > 0) {
         for (const id of assignmentIds) ids.add(id);
         resolved = true;
       }
-      const loopIds = loopIdsBefore(command, variable, offset, UUID_PATTERN);
+      const loopIds = loopIdsBefore(command, variable, offset, RUN_TARGET_PATTERN);
       for (const id of loopIds) ids.add(id);
       if (loopIds.length > 0) resolved = true;
     }
@@ -836,8 +846,8 @@ function toolActivity(part: ChatPart): ToolActivity {
   const rawCommand = inputString(normalizedInput, "command", "cmd");
   const toolOutput = part.state?.output || part.state?.error;
   const legacyTargetIds = inputStringArray(normalizedInput, "targetIds");
-  const preservedRunIds = [...inputStringArray(normalizedInput, "runTargetIds"), ...legacyTargetIds];
-  const preservedExperimentIds = [...inputStringArray(normalizedInput, "experimentTargetIds"), ...legacyTargetIds];
+  const preservedRunIds = normalizedTargetIds(inputStringArray(normalizedInput, "runTargetIds"), legacyTargetIds);
+  const preservedExperimentIds = normalizedTargetIds(inputStringArray(normalizedInput, "experimentTargetIds"), legacyTargetIds);
   const filePath = inputString(normalizedInput, "filePath", "file_path", "notebookPath", "notebook_path", "path");
   const description = inputString(normalizedInput, "description");
   const toolSegments = tool.toLowerCase().split(/(?::|\.|__)+/);
