@@ -678,9 +678,10 @@ export default function App() {
   // experiment and open the terminal view focused on it.
   const openRunLogs = useCallback(
     (runId: string) => {
-      const run = runsRef.current.find((r) => r.id === runId);
+      const matches = runsRef.current.filter((run) => run.id === runId || run.id.startsWith(runId));
+      const run = matches.length === 1 ? matches[0] : null;
       if (!run) return;
-      setSelectedRunId(runId);
+      setSelectedRunId(run.id);
       openExperimentTab(run.experimentId, "terminal");
     },
     [openExperimentTab],
@@ -699,7 +700,10 @@ export default function App() {
   }, [experimentNames, runs]);
 
   const runExperimentName = useCallback((runId: string) => {
-    return runExperimentNames.get(runId) ?? "";
+    const exact = runExperimentNames.get(runId);
+    if (exact) return exact;
+    const matches = [...runExperimentNames].filter(([id]) => id.startsWith(runId));
+    return matches.length === 1 ? matches[0][1] : "";
   }, [runExperimentNames]);
 
   const experimentName = useCallback((experimentId: string) => {

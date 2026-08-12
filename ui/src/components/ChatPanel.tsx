@@ -333,7 +333,62 @@ function meaningfulCommand(command: string): string {
   if ((first === "\"" || first === "'") && body[body.length - 1] === first) {
     body = body.slice(1, -1);
   }
-  return body.replace(/[\t\r ]+/g, " ").trim();
+  return stripHeredocBodies(body).replace(/[\t\r ]+/g, " ").trim();
+}
+
+function heredocMarker(line: string): { delimiter: string; stripTabs: boolean } | null {
+  let quote: "\"" | "'" | null = null;
+  let escaped = false;
+  for (let index = 0; index < line.length - 1; index++) {
+    const char = line[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char !== "<" || line[index + 1] !== "<") continue;
+    index += 2;
+    const stripTabs = line[index] === "-";
+    if (stripTabs) index++;
+    while (/\s/.test(line[index] ?? "")) index++;
+    const delimiterQuote = line[index] === "\"" || line[index] === "'" ? line[index++] : null;
+    let delimiter = "";
+    while (index < line.length) {
+      const current = line[index];
+      if (delimiterQuote ? current === delimiterQuote : /\s|[;|&]/.test(current)) break;
+      delimiter += current;
+      index++;
+    }
+    if (delimiter) return { delimiter, stripTabs };
+  }
+  return null;
+}
+
+function stripHeredocBodies(command: string): string {
+  const lines = command.split("\n");
+  const kept: string[] = [];
+  let marker: { delimiter: string; stripTabs: boolean } | null = null;
+  for (const line of lines) {
+    if (marker) {
+      const candidate = marker.stripTabs ? line.replace(/^\t+/, "") : line;
+      if (candidate.trimEnd() === marker.delimiter) marker = null;
+      continue;
+    }
+    kept.push(line);
+    marker = heredocMarker(line);
+  }
+  return kept.join("\n");
 }
 
 function shellCommandSegment(command: string, start: number): string {
@@ -454,6 +509,7 @@ function commandSearchPattern(command: string): string | null {
 }
 
 const UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const RUN_TARGET_PATTERN = `(?:${UUID_PATTERN}|[0-9a-f]{8})`;
 
 interface ShellCommandSegment {
   raw: string;
@@ -624,7 +680,7 @@ function commandRunIds(command: string, output?: string): string[] {
       break;
     }
     if (!target) continue;
-    if (new RegExp(`^${UUID_PATTERN}$`, "i").test(target)) {
+    if (new RegExp(`^${RUN_TARGET_PATTERN}$`, "i").test(target)) {
       ids.add(target);
       continue;
     }
@@ -632,12 +688,12 @@ function commandRunIds(command: string, output?: string): string[] {
     if (!variableMatch) continue;
     const variable = variableMatch[1];
     const assignment = command.match(
-      new RegExp(`(?:^|[\\s;])(?:export\\s+)?${variable}\\s*=\\s*["']?(${UUID_PATTERN})`, "i"),
+      new RegExp(`(?:^|[\\s;])(?:export\\s+)?${variable}\\s*=\\s*["']?(${RUN_TARGET_PATTERN})`, "i"),
     );
     if (assignment) ids.add(assignment[1]);
-    const loop = command.match(new RegExp(`\\bfor\\s+${variable}\\s+in\\s+([^;]+);\\s*do`, "i"));
+    const loop = command.match(new RegExp(`\\bfor\\s+${variable}\\s+in\\s+([\\s\\S]*?)(?:;|\\n)\\s*do\\b`, "i"));
     if (!loop) continue;
-    for (const id of loop[1].matchAll(new RegExp(UUID_PATTERN, "gi"))) ids.add(id[0]);
+    for (const id of loop[1].matchAll(new RegExp(RUN_TARGET_PATTERN, "gi"))) ids.add(id[0]);
   }
   if (ids.size === 0) idsFromToolOutput(output, "runs").forEach((id) => ids.add(id));
   return [...ids];
@@ -656,7 +712,7 @@ function commandExperimentIds(command: string, output?: string): string[] {
     const match = /\borx\s+exp\s+(?:status|desc)\s+["']?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/.exec(invocation.raw);
     if (!match) continue;
     const variable = match[1];
-    const loop = command.match(new RegExp(`\\bfor\\s+${variable}\\s+in\\s+([^;]+);\\s*do`, "i"));
+    const loop = command.match(new RegExp(`\\bfor\\s+${variable}\\s+in\\s+([\\s\\S]*?)(?:;|\\n)\\s*do\\b`, "i"));
     if (!loop) continue;
     for (const id of loop[1].matchAll(new RegExp(UUID_PATTERN, "gi"))) ids.add(id[0]);
   }
@@ -889,9 +945,11 @@ function ToolTargetOverflow({
 }) {
   const [open, setOpen] = useState(false);
   const revealRef = useRef<HTMLSpanElement>(null);
+  const focusReveal = useRef(false);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || !focusReveal.current) return;
+    focusReveal.current = false;
     revealRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
   }, [open]);
 
@@ -927,6 +985,7 @@ function ToolTargetOverflow({
         onClick={(event) => {
           event.preventDefault();
           event.stopPropagation();
+          focusReveal.current = !open && event.detail === 0;
           setOpen((value) => !value);
         }}
       >
@@ -1580,7 +1639,7 @@ function messageHasVisibleContent(m: ChatMessage): boolean {
   return m.parts.some(partIsVisible);
 }
 
-/** Memoized: streaming re-broadcasts the whole updated message ~7x/sec, and
+/** Memoized: streaming re-broadcasts the whole updated message up to ~13x/sec, and
  * `upsertMessage` preserves object identity for every untouched message — so
  * only the message actually being streamed re-renders (and re-parses its
  * markdown/KaTeX), not the entire transcript. Callback props must stay
@@ -1824,6 +1883,8 @@ export function SubagentTranscript({
 }) {
   const parts = spawn.children ?? [];
   const running = spawn.state?.status === "running";
+  const errored = spawn.state?.status === "error";
+  const errorMessage = (spawn.state?.error || spawn.state?.output || "").replace(/^Exit code \d+\s*/i, "").trim();
   const hasRun = useRef(running);
   useEffect(() => {
     if (running) hasRun.current = true;
@@ -1842,13 +1903,17 @@ export function SubagentTranscript({
   return (
     <div className="msg-assistant text-lg leading-[1.62] text-text min-w-0">
       <div className="subagent-tab-header flex items-center gap-2 pb-2 mb-2 border-b border-b-border-variant">
-        <ToolActivityIcon activity={spawnActivity} className={running ? "tool-running-shimmer-icon" : "text-muted"} />
-        <span className={`${TOOL_LINE_CLASS_NAME} ${running ? "tool-running-shimmer" : ""}`}>{spawnActivity.label}</span>
+        <ToolActivityIcon activity={spawnActivity} className={running ? "tool-running-shimmer-icon" : errored ? "text-accent-red" : "text-muted"} />
+        <span className={`${TOOL_LINE_CLASS_NAME} ${running ? "tool-running-shimmer" : errored ? "text-accent-red" : ""}`}>{spawnActivity.label}</span>
       </div>
       <span className="sr-only" role="status" aria-live="polite">
         {running ? spawnActivity.label : hasRun.current ? "Sub-agent activity completed" : ""}
       </span>
-      {rendered.length === 0 ? (
+      {errorMessage ? (
+        <div className="tool-output py-1.5 px-2.5 font-mono text-xs text-subtext whitespace-pre-wrap wrap-anywhere max-h-65 overflow-y-auto bg-background border border-border-variant rounded-sm">
+          {errorMessage.slice(0, 20000)}
+        </div>
+      ) : rendered.length === 0 ? (
         <div className="subagent-empty py-[3px] px-1 text-md text-muted">{running ? "Working…" : "No activity"}</div>
       ) : (
         rendered
@@ -1870,6 +1935,7 @@ function SubagentBlock({
   onOpenSubagent?: (spawnPartId: string) => void;
 }) {
   const errored = part.state?.status === "error";
+  const errorMessage = (part.state?.error || part.state?.output || "").replace(/^Exit code \d+\s*/i, "").trim();
   const running = part.state?.status === "running";
   const hasRun = useRef(running);
   useEffect(() => {
@@ -1879,13 +1945,13 @@ function SubagentBlock({
   return (
     <>
       <button
-        className={`subagent-row flex items-center gap-2 w-full my-3.5 mx-0 py-[3px] px-1 cursor-pointer text-text text-lg text-left rounded-sm [&:hover:not(:disabled)]:bg-surface [&:disabled]:cursor-default [&.has-error]:text-accent-red [&_.tool-line]:text-lg [&_.tool-line]:text-text ${errored ? "has-error" : ""}`}
-        title="Open sub-agent transcript"
+        className="subagent-row flex items-center gap-2 w-full my-3.5 mx-0 py-[3px] px-1 cursor-pointer text-text text-lg text-left rounded-sm [&:hover:not(:disabled)]:bg-surface [&:disabled]:cursor-default [&_.tool-line]:text-lg"
+        title={errored && errorMessage ? errorMessage : "Open sub-agent transcript"}
         onClick={() => onOpenSubagent?.(part.id)}
         disabled={!onOpenSubagent}
       >
-        <ToolActivityIcon activity={activity} className={`subagent-icon shrink-0 ${running ? "tool-running-shimmer-icon" : "text-muted"}`} />
-        <span className={`${TOOL_LINE_CLASS_NAME} ${running ? "tool-running-shimmer" : ""}`}>{activity.label}</span>
+        <ToolActivityIcon activity={activity} className={`subagent-icon shrink-0 ${running ? "tool-running-shimmer-icon" : errored ? "text-accent-red" : "text-muted"}`} />
+        <span className={`${TOOL_LINE_CLASS_NAME} ${running ? "tool-running-shimmer" : errored ? "text-accent-red" : "text-text"}`}>{activity.label}</span>
         <ChevronRight size={12} className="subagent-row-chevron shrink-0 text-muted" />
       </button>
       <span className="sr-only" role="status" aria-live="polite">
