@@ -337,7 +337,20 @@ pub fn record_chat_target(resource: &str, target: &str) {
         .open(path)
     {
         let scope = unsafe { libc::getppid() };
-        let _ = writeln!(file, "{scope}\t{resource}\t{target}");
+        let command = std::process::Command::new("/bin/ps")
+            .args(["-p", &scope.to_string(), "-o", "command="])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_default();
+        let event = json!({
+            "scope": scope.to_string(),
+            "command": command,
+            "resource": resource,
+            "target": target,
+        });
+        let _ = writeln!(file, "{event}");
     }
 }
 
@@ -345,6 +358,7 @@ fn attach_target_event(
     parts: &mut [WirePart],
     bound_part_id: Option<&str>,
     claimed_part_ids: &HashSet<String>,
+    command_hint: &str,
     resource: &str,
     target: &str,
 ) -> Option<String> {
@@ -353,6 +367,7 @@ fn attach_target_event(
             &mut part.children,
             bound_part_id,
             claimed_part_ids,
+            command_hint,
             resource,
             target,
         ) {
@@ -365,6 +380,17 @@ fn attach_target_event(
             continue;
         };
         let command = tool_command(input).to_ascii_lowercase();
+        let normalized_hint = command_hint
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        if !normalized_hint.is_empty()
+            && !command.contains(&normalized_hint)
+            && !normalized_hint.contains(&command)
+        {
+            continue;
+        }
         let matches = if resource == "runs" {
             command.contains("orx logs")
         } else {
@@ -402,6 +428,63 @@ fn attach_target_event(
         return Some(part.id.clone());
     }
     None
+}
+
+fn reconcile_target_file(session_id: &str) {
+    let path = target_event_path(session_id);
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(store) = Store::open() else { return };
+    let Ok(messages) = store.list_chat_messages(session_id) else {
+        return;
+    };
+    let Some(stored) = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+    else {
+        return;
+    };
+    let mut message = stored_to_wire(stored);
+    let mut bindings = HashMap::new();
+    let mut claimed = HashSet::new();
+    for line in contents.lines().take(TOOL_TARGET_INSPECTION_CAP) {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let (Some(scope), Some(command), Some(resource), Some(target)) = (
+            event.get("scope").and_then(Value::as_str),
+            event.get("command").and_then(Value::as_str),
+            event.get("resource").and_then(Value::as_str),
+            event.get("target").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let bound = bindings.get(scope).map(String::as_str);
+        let Some(part_id) = attach_target_event(
+            &mut message.parts,
+            bound,
+            &claimed,
+            command,
+            resource,
+            target,
+        ) else {
+            continue;
+        };
+        bindings
+            .entry(scope.to_string())
+            .or_insert_with(|| part_id.clone());
+        claimed.insert(part_id);
+    }
+    let _ = store.upsert_chat_message(&StoredChatMessage {
+        id: message.id,
+        session_id: session_id.to_string(),
+        role: message.role,
+        parts_json: serde_json::to_string(&message.parts).unwrap_or_default(),
+        created_at: message.created_at,
+    });
+    let _ = std::fs::remove_file(path);
 }
 
 /// Find a part by id anywhere in the tree (depth-first), returning `&mut` to it.
@@ -1799,7 +1882,7 @@ impl ChatHost {
         }
 
         let sid = session.id.clone();
-        let (target_event_path, target_event_offset) = target_event_start(&session.id);
+        let (target_path, target_event_offset) = target_event_start(&session.id);
         let mut ctx = TurnCtx {
             host: self.clone(),
             session_id: session.id.clone(),
@@ -1830,7 +1913,7 @@ impl ChatHost {
             last_flush: Instant::now() - FLUSH_INTERVAL,
             last_flushed_tool_states: Vec::new(),
             last_attempted_tool_states: Vec::new(),
-            target_event_path: Some(target_event_path),
+            target_event_path: Some(target_path),
             target_event_offset,
             pending_target_events: Vec::new(),
             target_event_bindings: HashMap::new(),
@@ -1856,6 +1939,7 @@ impl ChatHost {
                     ctx.push_error(format!("{err}"));
                 }
                 let _ = ctx.flush();
+                let _ = std::fs::remove_file(target_event_path(&ctx.session_id));
                 if let Some(usage) = &ctx.context_usage {
                     if let (Ok(store), Ok(json)) = (Store::open(), serde_json::to_string(usage)) {
                         let _ = store.set_chat_session_context_usage(&ctx.session_id, &json);
@@ -1937,6 +2021,7 @@ impl ChatHost {
         if let Some(handle) = handle {
             handle.abort();
         }
+        reconcile_target_file(session_id);
         self.finish_turn(session_id).await;
         Ok(true)
     }
@@ -2513,7 +2598,7 @@ pub struct TurnCtx {
     last_attempted_tool_states: Vec<(String, String)>,
     target_event_path: Option<PathBuf>,
     target_event_offset: u64,
-    pending_target_events: Vec<(String, String, String)>,
+    pending_target_events: Vec<(String, String, String, String)>,
     target_event_bindings: HashMap<String, String>,
 }
 
@@ -2588,16 +2673,22 @@ impl TurnCtx {
                         {
                             if let Some(complete_end) = pending.rfind('\n').map(|index| index + 1) {
                                 for line in pending[..complete_end].lines() {
-                                    let mut fields = line.splitn(3, '\t');
-                                    let (Some(scope), Some(resource), Some(target)) =
-                                        (fields.next(), fields.next(), fields.next())
-                                    else {
+                                    let Ok(event) = serde_json::from_str::<Value>(line) else {
+                                        continue;
+                                    };
+                                    let (Some(scope), Some(command), Some(resource), Some(target)) = (
+                                        event.get("scope").and_then(Value::as_str),
+                                        event.get("command").and_then(Value::as_str),
+                                        event.get("resource").and_then(Value::as_str),
+                                        event.get("target").and_then(Value::as_str),
+                                    ) else {
                                         continue;
                                     };
                                     if self.pending_target_events.len() < TOOL_TARGET_INSPECTION_CAP
                                     {
                                         self.pending_target_events.push((
                                             scope.to_string(),
+                                            command.to_string(),
                                             resource.to_string(),
                                             target.to_string(),
                                         ));
@@ -2610,24 +2701,31 @@ impl TurnCtx {
                 }
             }
         }
-        let claimed = self.target_event_bindings.values().cloned().collect();
-        self.pending_target_events
-            .retain(|(scope, resource, target)| {
-                let bound = self.target_event_bindings.get(scope).map(String::as_str);
-                let Some(part_id) = attach_target_event(
-                    &mut self.assistant.parts,
-                    bound,
-                    &claimed,
-                    resource,
-                    target,
-                ) else {
-                    return true;
-                };
-                self.target_event_bindings
-                    .entry(scope.clone())
-                    .or_insert(part_id);
-                false
-            });
+        let mut claimed = self
+            .target_event_bindings
+            .values()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut remaining = Vec::new();
+        for (scope, command, resource, target) in std::mem::take(&mut self.pending_target_events) {
+            let bound = self.target_event_bindings.get(&scope).map(String::as_str);
+            let Some(part_id) = attach_target_event(
+                &mut self.assistant.parts,
+                bound,
+                &claimed,
+                &command,
+                &resource,
+                &target,
+            ) else {
+                remaining.push((scope, command, resource, target));
+                continue;
+            };
+            self.target_event_bindings
+                .entry(scope)
+                .or_insert_with(|| part_id.clone());
+            claimed.insert(part_id);
+        }
+        self.pending_target_events = remaining;
     }
 
     /// Record the harness's own session id (CLIs mint/rotate them per turn).
@@ -2685,10 +2783,7 @@ impl TurnCtx {
 
     /// Insert or replace a part by id, preserving arrival order.
     pub fn upsert_part(&mut self, part: WirePart) {
-        match self.assistant.parts.iter_mut().find(|p| p.id == part.id) {
-            Some(existing) => *existing = part,
-            None => self.assistant.parts.push(part),
-        }
+        upsert_preserving_children(&mut self.assistant.parts, part);
     }
 
     /// Like `upsert_part`, but carries forward an existing part's `children` when
@@ -3275,7 +3370,15 @@ mod cap_tests {
             children: Vec::new(),
         }];
 
-        assert!(attach_target_event(&mut parts, None, &HashSet::new(), "runs", target).is_some());
+        assert!(attach_target_event(
+            &mut parts,
+            None,
+            &HashSet::new(),
+            "id=$(lookup); orx logs \"$id\"",
+            "runs",
+            target,
+        )
+        .is_some());
         let input = parts[0].state.as_ref().unwrap().input.as_ref().unwrap();
         assert_eq!(input["runTargetIds"], json!([target]));
         assert_eq!(input["runTargetIdsAuthoritative"], true);
