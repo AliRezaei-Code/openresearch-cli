@@ -36,6 +36,8 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(75);
 const TOOL_TEXT_CAP: usize = 16_000;
 const TOOL_TEXT_TRUNCATION_MARKER: &str = "\n… [output truncated]";
 const TOOL_TARGET_CAP: usize = 256;
+const TOOL_TARGET_INSPECTION_CAP: usize = 1_024;
+const TOOL_TARGET_SCAN_BYTES: usize = 256_000;
 
 /// Keep the head and tail of `text` within [`TOOL_TEXT_CAP`] chars, marking
 /// the omitted middle. Idempotent — an already-capped string is left alone.
@@ -66,6 +68,17 @@ fn cap_tool_text(text: &mut String) {
     capped.push_str(TOOL_TEXT_TRUNCATION_MARKER);
     capped.push_str(&text[tail_start..]);
     *text = capped;
+}
+
+fn bounded_tool_scan(text: &str) -> &str {
+    if text.len() <= TOOL_TARGET_SCAN_BYTES {
+        return text;
+    }
+    let mut end = TOOL_TARGET_SCAN_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 fn valid_tool_target(value: &str) -> bool {
@@ -205,6 +218,7 @@ fn preserve_tool_targets(state: &mut WireToolState) {
     let texts = [state.output.as_deref(), state.error.as_deref()]
         .into_iter()
         .flatten()
+        .map(bounded_tool_scan)
         .collect::<Vec<_>>();
     let mut marker_targets = Vec::new();
     let mut marker_seen = HashSet::new();
@@ -222,6 +236,7 @@ fn preserve_tool_targets(state: &mut WireToolState) {
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
+        .take(TOOL_TARGET_INSPECTION_CAP)
         .collect::<Vec<_>>();
     let mut targets = Vec::new();
     let mut seen = HashSet::new();
@@ -249,6 +264,24 @@ fn preserve_tool_targets(state: &mut WireToolState) {
     }
     if authoritative {
         input.insert(authority_key, Value::Bool(true));
+    }
+    if let Some(legacy) = input.get("targetIds").and_then(Value::as_array) {
+        let mut normalized = Vec::new();
+        let mut legacy_seen = HashSet::new();
+        for target in legacy
+            .iter()
+            .take(TOOL_TARGET_INSPECTION_CAP)
+            .filter_map(Value::as_str)
+        {
+            push_tool_target(&mut normalized, &mut legacy_seen, target);
+        }
+        input.insert("targetIds".into(), json!(normalized));
+    }
+    if let Some(output) = state.output.as_mut() {
+        cap_tool_text(output);
+    }
+    if let Some(error) = state.error.as_mut() {
+        cap_tool_text(error);
     }
     if let Some(output) = state.output.as_mut() {
         strip_tool_target_markers(output);
@@ -2925,10 +2958,9 @@ mod cap_tests {
         cap_tool_parts(&mut parts);
 
         let state = parts[0].state.as_ref().unwrap();
-        assert_eq!(
-            state.output.as_ref().unwrap().chars().count(),
-            TOOL_TEXT_CAP
-        );
+        let output = state.output.as_ref().unwrap();
+        assert!(output.chars().count() <= TOOL_TEXT_CAP);
+        assert!(output.contains(TOOL_TEXT_TRUNCATION_MARKER));
         assert_eq!(
             state.input.as_ref().unwrap()["runTargetIds"],
             json!([first, middle, last])
