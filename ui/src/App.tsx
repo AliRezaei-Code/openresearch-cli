@@ -686,16 +686,25 @@ export default function App() {
     [openExperimentTab],
   );
 
+  const experimentNames = useMemo(
+    () => new Map(experiments.map((experiment) => [experiment.id, experiment.title?.trim() || experiment.slug || "Experiment"])),
+    [experiments],
+  );
+  const runExperimentNames = useMemo(() => {
+    const names = new Map<string, string>();
+    for (const run of runs) {
+      names.set(run.id, experimentNames.get(run.experimentId) ?? "Experiment");
+    }
+    return names;
+  }, [experimentNames, runs]);
+
   const runExperimentName = useCallback((runId: string) => {
-    const run = runsRef.current.find((candidate) => candidate.id === runId);
-    const experiment = run && experimentsRef.current.find((candidate) => candidate.id === run.experimentId);
-    return experiment?.title?.trim() || experiment?.slug || "Experiment";
-  }, []);
+    return runExperimentNames.get(runId) ?? "";
+  }, [runExperimentNames]);
 
   const experimentName = useCallback((experimentId: string) => {
-    const experiment = experimentsRef.current.find((candidate) => candidate.id === experimentId);
-    return experiment?.title?.trim() || experiment?.slug || "Experiment";
-  }, []);
+    return experimentNames.get(experimentId) ?? "";
+  }, [experimentNames]);
 
   const openExperimentNotes = useCallback(
     (experimentId: string) => openExperimentTab(experimentId, "overview"),

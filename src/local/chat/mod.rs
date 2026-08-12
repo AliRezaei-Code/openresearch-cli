@@ -29,7 +29,7 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(75);
 
 /// Max chars of a tool part's `output`/`error` kept on the wire and in the
 /// store. Every flush re-broadcasts (and re-persists) the FULL assistant
-/// message, so uncapped tool outputs make each 150ms SSE frame O(total tool
+/// message, so uncapped tool outputs make each 75ms SSE frame O(total tool
 /// output) for the whole turn. The UI never shows more than 20k chars of a
 /// tool output anyway (ToolRow slices); capping below that keeps the
 /// truncation marker visible under the UI's own slice.

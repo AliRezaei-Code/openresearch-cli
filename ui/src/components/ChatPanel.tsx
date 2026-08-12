@@ -269,13 +269,6 @@ function reducer(state: ChatState, action: Action): ChatState {
 
 // --- rendering ---------------------------------------------------------------
 
-function toolStatusClass(status: string | undefined): string {
-  const base = "tool-status w-1.5 h-1.5 rounded-full shrink-0";
-  if (status === "error") return `${base} error bg-accent-red`;
-  if (status === "completed") return `${base} bg-muted`;
-  return `${base} running bg-accent-amber animate-[or-pulse_1.2s_ease-in-out_infinite]`;
-}
-
 function relTime(ts: number | undefined): string {
   if (!ts) return "";
   const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
@@ -460,39 +453,62 @@ function commandSearchPattern(command: string): string | null {
   return search?.[1] ?? search?.[2] ?? search?.[3] ?? null;
 }
 
-function commandRunIds(command: string): string[] {
-  if (!/\borx\s+logs\b/.test(command)) return [];
-  const uuid = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+
+function idsFromToolOutput(output: string | undefined, resource: "runs" | "experiments"): string[] {
+  if (!output) return [];
   const ids = new Set<string>();
-  for (const match of command.matchAll(new RegExp(`\\borx\\s+logs\\s+["']?(${uuid})`, "gi"))) {
+  const patterns = resource === "runs"
+    ? [
+        new RegExp(`/runs/(${UUID_PATTERN})`, "gi"),
+        new RegExp(`\\brun(?:_|\\s+)id:\\s*(${UUID_PATTERN})`, "gi"),
+        new RegExp(`={3,}\\s*(${UUID_PATTERN})\\s*={3,}`, "gi"),
+      ]
+    : [
+        new RegExp(`/experiments/(${UUID_PATTERN})`, "gi"),
+        new RegExp(`^\\s*id:\\s*(${UUID_PATTERN})`, "gim"),
+        new RegExp(`={3,}\\s*(${UUID_PATTERN})\\s*={3,}`, "gi"),
+      ];
+  patterns.push(new RegExp(`(?:^|\\s)(${UUID_PATTERN})(?=\\s|$)`, "gim"));
+  for (const pattern of patterns) {
+    for (const match of output.matchAll(pattern)) ids.add(match[1]);
+  }
+  return [...ids];
+}
+
+function commandRunIds(command: string, output?: string): string[] {
+  if (!/\borx\s+logs\b/.test(command)) return [];
+  const ids = new Set<string>();
+  for (const match of command.matchAll(new RegExp(`\\borx\\s+logs\\s+["']?(${UUID_PATTERN})`, "gi"))) {
     ids.add(match[1]);
   }
   for (const match of command.matchAll(/\borx\s+logs\s+["']?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g)) {
     const variable = match[1];
     const assignment = command.match(
-      new RegExp(`(?:^|[\\s;])(?:export\\s+)?${variable}\\s*=\\s*["']?(${uuid})`, "i"),
+      new RegExp(`(?:^|[\\s;])(?:export\\s+)?${variable}\\s*=\\s*["']?(${UUID_PATTERN})`, "i"),
     );
     if (assignment) ids.add(assignment[1]);
     const loop = command.match(new RegExp(`\\bfor\\s+${variable}\\s+in\\s+([^;]+);\\s*do`, "i"));
     if (!loop) continue;
-    for (const id of loop[1].matchAll(new RegExp(uuid, "gi"))) ids.add(id[0]);
+    for (const id of loop[1].matchAll(new RegExp(UUID_PATTERN, "gi"))) ids.add(id[0]);
   }
+  if (ids.size === 0) idsFromToolOutput(output, "runs").forEach((id) => ids.add(id));
   return [...ids];
 }
 
-function commandExperimentIds(command: string): string[] {
+function commandExperimentIds(command: string, output?: string): string[] {
   if (!/\borx\s+exp\s+desc\b/.test(command)) return [];
-  const uuid = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
   const ids = new Set<string>();
-  for (const match of command.matchAll(new RegExp(`\\borx\\s+exp\\s+desc\\s+["']?(${uuid})`, "gi"))) {
+  for (const match of command.matchAll(new RegExp(`\\borx\\s+exp\\s+desc\\s+["']?(${UUID_PATTERN})`, "gi"))) {
     ids.add(match[1]);
   }
   for (const match of command.matchAll(/\borx\s+exp\s+desc\s+["']?\$([A-Za-z_][A-Za-z0-9_]*)/g)) {
     const variable = match[1];
     const loop = command.match(new RegExp(`\\bfor\\s+${variable}\\s+in\\s+([^;]+);\\s*do`, "i"));
     if (!loop) continue;
-    for (const id of loop[1].matchAll(new RegExp(uuid, "gi"))) ids.add(id[0]);
+    for (const id of loop[1].matchAll(new RegExp(UUID_PATTERN, "gi"))) ids.add(id[0]);
   }
+  if (ids.size === 0) idsFromToolOutput(output, "experiments").forEach((id) => ids.add(id));
   return [...ids];
 }
 
@@ -503,6 +519,7 @@ function toolActivity(part: ChatPart): ToolActivity {
   const tool = part.tool ?? "tool";
   const input = part.state?.input ?? {};
   const rawCommand = inputString(input, "command");
+  const toolOutput = part.state?.output || part.state?.error;
   const filePath = inputString(input, "filePath", "file_path");
   const description = inputString(input, "description");
   switch (tool.toLowerCase()) {
@@ -518,7 +535,7 @@ function toolActivity(part: ChatPart): ToolActivity {
 
       const command = meaningfulCommand(rawCommand);
       if (/\borx\s+logs\b/.test(command)) {
-        const runIds = commandRunIds(command);
+        const runIds = commandRunIds(command, toolOutput);
         const label = runIds.length === 1 ? "Reviewed run log" : "Reviewed run logs";
         return { kind: "project", label, runIds };
       }
@@ -541,7 +558,7 @@ function toolActivity(part: ChatPart): ToolActivity {
         return {
           kind: "project",
           label: "Reviewed experiment status and notes",
-          experimentIds: commandExperimentIds(command),
+          experimentIds: commandExperimentIds(command, toolOutput),
         };
       }
       if (/\borx\s+exp\s+status\b/.test(command)) {
@@ -551,7 +568,7 @@ function toolActivity(part: ChatPart): ToolActivity {
         return {
           kind: "project",
           label: "Read experiment notes",
-          experimentIds: commandExperimentIds(command),
+          experimentIds: commandExperimentIds(command, toolOutput),
         };
       }
       if (/\borx\s+runs?\b/.test(command)) {
@@ -587,7 +604,7 @@ function toolActivity(part: ChatPart): ToolActivity {
     case "read": {
       const target = filePath ? baseName(filePath) : null;
       return target
-        ? { kind: "read", label: `Read ${target}`, filePath, labelPrefix: "Read ", labelTarget: target }
+        ? { kind: "read", label: `Read ${target}`, filePath: filePath ?? undefined, labelPrefix: "Read ", labelTarget: target }
         : { kind: "read", label: "Read a file" };
     }
     case "edit":
@@ -635,10 +652,6 @@ function toolActivity(part: ChatPart): ToolActivity {
       return { kind: "command", label: detail ? `${tool}: ${detail}` : tool };
     }
   }
-}
-
-function toolLine(part: ChatPart): string {
-  return toolActivity(part).label;
 }
 
 /** Readable one-liner for a Codex sub-agent spawn/activity row, from the
@@ -700,7 +713,7 @@ function ToolTargetOverflow({
   const [open, setOpen] = useState(false);
   return (
     <span className="tool-target-overflow inline">
-      {open ? (
+      {open && (
         <span className="tool-target-reveal">
           {items.map((item, index) => (
             <span key={item.id}>
@@ -722,19 +735,18 @@ function ToolTargetOverflow({
             </span>
           ))}
         </span>
-      ) : (
-        <button
-          className="tool-target-more"
-          aria-expanded={false}
-          onClick={(event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            setOpen(true);
-          }}
-        >
-          + {items.length} more
-        </button>
       )}
+      <button
+        className="tool-target-more"
+        aria-expanded={open}
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          setOpen((value) => !value);
+        }}
+      >
+        {open ? "show less" : `+ ${items.length} more`}
+      </button>
     </span>
   );
 }
@@ -786,11 +798,15 @@ function ToolActivityLabel({
     );
   }
   if (activity.runIds?.length) {
-    const multiple = activity.runIds.length > 1;
-    const visibleRunIds = activity.runIds.slice(0, 3);
-    const hiddenRuns = activity.runIds.slice(visibleRunIds.length).map((runId) => ({
+    const runIds = runExperimentName
+      ? activity.runIds.filter((runId) => Boolean(runExperimentName(runId)))
+      : activity.runIds;
+    if (runIds.length === 0) return activity.label;
+    const multiple = runIds.length > 1;
+    const visibleRunIds = runIds.slice(0, 3);
+    const hiddenRuns = runIds.slice(visibleRunIds.length).map((runId) => ({
       id: runId,
-      label: runExperimentName?.(runId) ?? "Experiment",
+      label: runExperimentName?.(runId) || "Experiment",
     }));
     return (
       <>
@@ -808,10 +824,10 @@ function ToolActivityLabel({
                   onOpenRun(runId);
                 }}
               >
-                {runExperimentName?.(runId) ?? "Experiment"}
+                {runExperimentName?.(runId) || "Experiment"}
               </button>
             ) : (
-              <span>{runExperimentName?.(runId) ?? "Experiment"}</span>
+              <span>{runExperimentName?.(runId) || "Experiment"}</span>
             )}
           </span>
         ))}
@@ -825,10 +841,14 @@ function ToolActivityLabel({
     );
   }
   if (activity.experimentIds?.length) {
-    const visibleExperimentIds = activity.experimentIds.slice(0, 3);
-    const hiddenExperiments = activity.experimentIds.slice(visibleExperimentIds.length).map((experimentId) => ({
+    const experimentIds = experimentName
+      ? activity.experimentIds.filter((experimentId) => Boolean(experimentName(experimentId)))
+      : activity.experimentIds;
+    if (experimentIds.length === 0) return activity.label;
+    const visibleExperimentIds = experimentIds.slice(0, 3);
+    const hiddenExperiments = experimentIds.slice(visibleExperimentIds.length).map((experimentId) => ({
       id: experimentId,
-      label: experimentName?.(experimentId) ?? "Experiment",
+      label: experimentName?.(experimentId) || "Experiment",
     }));
     return (
       <>
@@ -838,17 +858,17 @@ function ToolActivityLabel({
             {onOpenExperiment ? (
               <button
                 className="tool-target"
-                title={`Open notes for ${experimentName?.(experimentId) ?? "experiment"}`}
+                title={`Open notes for ${experimentName?.(experimentId) || "experiment"}`}
                 onClick={(event) => {
                   event.preventDefault();
                   event.stopPropagation();
                   onOpenExperiment(experimentId);
                 }}
               >
-                {experimentName?.(experimentId) ?? "Experiment"}
+                {experimentName?.(experimentId) || "Experiment"}
               </button>
             ) : (
-              <span>{experimentName?.(experimentId) ?? "Experiment"}</span>
+              <span>{experimentName?.(experimentId) || "Experiment"}</span>
             )}
           </span>
         ))}
@@ -923,11 +943,13 @@ function resolvedActivityLabel(
     return `${visible.join(", ")}${remaining > 0 ? `, + ${remaining} more` : ""}`;
   };
   if (activity.runIds?.length) {
-    const names = activity.runIds.map((runId) => runExperimentName?.(runId) ?? "Experiment");
+    const names = activity.runIds.map((runId) => runExperimentName?.(runId) || "").filter(Boolean);
+    if (names.length === 0) return activity.label;
     return `${activity.label}${names.length > 1 ? " for " : " "}${summarizedNames(names)}`;
   }
   if (activity.experimentIds?.length) {
-    const names = activity.experimentIds.map((experimentId) => experimentName?.(experimentId) ?? "Experiment");
+    const names = activity.experimentIds.map((experimentId) => experimentName?.(experimentId) || "").filter(Boolean);
+    if (names.length === 0) return activity.label;
     return `${activity.label} for ${summarizedNames(names)}`;
   }
   return activity.label;
@@ -961,7 +983,7 @@ function squashableToolPartKey(part: ChatPart): string | null {
     activity.kind,
     activity.label,
     activity.filePath ?? null,
-    activity.litCall?.id ?? null,
+    activity.litCall?.kind === "paper" ? activity.litCall.id ?? null : null,
     activity.runIds ?? null,
     activity.experimentIds ?? null,
   ]);
@@ -1079,6 +1101,18 @@ function ToolGroup({
   }, [running]);
 
   if (parts.length === 1) {
+    if (runningActivity) {
+      return (
+        <div className="tool-group my-3.5 mx-0">
+          <div className="tool-row flex items-start gap-2 min-w-0 py-[3px] px-1 text-lg text-subtext" role="status" aria-live="polite">
+            <ToolActivityIcon activity={runningActivity} className="tool-running-shimmer-icon self-start mt-[5px]" />
+            <span className="tool-running-shimmer min-w-0 whitespace-normal break-words">
+              {resolvedActivityLabel(runningActivity, runExperimentName, experimentName)}
+            </span>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="tool-group my-3.5 mx-0">
         <ToolRow
@@ -1103,15 +1137,15 @@ function ToolGroup({
   return (
     <div className="tool-group my-3.5 mx-0">
       <button
-        className="tool-group-summary flex items-center gap-2 w-fit max-w-full py-[3px] px-1 cursor-pointer text-lg text-subtext text-left rounded-sm [&:hover]:bg-surface"
+        className="tool-group-summary flex items-start gap-2 w-fit max-w-full py-[3px] px-1 cursor-pointer text-lg text-subtext text-left rounded-sm [&:hover]:bg-surface"
         onClick={() => setOpen((value) => !value)}
         aria-expanded={expanded}
       >
-        <ToolActivityIcon activity={iconActivity} className={running ? "tool-running-shimmer-icon" : "text-muted"} />
-        <span className={`tool-group-label min-w-0 overflow-hidden text-ellipsis whitespace-nowrap ${running ? "tool-running-shimmer" : ""}`}>
+        <ToolActivityIcon activity={iconActivity} className={`${running ? "tool-running-shimmer-icon" : "text-muted"} mt-[5px]`} />
+        <span className={`tool-group-label min-w-0 whitespace-normal break-words ${running ? "tool-running-shimmer" : ""}`} role={running ? "status" : undefined} aria-live={running ? "polite" : undefined}>
           {summaryLabel}
         </span>
-        <ChevronRight size={13} className={`tool-chevron shrink-0 text-muted transition-transform duration-120 ease-standard [&.open]:rotate-90 ${expanded ? "open" : ""}`} />
+        <ChevronRight size={13} className={`tool-chevron shrink-0 mt-[6px] text-muted transition-transform duration-120 ease-standard [&.open]:rotate-90 ${expanded ? "open" : ""}`} />
       </button>
       {expanded && (
         <div className="tool-group-rows flex flex-col gap-px mt-0.5 mr-0 mb-1 ml-6">
@@ -1607,12 +1641,12 @@ export function SubagentTranscript({
     experimentName,
     onOpenSubagent,
   });
+  const spawnActivity = running ? activityInProgress(toolActivity(spawn)) : toolActivity(spawn);
   return (
     <div className="msg-assistant text-lg leading-[1.62] text-text min-w-0">
-      <div className="subagent-tab-header flex items-center gap-2 pb-2 mb-2 border-b border-b-border-variant">
-        <span className={toolStatusClass(spawn.state?.status)} />
-        <span className={TOOL_LINE_CLASS_NAME}>{toolLine(spawn)}</span>
-        {running && <span className="subagent-live shrink-0 text-xs text-accent-amber">live</span>}
+      <div className="subagent-tab-header flex items-center gap-2 pb-2 mb-2 border-b border-b-border-variant" role={running ? "status" : undefined} aria-live={running ? "polite" : undefined}>
+        <ToolActivityIcon activity={spawnActivity} className={running ? "tool-running-shimmer-icon" : "text-muted"} />
+        <span className={`${TOOL_LINE_CLASS_NAME} ${running ? "tool-running-shimmer" : ""}`}>{spawnActivity.label}</span>
       </div>
       {rendered.length === 0 ? (
         <div className="subagent-empty py-[3px] px-1 text-md text-muted">{running ? "Working…" : "No activity"}</div>
@@ -1636,6 +1670,8 @@ function SubagentBlock({
   onOpenSubagent?: (spawnPartId: string) => void;
 }) {
   const errored = part.state?.status === "error";
+  const running = part.state?.status === "running";
+  const activity = running ? activityInProgress(toolActivity(part)) : toolActivity(part);
   return (
     <button
       className={`subagent-row flex items-center gap-2 w-full my-3.5 mx-0 py-[3px] px-1 cursor-pointer text-text text-lg text-left rounded-sm [&:hover:not(:disabled)]:bg-surface [&:disabled]:cursor-default [&.has-error]:text-accent-red [&_.tool-line]:text-lg [&_.tool-line]:text-text ${errored ? "has-error" : ""}`}
@@ -1643,9 +1679,8 @@ function SubagentBlock({
       onClick={() => onOpenSubagent?.(part.id)}
       disabled={!onOpenSubagent}
     >
-      <Users size={12} className="subagent-icon shrink-0 text-muted" />
-      <span className={toolStatusClass(part.state?.status)} />
-      <span className={TOOL_LINE_CLASS_NAME}>{toolLine(part)}</span>
+      <ToolActivityIcon activity={activity} className={`subagent-icon shrink-0 ${running ? "tool-running-shimmer-icon" : "text-muted"}`} />
+      <span className={`${TOOL_LINE_CLASS_NAME} ${running ? "tool-running-shimmer" : ""}`} role={running ? "status" : undefined} aria-live={running ? "polite" : undefined}>{activity.label}</span>
       <ChevronRight size={12} className="subagent-row-chevron shrink-0 text-muted" />
     </button>
   );
