@@ -1479,30 +1479,60 @@ pub fn list_tree_files(repo: &Path, sha: &str) -> Result<Vec<String>> {
     Ok(split_nul(&bytes))
 }
 
-/// A file's committed content at `<sha>:<path>`, read from a streamed
+/// Whether `<sha>:<path>` is a blob in the committed tree.
+pub fn file_exists_at(repo: &Path, sha: &str, path: &str) -> Result<bool> {
+    Ok(file_size_at(repo, sha, path)?.is_some())
+}
+
+/// Size of a committed blob at `<sha>:<path>`, or `None` when the path does
+/// not name a blob.
+pub fn file_size_at(repo: &Path, sha: &str, path: &str) -> Result<Option<u64>> {
+    use std::process::Stdio;
+    let spec = format!("{sha}:{path}");
+    let kind = Command::new("git")
+        .current_dir(repo)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["cat-file", "-t", &spec])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| anyhow!("Could not run git: {}", e))?;
+    if !kind.status.success() || kind.stdout != b"blob\n" {
+        return Ok(None);
+    }
+    let size = Command::new("git")
+        .current_dir(repo)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["cat-file", "-s", &spec])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| anyhow!("Could not run git: {}", e))?;
+    if !size.status.success() {
+        return Err(anyhow!("git cat-file -s {spec} failed"));
+    }
+    let value = String::from_utf8(size.stdout)
+        .map_err(|e| anyhow!("git cat-file returned invalid size: {e}"))?;
+    let value = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|e| anyhow!("git cat-file returned invalid size: {e}"))?;
+    Ok(Some(value))
+}
+
+/// A file's committed bytes at `<sha>:<path>`, read from a streamed
 /// `git cat-file blob` and capped at `limit` bytes — a multi-GB committed
-/// blob costs one pipe buffer, not one allocation (unlike `file_at`, which
-/// is fine for its known-small callers). Existence is checked first with
-/// `cat-file -e` (exit code only, no error-message parsing): `Ok(None)`
-/// when the path isn't in that tree. Returns `(content, truncated)`,
-/// lossy-decoded, byte-exact up to the cap — no trimming.
-pub fn file_at_capped(
+/// blob costs one pipe buffer, not one allocation. Returns byte-exact content
+/// so callers can decide whether it is text or media without lossy decoding.
+pub fn file_bytes_at_capped(
     repo: &Path,
     sha: &str,
     path: &str,
     limit: u64,
-) -> Result<Option<(String, bool)>> {
+) -> Result<Option<(Vec<u8>, bool)>> {
     use std::process::Stdio;
     let spec = format!("{sha}:{path}");
-    let exists = Command::new("git")
-        .current_dir(repo)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .args(["cat-file", "-e", &spec])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| anyhow!("Could not run git: {}", e))?;
-    if !exists.success() {
+    if !file_exists_at(repo, sha, path)? {
         return Ok(None);
     }
     let mut child = Command::new("git")
@@ -1540,10 +1570,7 @@ pub fn file_at_capped(
         }
     }
     buf.truncate(limit as usize);
-    Ok(Some((
-        String::from_utf8_lossy(&buf).into_owned(),
-        truncated,
-    )))
+    Ok(Some((buf, truncated)))
 }
 
 #[cfg(test)]
@@ -1576,6 +1603,23 @@ mod tests {
             std::fs::create_dir_all(parent).expect("create parent");
         }
         std::fs::write(path, contents).expect("write file");
+    }
+
+    #[test]
+    fn committed_file_reads_preserve_binary_bytes() {
+        let dir = temp_repo();
+        let bytes = [0x89, b'P', b'N', b'G', 0, 0xff];
+        std::fs::write(dir.join("figure.png"), bytes).unwrap();
+        run(&dir, &["add", "figure.png"]);
+        run(&dir, &["commit", "-q", "-m", "binary"]);
+        let sha = run(&dir, &["rev-parse", "HEAD"]);
+
+        let (actual, truncated) = file_bytes_at_capped(&dir, &sha, "figure.png", 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual, bytes);
+        assert!(!truncated);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn statuses(files: &[ChangedFile]) -> Vec<(String, ChangedStatus)> {
