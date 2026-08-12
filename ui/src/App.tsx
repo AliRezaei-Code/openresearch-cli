@@ -686,6 +686,22 @@ export default function App() {
     [openExperimentTab],
   );
 
+  const runExperimentName = useCallback((runId: string) => {
+    const run = runsRef.current.find((candidate) => candidate.id === runId);
+    const experiment = run && experimentsRef.current.find((candidate) => candidate.id === run.experimentId);
+    return experiment?.title?.trim() || experiment?.slug || "Experiment";
+  }, []);
+
+  const experimentName = useCallback((experimentId: string) => {
+    const experiment = experimentsRef.current.find((candidate) => candidate.id === experimentId);
+    return experiment?.title?.trim() || experiment?.slug || "Experiment";
+  }, []);
+
+  const openExperimentNotes = useCallback(
+    (experimentId: string) => openExperimentTab(experimentId, "overview"),
+    [openExperimentTab],
+  );
+
   const closeExperimentTab = useCallback(
     (tab: ExpViewDef) => {
       const idx = expTabs.findIndex((t) => sameExpTab(t, tab));
@@ -1030,6 +1046,9 @@ export default function App() {
             onOpenArtifacts={openArtifactsTab}
             onOpenFile={openChatFile}
             onOpenRun={openRunLogs}
+            runExperimentName={runExperimentName}
+            onOpenExperiment={openExperimentNotes}
+            experimentName={experimentName}
             onOpenPlan={openPlanTab}
             onOpenSubagent={openSubagentTab}
             onOpenWorktree={openWorktreeTab}
@@ -1362,6 +1381,9 @@ export default function App() {
               spawnPartId={subagentTab.spawnPartId}
               onOpenFile={(path) => openFileTab(path, subagentTab.sessionId)}
               onOpenRun={openRunLogs}
+              runExperimentName={runExperimentName}
+              onOpenExperiment={openExperimentNotes}
+              experimentName={experimentName}
               onOpenSubagent={(pid) => openSubagentTab(subagentTab.sessionId, pid)}
             />
           ) : codeTab ? (

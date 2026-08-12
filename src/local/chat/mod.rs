@@ -25,7 +25,7 @@ use crate::store::{now_ms, Store, StoredChatMessage, StoredChatSession};
 
 /// Min interval between mid-turn persist+broadcast flushes (streaming parts
 /// can update many times a second; the final flush is always unconditional).
-const FLUSH_INTERVAL: Duration = Duration::from_millis(150);
+const FLUSH_INTERVAL: Duration = Duration::from_millis(75);
 
 /// Max chars of a tool part's `output`/`error` kept on the wire and in the
 /// store. Every flush re-broadcasts (and re-persists) the FULL assistant
@@ -101,6 +101,26 @@ fn cap_tool_parts(parts: &mut [WirePart]) {
         }
         cap_tool_parts(&mut part.children);
     }
+}
+
+fn tool_state_signature(parts: &[WirePart]) -> Vec<(String, String)> {
+    fn collect(parts: &[WirePart], parent: &str, states: &mut Vec<(String, String)>) {
+        for part in parts {
+            let path = if parent.is_empty() {
+                part.id.clone()
+            } else {
+                format!("{parent}/{}", part.id)
+            };
+            if let Some(state) = &part.state {
+                states.push((path.clone(), state.status.clone()));
+            }
+            collect(&part.children, &path, states);
+        }
+    }
+
+    let mut states = Vec::new();
+    collect(parts, "", &mut states);
+    states
 }
 
 /// How long a bridge approval card may sit unanswered before it's denied and
@@ -1269,6 +1289,7 @@ impl ChatHost {
                 .as_deref()
                 .and_then(|json| serde_json::from_str(json).ok()),
             last_flush: Instant::now() - FLUSH_INTERVAL,
+            last_flushed_tool_states: Vec::new(),
         };
         // Upgrade the reservation None→Some(handle), atomically re-checking that
         // it's still ours: an `interrupt` racing the prologue above may have
@@ -1928,6 +1949,7 @@ pub struct TurnCtx {
     /// turn end; `report_usage` also streams it live over `chat.usage`.
     pub context_usage: Option<ContextUsage>,
     last_flush: Instant,
+    last_flushed_tool_states: Vec<(String, String)>,
 }
 
 impl TurnCtx {
@@ -1976,6 +1998,7 @@ impl TurnCtx {
             },
             context_usage: None,
             last_flush: Instant::now(),
+            last_flushed_tool_states: Vec::new(),
         }
     }
 
@@ -2095,7 +2118,10 @@ impl TurnCtx {
 
     /// Persist + broadcast the assistant message, rate-limited mid-turn.
     pub fn maybe_flush(&mut self) {
-        if self.last_flush.elapsed() >= FLUSH_INTERVAL {
+        let tool_states = tool_state_signature(&self.assistant.parts);
+        if tool_states != self.last_flushed_tool_states
+            || self.last_flush.elapsed() >= FLUSH_INTERVAL
+        {
             let _ = self.flush();
         }
     }
@@ -2137,6 +2163,7 @@ impl TurnCtx {
             "chat.message",
             message_json(&self.assistant, &self.session_id),
         );
+        self.last_flushed_tool_states = tool_state_signature(&self.assistant.parts);
         Ok(())
     }
 
