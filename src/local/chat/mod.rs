@@ -149,6 +149,22 @@ fn structured_tool_targets(
     }
 }
 
+fn strip_tool_target_markers(text: &mut String) {
+    if !text.contains("[orx-") {
+        return;
+    }
+    let filtered = text
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !(trimmed.starts_with("[orx-run:") || trimmed.starts_with("[orx-experiment:"))
+                || !trimmed.ends_with(']')
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    *text = filtered;
+}
+
 fn preserve_tool_targets(state: &mut WireToolState) {
     let Some(input) = state.input.as_mut().and_then(Value::as_object_mut) else {
         return;
@@ -172,15 +188,18 @@ fn preserve_tool_targets(state: &mut WireToolState) {
     } else {
         "experimentTargetIds"
     };
-    let mut targets = input
+    let existing = input
         .get(key)
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .map(str::to_string)
         .collect::<Vec<_>>();
-    let mut seen = targets.iter().cloned().collect::<HashSet<_>>();
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    for target in existing {
+        push_tool_target(&mut targets, &mut seen, target);
+    }
     for text in [state.output.as_deref(), state.error.as_deref()]
         .into_iter()
         .flatten()
@@ -189,6 +208,12 @@ fn preserve_tool_targets(state: &mut WireToolState) {
     }
     if !targets.is_empty() {
         input.insert(key.into(), json!(targets));
+    }
+    if let Some(output) = state.output.as_mut() {
+        strip_tool_target_markers(output);
+    }
+    if let Some(error) = state.error.as_mut() {
+        strip_tool_target_markers(error);
     }
 }
 

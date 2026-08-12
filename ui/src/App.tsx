@@ -717,13 +717,18 @@ export default function App() {
   }, [runExperimentNames]);
 
   const experimentName = useCallback((experimentId: string) => {
-    return experimentNames.get(experimentId) ?? "";
+    const exact = experimentNames.get(experimentId);
+    if (exact) return exact;
+    const matches = [...experimentNames].filter(([id]) => id.startsWith(experimentId));
+    return matches.length === 1 ? matches[0][1] : "";
   }, [experimentNames]);
 
-  const openExperimentNotes = useCallback(
-    (experimentId: string) => openExperimentTab(experimentId, "overview"),
-    [openExperimentTab],
-  );
+  const openExperimentNotes = useCallback((experimentId: string) => {
+    const matches = experimentsRef.current.filter(
+      (experiment) => experiment.id === experimentId || experiment.id.startsWith(experimentId),
+    );
+    if (matches.length === 1) openExperimentTab(matches[0].id, "overview");
+  }, [openExperimentTab]);
 
   const closeExperimentTab = useCallback(
     (tab: ExpViewDef) => {
