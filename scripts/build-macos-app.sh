@@ -19,8 +19,23 @@ if [[ "$(uname)" != "Darwin" ]]; then
 fi
 
 VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
-echo "==> Building release orx (v$VERSION)"
-cargo build --release --bin orx --manifest-path "$ROOT/Cargo.toml"
+
+# ORX_APP_UNIVERSAL=1 builds a universal (arm64 + x86_64) binary for
+# distribution; the default single-arch build is faster for local iteration.
+if [[ "${ORX_APP_UNIVERSAL:-0}" == "1" ]]; then
+  echo "==> Building universal release orx (v$VERSION: arm64 + x86_64)"
+  cargo build --release --bin orx --target aarch64-apple-darwin --manifest-path "$ROOT/Cargo.toml"
+  cargo build --release --bin orx --target x86_64-apple-darwin --manifest-path "$ROOT/Cargo.toml"
+  BIN="$ROOT/target/universal-apple-darwin/release/orx"
+  mkdir -p "$(dirname "$BIN")"
+  lipo -create -output "$BIN" \
+    "$ROOT/target/aarch64-apple-darwin/release/orx" \
+    "$ROOT/target/x86_64-apple-darwin/release/orx"
+else
+  echo "==> Building release orx (v$VERSION, native arch — set ORX_APP_UNIVERSAL=1 for universal)"
+  cargo build --release --bin orx --manifest-path "$ROOT/Cargo.toml"
+  BIN="$ROOT/target/release/orx"
+fi
 
 echo "==> Generating AppIcon.icns"
 TMP="$(mktemp -d)"
@@ -42,7 +57,7 @@ gen icon_512x512@2x.png 1024
 echo "==> Assembling $APP"
 rm -rf "$APP"
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
-cp "$ROOT/target/release/orx" "$CONTENTS/MacOS/OpenResearch"
+cp "$BIN" "$CONTENTS/MacOS/OpenResearch"
 chmod +x "$CONTENTS/MacOS/OpenResearch"
 iconutil -c icns "$ICONSET" -o "$CONTENTS/Resources/AppIcon.icns"
 sed "s/__VERSION__/$VERSION/g" "$ROOT/macos/Info.plist" > "$CONTENTS/Info.plist"
