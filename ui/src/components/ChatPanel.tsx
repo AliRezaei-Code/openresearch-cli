@@ -701,17 +701,17 @@ function invocationOffsets(command: string, invocations: ShellCommandSegment[]):
   });
 }
 
-function assignedIdBefore(command: string, variable: string, before: number, idPattern: string): string | null {
+function assignedIdsBefore(command: string, variable: string, before: number, idPattern: string): string[] {
   const assignment = new RegExp(
-    `(?:^|[\\s;])(?:export\\s+)?${variable}\\s*=\\s*["']?(${idPattern})`,
+    `(?:^|[\\s;])(?:export\\s+)?${variable}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s;]+))`,
     "gi",
   );
-  let resolved: string | null = null;
+  let resolved = "";
   for (const match of command.matchAll(assignment)) {
     if ((match.index ?? 0) >= before) break;
-    resolved = match[1];
+    resolved = match[1] ?? match[2] ?? match[3] ?? "";
   }
-  return resolved;
+  return [...resolved.matchAll(new RegExp(idPattern, "gi"))].map((match) => match[0]);
 }
 
 function loopIdsBefore(command: string, variable: string, before: number, idPattern: string): string[] {
@@ -759,11 +759,11 @@ function commandRunIds(command: string, output?: string): string[] {
       continue;
     }
     const variable = variableMatch[1];
-    const assignment = assignedIdBefore(command, variable, offset, RUN_TARGET_PATTERN);
-    if (assignment) ids.add(assignment);
+    const assignmentIds = assignedIdsBefore(command, variable, offset, RUN_TARGET_PATTERN);
+    for (const id of assignmentIds) ids.add(id);
     const loopIds = loopIdsBefore(command, variable, offset, RUN_TARGET_PATTERN);
     for (const id of loopIds) ids.add(id);
-    if (!assignment && loopIds.length === 0) hasUnresolvedTarget = true;
+    if (assignmentIds.length === 0 && loopIds.length === 0) hasUnresolvedTarget = true;
   }
   if (ids.size === 0 || hasUnresolvedTarget) idsFromToolOutput(output, "runs").forEach((id) => ids.add(id));
   return [...ids];
@@ -783,9 +783,9 @@ function commandExperimentIds(command: string, output?: string): string[] {
     const match = /\borx\s+exp\s+(?:status|desc)\s+["']?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/.exec(invocation.raw);
     if (match) {
       const variable = match[1];
-      const assignment = assignedIdBefore(command, variable, offset, UUID_PATTERN);
-      if (assignment) {
-        ids.add(assignment);
+      const assignmentIds = assignedIdsBefore(command, variable, offset, UUID_PATTERN);
+      if (assignmentIds.length > 0) {
+        for (const id of assignmentIds) ids.add(id);
         resolved = true;
       }
       const loopIds = loopIdsBefore(command, variable, offset, UUID_PATTERN);
@@ -836,6 +836,9 @@ function toolActivity(part: ChatPart): ToolActivity {
     ["exec", "bash"],
     ["exec_command", "bash"],
     ["run_command", "bash"],
+    ["agent", "task"],
+    ["collabagenttoolcall", "subagent"],
+    ["subagentactivity", "subagent"],
   ]).get(baseTool) ?? baseTool;
   switch (normalizedTool) {
     case "bash": {
@@ -1415,6 +1418,7 @@ function ToolRow({
   const failed = state?.status === "error";
   const errorMessage = (state?.error || state?.output || "").replace(/^Exit code \d+\s*/i, "").trim();
   const hasDetail = failed && Boolean(errorMessage);
+  const [detailOpen, setDetailOpen] = useState(false);
   const line = (
     <>
       {failed && <span className="sr-only">Failed: </span>}
@@ -1445,17 +1449,27 @@ function ToolRow({
   }
 
   return (
-    <details className="tool-row tool-row-error group flex flex-col [&_summary]:flex [&_summary]:items-center [&_summary]:gap-2 [&_summary]:w-fit [&_summary]:max-w-full [&_summary]:py-[3px] [&_summary]:px-1 [&_summary]:cursor-pointer [&_summary]:list-none [&_summary]:select-none [&_summary]:min-w-0 [&_summary]:rounded-sm [&_summary:hover]:bg-surface [&_summary::-webkit-details-marker]:hidden">
-      <summary>
+    <div className="tool-row tool-row-error flex flex-col min-w-0">
+      <div className="flex items-center gap-2 w-fit max-w-full py-[3px] px-1 min-w-0 rounded-sm">
         {line}
-        <ChevronRight size={12} className="tool-row-chevron shrink-0 text-accent-red transition-transform duration-120 ease-standard group-open:rotate-90" />
-      </summary>
-      <div className="tool-detail mt-1 mr-0 mb-1 ml-6">
-        <div className="tool-output py-1.5 px-2.5 font-mono text-xs text-subtext whitespace-pre-wrap wrap-anywhere max-h-65 overflow-y-auto bg-background border border-border-variant rounded-sm">
-          {errorMessage.slice(0, 20000)}
-        </div>
+        <button
+          type="button"
+          className="tool-row-detail-toggle shrink-0 inline-flex items-center justify-center p-0.5 rounded-sm cursor-pointer hover:bg-surface"
+          aria-expanded={detailOpen}
+          aria-label={detailOpen ? "Hide error details" : "Show error details"}
+          onClick={() => setDetailOpen((current) => !current)}
+        >
+          <ChevronRight size={12} className={`text-accent-red transition-transform duration-120 ease-standard ${detailOpen ? "rotate-90" : ""}`} />
+        </button>
       </div>
-    </details>
+      {detailOpen && (
+        <div className="tool-detail mt-1 mr-0 mb-1 ml-6">
+          <div className="tool-output py-1.5 px-2.5 font-mono text-xs text-subtext whitespace-pre-wrap wrap-anywhere max-h-65 overflow-y-auto bg-background border border-border-variant rounded-sm">
+            {errorMessage.slice(0, 20000)}
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1480,6 +1494,7 @@ function ToolGroup({
   const failedCount = parts.filter((part) => part.state?.status === "error").length;
   const [open, setOpen] = useState(running || failedCount > 0);
   const wasRunning = useRef(running);
+  const previousFailedCount = useRef(failedCount);
   const hasRun = useRef(running);
   const displayParts = squashToolParts(parts);
   const activities = displayParts.map(({ part }) => toolActivity(part));
@@ -1491,11 +1506,9 @@ function ToolGroup({
     : summary;
   const liveMessage = running
     ? summaryLabel
-    : hasRun.current
-      ? failedCount > 0
-        ? `Tool activity completed with ${failedCount} ${failedCount === 1 ? "failure" : "failures"}`
-        : "Tool activity completed"
-      : "";
+    : failedCount > 0
+      ? `Tool activity completed with ${failedCount} ${failedCount === 1 ? "failure" : "failures"}`
+      : hasRun.current ? "Tool activity completed" : "";
 
   useEffect(() => {
     if (running) hasRun.current = true;
@@ -1506,6 +1519,11 @@ function ToolGroup({
     wasRunning.current = running;
     setOpen(running || failedCount > 0);
   }, [failedCount, running]);
+
+  useEffect(() => {
+    if (failedCount > previousFailedCount.current) setOpen(true);
+    previousFailedCount.current = failedCount;
+  }, [failedCount]);
 
   if (parts.length === 1) {
     if (runningActivity) {
@@ -2039,10 +2057,6 @@ export function SubagentTranscript({
   const errorMessage = errored
     ? (spawn.state?.error || spawn.state?.output || "").replace(/^Exit code \d+\s*/i, "").trim()
     : "";
-  const hasRun = useRef(running);
-  useEffect(() => {
-    if (running) hasRun.current = true;
-  }, [running]);
   // Gate the empty state on what actually renders, not the raw part count — a
   // stored transcript of nothing but invisible parts must still read as empty.
   const rendered = renderParts(parts, {
@@ -2061,9 +2075,6 @@ export function SubagentTranscript({
         <ToolActivityIcon activity={spawnActivity} className={running ? "tool-running-shimmer-icon" : errored ? "text-accent-red" : "text-muted"} />
         <span className={`${TOOL_LINE_CLASS_NAME} ${running ? "tool-running-shimmer" : errored ? "text-accent-red" : ""}`}>{spawnActivity.label}</span>
       </div>
-      <span className="sr-only" role="status" aria-live="polite">
-        {running ? spawnActivity.label : hasRun.current ? errored ? "Sub-agent activity failed" : "Sub-agent activity completed" : ""}
-      </span>
       {errorMessage && (
         <div className="tool-output py-1.5 px-2.5 font-mono text-xs text-subtext whitespace-pre-wrap wrap-anywhere max-h-65 overflow-y-auto bg-background border border-border-variant rounded-sm">
           {errorMessage.slice(0, 20000)}
@@ -2112,7 +2123,7 @@ function SubagentBlock({
         <ChevronRight size={12} className="subagent-row-chevron shrink-0 text-muted" />
       </button>
       <span className="sr-only" role="status" aria-live="polite">
-        {running ? activity.label : hasRun.current ? errored ? "Sub-agent activity failed" : "Sub-agent activity completed" : ""}
+        {running ? activity.label : errored ? "Sub-agent activity failed" : hasRun.current ? "Sub-agent activity completed" : ""}
       </span>
     </>
   );

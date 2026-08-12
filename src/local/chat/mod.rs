@@ -98,8 +98,8 @@ pub fn upsert_preserving_children(parts: &mut Vec<WirePart>, mut part: WirePart)
     }
 }
 
-/// Cap every tool part's `output`/`error` in a wire-copy before persistence.
-/// Recurses into `children` so nested sub-agent output is bounded too.
+/// Bound every live tool part's `output`/`error` before persistence. The
+/// head-and-tail cap keeps accepting new tail output without growing memory.
 fn cap_tool_parts(parts: &mut [WirePart]) {
     for part in parts.iter_mut() {
         if let Some(state) = part.state.as_mut() {
@@ -2328,6 +2328,7 @@ impl TurnCtx {
         if self.assistant.parts.is_empty() {
             return Ok(());
         }
+        cap_tool_parts(&mut self.assistant.parts);
         let store = Store::open()?;
         // A prompt card the harness surfaced mid-turn (opencode's inline
         // permission/question) may be answered *while the turn is still running*
@@ -2642,6 +2643,11 @@ mod cap_tests {
         let capped = long.clone();
         cap_tool_text(&mut long);
         assert_eq!(long, capped);
+
+        long.push_str("terminal error");
+        cap_tool_text(&mut long);
+        assert_eq!(long.chars().count(), TOOL_TEXT_CAP);
+        assert!(long.ends_with("terminal error"));
 
         // Multi-byte chars: truncation lands on a char boundary.
         let mut wide = "é".repeat(TOOL_TEXT_CAP * 2);
