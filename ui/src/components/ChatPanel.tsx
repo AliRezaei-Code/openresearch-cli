@@ -333,7 +333,7 @@ function meaningfulCommand(command: string): string {
   if ((first === "\"" || first === "'") && body[body.length - 1] === first) {
     body = body.slice(1, -1);
   }
-  return body.replace(/\s+/g, " ").trim();
+  return body.replace(/[\t\r ]+/g, " ").trim();
 }
 
 function shellCommandSegment(command: string, start: number): string {
@@ -455,8 +455,64 @@ function commandSearchPattern(command: string): string | null {
 
 const UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 
+interface ShellCommandSegment {
+  raw: string;
+  code: string;
+}
+
+function shellCommandSegments(command: string): ShellCommandSegment[] {
+  const segments: ShellCommandSegment[] = [];
+  let raw = "";
+  let code = "";
+  let quote: "\"" | "'" | null = null;
+  let escaped = false;
+  const push = () => {
+    if (raw.trim() || code.trim()) segments.push({ raw: raw.trim(), code: code.trim() });
+    raw = "";
+    code = "";
+  };
+
+  for (let index = 0; index < command.length; index++) {
+    const char = command[index];
+    if (escaped) {
+      raw += char;
+      if (!quote) code += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\" && quote !== "'") {
+      raw += char;
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      raw += char;
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      raw += char;
+      quote = char;
+      continue;
+    }
+    if (char === ";" || char === "|" || char === "&" || char === "(" || char === ")" || char === "\n") {
+      push();
+      continue;
+    }
+    raw += char;
+    code += char;
+  }
+  push();
+  return segments;
+}
+
+function orxCommandSegments(command: string, args: string): ShellCommandSegment[] {
+  const invocation = new RegExp(`(?:^|\\b(?:do|then|else|if|while|until)\\s+)(?:[A-Za-z_][A-Za-z0-9_]*=[^\\s]+\\s+)*orx\\s+${args}\\b`, "i");
+  return shellCommandSegments(command).filter((segment) => invocation.test(segment.code));
+}
+
 function commandInvokesOrx(command: string, args: string): boolean {
-  return new RegExp(`(?:^|[;|&(\\n]\\s*|\\b(?:do|then)\\s+)orx\\s+${args}\\b`, "i").test(command);
+  return orxCommandSegments(command, args).length > 0;
 }
 
 function idsFromToolOutput(output: string | undefined, resource: "runs" | "experiments"): string[] {
@@ -484,12 +540,17 @@ function idsFromToolOutput(output: string | undefined, resource: "runs" | "exper
 }
 
 function commandRunIds(command: string, output?: string): string[] {
-  if (!commandInvokesOrx(command, "logs")) return [];
+  const invocations = orxCommandSegments(command, "logs");
+  if (invocations.length === 0) return [];
   const ids = new Set<string>();
-  for (const match of command.matchAll(new RegExp(`\\borx\\s+logs\\s+["']?(${UUID_PATTERN})`, "gi"))) {
-    ids.add(match[1]);
+  for (const invocation of invocations) {
+    for (const match of invocation.raw.matchAll(new RegExp(`\\borx\\s+logs\\s+["']?(${UUID_PATTERN})`, "gi"))) {
+      ids.add(match[1]);
+    }
   }
-  for (const match of command.matchAll(/\borx\s+logs\s+["']?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g)) {
+  for (const invocation of invocations) {
+    const match = /\borx\s+logs\s+["']?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/.exec(invocation.raw);
+    if (!match) continue;
     const variable = match[1];
     const assignment = command.match(
       new RegExp(`(?:^|[\\s;])(?:export\\s+)?${variable}\\s*=\\s*["']?(${UUID_PATTERN})`, "i"),
@@ -504,12 +565,17 @@ function commandRunIds(command: string, output?: string): string[] {
 }
 
 function commandExperimentIds(command: string, output?: string): string[] {
-  if (!commandInvokesOrx(command, "exp\\s+(?:status|desc)")) return [];
+  const invocations = orxCommandSegments(command, "exp\\s+(?:status|desc)");
+  if (invocations.length === 0) return [];
   const ids = new Set<string>();
-  for (const match of command.matchAll(new RegExp(`\\borx\\s+exp\\s+(?:status|desc)\\s+["']?(${UUID_PATTERN})`, "gi"))) {
-    ids.add(match[1]);
+  for (const invocation of invocations) {
+    for (const match of invocation.raw.matchAll(new RegExp(`\\borx\\s+exp\\s+(?:status|desc)\\s+["']?(${UUID_PATTERN})`, "gi"))) {
+      ids.add(match[1]);
+    }
   }
-  for (const match of command.matchAll(/\borx\s+exp\s+(?:status|desc)\s+["']?\$([A-Za-z_][A-Za-z0-9_]*)/g)) {
+  for (const invocation of invocations) {
+    const match = /\borx\s+exp\s+(?:status|desc)\s+["']?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/.exec(invocation.raw);
+    if (!match) continue;
     const variable = match[1];
     const loop = command.match(new RegExp(`\\bfor\\s+${variable}\\s+in\\s+([^;]+);\\s*do`, "i"));
     if (!loop) continue;
