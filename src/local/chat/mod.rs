@@ -3285,6 +3285,48 @@ fn zsh_startup_wrapper(name: &str) -> String {
     )
 }
 
+fn zshenv_hook(original_zdotdir: &std::path::Path) -> String {
+    format!(
+        "_ORX_CHAT_SHIM_ZDOTDIR=$ZDOTDIR\n\
+         _ORX_CHAT_USER_ZDOTDIR={}\n\
+         ZDOTDIR=$_ORX_CHAT_USER_ZDOTDIR\n\
+         [[ -r \"$ZDOTDIR/.zshenv\" ]] && source \"$ZDOTDIR/.zshenv\"\n\
+         _ORX_CHAT_USER_ZDOTDIR=$ZDOTDIR\n\
+         ZDOTDIR=$_ORX_CHAT_SHIM_ZDOTDIR\n\
+         export ORX_CHAT_TOOL_SCOPE=\"zsh-$$\"\n\
+         export ORX_CHAT_TOOL_COMMAND=\"$ZSH_EXECUTION_STRING\"\n\
+         if [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" && -r \"${{ORX_CHAT_TARGET_POINTER-}}\" ]]; then\n\
+           export ORX_CHAT_TARGET_FILE=$(<\"$ORX_CHAT_TARGET_POINTER\")\n\
+         elif [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" ]]; then\n\
+           unset ORX_CHAT_TARGET_FILE\n\
+         fi\n",
+        shell_single_quote(original_zdotdir)
+    )
+}
+
+fn bash_env_hook(original: Option<String>) -> String {
+    let source = original
+        .map(|value| {
+            format!(
+                "_ORX_CHAT_USER_BASH_ENV={}\n\
+                 eval \"_ORX_CHAT_USER_BASH_ENV=\\\"$_ORX_CHAT_USER_BASH_ENV\\\"\"\n\
+                 [[ -r \"$_ORX_CHAT_USER_BASH_ENV\" ]] && source \"$_ORX_CHAT_USER_BASH_ENV\"\n",
+                shell_single_quote(std::path::Path::new(&value))
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "{source}\
+         export ORX_CHAT_TOOL_SCOPE=\"bash-$$\"\n\
+         export ORX_CHAT_TOOL_COMMAND=\"$BASH_EXECUTION_STRING\"\n\
+         if [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" && -r \"${{ORX_CHAT_TARGET_POINTER-}}\" ]]; then\n\
+           export ORX_CHAT_TARGET_FILE=$(<\"$ORX_CHAT_TARGET_POINTER\")\n\
+         elif [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" ]]; then\n\
+           unset ORX_CHAT_TARGET_FILE\n\
+         fi\n"
+    )
+}
+
 fn child_env_value(key: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(key).or_else(|| {
         crate::config::list_synced_env()
@@ -3299,6 +3341,7 @@ fn child_env_value(key: &str) -> Option<std::ffi::OsString> {
 pub fn set_chat_session_env(cmd: &mut tokio::process::Command, session_id: &str) {
     cmd.env(CHAT_SESSION_ENV, session_id);
     cmd.env(LOCAL_SESSION_ENV, "1");
+    cmd.env_remove(CHAT_TARGET_FILE_ENV);
 
     let shell_dir = shell_hook_dir(session_id);
     if std::fs::create_dir_all(&shell_dir).is_err() {
@@ -3311,22 +3354,7 @@ pub fn set_chat_session_env(cmd: &mut tokio::process::Command, session_id: &str)
         return;
     };
     let pointer = target_event_pointer(session_id);
-    let zshenv = format!(
-        "_ORX_CHAT_SHIM_ZDOTDIR=$ZDOTDIR\n\
-         _ORX_CHAT_USER_ZDOTDIR={}\n\
-         ZDOTDIR=$_ORX_CHAT_USER_ZDOTDIR\n\
-         [[ -r \"$ZDOTDIR/.zshenv\" ]] && source \"$ZDOTDIR/.zshenv\"\n\
-         _ORX_CHAT_USER_ZDOTDIR=$ZDOTDIR\n\
-         ZDOTDIR=$_ORX_CHAT_SHIM_ZDOTDIR\n\
-         export ORX_CHAT_TOOL_SCOPE=\"zsh-$$\"\n\
-         export ORX_CHAT_TOOL_COMMAND=\"$ZSH_EXECUTION_STRING\"\n\
-         if [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" && -r \"$ORX_CHAT_TARGET_POINTER\" ]]; then\n\
-           export ORX_CHAT_TARGET_FILE=$(<\"$ORX_CHAT_TARGET_POINTER\")\n\
-         elif [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" ]]; then\n\
-           unset ORX_CHAT_TARGET_FILE\n\
-         fi\n",
-        shell_single_quote(&original_zdotdir)
-    );
+    let zshenv = zshenv_hook(&original_zdotdir);
     let mut hooks = vec![(".zshenv", zshenv)];
     hooks.extend(
         [".zprofile", ".zshrc", ".zlogin", ".zlogout"]
@@ -3341,27 +3369,9 @@ pub fn set_chat_session_env(cmd: &mut tokio::process::Command, session_id: &str)
     }
 
     let bash_env = shell_dir.join("bash_env");
-    let original_bash_env = child_env_value("BASH_ENV")
-        .map(|value| value.to_string_lossy().into_owned())
-        .map(|value| {
-            format!(
-                "_ORX_CHAT_USER_BASH_ENV={}\n\
-                 eval \"_ORX_CHAT_USER_BASH_ENV=\\\"$_ORX_CHAT_USER_BASH_ENV\\\"\"\n\
-                 [[ -r \"$_ORX_CHAT_USER_BASH_ENV\" ]] && source \"$_ORX_CHAT_USER_BASH_ENV\"\n",
-                shell_single_quote(std::path::Path::new(&value))
-            )
-        })
-        .unwrap_or_default();
-    let bash_hook = format!(
-        "{original_bash_env}\
-         export ORX_CHAT_TOOL_SCOPE=\"bash-$$\"\n\
-         export ORX_CHAT_TOOL_COMMAND=\"$BASH_EXECUTION_STRING\"\n\
-         if [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" && -r \"$ORX_CHAT_TARGET_POINTER\" ]]; then\n\
-           export ORX_CHAT_TARGET_FILE=$(<\"$ORX_CHAT_TARGET_POINTER\")\n\
-         elif [[ -z \"${{ORX_CHAT_TARGET_FILE-}}\" ]]; then\n\
-           unset ORX_CHAT_TARGET_FILE\n\
-         fi\n"
-    );
+    let original_bash_env =
+        child_env_value("BASH_ENV").map(|value| value.to_string_lossy().into_owned());
+    let bash_hook = bash_env_hook(original_bash_env);
     if std::fs::write(&bash_env, bash_hook).is_err() {
         return;
     }
@@ -3471,6 +3481,40 @@ mod cap_tests {
     fn session_path_names_are_injective_for_punctuation() {
         assert_ne!(safe_session_name("a/b"), safe_session_name("ab"));
         assert!(!safe_session_name("...").is_empty());
+    }
+
+    #[test]
+    fn shell_hooks_tolerate_nounset_and_preserve_spaced_bash_env() {
+        let root = std::env::temp_dir().join(format!("orx-shell-hook-{}", uuid::Uuid::new_v4()));
+        let hook_dir = root.join("path with space");
+        std::fs::create_dir_all(&hook_dir).unwrap();
+        let user_hook = hook_dir.join("user_hook");
+        std::fs::write(&user_hook, "set -u\nexport ORX_USER_HOOK_LOADED=yes\n").unwrap();
+        let shim = root.join("bash_env");
+        std::fs::write(
+            &shim,
+            bash_env_hook(Some("$ORX_TEST_HOME/path with space/user_hook".into())),
+        )
+        .unwrap();
+
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("printf '%s' \"$ORX_USER_HOOK_LOADED\"")
+            .env("BASH_ENV", &shim)
+            .env("ORX_TEST_HOME", &root)
+            .env_remove(CHAT_TARGET_FILE_ENV)
+            .env_remove(CHAT_TARGET_POINTER_ENV)
+            .output()
+            .unwrap();
+
+        let _ = std::fs::remove_dir_all(root);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "yes");
+        assert!(zshenv_hook(std::path::Path::new("/tmp")).contains("${ORX_CHAT_TARGET_FILE-}"));
     }
 
     #[test]
