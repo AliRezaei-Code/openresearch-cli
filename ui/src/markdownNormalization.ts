@@ -17,8 +17,10 @@ function isEscaped(text: string, index: number): boolean {
 }
 
 function fenceMarkerOffset(line: string): number {
-  const prefix = /^(?:(?: {0,3}>[ \t]?)|(?: {0,3}(?:[-+*]|\d+[.)])[ \t]+))*[ \t]*/.exec(line);
-  return prefix?.[0].length ?? 0;
+  const container = /^(?:(?: {0,3}>[ \t]?)|(?: {0,3}(?:[-+*]|\d+[.)])[ \t]+))*/.exec(line);
+  const containerLength = container?.[0].length ?? 0;
+  const indentation = /^ {0,3}/.exec(line.slice(containerLength));
+  return containerLength + (indentation?.[0].length ?? 0);
 }
 
 function isFenceStart(text: string, index: number): boolean {
@@ -146,21 +148,34 @@ export function normalizeCurrencyDollars(
       continue;
     }
 
-    const content = text.slice(index + 1, next);
-    if (looksLikeNumberLedMath(content, amount[0].length)) {
-      protectedMath.add(index);
-      protectedMath.add(next);
-      position += 1;
-    } else {
-      escaped.add(index);
+    protectedMath.add(index);
+    protectedMath.add(next);
+    position += 1;
+  }
+
+  const mathFlowTriples = new Set<number>();
+  const flowCandidates: number[] = [];
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] !== "$" || runLength(text, index, "$") !== 3 || isEscaped(text, index)) continue;
+    const lineStart = text.lastIndexOf("\n", index - 1) + 1;
+    const lineEndAt = text.indexOf("\n", index + 3);
+    const lineEnd = lineEndAt === -1 ? text.length : lineEndAt;
+    if (/^[ \t]*$/.test(text.slice(lineStart, index)) && /^[ \t\r]*$/.test(text.slice(index + 3, lineEnd))) {
+      flowCandidates.push(index);
     }
+  }
+  for (let index = 0; index + 1 < flowCandidates.length; index += 2) {
+    mathFlowTriples.add(flowCandidates[index]!);
+    mathFlowTriples.add(flowCandidates[index + 1]!);
   }
 
   const standaloneTriples = new Set<number>();
   for (let index = 0; index < text.length; index += 1) {
     if (text[index] !== "$") continue;
     const length = runLength(text, index, "$");
-    if (length === 3 && !isEscaped(text, index)) standaloneTriples.add(index);
+    if (length === 3 && !isEscaped(text, index) && !mathFlowTriples.has(index)) {
+      standaloneTriples.add(index);
+    }
     index += length - 1;
   }
   let normalized = "";

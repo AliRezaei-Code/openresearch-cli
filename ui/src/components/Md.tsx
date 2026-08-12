@@ -70,10 +70,6 @@ function parseTagAttrs(attrs: string): Record<string, string> {
   return out;
 }
 
-/** Split raw-html text around `<file .../>` and `<run .../>` tags into text +
- * custom nodes. A `<file>` needs a `path`; a `<run>` needs an `id` — a tag
- * missing its required attribute is almost certainly not ours, so leave it as
- * text. */
 function pointAt(value: string, start: MdastPoint, relativeOffset: number): MdastPoint {
   let line = start.line;
   let column = start.column;
@@ -100,6 +96,7 @@ function positionFor(node: MdastNode, start: number, end: number): MdastPosition
   };
 }
 
+/** Split raw HTML around valid `<file>` and `<run>` tags into custom nodes. */
 function parseMentionHtml(node: MdastNode): MdastNode[] | null {
   const value = node.value ?? "";
   const regex = /<(file|run)\b([^>]*?)\/?>/gi;
