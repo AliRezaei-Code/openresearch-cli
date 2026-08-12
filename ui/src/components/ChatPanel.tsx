@@ -91,6 +91,9 @@ const TOOL_LINE_CLASS_NAME = [
   "tool-line flex-1 min-w-0 overflow-hidden text-ellipsis whitespace-nowrap",
   "text-lg",
 ].join(" ");
+const TOOL_TARGET_LIMIT = 256;
+const TOOL_TARGET_INSPECTION_LIMIT = 1_024;
+const TOOL_OUTPUT_SCAN_LIMIT = 20_000;
 
 const PROMPT_COLLAPSED_CLASS_NAME = [
   "prompt-collapsed text-muted text-lg font-[375] my-3.5 mx-0 [&_summary]:flex",
@@ -321,15 +324,24 @@ function arrayInputString(input: Record<string, unknown>, key: string, field: st
 
 function inputStringArray(input: Record<string, unknown>, key: string): string[] {
   const values = input[key];
-  return Array.isArray(values) ? values.filter((value): value is string => typeof value === "string") : [];
+  if (!Array.isArray(values)) return [];
+  const strings: string[] = [];
+  for (let index = 0; index < Math.min(values.length, TOOL_TARGET_INSPECTION_LIMIT); index++) {
+    if (typeof values[index] === "string") strings.push(values[index]);
+    if (strings.length >= TOOL_TARGET_LIMIT) break;
+  }
+  return strings;
 }
 
 function normalizedTargetIds(...collections: string[][]): string[] {
   const ids = new Set<string>();
   const target = new RegExp(`^${RUN_TARGET_PATTERN}$`, "i");
-  for (const value of collections.flat()) {
-    if (ids.size >= 256) break;
-    if (target.test(value)) ids.add(value.toLowerCase());
+  let inspected = 0;
+  for (const collection of collections) {
+    for (const value of collection) {
+      if (ids.size >= TOOL_TARGET_LIMIT || inspected++ >= TOOL_TARGET_INSPECTION_LIMIT) return [...ids];
+      if (target.test(value)) ids.add(value.toLowerCase());
+    }
   }
   return [...ids];
 }
@@ -697,6 +709,7 @@ function commandInvokesOrx(command: string, args: string): boolean {
 function idsFromToolOutput(output: string | undefined, resource: "runs" | "experiments"): string[] {
   if (!output) return [];
   const ids = new Set<string>();
+  const boundedOutput = output.slice(0, TOOL_OUTPUT_SCAN_LIMIT);
   const patterns = resource === "runs"
     ? [
         new RegExp(`/runs/(${UUID_PATTERN})`, "gi"),
@@ -709,10 +722,16 @@ function idsFromToolOutput(output: string | undefined, resource: "runs" | "exper
         new RegExp(`={3,}\\s*(${UUID_PATTERN})\\s*={3,}`, "gi"),
       ];
   for (const pattern of patterns) {
-    for (const match of output.matchAll(pattern)) ids.add(match[1]);
+    for (const match of boundedOutput.matchAll(pattern)) {
+      ids.add(match[1]);
+      if (ids.size >= TOOL_TARGET_LIMIT) return [...ids];
+    }
   }
   const bareIdLine = new RegExp(`^\\s*(${UUID_PATTERN})\\s*$`, "gim");
-  for (const match of output.matchAll(bareIdLine)) ids.add(match[1]);
+  for (const match of boundedOutput.matchAll(bareIdLine)) {
+    ids.add(match[1]);
+    if (ids.size >= TOOL_TARGET_LIMIT) break;
+  }
   return [...ids];
 }
 
@@ -752,7 +771,7 @@ function loopIdsBefore(command: string, variable: string, before: number, idPatt
   return [...values.matchAll(new RegExp(idPattern, "gi"))].map((match) => match[0]);
 }
 
-function commandRunIds(command: string, output?: string, preservedIds: string[] = []): string[] {
+function commandRunIds(command: string, output?: string, preservedIds: string[] = [], legacyIds: string[] = []): string[] {
   const invocations = orxCommandSegments(command, "logs");
   if (invocations.length === 0) return [];
   const ids = new Set<string>();
@@ -794,13 +813,17 @@ function commandRunIds(command: string, output?: string, preservedIds: string[] 
     if (assignmentIds.length === 0 && loopIds.length === 0) hasUnresolvedTarget = true;
   }
   if (ids.size === 0 || hasUnresolvedTarget) {
-    idsFromToolOutput(output, "runs").forEach((id) => ids.add(id));
-    preservedIds.forEach((id) => ids.add(id));
+    const outputIds = preservedIds.length > 0 ? [] : idsFromToolOutput(output, "runs");
+    const fallback = preservedIds.length > 0 ? preservedIds : outputIds.length > 0 ? outputIds : legacyIds;
+    for (const id of fallback) {
+      ids.add(id);
+      if (ids.size >= TOOL_TARGET_LIMIT) break;
+    }
   }
-  return [...ids];
+  return normalizedTargetIds([...ids]);
 }
 
-function commandExperimentIds(command: string, output?: string, preservedIds: string[] = []): string[] {
+function commandExperimentIds(command: string, output?: string, preservedIds: string[] = [], legacyIds: string[] = []): string[] {
   const invocations = orxCommandSegments(command, "exp\\s+(?:status|desc)");
   if (invocations.length === 0) return [];
   const ids = new Set<string>();
@@ -826,10 +849,14 @@ function commandExperimentIds(command: string, output?: string, preservedIds: st
     if (!resolved) hasUnresolvedTarget = true;
   }
   if (ids.size === 0 || hasUnresolvedTarget) {
-    idsFromToolOutput(output, "experiments").forEach((id) => ids.add(id));
-    preservedIds.forEach((id) => ids.add(id));
+    const outputIds = preservedIds.length > 0 ? [] : idsFromToolOutput(output, "experiments");
+    const fallback = preservedIds.length > 0 ? preservedIds : outputIds.length > 0 ? outputIds : legacyIds;
+    for (const id of fallback) {
+      ids.add(id);
+      if (ids.size >= TOOL_TARGET_LIMIT) break;
+    }
   }
-  return [...ids];
+  return normalizedTargetIds([...ids]);
 }
 
 /** User-facing activity inferred from the structured tool input. Shell calls
@@ -845,9 +872,9 @@ function toolActivity(part: ChatPart): ToolActivity {
   const normalizedInput = { ...input, ...argumentsInput };
   const rawCommand = inputString(normalizedInput, "command", "cmd");
   const toolOutput = part.state?.output || part.state?.error;
-  const legacyTargetIds = inputStringArray(normalizedInput, "targetIds");
-  const preservedRunIds = normalizedTargetIds(inputStringArray(normalizedInput, "runTargetIds"), legacyTargetIds);
-  const preservedExperimentIds = normalizedTargetIds(inputStringArray(normalizedInput, "experimentTargetIds"), legacyTargetIds);
+  const legacyTargetIds = normalizedTargetIds(inputStringArray(normalizedInput, "targetIds"));
+  const resourceRunIds = normalizedTargetIds(inputStringArray(normalizedInput, "runTargetIds"));
+  const resourceExperimentIds = normalizedTargetIds(inputStringArray(normalizedInput, "experimentTargetIds"));
   const filePath = inputString(normalizedInput, "filePath", "file_path", "notebookPath", "notebook_path", "path");
   const description = inputString(normalizedInput, "description");
   const toolSegments = tool.toLowerCase().split(/(?::|\.|__)+/);
@@ -902,7 +929,7 @@ function toolActivity(part: ChatPart): ToolActivity {
         ? "Checked experiment status and updated notes"
         : "Reviewed experiment status and notes";
       if (commandInvokesOrx(command, "logs")) {
-        const runIds = commandRunIds(command, toolOutput, preservedRunIds);
+        const runIds = commandRunIds(command, toolOutput, resourceRunIds, legacyTargetIds);
         const label = runIds.length === 1 ? "Reviewed run log" : "Reviewed run logs";
         return { kind: "project", label, runIds };
       }
@@ -920,21 +947,21 @@ function toolActivity(part: ChatPart): ToolActivity {
         return {
           kind: "project",
           label: combinedLabel,
-          experimentIds: commandExperimentIds(command, toolOutput, preservedExperimentIds),
+          experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
         };
       }
       if (readsProject && readsExperimentNotes) {
         return {
           kind: "project",
           label: notesLabel,
-          experimentIds: commandExperimentIds(command, toolOutput, preservedExperimentIds),
+          experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
         };
       }
       if (readsProject && readsExperimentStatus) {
         return {
           kind: "project",
           label: "Checked experiment status",
-          experimentIds: commandExperimentIds(command, toolOutput, preservedExperimentIds),
+          experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
         };
       }
       if (readsProject) {
@@ -944,21 +971,21 @@ function toolActivity(part: ChatPart): ToolActivity {
         return {
           kind: "project",
           label: combinedLabel,
-          experimentIds: commandExperimentIds(command, toolOutput, preservedExperimentIds),
+          experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
         };
       }
       if (readsExperimentStatus) {
         return {
           kind: "project",
           label: "Checked experiment status",
-          experimentIds: commandExperimentIds(command, toolOutput, preservedExperimentIds),
+          experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
         };
       }
       if (readsExperimentNotes) {
         return {
           kind: "project",
           label: notesLabel,
-          experimentIds: commandExperimentIds(command, toolOutput, preservedExperimentIds),
+          experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
         };
       }
       if (commandInvokesOrx(command, "runs?")) {
