@@ -341,6 +341,14 @@ function upsert<T extends { id: string }>(list: T[], item: T): T[] {
   return next;
 }
 
+function useStableStringMap(next: Map<string, string>): Map<string, string> {
+  const current = useRef(next);
+  const unchanged = current.current.size === next.size
+    && [...next].every(([key, value]) => current.current.get(key) === value);
+  if (!unchanged) current.current = next;
+  return current.current;
+}
+
 export default function App() {
   const [projects, setProjects] = useState<Project[] | null>(null);
   const [uiState, setUiState] = useState<UiState | null>(null);
@@ -687,17 +695,19 @@ export default function App() {
     [openExperimentTab],
   );
 
-  const experimentNames = useMemo(
+  const nextExperimentNames = useMemo(
     () => new Map(experiments.map((experiment) => [experiment.id, experiment.title?.trim() || experiment.slug || "Experiment"])),
     [experiments],
   );
-  const runExperimentNames = useMemo(() => {
+  const experimentNames = useStableStringMap(nextExperimentNames);
+  const nextRunExperimentNames = useMemo(() => {
     const names = new Map<string, string>();
     for (const run of runs) {
       names.set(run.id, experimentNames.get(run.experimentId) ?? "Experiment");
     }
     return names;
   }, [experimentNames, runs]);
+  const runExperimentNames = useStableStringMap(nextRunExperimentNames);
 
   const runExperimentName = useCallback((runId: string) => {
     const exact = runExperimentNames.get(runId);

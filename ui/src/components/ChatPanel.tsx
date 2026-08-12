@@ -307,6 +307,17 @@ function inputString(input: Record<string, unknown>, ...keys: string[]): string 
   return null;
 }
 
+function arrayInputString(input: Record<string, unknown>, key: string, field: string): string | null {
+  const values = input[key];
+  if (!Array.isArray(values)) return null;
+  for (const value of values) {
+    if (!value || typeof value !== "object" || !(field in value)) continue;
+    const candidate = value[field];
+    if (typeof candidate === "string" && candidate) return candidate;
+  }
+  return null;
+}
+
 function editChange(input: Record<string, unknown>): { path: string; type: string | null } | null {
   const changes = input.changes;
   if (!Array.isArray(changes)) return null;
@@ -391,40 +402,6 @@ function stripHeredocBodies(command: string): string {
   return kept.join("\n");
 }
 
-function shellCommandSegment(command: string, start: number): string {
-  let segment = "";
-  let quote: "\"" | "'" | null = null;
-  let escaped = false;
-  for (let i = start; i < command.length; i++) {
-    const char = command[i];
-    if (escaped) {
-      segment += char;
-      escaped = false;
-      continue;
-    }
-    if (char === "\\" && quote !== "'") {
-      segment += char;
-      escaped = true;
-      continue;
-    }
-    if (quote) {
-      segment += char;
-      if (char === quote) quote = null;
-      continue;
-    }
-    if (char === "\"" || char === "'") {
-      quote = char;
-      segment += char;
-      continue;
-    }
-    if (char === ";" || char === "|" || char === "&" || char === "<" || char === ">") {
-      return segment.replace(/\s+\d+$/, "").trim();
-    }
-    segment += char;
-  }
-  return segment.trim();
-}
-
 function shellWords(input: string): string[] {
   const words: string[] = [];
   let word = "";
@@ -466,11 +443,31 @@ function validReadTarget(value: string | undefined): string | null {
   return value;
 }
 
-function commandReadTarget(command: string): string | null {
-  const reader = /(?:^|[^\w-])(sed|cat|head|tail)\b/.exec(command);
-  if (!reader || reader.index === undefined) return null;
-  const args = shellWords(shellCommandSegment(command, reader.index + reader[0].length));
-  const name = reader[1];
+interface ShellInvocation {
+  name: string;
+  args: string[];
+}
+
+function shellInvocation(command: string): ShellInvocation | null {
+  const words = shellWords(command);
+  let index = 0;
+  while (["do", "then", "else", "if", "while", "until"].includes(words[index])) index++;
+  while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index] ?? "")) index++;
+  if (words[index] === "command") {
+    index++;
+    while (words[index]?.startsWith("-")) index++;
+  }
+  if (words[index] === "env") {
+    index++;
+    while (words[index]?.startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index] ?? "")) index++;
+  }
+  const executable = words[index];
+  if (!executable) return null;
+  return { name: executable.split("/").pop() ?? executable, args: words.slice(index + 1) };
+}
+
+function commandReadTarget(invocation: ShellInvocation): string | null {
+  const { name, args } = invocation;
 
   if (name === "sed") {
     let index = 0;
@@ -506,6 +503,43 @@ function commandReadTarget(command: string): string | null {
 function commandSearchPattern(command: string): string | null {
   const search = command.match(/\b(?:rg|grep)\b(?:\s+-[^\s]+)*\s+(?:"([^"]+)"|'([^']+)'|([^\s]+))/);
   return search?.[1] ?? search?.[2] ?? search?.[3] ?? null;
+}
+
+function resolvePosixPath(base: string, target: string): string | null {
+  if (/[$`~]/.test(base) || /[$`~]/.test(target)) return null;
+  const absolute = target.startsWith("/") || (!target.startsWith("/") && base.startsWith("/"));
+  const parts = target.startsWith("/") ? [] : base.split("/").filter(Boolean);
+  for (const part of target.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (parts.length > 0 && parts[parts.length - 1] !== "..") parts.pop();
+      else if (!absolute) parts.push(part);
+      continue;
+    }
+    parts.push(part);
+  }
+  const resolved = `${absolute ? "/" : ""}${parts.join("/")}`;
+  return resolved || (absolute ? "/" : null);
+}
+
+function commandFilePath(
+  target: string,
+  segments: ShellCommandSegment[],
+  segmentIndex: number,
+  declaredWorkdir: string | null,
+): string | null {
+  if (target.startsWith("/")) return target;
+  let directory = declaredWorkdir ?? "";
+  for (let index = 0; index < segmentIndex; index++) {
+    const invocation = shellInvocation(segments[index].raw);
+    if (invocation?.name !== "cd") continue;
+    const next = invocation.args.find((arg) => !arg.startsWith("-"));
+    if (!next) return null;
+    const resolved = resolvePosixPath(directory, next);
+    if (!resolved) return null;
+    directory = resolved;
+  }
+  return directory ? resolvePosixPath(directory, target) : target;
 }
 
 const UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
@@ -694,6 +728,7 @@ function commandRunIds(command: string, output?: string): string[] {
   const invocations = orxCommandSegments(command, "logs");
   if (invocations.length === 0) return [];
   const ids = new Set<string>();
+  let hasUnresolvedTarget = false;
   for (const { invocation, offset } of invocationOffsets(command, invocations)) {
     const logs = /\borx\s+logs\b/i.exec(invocation.raw);
     if (!logs) continue;
@@ -710,19 +745,27 @@ function commandRunIds(command: string, output?: string): string[] {
       target = word;
       break;
     }
-    if (!target) continue;
+    if (!target) {
+      hasUnresolvedTarget = true;
+      continue;
+    }
     if (new RegExp(`^${RUN_TARGET_PATTERN}$`, "i").test(target)) {
       ids.add(target);
       continue;
     }
     const variableMatch = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(target);
-    if (!variableMatch) continue;
+    if (!variableMatch) {
+      hasUnresolvedTarget = true;
+      continue;
+    }
     const variable = variableMatch[1];
     const assignment = assignedIdBefore(command, variable, offset, RUN_TARGET_PATTERN);
     if (assignment) ids.add(assignment);
-    for (const id of loopIdsBefore(command, variable, offset, RUN_TARGET_PATTERN)) ids.add(id);
+    const loopIds = loopIdsBefore(command, variable, offset, RUN_TARGET_PATTERN);
+    for (const id of loopIds) ids.add(id);
+    if (!assignment && loopIds.length === 0) hasUnresolvedTarget = true;
   }
-  if (ids.size === 0) idsFromToolOutput(output, "runs").forEach((id) => ids.add(id));
+  if (ids.size === 0 || hasUnresolvedTarget) idsFromToolOutput(output, "runs").forEach((id) => ids.add(id));
   return [...ids];
 }
 
@@ -730,20 +773,28 @@ function commandExperimentIds(command: string, output?: string): string[] {
   const invocations = orxCommandSegments(command, "exp\\s+(?:status|desc)");
   if (invocations.length === 0) return [];
   const ids = new Set<string>();
-  for (const { invocation } of invocationOffsets(command, invocations)) {
+  let hasUnresolvedTarget = false;
+  for (const { invocation, offset } of invocationOffsets(command, invocations)) {
+    let resolved = false;
     for (const match of invocation.raw.matchAll(new RegExp(`\\borx\\s+exp\\s+(?:status|desc)\\s+["']?(${UUID_PATTERN})`, "gi"))) {
       ids.add(match[1]);
+      resolved = true;
     }
-  }
-  for (const { invocation, offset } of invocationOffsets(command, invocations)) {
     const match = /\borx\s+exp\s+(?:status|desc)\s+["']?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/.exec(invocation.raw);
-    if (!match) continue;
-    const variable = match[1];
-    const assignment = assignedIdBefore(command, variable, offset, UUID_PATTERN);
-    if (assignment) ids.add(assignment);
-    for (const id of loopIdsBefore(command, variable, offset, UUID_PATTERN)) ids.add(id);
+    if (match) {
+      const variable = match[1];
+      const assignment = assignedIdBefore(command, variable, offset, UUID_PATTERN);
+      if (assignment) {
+        ids.add(assignment);
+        resolved = true;
+      }
+      const loopIds = loopIdsBefore(command, variable, offset, UUID_PATTERN);
+      for (const id of loopIds) ids.add(id);
+      if (loopIds.length > 0) resolved = true;
+    }
+    if (!resolved) hasUnresolvedTarget = true;
   }
-  if (ids.size === 0) idsFromToolOutput(output, "experiments").forEach((id) => ids.add(id));
+  if (ids.size === 0 || hasUnresolvedTarget) idsFromToolOutput(output, "experiments").forEach((id) => ids.add(id));
   return [...ids];
 }
 
@@ -760,9 +811,24 @@ function toolActivity(part: ChatPart): ToolActivity {
   const normalizedInput = { ...input, ...argumentsInput };
   const rawCommand = inputString(normalizedInput, "command", "cmd");
   const toolOutput = part.state?.output || part.state?.error;
-  const filePath = inputString(normalizedInput, "filePath", "file_path", "path");
+  const filePath = inputString(normalizedInput, "filePath", "file_path", "notebookPath", "notebook_path", "path");
   const description = inputString(normalizedInput, "description");
-  const baseTool = tool.toLowerCase().split(":").at(-1) ?? tool.toLowerCase();
+  const toolSegments = tool.toLowerCase().split(/(?::|\.|__)+/);
+  const baseTool = toolSegments.at(-1) ?? tool.toLowerCase();
+  if (baseTool === "run" && toolSegments.includes("web")) {
+    const query = arrayInputString(normalizedInput, "search_query", "q");
+    const imageQuery = arrayInputString(normalizedInput, "image_query", "q");
+    const pattern = arrayInputString(normalizedInput, "find", "pattern");
+    if (query) return { kind: "web", label: `Searched the web for “${query}”` };
+    if (imageQuery) return { kind: "web", label: `Searched images for “${imageQuery}”` };
+    if (pattern) return { kind: "web", label: `Searched a web page for “${pattern}”` };
+    if (Array.isArray(normalizedInput.open)) return { kind: "web", label: "Opened web pages" };
+    if (Array.isArray(normalizedInput.weather)) return { kind: "web", label: "Checked the weather" };
+    if (Array.isArray(normalizedInput.finance)) return { kind: "web", label: "Checked market data" };
+    if (Array.isArray(normalizedInput.sports)) return { kind: "web", label: "Checked sports data" };
+    if (Array.isArray(normalizedInput.time)) return { kind: "web", label: "Checked local times" };
+    return { kind: "web", label: "Browsed the web" };
+  }
   const normalizedTool = new Map([
     ["read_file", "read"],
     ["write_file", "write"],
@@ -785,7 +851,7 @@ function toolActivity(part: ChatPart): ToolActivity {
       }
 
       const shellSegments = shellCommandSegments(command);
-      const executableCode = shellSegments.map((segment) => segment.code).join("\n");
+      const shellInvocations = shellSegments.map((segment) => shellInvocation(segment.raw));
       const readsExperimentStatus = commandInvokesOrx(command, "exp\\s+status");
       const readsExperimentNotes = commandInvokesOrx(command, "exp\\s+desc");
       const updatesExperimentNotes = orxCommandSegments(command, "exp\\s+desc").some((segment) =>
@@ -859,32 +925,56 @@ function toolActivity(part: ChatPart): ToolActivity {
         return { kind: "project", label: "Listed project runs" };
       }
 
-      const readSegment = shellSegments.find((segment) => /(?:^|[^\w-])(?:sed|cat|head|tail)\b/.test(segment.code));
-      const readTarget = readSegment ? commandReadTarget(readSegment.raw) : null;
-      if (readTarget) {
+      const readSegmentIndex = shellInvocations.findIndex((invocation) =>
+        invocation != null && ["sed", "cat", "head", "tail"].includes(invocation.name),
+      );
+      const readInvocation = readSegmentIndex >= 0 ? shellInvocations[readSegmentIndex] : null;
+      const readTarget = readInvocation ? commandReadTarget(readInvocation) : null;
+      const readPath = readTarget
+        ? commandFilePath(
+            readTarget,
+            shellSegments,
+            readSegmentIndex,
+            inputString(normalizedInput, "cwd", "workdir"),
+          )
+        : null;
+      if (readTarget && readPath) {
         return {
           kind: "read",
           label: `Read ${baseName(readTarget)}`,
-          filePath: readTarget,
+          filePath: readPath,
           labelPrefix: "Read ",
           labelTarget: baseName(readTarget),
         };
       }
-      if (/\brg\s+--files\b/.test(executableCode) || /\bfind\s+/.test(executableCode) || /^ls(?:\s|$)/m.test(executableCode)) {
+      if (shellInvocations.some((invocation) =>
+        invocation?.name === "find"
+        || invocation?.name === "ls"
+        || (invocation?.name === "rg" && invocation.args.includes("--files")),
+      )) {
         return { kind: "search", label: "Listed files" };
       }
-      const searchSegment = shellSegments.find((segment) => /\b(?:rg|grep)\b/.test(segment.code));
-      if (searchSegment) {
-        const pattern = commandSearchPattern(searchSegment.raw);
+      const searchSegmentIndex = shellInvocations.findIndex((invocation) =>
+        invocation?.name === "rg" || invocation?.name === "grep",
+      );
+      if (searchSegmentIndex >= 0) {
+        const pattern = commandSearchPattern(shellSegments[searchSegmentIndex].raw);
         return { kind: "search", label: pattern ? `Searched code for “${pattern}”` : "Searched code" };
       }
-      if (/\bgit\s+status\b/.test(executableCode)) return { kind: "command", label: "Checked Git status" };
-      if (/\bgit\s+diff\b/.test(executableCode)) return { kind: "command", label: "Reviewed code changes" };
-      if (/\bgit\s+log\b/.test(executableCode)) return { kind: "command", label: "Read Git history" };
-      if (/\b(?:cargo|pnpm|npm|yarn)\s+(?:run\s+)?test\b/.test(executableCode)) return { kind: "command", label: "Ran tests" };
-      if (/\b(?:typecheck|tsc\b)/.test(executableCode)) return { kind: "command", label: "Checked types" };
-      if (/\blint\b/.test(executableCode)) return { kind: "command", label: "Checked code style" };
-      if (/\b(?:cargo|pnpm|npm|yarn)\s+(?:run\s+)?build\b/.test(executableCode)) return { kind: "command", label: "Built the project" };
+      const gitAction = shellInvocations.find((invocation) => invocation?.name === "git")?.args[0];
+      if (gitAction === "status") return { kind: "command", label: "Checked Git status" };
+      if (gitAction === "diff") return { kind: "command", label: "Reviewed code changes" };
+      if (gitAction === "log") return { kind: "command", label: "Read Git history" };
+      const packageAction = (action: string) => shellInvocations.some((invocation) => {
+        if (!invocation || !["cargo", "pnpm", "npm", "yarn"].includes(invocation.name)) return false;
+        return invocation.args[0] === action || (invocation.args[0] === "run" && invocation.args[1] === action);
+      });
+      if (packageAction("test")) return { kind: "command", label: "Ran tests" };
+      if (shellInvocations.some((invocation) => invocation?.name === "tsc") || packageAction("typecheck")) {
+        return { kind: "command", label: "Checked types" };
+      }
+      if (packageAction("lint")) return { kind: "command", label: "Checked code style" };
+      if (packageAction("build")) return { kind: "command", label: "Built the project" };
       return { kind: "command", label: `Ran ${command}` };
     }
     case "read": {
@@ -1388,7 +1478,7 @@ function ToolGroup({
 }) {
   const running = parts.some((p) => p.state?.status === "running");
   const failedCount = parts.filter((part) => part.state?.status === "error").length;
-  const [open, setOpen] = useState(running);
+  const [open, setOpen] = useState(running || failedCount > 0);
   const wasRunning = useRef(running);
   const hasRun = useRef(running);
   const displayParts = squashToolParts(parts);

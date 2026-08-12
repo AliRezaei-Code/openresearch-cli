@@ -36,21 +36,35 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(75);
 const TOOL_TEXT_CAP: usize = 16_000;
 const TOOL_TEXT_TRUNCATION_MARKER: &str = "\n… [output truncated]";
 
-/// Truncate `text` to [`TOOL_TEXT_CAP`] chars (on a char boundary), marking
-/// the cut. Idempotent — an already-capped string is left alone.
+/// Keep the head and tail of `text` within [`TOOL_TEXT_CAP`] chars, marking
+/// the omitted middle. Idempotent — an already-capped string is left alone.
 fn cap_tool_text(text: &mut String) {
     // Bytes >= chars, so a string within the cap in bytes needs no scan.
-    if text.len() <= TOOL_TEXT_CAP || text.chars().count() <= TOOL_TEXT_CAP {
+    if text.len() <= TOOL_TEXT_CAP {
         return;
     }
-    let keep = TOOL_TEXT_CAP - TOOL_TEXT_TRUNCATION_MARKER.chars().count();
-    let cut = text
+    let char_count = text.chars().count();
+    if char_count <= TOOL_TEXT_CAP {
+        return;
+    }
+    let retained = TOOL_TEXT_CAP - TOOL_TEXT_TRUNCATION_MARKER.chars().count();
+    let head_chars = retained / 2;
+    let tail_chars = retained - head_chars;
+    let head_end = text
         .char_indices()
-        .nth(keep)
+        .nth(head_chars)
         .map(|(i, _)| i)
         .unwrap_or(text.len());
-    text.truncate(cut);
-    text.push_str(TOOL_TEXT_TRUNCATION_MARKER);
+    let tail_start = text
+        .char_indices()
+        .nth(char_count - tail_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    let mut capped = String::with_capacity(text.len().min(TOOL_TEXT_CAP));
+    capped.push_str(&text[..head_end]);
+    capped.push_str(TOOL_TEXT_TRUNCATION_MARKER);
+    capped.push_str(&text[tail_start..]);
+    *text = capped;
 }
 
 /// Find a part by id anywhere in the tree (depth-first), returning `&mut` to it.
@@ -84,11 +98,8 @@ pub fn upsert_preserving_children(parts: &mut Vec<WirePart>, mut part: WirePart)
     }
 }
 
-/// Cap every tool part's `output`/`error` in place. Applied on each flush —
-/// this covers every adapter (they all land parts on the turn's
-/// `assistant.parts`, some by direct mutation); an adapter that re-upserts a
-/// part with the full output just gets re-capped on the next flush. Recurses
-/// into `children` so a nested sub-agent transcript's output is bounded too.
+/// Cap every tool part's `output`/`error` in a wire-copy before persistence.
+/// Recurses into `children` so nested sub-agent output is bounded too.
 fn cap_tool_parts(parts: &mut [WirePart]) {
     for part in parts.iter_mut() {
         if let Some(state) = part.state.as_mut() {
@@ -2317,7 +2328,6 @@ impl TurnCtx {
         if self.assistant.parts.is_empty() {
             return Ok(());
         }
-        cap_tool_parts(&mut self.assistant.parts);
         let store = Store::open()?;
         // A prompt card the harness surfaced mid-turn (opencode's inline
         // permission/question) may be answered *while the turn is still running*
@@ -2329,7 +2339,7 @@ impl TurnCtx {
         // (else that reconcile-then-clobber is a lost update). Only pay the lock
         // when this message actually carries a prompt part.
         let has_prompt = self.assistant.parts.iter().any(|p| p.prompt.is_some());
-        {
+        let wire_assistant = {
             // Clone the host handle so the guard borrows it, not `self` — the
             // reconcile below needs `&mut self`.
             let host = self.host.clone();
@@ -2337,17 +2347,20 @@ impl TurnCtx {
             if has_prompt {
                 self.adopt_resolved_prompts(&store);
             }
+            let mut wire_assistant = self.assistant.clone();
+            cap_tool_parts(&mut wire_assistant.parts);
             store.upsert_chat_message(&StoredChatMessage {
-                id: self.assistant.id.clone(),
+                id: wire_assistant.id.clone(),
                 session_id: self.session_id.clone(),
-                role: "assistant".into(),
-                parts_json: serde_json::to_string(&self.assistant.parts)?,
-                created_at: self.assistant.created_at,
+                role: wire_assistant.role.clone(),
+                parts_json: serde_json::to_string(&wire_assistant.parts)?,
+                created_at: wire_assistant.created_at,
             })?;
-        }
+            wire_assistant
+        };
         self.host.emit(
             "chat.message",
-            message_json(&self.assistant, &self.session_id),
+            message_json(&wire_assistant, &self.session_id),
         );
         self.last_flushed_tool_states = tool_state_signature(&self.assistant.parts);
         self.last_attempted_tool_states = self.last_flushed_tool_states.clone();
@@ -2621,7 +2634,9 @@ mod cap_tests {
         let mut long = "x".repeat(TOOL_TEXT_CAP + 1);
         cap_tool_text(&mut long);
         assert_eq!(long.chars().count(), TOOL_TEXT_CAP);
-        assert!(long.ends_with(TOOL_TEXT_TRUNCATION_MARKER));
+        assert!(long.contains(TOOL_TEXT_TRUNCATION_MARKER));
+        assert!(long.starts_with('x'));
+        assert!(long.ends_with('x'));
 
         // Re-capping a capped string must not shave it further.
         let capped = long.clone();
@@ -2632,7 +2647,8 @@ mod cap_tests {
         let mut wide = "é".repeat(TOOL_TEXT_CAP * 2);
         cap_tool_text(&mut wide);
         assert_eq!(wide.chars().count(), TOOL_TEXT_CAP);
-        assert!(wide.ends_with(TOOL_TEXT_TRUNCATION_MARKER));
+        assert!(wide.contains(TOOL_TEXT_TRUNCATION_MARKER));
+        assert!(wide.ends_with('é'));
     }
 
     /// The per-flush pass caps `output` and `error` on tool parts and leaves
