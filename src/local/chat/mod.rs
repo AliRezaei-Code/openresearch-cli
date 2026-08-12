@@ -120,6 +120,7 @@ fn structured_tool_targets(
     } else {
         "[orx-experiment:"
     };
+    let initial_len = targets.len();
     for line in text.lines() {
         if targets.len() >= TOOL_TARGET_CAP {
             break;
@@ -130,6 +131,15 @@ fn structured_tool_targets(
                 push_tool_target(targets, seen, value);
             }
         }
+    }
+    if targets.len() > initial_len || initial_len > 0 {
+        return;
+    }
+    for line in text.lines() {
+        if targets.len() >= TOOL_TARGET_CAP {
+            break;
+        }
+        let trimmed = line.trim();
         if let Some(start) = trimmed.find(&endpoint) {
             if let Some(value) = trimmed[start + endpoint.len()..]
                 .split(|char: char| !char.is_ascii_hexdigit() && char != '-')
@@ -154,14 +164,13 @@ fn strip_tool_target_markers(text: &mut String) {
         return;
     }
     let filtered = text
-        .lines()
+        .split_inclusive('\n')
         .filter(|line| {
             let trimmed = line.trim();
             !(trimmed.starts_with("[orx-run:") || trimmed.starts_with("[orx-experiment:"))
                 || !trimmed.ends_with(']')
         })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect::<String>();
     *text = filtered;
 }
 
@@ -2920,6 +2929,30 @@ mod cap_tests {
         assert_eq!(targets.len(), TOOL_TARGET_CAP);
         assert!(!targets.iter().any(|value| value == parent));
         assert!(!targets.iter().any(|value| value == latest_run));
+    }
+
+    #[test]
+    fn semantic_markers_are_authoritative_and_preserve_newlines() {
+        let target = "11111111-1111-1111-1111-111111111111";
+        let mentioned = "22222222-2222-2222-2222-222222222222";
+        let mut state = WireToolState {
+            status: "error".into(),
+            input: Some(json!({ "command": "orx logs $id" })),
+            output: Some(format!(
+                "[orx-run:{target}]\nfirst line\n/runs/{mentioned}\n"
+            )),
+            error: None,
+            title: None,
+        };
+
+        preserve_tool_targets(&mut state);
+
+        assert_eq!(
+            state.input.as_ref().unwrap()["runTargetIds"],
+            json!([target])
+        );
+        let expected = format!("first line\n/runs/{mentioned}\n");
+        assert_eq!(state.output.as_deref(), Some(expected.as_str()));
     }
 }
 
