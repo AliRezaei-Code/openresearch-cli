@@ -3954,13 +3954,17 @@ export function ChatPanel({
               onClick={() => {
                 const skill = skills.find((s) => s.name === "reproduce-paper");
                 if (paperId && skill) {
+                  // Arm the skill and let its placeholder guide input. The paper
+                  // and compute are both optional: the playbook injects the
+                  // linked paper into every harness, and compute defaults to the
+                  // configured target (local when none). So no pre-filled args.
                   setPickedSkill(skill);
-                  setDraft(`${paperId} on `);
+                  setDraft("");
                 } else {
                   setPickedSkill(null);
                   setDraft(
                     paperId
-                      ? `/reproduce-paper ${paperId} on `
+                      ? `/reproduce-paper `
                       : "Find and summarize the research most relevant to this project.",
                   );
                 }
