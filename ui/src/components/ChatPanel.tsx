@@ -105,7 +105,6 @@ interface SelectionAction {
   text: string;
   x: number;
   y: number;
-  placement: "above" | "below";
 }
 
 function elementForNode(node: Node): Element | null {
@@ -130,22 +129,21 @@ function currentTranscriptSelection(root: HTMLElement): SelectionAction | null {
     .trim();
   if (!text) return null;
 
-  const focusRange = document.createRange();
-  focusRange.setStart(focusNode, selection.focusOffset);
-  focusRange.collapse(true);
-  const selectionRects = Array.from(range.getClientRects());
-  const focusAtEnd =
-    focusNode === range.endContainer && selection.focusOffset === range.endOffset;
-  const rect =
-    focusRange.getClientRects()[0] ??
-    (focusAtEnd ? selectionRects.at(-1) : selectionRects[0]) ??
-    range.getBoundingClientRect();
-  const placement = rect.top >= 52 ? "above" : "below";
+  const selectionRects = Array.from(range.getClientRects()).filter(
+    (rect) => rect.width > 0 && rect.height > 0,
+  );
+  const firstRect = selectionRects[0] ?? range.getBoundingClientRect();
+  const firstLineRects = selectionRects.filter(
+    (rect) => rect.top < firstRect.bottom && rect.bottom > firstRect.top,
+  );
+  const lineRects = firstLineRects.length > 0 ? firstLineRects : [firstRect];
+  const left = Math.min(...lineRects.map((rect) => rect.left));
+  const right = Math.max(...lineRects.map((rect) => rect.right));
+  const top = Math.min(...lineRects.map((rect) => rect.top));
   return {
     text,
-    x: Math.min(window.innerWidth - 88, Math.max(88, rect.left + rect.width / 2)),
-    y: placement === "above" ? rect.top - 8 : rect.bottom + 8,
-    placement,
+    x: left + (right - left) / 2,
+    y: top - 8,
   };
 }
 
@@ -4274,10 +4272,7 @@ export function ChatPanel({
           style={{
             left: transcriptSelection.action.x,
             top: transcriptSelection.action.y,
-            transform:
-              transcriptSelection.action.placement === "above"
-                ? "translate(-50%, -100%)"
-                : "translateX(-50%)",
+            transform: "translate(-50%, -100%)",
           }}
           onMouseDown={(event) => event.preventDefault()}
           onClick={transcriptSelection.add}
