@@ -25,7 +25,7 @@ import {
 } from "../api";
 import { CodeView } from "./CodeView";
 import { FileTypeIcon, isImageFile, isMarkdownFile } from "./FileTypeIcon";
-import { normalizeMathDelimiters } from "../markdownNormalization";
+import { normalizeMarkdownForRendering } from "../markdownNormalization";
 import { mdCodeComponents, remarkMathOptions } from "./Md";
 import { ICON_BUTTON_BASE_CLASS_NAME, ICON_BUTTON_CLASS_NAME, SETTINGS_LOADING_CLASS_NAME, SPINNER_CLASS_NAME } from "../styleClasses";
 
@@ -170,7 +170,7 @@ export function ArtifactMarkdown({
           ...mdCodeComponents,
         }}
       >
-        {normalizeMathDelimiters(stripFrontmatter(markdown))}
+        {normalizeMarkdownForRendering(stripFrontmatter(markdown))}
       </ReactMarkdown>
     </div>
   );

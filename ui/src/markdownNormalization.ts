@@ -1,89 +1,219 @@
-// Markdown code regions are intentionally opaque to delimiter normalization.
-// The unclosed-fence alternatives matter while assistant text is streaming.
-const CODE_REGIONS = /(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`)/g;
-
 const CURRENCY_AMOUNT = /^\d+(?:,\d{3})*(?:\.\d+)?(?:\s*[–—-]\s*\$?\d+(?:,\d{3})*(?:\.\d+)?)?(?:\/[A-Za-z][A-Za-z0-9-]*)?/;
 
-function unescapedDollarIndices(text: string): number[] {
+interface NormalizationOptions {
+  predictMath?: boolean;
+}
+
+function runLength(text: string, index: number, character: string): number {
+  let end = index;
+  while (text[end] === character) end += 1;
+  return end - index;
+}
+
+function isEscaped(text: string, index: number): boolean {
+  let slashes = 0;
+  for (let cursor = index - 1; cursor >= 0 && text[cursor] === "\\"; cursor -= 1) slashes += 1;
+  return slashes % 2 === 1;
+}
+
+function fenceMarkerOffset(line: string): number {
+  const prefix = /^(?:(?: {0,3}>[ \t]?)|(?: {0,3}(?:[-+*]|\d+[.)])[ \t]+))*[ \t]*/.exec(line);
+  return prefix?.[0].length ?? 0;
+}
+
+function isFenceStart(text: string, index: number): boolean {
+  const character = text[index];
+  if (character !== "`" && character !== "~") return false;
+  if (isEscaped(text, index)) return false;
+  if (runLength(text, index, character) < 3) return false;
+  const lineStart = text.lastIndexOf("\n", index - 1) + 1;
+  const lineEnd = text.indexOf("\n", index);
+  const line = text.slice(lineStart, lineEnd === -1 ? text.length : lineEnd);
+  return lineStart + fenceMarkerOffset(line) === index;
+}
+
+function fencedRegionEnd(text: string, index: number): number {
+  const character = text[index]!;
+  const openingLength = runLength(text, index, character);
+  let lineStart = text.indexOf("\n", index + openingLength);
+  if (lineStart === -1) return text.length;
+  lineStart += 1;
+
+  while (lineStart < text.length) {
+    const lineEnd = text.indexOf("\n", lineStart);
+    const end = lineEnd === -1 ? text.length : lineEnd;
+    const line = text.slice(lineStart, end);
+    const marker = lineStart + fenceMarkerOffset(line);
+    const closingLength = runLength(text, marker, character);
+    if (closingLength >= openingLength && /^[ \t\r]*$/.test(text.slice(marker + closingLength, end))) {
+      return lineEnd === -1 ? text.length : lineEnd + 1;
+    }
+    if (lineEnd === -1) return text.length;
+    lineStart = lineEnd + 1;
+  }
+  return text.length;
+}
+
+function inlineCodeRegionEnd(text: string, index: number, allowUnclosed: boolean): number | null {
+  const length = runLength(text, index, "`");
+  let candidate = index + length;
+  while (candidate < text.length) {
+    candidate = text.indexOf("`".repeat(length), candidate);
+    if (candidate === -1) return allowUnclosed ? text.length : null;
+    if (text[candidate - 1] !== "`" && text[candidate + length] !== "`") {
+      return candidate + length;
+    }
+    candidate += length;
+  }
+  return allowUnclosed ? text.length : null;
+}
+
+function mentionRegionEnd(text: string, index: number, allowUnclosed: boolean): number | null {
+  if (!/^<(?:file|run)\b/i.test(text.slice(index))) return null;
+  let quote: string | null = null;
+  for (let cursor = index + 1; cursor < text.length; cursor += 1) {
+    const character = text[cursor]!;
+    if (quote) {
+      if (character === quote && text[cursor - 1] !== "\\") quote = null;
+    } else if (character === '"' || character === "'") {
+      quote = character;
+    } else if (character === ">") {
+      return cursor + 1;
+    }
+  }
+  return allowUnclosed ? text.length : null;
+}
+
+function unescapedSingleDollarIndices(text: string): number[] {
   const indices: number[] = [];
-  for (let i = 0; i < text.length; i += 1) {
-    if (text[i] !== "$") continue;
-    let slashes = 0;
-    for (let j = i - 1; j >= 0 && text[j] === "\\"; j -= 1) slashes += 1;
-    if (slashes % 2 === 1) continue;
-    if (text[i - 1] !== "$" && text[i + 1] !== "$") indices.push(i);
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] !== "$") continue;
+    if (isEscaped(text, index)) continue;
+    if (text[index - 1] !== "$" && text[index + 1] !== "$") indices.push(index);
   }
   return indices;
 }
 
-/** Escape legacy currency markers at render time while preserving paired math. */
-export function normalizeCurrencyDollars(text: string): string {
-  const dollars = unescapedDollarIndices(text);
+function looksLikeNumberLedMath(content: string, amountLength: number): boolean {
+  const remainder = content.slice(amountLength);
+  if (!remainder) return true;
+  if (!/^[\s\dA-Za-z.,%+*/=^_{}\\<>|()[\]-]+$/.test(remainder)) return false;
+  if (/^[eE][+-]?\d+$/.test(remainder)) return true;
+  if (/[+*/=^_{}\\<>|()]/.test(remainder)) return true;
+  return /^[A-Za-z][A-Za-z0-9]*$/.test(remainder);
+}
+
+/** Escape legacy currency markers without mutating stored transcript content. */
+export function normalizeCurrencyDollars(
+  text: string,
+  { predictMath = false }: NormalizationOptions = {},
+): string {
+  const dollars = unescapedSingleDollarIndices(text);
   const escaped = new Set<number>();
   const protectedMath = new Set<number>();
 
-  for (let d = 0; d < dollars.length; d += 1) {
-    const index = dollars[d]!;
+  for (let position = 0; position < dollars.length; position += 1) {
+    const index = dollars[position]!;
     if (protectedMath.has(index)) continue;
-    const next = dollars[d + 1];
+    const next = dollars[position + 1];
     const amount = CURRENCY_AMOUNT.exec(text.slice(index + 1));
 
     if (!amount) {
       if (next != null) {
         protectedMath.add(index);
         protectedMath.add(next);
-        d += 1;
+        position += 1;
       }
       continue;
     }
 
-    const amountEnd = index + 1 + amount[0].length;
-    if (next === amountEnd) {
+    if (next == null) {
+      const content = text.slice(index + 1);
+      const strongCurrency = /[–—]|\/[A-Za-z]/.test(amount[0]);
+      const plausibleMath = content.length === amount[0].length
+        || looksLikeNumberLedMath(content, amount[0].length);
+      if (!predictMath || strongCurrency || !plausibleMath) escaped.add(index);
+      continue;
+    }
+
+    if (CURRENCY_AMOUNT.test(text.slice(next + 1))) {
+      escaped.add(index);
+      continue;
+    }
+
+    if (/[A-Za-z]/.test(text[next + 1] ?? "")) {
+      escaped.add(index);
+      continue;
+    }
+
+    const content = text.slice(index + 1, next);
+    if (looksLikeNumberLedMath(content, amount[0].length)) {
       protectedMath.add(index);
       protectedMath.add(next);
-      d += 1;
-      continue;
+      position += 1;
+    } else {
+      escaped.add(index);
     }
-
-    if (next != null) {
-      const remainder = text.slice(amountEnd, next);
-      const numericExpression = /^[\s\d.,%+*/=^_{}\\<>|()-]+$/.test(remainder)
-        && /[+*/=^_{}\\<>|]/.test(remainder);
-      if (numericExpression || /[=^_{}\\]/.test(remainder)) {
-        protectedMath.add(index);
-        protectedMath.add(next);
-        d += 1;
-        continue;
-      }
-    }
-
-    escaped.add(index);
   }
 
+  const standaloneTriples = new Set<number>();
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] !== "$") continue;
+    const length = runLength(text, index, "$");
+    if (length === 3 && !isEscaped(text, index)) standaloneTriples.add(index);
+    index += length - 1;
+  }
   let normalized = "";
-  for (let i = 0; i < text.length; i += 1) {
-    if (text.startsWith("$$$", i) && text[i - 1] !== "$") {
+  for (let index = 0; index < text.length; index += 1) {
+    if (standaloneTriples.has(index)) {
       normalized += "\\$\\$\\$";
-      i += 2;
-    } else if (escaped.has(i)) {
+      index += 2;
+    } else if (escaped.has(index)) {
       normalized += "\\$";
     } else {
-      normalized += text[i];
+      normalized += text[index];
     }
   }
   return normalized;
 }
 
-/** Normalize legacy LaTeX delimiters and unescaped currency outside code. */
-export function normalizeMathDelimiters(text: string): string {
-  return text
-    .split(CODE_REGIONS)
-    .map((segment, index) => {
-      if (index % 2 === 1) return segment;
-      const normalizedMath = segment
-        .replace(/\\\[([\s\S]+?)\\\]/g, (_, inner: string) => `$$${inner}$$`)
-        .replace(/\\\(([\s\S]+?)\\\)/g, (_, inner: string) => `$$${inner}$$`);
-      return normalizeCurrencyDollars(normalizedMath);
-    })
-    .join("");
+function normalizeProse(text: string, options: NormalizationOptions): string {
+  const normalizedMath = text
+    .replace(/\\\[([\s\S]+?)\\\]/g, (_, inner: string) => `$$${inner}$$`)
+    .replace(/\\\(([\s\S]+?)\\\)/g, (_, inner: string) => `$$${inner}$$`);
+  return normalizeCurrencyDollars(normalizedMath, options);
+}
+
+/** Normalize math and legacy currency while leaving code and mention tags opaque. */
+export function normalizeMarkdownForRendering(
+  text: string,
+  options: NormalizationOptions = {},
+): string {
+  let normalized = "";
+  let proseStart = 0;
+  let index = 0;
+
+  while (index < text.length) {
+    let opaqueEnd: number | null = null;
+    if (isFenceStart(text, index)) {
+      opaqueEnd = fencedRegionEnd(text, index);
+    } else if (text[index] === "`" && !isEscaped(text, index)) {
+      opaqueEnd = inlineCodeRegionEnd(text, index, options.predictMath === true);
+    } else if (text[index] === "<") {
+      opaqueEnd = mentionRegionEnd(text, index, options.predictMath === true);
+    }
+
+    if (opaqueEnd == null) {
+      index += 1;
+      continue;
+    }
+
+    normalized += normalizeProse(text.slice(proseStart, index), options);
+    normalized += text.slice(index, opaqueEnd);
+    index = opaqueEnd;
+    proseStart = opaqueEnd;
+  }
+
+  normalized += normalizeProse(text.slice(proseStart), options);
+  return normalized;
 }
