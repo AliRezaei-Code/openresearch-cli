@@ -3,7 +3,15 @@
 // terminals can subscribe without threading props everywhere.
 
 import { useEffect, useRef } from "react";
-import type { ChatMessage, ChatSession, ContextUsage, Experiment, Project, Run } from "./api";
+import type {
+  ChatMessage,
+  ChatSession,
+  ContextUsage,
+  Experiment,
+  Project,
+  QueuedMessage,
+  Run,
+} from "./api";
 
 export interface RunLogEvent {
   runId: string;
@@ -38,6 +46,7 @@ export type ChatEvent =
   | { type: "message"; sessionId: string; message: ChatMessage }
   | { type: "busy"; sessionId: string; busy: boolean }
   | { type: "usage"; sessionId: string; usage: ContextUsage }
+  | { type: "queued"; sessionId: string; items: QueuedMessage[] }
   /** The EventSource re-connected after a drop. Chat events are edge-only (no
    * snapshot on connect), so frames emitted during the gap are lost for good —
    * subscribers must refetch whatever they render from chat events. */
@@ -175,6 +184,10 @@ export function useOrxEvents(handlers: OrxEventHandlers) {
     es.addEventListener("chat.usage", (e) => {
       const d = parse<{ sessionId: string; usage: ContextUsage }>(e as MessageEvent);
       if (d?.sessionId && d.usage) emitChat({ type: "usage", sessionId: d.sessionId, usage: d.usage });
+    });
+    es.addEventListener("chat.queued", (e) => {
+      const d = parse<{ sessionId: string; items: QueuedMessage[] }>(e as MessageEvent);
+      if (d?.sessionId) emitChat({ type: "queued", sessionId: d.sessionId, items: d.items ?? [] });
     });
     es.addEventListener("harness.auth", (e) => {
       const d = parse<HarnessAuthEvent>(e as MessageEvent);
