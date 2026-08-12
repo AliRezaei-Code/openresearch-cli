@@ -3972,10 +3972,8 @@ export function ChatPanel({
               onClick={() => {
                 const skill = skills.find((s) => s.name === "reproduce-paper");
                 if (paperId && skill) {
-                  // Arm the skill and let its placeholder guide input. The paper
-                  // and compute are both optional: the playbook injects the
-                  // linked paper into every harness, and compute defaults to the
-                  // configured target (local when none). So no pre-filled args.
+                  // Both args are optional (the playbook injects the linked paper;
+                  // compute defaults to the configured target) — arm with an empty draft.
                   setPickedSkill(skill);
                   setDraft("");
                 } else {
@@ -4169,10 +4167,10 @@ export function ChatPanel({
               onScroll={syncChipScroll}
               placeholder={
                 // A pending question card owns typed text (see send()); say so.
-                // With a chip active, the skill's arg hint says what to type —
-                // and when the project already has a paper attached, the paper
-                // part of the paper-reproduction skills defaults to it, so mark
-                // just that part optional (compute is still expected).
+                // With a chip active, the skill's arg hint says what to type. For
+                // the paper-reproduction skills with a paper attached, both parts
+                // are optional — paper defaults to it, compute to the configured
+                // target — so the hint just states the defaults.
                 // Otherwise follow `composerSelection` so the name tracks the
                 // picker for a new session and the open session once one exists.
                 pendingQuestion
@@ -4180,7 +4178,7 @@ export function ChatPanel({
                   : pickedSkill
                     ? ["reproduce-paper", "paper-to-marimo"].includes(pickedSkill.name) &&
                       paperId
-                      ? `[paper — optional, defaults to ${paperId}] on [compute]`
+                      ? `[optional — defaults to ${paperId} on your default compute]`
                       : pickedSkill.argHint
                     : composerSelection
                       ? activeHarness?.agentReady
