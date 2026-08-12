@@ -455,6 +455,10 @@ function commandSearchPattern(command: string): string | null {
 
 const UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 
+function commandInvokesOrx(command: string, args: string): boolean {
+  return new RegExp(`(?:^|[;|&(\\n]\\s*|\\b(?:do|then)\\s+)orx\\s+${args}\\b`, "i").test(command);
+}
+
 function idsFromToolOutput(output: string | undefined, resource: "runs" | "experiments"): string[] {
   if (!output) return [];
   const ids = new Set<string>();
@@ -480,7 +484,7 @@ function idsFromToolOutput(output: string | undefined, resource: "runs" | "exper
 }
 
 function commandRunIds(command: string, output?: string): string[] {
-  if (!/\borx\s+logs\b/.test(command)) return [];
+  if (!commandInvokesOrx(command, "logs")) return [];
   const ids = new Set<string>();
   for (const match of command.matchAll(new RegExp(`\\borx\\s+logs\\s+["']?(${UUID_PATTERN})`, "gi"))) {
     ids.add(match[1]);
@@ -500,7 +504,7 @@ function commandRunIds(command: string, output?: string): string[] {
 }
 
 function commandExperimentIds(command: string, output?: string): string[] {
-  if (!/\borx\s+exp\s+(?:status|desc)\b/.test(command)) return [];
+  if (!commandInvokesOrx(command, "exp\\s+(?:status|desc)")) return [];
   const ids = new Set<string>();
   for (const match of command.matchAll(new RegExp(`\\borx\\s+exp\\s+(?:status|desc)\\s+["']?(${UUID_PATTERN})`, "gi"))) {
     ids.add(match[1]);
@@ -537,44 +541,45 @@ function toolActivity(part: ChatPart): ToolActivity {
       }
 
       const command = meaningfulCommand(rawCommand);
-      const readsExperimentStatus = /\borx\s+exp\s+status\b/.test(command);
-      const readsExperimentNotes = /\borx\s+exp\s+desc\b/.test(command);
-      if (/\borx\s+logs\b/.test(command)) {
+      const readsExperimentStatus = commandInvokesOrx(command, "exp\\s+status");
+      const readsExperimentNotes = commandInvokesOrx(command, "exp\\s+desc");
+      if (commandInvokesOrx(command, "logs")) {
         const runIds = commandRunIds(command, toolOutput);
         const label = runIds.length === 1 ? "Reviewed run log" : "Reviewed run logs";
         return { kind: "project", label, runIds };
       }
-      if (/\borx\s+exp\s+run\b/.test(command)) {
+      if (commandInvokesOrx(command, "exp\\s+run")) {
         return { kind: "project", label: "Started an experiment run" };
       }
-      if (/\borx\s+exp\s+wait\b/.test(command)) {
+      if (commandInvokesOrx(command, "exp\\s+wait")) {
         return { kind: "project", label: "Waited for an experiment run" };
       }
-      if (/\borx\s+exp\s+cancel\b/.test(command)) {
+      if (commandInvokesOrx(command, "exp\\s+cancel")) {
         return { kind: "project", label: "Cancelled an experiment run" };
       }
-      if (/\borx\s+project\s+view\b/.test(command) && readsExperimentStatus && readsExperimentNotes) {
+      const readsProject = commandInvokesOrx(command, "project\\s+view");
+      if (readsProject && readsExperimentStatus && readsExperimentNotes) {
         return {
           kind: "project",
           label: "Reviewed experiment status and notes",
           experimentIds: commandExperimentIds(command, toolOutput),
         };
       }
-      if (/\borx\s+project\s+view\b/.test(command) && readsExperimentNotes) {
+      if (readsProject && readsExperimentNotes) {
         return {
           kind: "project",
           label: "Read experiment notes",
           experimentIds: commandExperimentIds(command, toolOutput),
         };
       }
-      if (/\borx\s+project\s+view\b/.test(command) && readsExperimentStatus) {
+      if (readsProject && readsExperimentStatus) {
         return {
           kind: "project",
           label: "Checked experiment status",
           experimentIds: commandExperimentIds(command, toolOutput),
         };
       }
-      if (/\borx\s+project\s+view\b/.test(command)) {
+      if (readsProject) {
         return { kind: "project", label: "Read project details" };
       }
       if (readsExperimentStatus && readsExperimentNotes) {
@@ -598,7 +603,7 @@ function toolActivity(part: ChatPart): ToolActivity {
           experimentIds: commandExperimentIds(command, toolOutput),
         };
       }
-      if (/\borx\s+runs?\b/.test(command)) {
+      if (commandInvokesOrx(command, "runs?")) {
         return { kind: "project", label: "Listed project runs" };
       }
 
@@ -893,7 +898,7 @@ function ToolActivityLabel({
             {onOpenExperiment ? (
               <button
                 className="tool-target"
-                title={`Open notes for ${experimentName?.(experimentId) || "experiment"}`}
+                title={`Open experiment ${experimentName?.(experimentId) || ""}`.trim()}
                 onClick={(event) => {
                   event.preventDefault();
                   event.stopPropagation();
