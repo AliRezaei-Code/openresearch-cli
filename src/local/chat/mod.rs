@@ -1862,6 +1862,12 @@ impl ChatHost {
             // runs when the turn ends, instead of rejecting it. System/resume
             // sends pass `queue_if_busy = false` and keep the old rejection.
             None if queue_if_busy && !(text.trim().is_empty() && images.is_empty()) => {
+                if matches!(
+                    self.turns.lock().await.get(session_id),
+                    Some(TurnState::Cancelling)
+                ) {
+                    return Err(anyhow!("session is stopping — send again once it is idle"));
+                }
                 self.queued
                     .lock()
                     .unwrap()
@@ -1874,6 +1880,9 @@ impl ChatHost {
                         images,
                     });
                 self.emit_queued(session_id);
+                if !self.is_busy(session_id).await {
+                    self.drain_queue(session_id).await;
+                }
                 return Ok(());
             }
             None => return Err(anyhow!("session is busy — interrupt it first")),
@@ -2167,7 +2176,6 @@ impl ChatHost {
 
     async fn finish_interruption(self: &Arc<Self>, session_id: &str) {
         self.finish_turn(session_id, None).await;
-        self.drain_queue(session_id).await;
     }
 
     /// Abort an in-flight turn. Child processes die via kill_on_drop; the
