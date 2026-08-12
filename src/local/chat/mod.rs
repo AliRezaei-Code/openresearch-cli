@@ -304,10 +304,13 @@ fn preserve_tool_targets(state: &mut WireToolState) {
 }
 
 fn safe_session_name(session_id: &str) -> String {
-    session_id
-        .chars()
-        .filter(|char| char.is_ascii_alphanumeric() || matches!(char, '-' | '_'))
-        .collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(session_id.len() * 2);
+    for byte in session_id.as_bytes() {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn target_event_path(session_id: &str, message_id: &str) -> PathBuf {
@@ -605,6 +608,21 @@ fn remove_target_pointer_if_matches(session_id: &str, message_id: &str) {
     {
         let _ = std::fs::remove_file(pointer);
     }
+}
+
+fn remove_session_target_events(session_id: &str) {
+    let directory = crate::store::data_dir().join("chat-targets");
+    let prefix = format!("{}-", safe_session_name(session_id));
+    if let Ok(entries) = std::fs::read_dir(&directory) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with(&prefix) && name.ends_with(".events") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let _ = std::fs::remove_file(target_event_pointer(session_id));
 }
 
 /// Find a part by id anywhere in the tree (depth-first), returning `&mut` to it.
@@ -2484,7 +2502,7 @@ impl ChatHost {
         store.delete_chat_session(session_id)?;
         self.emit("chat.session.deleted", json!({ "sessionId": session_id }));
         if let Some(session) = session {
-            let _ = std::fs::remove_file(target_event_pointer(&session.id));
+            remove_session_target_events(&session.id);
             let _ = std::fs::remove_dir_all(shell_hook_dir(&session.id));
             if let Ok(Some(project)) = store.get_local_project(&session.project_id) {
                 cleanup_session_worktree(&project, session_id);
@@ -3402,6 +3420,12 @@ mod session_env_tests {
 #[cfg(test)]
 mod cap_tests {
     use super::*;
+
+    #[test]
+    fn session_path_names_are_injective_for_punctuation() {
+        assert_ne!(safe_session_name("a/b"), safe_session_name("ab"));
+        assert!(!safe_session_name("...").is_empty());
+    }
 
     #[test]
     fn cap_tool_text_truncates_and_is_idempotent() {
