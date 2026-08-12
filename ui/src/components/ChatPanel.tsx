@@ -497,12 +497,12 @@ function commandRunIds(command: string, output?: string): string[] {
 }
 
 function commandExperimentIds(command: string, output?: string): string[] {
-  if (!/\borx\s+exp\s+desc\b/.test(command)) return [];
+  if (!/\borx\s+exp\s+(?:status|desc)\b/.test(command)) return [];
   const ids = new Set<string>();
-  for (const match of command.matchAll(new RegExp(`\\borx\\s+exp\\s+desc\\s+["']?(${UUID_PATTERN})`, "gi"))) {
+  for (const match of command.matchAll(new RegExp(`\\borx\\s+exp\\s+(?:status|desc)\\s+["']?(${UUID_PATTERN})`, "gi"))) {
     ids.add(match[1]);
   }
-  for (const match of command.matchAll(/\borx\s+exp\s+desc\s+["']?\$([A-Za-z_][A-Za-z0-9_]*)/g)) {
+  for (const match of command.matchAll(/\borx\s+exp\s+(?:status|desc)\s+["']?\$([A-Za-z_][A-Za-z0-9_]*)/g)) {
     const variable = match[1];
     const loop = command.match(new RegExp(`\\bfor\\s+${variable}\\s+in\\s+([^;]+);\\s*do`, "i"));
     if (!loop) continue;
@@ -534,6 +534,8 @@ function toolActivity(part: ChatPart): ToolActivity {
       }
 
       const command = meaningfulCommand(rawCommand);
+      const readsExperimentStatus = /\borx\s+exp\s+status\b/.test(command);
+      const readsExperimentNotes = /\borx\s+exp\s+desc\b/.test(command);
       if (/\borx\s+logs\b/.test(command)) {
         const runIds = commandRunIds(command, toolOutput);
         const label = runIds.length === 1 ? "Reviewed run log" : "Reviewed run logs";
@@ -548,27 +550,45 @@ function toolActivity(part: ChatPart): ToolActivity {
       if (/\borx\s+exp\s+cancel\b/.test(command)) {
         return { kind: "project", label: "Cancelled an experiment run" };
       }
-      if (/\borx\s+project\s+view\b/.test(command) && /\borx\s+exp\s+(?:status|desc)\b/.test(command)) {
+      if (/\borx\s+project\s+view\b/.test(command) && readsExperimentStatus && readsExperimentNotes) {
         return {
           kind: "project",
           label: "Reviewed experiment status and notes",
+          experimentIds: commandExperimentIds(command, toolOutput),
+        };
+      }
+      if (/\borx\s+project\s+view\b/.test(command) && readsExperimentNotes) {
+        return {
+          kind: "project",
+          label: "Read experiment notes",
+          experimentIds: commandExperimentIds(command, toolOutput),
+        };
+      }
+      if (/\borx\s+project\s+view\b/.test(command) && readsExperimentStatus) {
+        return {
+          kind: "project",
+          label: "Checked experiment status",
           experimentIds: commandExperimentIds(command, toolOutput),
         };
       }
       if (/\borx\s+project\s+view\b/.test(command)) {
         return { kind: "project", label: "Read project details" };
       }
-      if (/\borx\s+exp\s+status\b/.test(command) && /\borx\s+exp\s+desc\b/.test(command)) {
+      if (readsExperimentStatus && readsExperimentNotes) {
         return {
           kind: "project",
           label: "Reviewed experiment status and notes",
           experimentIds: commandExperimentIds(command, toolOutput),
         };
       }
-      if (/\borx\s+exp\s+status\b/.test(command)) {
-        return { kind: "project", label: "Checked experiment status" };
+      if (readsExperimentStatus) {
+        return {
+          kind: "project",
+          label: "Checked experiment status",
+          experimentIds: commandExperimentIds(command, toolOutput),
+        };
       }
-      if (/\borx\s+exp\s+desc\b/.test(command)) {
+      if (readsExperimentNotes) {
         return {
           kind: "project",
           label: "Read experiment notes",
