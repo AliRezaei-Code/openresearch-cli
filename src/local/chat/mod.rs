@@ -499,19 +499,20 @@ fn attach_target_event(
         {
             candidates.retain(|(_, _, cwd)| cwd.as_deref() == Some(cwd_hint));
         }
-        let Some((_, selected_command, _)) = candidates
-            .iter()
-            .find(|(id, _, _)| !claimed_part_ids.contains(id))
-            .or_else(|| candidates.first())
-        else {
+        candidates.retain(|(id, _, _)| !claimed_part_ids.contains(id));
+        let Some((_, selected_command, _)) = candidates.first() else {
             return Vec::new();
         };
         let selected_command = selected_command.clone();
-        candidates
+        let ids = candidates
             .into_iter()
             .filter(|(_, command, _)| command == &selected_command)
             .map(|(id, _, _)| id)
-            .collect::<HashSet<_>>()
+            .collect::<HashSet<_>>();
+        if ids.len() != 1 {
+            return Vec::new();
+        }
+        ids
     };
     attach_target_to_ids(parts, &ids, resource, target);
     ids.into_iter().collect()
@@ -2075,7 +2076,9 @@ impl ChatHost {
                         let _ = store.set_chat_session_context_usage(&ctx.session_id, &json);
                     }
                 }
-                ctx.host.finish_turn(&ctx.session_id).await;
+                ctx.host
+                    .finish_turn(&ctx.session_id, &ctx.assistant.id)
+                    .await;
                 // Natural completion only: a user Stop aborts this task before
                 // it reaches here (and clears the queue itself), so an
                 // interrupted turn never drains.
@@ -2097,8 +2100,21 @@ impl ChatHost {
     }
 
     /// Turn cleanup: drop the handle, bump the session, broadcast idle.
-    async fn finish_turn(&self, session_id: &str) {
-        self.turns.lock().await.remove(session_id);
+    async fn finish_turn(&self, session_id: &str, message_id: &str) {
+        let should_finish = {
+            let mut turns = self.turns.lock().await;
+            match turns.get(session_id) {
+                Some(Some(active)) if active.message_id == message_id => {
+                    turns.remove(session_id);
+                    true
+                }
+                None => true,
+                _ => false,
+            }
+        };
+        if !should_finish {
+            return;
+        }
         // Any bridge card still pending belongs to the turn that just ended —
         // deny it so the (dying) bridge child's long-poll unblocks.
         self.cancel_pending_permissions(session_id);
@@ -2127,6 +2143,7 @@ impl ChatHost {
         let Some(handle) = self.turns.lock().await.remove(session_id) else {
             return Ok(false);
         };
+        self.cancel_pending_permissions(session_id);
         if let Ok(store) = Store::open() {
             if let Ok(Some(session)) = store.get_chat_session(session_id) {
                 if session.harness == "opencode" {
@@ -2160,8 +2177,12 @@ impl ChatHost {
             if let Some(message) = reconcile_target_file(session_id, &active.message_id) {
                 self.emit("chat.message", message_json(&message, session_id));
             }
+            let _ = std::fs::remove_file(target_event_path(session_id, &active.message_id));
+            remove_target_pointer_if_matches(session_id, &active.message_id);
+            self.finish_turn(session_id, &active.message_id).await;
+        } else {
+            self.finish_turn(session_id, "").await;
         }
-        self.finish_turn(session_id).await;
         Ok(true)
     }
 
@@ -2461,10 +2482,10 @@ impl ChatHost {
         let store = Store::open()?;
         let session = store.get_chat_session(session_id)?;
         store.delete_chat_session(session_id)?;
-        let _ = std::fs::remove_file(target_event_pointer(session_id));
-        let _ = std::fs::remove_dir_all(shell_hook_dir(session_id));
         self.emit("chat.session.deleted", json!({ "sessionId": session_id }));
         if let Some(session) = session {
+            let _ = std::fs::remove_file(target_event_pointer(&session.id));
+            let _ = std::fs::remove_dir_all(shell_hook_dir(&session.id));
             if let Ok(Some(project)) = store.get_local_project(&session.project_id) {
                 cleanup_session_worktree(&project, session_id);
             }
@@ -3270,19 +3291,12 @@ pub fn set_chat_session_env(cmd: &mut tokio::process::Command, session_id: &str)
     let bash_hook = format!(
         "{original_bash_env}\
          export ORX_CHAT_TOOL_SCOPE=\"bash-$$\"\n\
+         export ORX_CHAT_TOOL_COMMAND=\"$BASH_EXECUTION_STRING\"\n\
          if [[ -r \"$ORX_CHAT_TARGET_POINTER\" ]]; then\n\
            export ORX_CHAT_TARGET_FILE=$(<\"$ORX_CHAT_TARGET_POINTER\")\n\
          else\n\
            unset ORX_CHAT_TARGET_FILE\n\
-         fi\n\
-         _ORX_CHAT_PRIOR_DEBUG=$(trap -p DEBUG)\n\
-         _ORX_CHAT_PRIOR_DEBUG=${{_ORX_CHAT_PRIOR_DEBUG#trap -- \\'}}\n\
-         _ORX_CHAT_PRIOR_DEBUG=${{_ORX_CHAT_PRIOR_DEBUG%\\' DEBUG}}\n\
-         _orx_chat_debug() {{\n\
-           export ORX_CHAT_TOOL_COMMAND=\"$BASH_COMMAND\"\n\
-           [[ -n \"$_ORX_CHAT_PRIOR_DEBUG\" ]] && eval \"$_ORX_CHAT_PRIOR_DEBUG\"\n\
-         }}\n\
-         trap _orx_chat_debug DEBUG\n"
+         fi\n"
     );
     if std::fs::write(&bash_env, bash_hook).is_err() {
         return;
@@ -3615,9 +3629,8 @@ mod cap_tests {
     }
 
     #[test]
-    fn identical_parallel_commands_share_authoritative_targets() {
-        let first = "11111111-1111-1111-1111-111111111111";
-        let second = "22222222-2222-2222-2222-222222222222";
+    fn identical_parallel_commands_are_left_unattributed() {
+        let target = "11111111-1111-1111-1111-111111111111";
         let make_part = |id: &str| WirePart {
             id: id.into(),
             kind: "tool".into(),
@@ -3634,7 +3647,7 @@ mod cap_tests {
             children: Vec::new(),
         };
         let mut parts = vec![make_part("one"), make_part("two")];
-        let mut claimed = HashSet::new();
+        let claimed = HashSet::new();
         let ids = attach_target_event(
             &mut parts,
             None,
@@ -3642,23 +3655,13 @@ mod cap_tests {
             "orx logs \"$id\"",
             "",
             "runs",
-            first,
+            target,
         );
-        claimed.extend(ids);
-        assert!(!attach_target_event(
-            &mut parts,
-            None,
-            &claimed,
-            "orx logs \"$id\"",
-            "",
-            "runs",
-            second,
-        )
-        .is_empty());
+        assert!(ids.is_empty());
 
         for part in parts {
             let input = part.state.unwrap().input.unwrap();
-            assert_eq!(input["runTargetIds"], json!([first, second]));
+            assert!(input["runTargetIds"].is_null());
         }
     }
 
