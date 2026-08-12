@@ -35,6 +35,7 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(75);
 /// truncation marker visible under the UI's own slice.
 const TOOL_TEXT_CAP: usize = 16_000;
 const TOOL_TEXT_TRUNCATION_MARKER: &str = "\n… [output truncated]";
+const TOOL_TARGET_CAP: usize = 256;
 
 /// Keep the head and tail of `text` within [`TOOL_TEXT_CAP`] chars, marking
 /// the omitted middle. Idempotent — an already-capped string is left alone.
@@ -67,64 +68,152 @@ fn cap_tool_text(text: &mut String) {
     *text = capped;
 }
 
-fn uuid_targets(text: &str) -> Vec<String> {
-    let mut targets = Vec::new();
-    let mut seen = HashSet::new();
-    for window in text.as_bytes().windows(36) {
-        let valid = window.iter().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                *byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        });
-        if !valid {
-            continue;
-        }
-        let target = String::from_utf8_lossy(window).to_ascii_lowercase();
-        if seen.insert(target.clone()) {
-            targets.push(target);
+fn valid_tool_target(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (bytes.len() == 8 && bytes.iter().all(u8::is_ascii_hexdigit))
+        || (bytes.len() == 36
+            && bytes.iter().enumerate().all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    *byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            }))
+}
+
+fn tool_command(input: &serde_json::Map<String, Value>) -> &str {
+    let arguments = input.get("arguments").and_then(Value::as_object);
+    [
+        input.get("command"),
+        input.get("cmd"),
+        arguments.and_then(|a| a.get("command")),
+        arguments.and_then(|a| a.get("cmd")),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_str)
+    .unwrap_or("")
+}
+
+fn push_tool_target(targets: &mut Vec<String>, seen: &mut HashSet<String>, value: &str) {
+    if targets.len() >= TOOL_TARGET_CAP {
+        return;
+    }
+    let candidate = value.trim_matches(|char: char| !char.is_ascii_hexdigit() && char != '-');
+    if valid_tool_target(candidate) {
+        let normalized = candidate.to_ascii_lowercase();
+        if seen.insert(normalized.clone()) {
+            targets.push(normalized);
         }
     }
-    targets
+}
+
+fn structured_tool_targets(
+    text: &str,
+    resource: &str,
+    targets: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    let endpoint = format!("/{resource}/");
+    let marker = if resource == "runs" {
+        "[orx-run:"
+    } else {
+        "[orx-experiment:"
+    };
+    for line in text.lines() {
+        if targets.len() >= TOOL_TARGET_CAP {
+            break;
+        }
+        let trimmed = line.trim();
+        if let Some(start) = trimmed.find(marker) {
+            if let Some(value) = trimmed[start + marker.len()..].split(']').next() {
+                push_tool_target(targets, seen, value);
+            }
+        }
+        if let Some(start) = trimmed.find(&endpoint) {
+            if let Some(value) = trimmed[start + endpoint.len()..]
+                .split(|char: char| !char.is_ascii_hexdigit() && char != '-')
+                .next()
+            {
+                push_tool_target(targets, seen, value);
+            }
+        }
+        if resource == "runs" {
+            let lower = trimmed.to_ascii_lowercase();
+            if let Some(value) = lower.strip_prefix("run id:") {
+                push_tool_target(targets, seen, value);
+            }
+        } else if let Some(value) = trimmed.strip_prefix("id:") {
+            push_tool_target(targets, seen, value);
+        }
+    }
+}
+
+fn strip_tool_target_markers(text: &mut String) {
+    if !text.contains("[orx-") {
+        return;
+    }
+    let filtered = text
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !(trimmed.starts_with("[orx-run:") || trimmed.starts_with("[orx-experiment:"))
+                || !trimmed.ends_with(']')
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    *text = filtered;
 }
 
 fn preserve_tool_targets(state: &mut WireToolState) {
     let Some(input) = state.input.as_mut().and_then(Value::as_object_mut) else {
         return;
     };
-    let command = input
-        .get("command")
-        .and_then(Value::as_str)
-        .unwrap_or("")
+    let normalized_command = tool_command(input)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
         .to_ascii_lowercase();
-    if !command.contains("orx logs")
-        && !command.contains("orx exp status")
-        && !command.contains("orx exp desc")
+    let resource = if normalized_command.contains("orx logs") {
+        "runs"
+    } else if normalized_command.contains("orx exp status")
+        || normalized_command.contains("orx exp desc")
     {
+        "experiments"
+    } else {
         return;
-    }
-    let mut targets = input
-        .get("targetIds")
+    };
+    let key = if resource == "runs" {
+        "runTargetIds"
+    } else {
+        "experimentTargetIds"
+    };
+    let existing = input
+        .get(key)
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .map(str::to_string)
         .collect::<Vec<_>>();
-    let mut seen = targets.iter().cloned().collect::<HashSet<_>>();
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    for target in existing {
+        push_tool_target(&mut targets, &mut seen, target);
+    }
     for text in [state.output.as_deref(), state.error.as_deref()]
         .into_iter()
         .flatten()
     {
-        for target in uuid_targets(text) {
-            if seen.insert(target.clone()) {
-                targets.push(target);
-            }
-        }
+        structured_tool_targets(text, resource, &mut targets, &mut seen);
     }
     if !targets.is_empty() {
-        input.insert("targetIds".into(), json!(targets));
+        input.insert(key.into(), json!(targets));
+    }
+    if let Some(output) = state.output.as_mut() {
+        strip_tool_target_markers(output);
+    }
+    if let Some(error) = state.error.as_mut() {
+        strip_tool_target_markers(error);
     }
 }
 
@@ -2770,7 +2859,7 @@ mod cap_tests {
         let middle = "22222222-2222-2222-2222-222222222222";
         let last = "33333333-3333-3333-3333-333333333333";
         let output = format!(
-            "{first}\n{}\n{middle}\n{}\n{last}",
+            "[orx-run:{first}]\n{}\n[orx-run:{middle}]\n{}\n[orx-run:{last}]",
             "x".repeat(20_000),
             "y".repeat(20_000)
         );
@@ -2798,9 +2887,39 @@ mod cap_tests {
             TOOL_TEXT_CAP
         );
         assert_eq!(
-            state.input.as_ref().unwrap()["targetIds"],
+            state.input.as_ref().unwrap()["runTargetIds"],
             json!([first, middle, last])
         );
+    }
+
+    #[test]
+    fn semantic_targets_are_resource_specific_and_bounded() {
+        let parent = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let latest_run = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let mut output = format!(
+            "id: 11111111-1111-1111-1111-111111111111\nparent: {parent}\nlast run: {latest_run}\n"
+        );
+        for index in 0..300 {
+            output.push_str(&format!(
+                "[orx-experiment:{index:08x}-1111-1111-1111-111111111111]\n"
+            ));
+        }
+        let mut state = WireToolState {
+            status: "completed".into(),
+            input: Some(json!({ "arguments": { "cmd": "orx exp status $id" } })),
+            output: Some(output),
+            error: None,
+            title: None,
+        };
+
+        preserve_tool_targets(&mut state);
+
+        let targets = state.input.as_ref().unwrap()["experimentTargetIds"]
+            .as_array()
+            .unwrap();
+        assert_eq!(targets.len(), TOOL_TARGET_CAP);
+        assert!(!targets.iter().any(|value| value == parent));
+        assert!(!targets.iter().any(|value| value == latest_run));
     }
 }
 

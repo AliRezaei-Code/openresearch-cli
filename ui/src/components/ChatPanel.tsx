@@ -5,6 +5,7 @@ import {
   ChartSpline,
   Check,
   ChevronRight,
+  CircleX,
   Clock,
   CornerDownLeft,
   FileText,
@@ -321,6 +322,15 @@ function arrayInputString(input: Record<string, unknown>, key: string, field: st
 function inputStringArray(input: Record<string, unknown>, key: string): string[] {
   const values = input[key];
   return Array.isArray(values) ? values.filter((value): value is string => typeof value === "string") : [];
+}
+
+function cleanToolError(value: string): string {
+  return value
+    .replace(/^Exit code \d+\s*/i, "")
+    .split("\n")
+    .filter((line) => !/^\s*\[orx-(?:run|experiment):[^\]]+\]\s*$/.test(line))
+    .join("\n")
+    .trim();
 }
 
 function editChange(input: Record<string, unknown>): { path: string; type: string | null } | null {
@@ -723,7 +733,10 @@ function loopIdsBefore(command: string, variable: string, before: number, idPatt
   const loop = new RegExp(`\\bfor\\s+${variable}\\s+in\\s+([\\s\\S]*?)(?:;|\\n)\\s*do\\b`, "gi");
   let values = "";
   for (const match of command.matchAll(loop)) {
-    if ((match.index ?? 0) + match[0].length > before) break;
+    const start = match.index ?? 0;
+    if (start >= before) break;
+    const headerEnd = start + match[0].length;
+    if (headerEnd <= before && /\bdone\b/.test(command.slice(headerEnd, before))) continue;
     values = match[1];
   }
   return [...values.matchAll(new RegExp(idPattern, "gi"))].map((match) => match[0]);
@@ -770,8 +783,10 @@ function commandRunIds(command: string, output?: string, preservedIds: string[] 
     for (const id of loopIds) ids.add(id);
     if (assignmentIds.length === 0 && loopIds.length === 0) hasUnresolvedTarget = true;
   }
-  if (ids.size === 0 || hasUnresolvedTarget) idsFromToolOutput(output, "runs").forEach((id) => ids.add(id));
-  preservedIds.forEach((id) => ids.add(id));
+  if (ids.size === 0 || hasUnresolvedTarget) {
+    idsFromToolOutput(output, "runs").forEach((id) => ids.add(id));
+    preservedIds.forEach((id) => ids.add(id));
+  }
   return [...ids];
 }
 
@@ -800,8 +815,10 @@ function commandExperimentIds(command: string, output?: string, preservedIds: st
     }
     if (!resolved) hasUnresolvedTarget = true;
   }
-  if (ids.size === 0 || hasUnresolvedTarget) idsFromToolOutput(output, "experiments").forEach((id) => ids.add(id));
-  preservedIds.forEach((id) => ids.add(id));
+  if (ids.size === 0 || hasUnresolvedTarget) {
+    idsFromToolOutput(output, "experiments").forEach((id) => ids.add(id));
+    preservedIds.forEach((id) => ids.add(id));
+  }
   return [...ids];
 }
 
@@ -818,7 +835,9 @@ function toolActivity(part: ChatPart): ToolActivity {
   const normalizedInput = { ...input, ...argumentsInput };
   const rawCommand = inputString(normalizedInput, "command", "cmd");
   const toolOutput = part.state?.output || part.state?.error;
-  const preservedIds = inputStringArray(normalizedInput, "targetIds");
+  const legacyTargetIds = inputStringArray(normalizedInput, "targetIds");
+  const preservedRunIds = [...inputStringArray(normalizedInput, "runTargetIds"), ...legacyTargetIds];
+  const preservedExperimentIds = [...inputStringArray(normalizedInput, "experimentTargetIds"), ...legacyTargetIds];
   const filePath = inputString(normalizedInput, "filePath", "file_path", "notebookPath", "notebook_path", "path");
   const description = inputString(normalizedInput, "description");
   const toolSegments = tool.toLowerCase().split(/(?::|\.|__)+/);
@@ -873,7 +892,7 @@ function toolActivity(part: ChatPart): ToolActivity {
         ? "Checked experiment status and updated notes"
         : "Reviewed experiment status and notes";
       if (commandInvokesOrx(command, "logs")) {
-        const runIds = commandRunIds(command, toolOutput, preservedIds);
+        const runIds = commandRunIds(command, toolOutput, preservedRunIds);
         const label = runIds.length === 1 ? "Reviewed run log" : "Reviewed run logs";
         return { kind: "project", label, runIds };
       }
@@ -891,21 +910,21 @@ function toolActivity(part: ChatPart): ToolActivity {
         return {
           kind: "project",
           label: combinedLabel,
-          experimentIds: commandExperimentIds(command, toolOutput, preservedIds),
+          experimentIds: commandExperimentIds(command, toolOutput, preservedExperimentIds),
         };
       }
       if (readsProject && readsExperimentNotes) {
         return {
           kind: "project",
           label: notesLabel,
-          experimentIds: commandExperimentIds(command, toolOutput, preservedIds),
+          experimentIds: commandExperimentIds(command, toolOutput, preservedExperimentIds),
         };
       }
       if (readsProject && readsExperimentStatus) {
         return {
           kind: "project",
           label: "Checked experiment status",
-          experimentIds: commandExperimentIds(command, toolOutput, preservedIds),
+          experimentIds: commandExperimentIds(command, toolOutput, preservedExperimentIds),
         };
       }
       if (readsProject) {
@@ -915,21 +934,21 @@ function toolActivity(part: ChatPart): ToolActivity {
         return {
           kind: "project",
           label: combinedLabel,
-          experimentIds: commandExperimentIds(command, toolOutput, preservedIds),
+          experimentIds: commandExperimentIds(command, toolOutput, preservedExperimentIds),
         };
       }
       if (readsExperimentStatus) {
         return {
           kind: "project",
           label: "Checked experiment status",
-          experimentIds: commandExperimentIds(command, toolOutput, preservedIds),
+          experimentIds: commandExperimentIds(command, toolOutput, preservedExperimentIds),
         };
       }
       if (readsExperimentNotes) {
         return {
           kind: "project",
           label: notesLabel,
-          experimentIds: commandExperimentIds(command, toolOutput, preservedIds),
+          experimentIds: commandExperimentIds(command, toolOutput, preservedExperimentIds),
         };
       }
       if (commandInvokesOrx(command, "runs?")) {
@@ -1093,9 +1112,11 @@ function ToolActivityIcon({ activity, className = "" }: { activity: ToolActivity
 function ToolTargetOverflow({
   items,
   onOpen,
+  targetType,
 }: {
   items: Array<{ id: string; label: string }>;
   onOpen?: (id: string) => void;
+  targetType: string;
 }) {
   const [open, setOpen] = useState(false);
   const revealRef = useRef<HTMLSpanElement>(null);
@@ -1136,6 +1157,7 @@ function ToolTargetOverflow({
       <button
         className="tool-target-more"
         aria-expanded={open}
+        aria-label={open ? `Hide additional ${targetType}` : `Show ${items.length} more ${targetType}`}
         onClick={(event) => {
           event.preventDefault();
           event.stopPropagation();
@@ -1232,7 +1254,7 @@ function ToolActivityLabel({
         {hiddenRuns.length > 0 && (
           <>
             {", "}
-            <ToolTargetOverflow items={hiddenRuns} onOpen={onOpenRun} />
+            <ToolTargetOverflow items={hiddenRuns} onOpen={onOpenRun} targetType="run logs" />
           </>
         )}
       </>
@@ -1273,7 +1295,7 @@ function ToolActivityLabel({
         {hiddenExperiments.length > 0 && (
           <>
             {", "}
-            <ToolTargetOverflow items={hiddenExperiments} onOpen={onOpenExperiment} />
+            <ToolTargetOverflow items={hiddenExperiments} onOpen={onOpenExperiment} targetType="experiments" />
           </>
         )}
       </>
@@ -1424,16 +1446,18 @@ function ToolRow({
   const state = part.state;
   const activity = toolActivity(part);
   const failed = state?.status === "error";
-  const errorMessage = (state?.error || state?.output || "").replace(/^Exit code \d+\s*/i, "").trim();
+  const errorMessage = cleanToolError(state?.error || state?.output || "");
   const hasDetail = failed && Boolean(errorMessage);
   const [detailOpen, setDetailOpen] = useState(false);
+  const detailId = `tool-error-${part.id.replace(/[^A-Za-z0-9_-]/g, "-")}`;
   const line = (
     <>
       {failed && <span className="sr-only">Failed: </span>}
-      <ToolActivityIcon
-        activity={activity}
-        className={`${failed ? "text-accent-red" : "text-muted"} self-start mt-[5px]`}
-      />
+      {failed ? (
+        <CircleX size={16} strokeWidth={1.75} className="tool-kind-icon shrink-0 text-accent-red self-start mt-[5px]" aria-hidden="true" />
+      ) : (
+        <ToolActivityIcon activity={activity} className="text-muted self-start mt-[5px]" />
+      )}
       <span className={`tool-line flex-1 min-w-0 whitespace-normal break-words text-lg ${failed ? "text-accent-red" : "text-subtext"}`}>
         <ToolActivityLabel
           activity={activity}
@@ -1464,14 +1488,15 @@ function ToolRow({
           type="button"
           className="tool-row-detail-toggle shrink-0 inline-flex items-center justify-center p-0.5 rounded-sm cursor-pointer hover:bg-surface"
           aria-expanded={detailOpen}
-          aria-label={detailOpen ? "Hide error details" : "Show error details"}
+          aria-controls={detailId}
+          aria-label={`${detailOpen ? "Hide" : "Show"} error details for ${activity.label}`}
           onClick={() => setDetailOpen((current) => !current)}
         >
           <ChevronRight size={12} className={`text-accent-red transition-transform duration-120 ease-standard ${detailOpen ? "rotate-90" : ""}`} />
         </button>
       </div>
       {detailOpen && (
-        <div className="tool-detail mt-1 mr-0 mb-1 ml-6">
+        <div className="tool-detail mt-1 mr-0 mb-1 ml-6" id={detailId}>
           <div className="tool-output py-1.5 px-2.5 font-mono text-xs text-subtext whitespace-pre-wrap wrap-anywhere max-h-65 overflow-y-auto bg-background border border-border-variant rounded-sm">
             {errorMessage.slice(0, 20000)}
           </div>
@@ -2064,7 +2089,7 @@ export function SubagentTranscript({
   const running = spawn.state?.status === "running";
   const errored = spawn.state?.status === "error";
   const errorMessage = errored
-    ? (spawn.state?.error || spawn.state?.output || "").replace(/^Exit code \d+\s*/i, "").trim()
+    ? cleanToolError(spawn.state?.error || spawn.state?.output || "")
     : "";
   // Gate the empty state on what actually renders, not the raw part count — a
   // stored transcript of nothing but invisible parts must still read as empty.
@@ -2082,7 +2107,11 @@ export function SubagentTranscript({
     <div className="msg-assistant text-lg leading-[1.62] text-text min-w-0">
       <div className="subagent-tab-header flex items-center gap-2 pb-2 mb-2 border-b border-b-border-variant">
         {errored && <span className="sr-only">Failed: </span>}
-        <ToolActivityIcon activity={spawnActivity} className={running ? "tool-running-shimmer-icon" : errored ? "text-accent-red" : "text-muted"} />
+        {errored ? (
+          <CircleX size={16} strokeWidth={1.75} className="tool-kind-icon shrink-0 text-accent-red" aria-hidden="true" />
+        ) : (
+          <ToolActivityIcon activity={spawnActivity} className={running ? "tool-running-shimmer-icon" : "text-muted"} />
+        )}
         <span className={`${TOOL_LINE_CLASS_NAME} ${running ? "tool-running-shimmer" : errored ? "text-accent-red" : ""}`}>{spawnActivity.label}</span>
       </div>
       {errorMessage && (
@@ -2112,7 +2141,7 @@ function SubagentBlock({
   onOpenSubagent?: (spawnPartId: string) => void;
 }) {
   const errored = part.state?.status === "error";
-  const errorMessage = (part.state?.error || part.state?.output || "").replace(/^Exit code \d+\s*/i, "").trim();
+  const errorMessage = cleanToolError(part.state?.error || part.state?.output || "");
   const running = part.state?.status === "running";
   const activity = running ? activityInProgress(toolActivity(part)) : toolActivity(part);
   return (
@@ -2124,7 +2153,11 @@ function SubagentBlock({
         disabled={!onOpenSubagent}
       >
         {errored && <span className="sr-only">Failed: </span>}
-        <ToolActivityIcon activity={activity} className={`subagent-icon shrink-0 ${running ? "tool-running-shimmer-icon" : errored ? "text-accent-red" : "text-muted"}`} />
+        {errored ? (
+          <CircleX size={16} strokeWidth={1.75} className="subagent-icon shrink-0 text-accent-red" aria-hidden="true" />
+        ) : (
+          <ToolActivityIcon activity={activity} className={`subagent-icon shrink-0 ${running ? "tool-running-shimmer-icon" : "text-muted"}`} />
+        )}
         <span className={`${TOOL_LINE_CLASS_NAME} ${running ? "tool-running-shimmer" : errored ? "text-accent-red" : "text-text"}`}>{activity.label}</span>
         <ChevronRight size={12} className="subagent-row-chevron shrink-0 text-muted" />
       </button>
@@ -2140,49 +2173,71 @@ function SubagentBlock({
  * compare instead of O(messages) work. */
 interface AnnouncedToolState {
   status: string;
-  label: string;
+  part: ChatPart;
 }
 
-function transcriptToolStates(messages: ChatMessage[]): Map<string, AnnouncedToolState> {
+function latestToolStates(messages: ChatMessage[]): { messageId: string; states: Map<string, AnnouncedToolState> } {
   const states = new Map<string, AnnouncedToolState>();
+  let message: ChatMessage | undefined;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (messages[index].role !== "assistant") continue;
+    message = messages[index];
+    break;
+  }
+  if (!message) return { messageId: "", states };
   const visit = (parts: ChatPart[], parent: string) => {
     for (const part of parts) {
       const path = `${parent}/${part.id}`;
       if (part.type === "tool" && part.state?.status) {
-        states.set(path, { status: part.state.status, label: toolActivity(part).label });
+        states.set(path, { status: part.state.status, part });
       }
       if (part.children?.length) visit(part.children, path);
     }
   };
-  for (const message of messages) visit(message.parts, message.id);
-  return states;
+  visit(message.parts, message.id);
+  return { messageId: message.id, states };
 }
 
-function useToolActivityAnnouncement(messages: ChatMessage[]): string {
-  const [announcement, setAnnouncement] = useState("");
-  const previous = useRef<{ transcript: string; states: Map<string, AnnouncedToolState> } | null>(null);
+interface ToolAnnouncement {
+  text: string;
+  sequence: number;
+}
+
+function useToolActivityAnnouncement(messages: ChatMessage[]): ToolAnnouncement {
+  const [announcement, setAnnouncement] = useState<ToolAnnouncement>({ text: "", sequence: 0 });
+  const previous = useRef<{ transcript: string; messageId: string; states: Map<string, AnnouncedToolState> } | null>(null);
   useEffect(() => {
     const transcript = messages[0]?.id ?? "";
-    const states = transcriptToolStates(messages);
+    const { messageId, states } = latestToolStates(messages);
     if (!previous.current || previous.current.transcript !== transcript) {
-      previous.current = { transcript, states };
-      setAnnouncement("");
+      previous.current = { transcript, messageId, states };
+      setAnnouncement((current) => ({ text: "", sequence: current.sequence + 1 }));
       return;
     }
-    const changes = [...states].filter(([path, state]) => previous.current?.states.get(path)?.status !== state.status);
-    previous.current = { transcript, states };
+    const previousStates = previous.current.messageId === messageId ? previous.current.states : new Map<string, AnnouncedToolState>();
+    const changes = [...states].filter(([path, state]) => previousStates.get(path)?.status !== state.status);
+    previous.current = { transcript, messageId, states };
     const failures = changes.filter(([, state]) => state.status === "error");
     if (failures.length > 0) {
-      const labels = failures.slice(0, 2).map(([, state]) => state.label).join(", ");
-      setAnnouncement(`${failures.length === 1 ? "Tool activity failed" : `${failures.length} tool activities failed`}: ${labels}`);
+      const labels = failures.slice(0, 2).map(([, state]) => toolActivity(state.part).label).join(", ");
+      setAnnouncement((current) => ({
+        text: `${failures.length === 1 ? "Tool activity failed" : `${failures.length} tool activities failed`}: ${labels}`,
+        sequence: current.sequence + 1,
+      }));
       return;
     }
     const running = changes.filter(([, state]) => state.status === "running");
     if (running.length > 0) {
-      setAnnouncement(activityInProgress({ kind: "command", label: running.at(-1)?.[1].label ?? "Running a tool" }).label);
+      const part = running.at(-1)?.[1].part;
+      setAnnouncement((current) => ({
+        text: part ? activityInProgress(toolActivity(part)).label : "Running a tool",
+        sequence: current.sequence + 1,
+      }));
       return;
     }
-    if (changes.some(([, state]) => state.status === "completed")) setAnnouncement("Tool activity completed");
+    if (changes.some(([, state]) => state.status === "completed")) {
+      setAnnouncement((current) => ({ text: "Tool activity completed", sequence: current.sequence + 1 }));
+    }
   }, [messages]);
   return announcement;
 }
@@ -2217,7 +2272,9 @@ const Transcript = memo(function Transcript({
   const activityAnnouncement = useToolActivityAnnouncement(messages);
   return (
     <>
-      <span className="sr-only" role="status" aria-live="polite">{activityAnnouncement}</span>
+      <span className="sr-only" role="status" aria-live="polite">
+        <span key={activityAnnouncement.sequence}>{activityAnnouncement.text}</span>
+      </span>
       {visibleMessages.map((m) => (
         <Message
           key={m.id}
