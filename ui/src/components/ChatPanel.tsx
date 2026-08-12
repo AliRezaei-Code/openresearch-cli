@@ -357,7 +357,7 @@ function heredocMarker(line: string): { delimiter: string; stripTabs: boolean } 
       quote = char;
       continue;
     }
-    if (char !== "<" || line[index + 1] !== "<") continue;
+    if (char !== "<" || line[index + 1] !== "<" || line[index + 2] === "<") continue;
     index += 2;
     const stripTabs = line[index] === "-";
     if (stripTabs) index++;
@@ -712,6 +712,10 @@ function commandExperimentIds(command: string, output?: string): string[] {
     const match = /\borx\s+exp\s+(?:status|desc)\s+["']?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/.exec(invocation.raw);
     if (!match) continue;
     const variable = match[1];
+    const assignment = command.match(
+      new RegExp(`(?:^|[\\s;])(?:export\\s+)?${variable}\\s*=\\s*["']?(${UUID_PATTERN})`, "i"),
+    );
+    if (assignment) ids.add(assignment[1]);
     const loop = command.match(new RegExp(`\\bfor\\s+${variable}\\s+in\\s+([\\s\\S]*?)(?:;|\\n)\\s*do\\b`, "i"));
     if (!loop) continue;
     for (const id of loop[1].matchAll(new RegExp(UUID_PATTERN, "gi"))) ids.add(id[0]);
@@ -742,8 +746,17 @@ function toolActivity(part: ChatPart): ToolActivity {
       }
 
       const command = meaningfulCommand(rawCommand);
+      const shellSegments = shellCommandSegments(command);
+      const executableCode = shellSegments.map((segment) => segment.code).join("\n");
       const readsExperimentStatus = commandInvokesOrx(command, "exp\\s+status");
       const readsExperimentNotes = commandInvokesOrx(command, "exp\\s+desc");
+      const updatesExperimentNotes = orxCommandSegments(command, "exp\\s+desc").some((segment) =>
+        /(?:^|\s)--(?:set(?:=|\s)|stdin\b)/.test(segment.raw),
+      );
+      const notesLabel = updatesExperimentNotes ? "Updated experiment notes" : "Read experiment notes";
+      const combinedLabel = updatesExperimentNotes
+        ? "Checked experiment status and updated notes"
+        : "Reviewed experiment status and notes";
       if (commandInvokesOrx(command, "logs")) {
         const runIds = commandRunIds(command, toolOutput);
         const label = runIds.length === 1 ? "Reviewed run log" : "Reviewed run logs";
@@ -762,14 +775,14 @@ function toolActivity(part: ChatPart): ToolActivity {
       if (readsProject && readsExperimentStatus && readsExperimentNotes) {
         return {
           kind: "project",
-          label: "Reviewed experiment status and notes",
+          label: combinedLabel,
           experimentIds: commandExperimentIds(command, toolOutput),
         };
       }
       if (readsProject && readsExperimentNotes) {
         return {
           kind: "project",
-          label: "Read experiment notes",
+          label: notesLabel,
           experimentIds: commandExperimentIds(command, toolOutput),
         };
       }
@@ -786,7 +799,7 @@ function toolActivity(part: ChatPart): ToolActivity {
       if (readsExperimentStatus && readsExperimentNotes) {
         return {
           kind: "project",
-          label: "Reviewed experiment status and notes",
+          label: combinedLabel,
           experimentIds: commandExperimentIds(command, toolOutput),
         };
       }
@@ -800,7 +813,7 @@ function toolActivity(part: ChatPart): ToolActivity {
       if (readsExperimentNotes) {
         return {
           kind: "project",
-          label: "Read experiment notes",
+          label: notesLabel,
           experimentIds: commandExperimentIds(command, toolOutput),
         };
       }
@@ -808,7 +821,8 @@ function toolActivity(part: ChatPart): ToolActivity {
         return { kind: "project", label: "Listed project runs" };
       }
 
-      const readTarget = commandReadTarget(command);
+      const readSegment = shellSegments.find((segment) => /(?:^|[^\w-])(?:sed|cat|head|tail)\b/.test(segment.code));
+      const readTarget = readSegment ? commandReadTarget(readSegment.raw) : null;
       if (readTarget) {
         return {
           kind: "read",
@@ -818,20 +832,21 @@ function toolActivity(part: ChatPart): ToolActivity {
           labelTarget: baseName(readTarget),
         };
       }
-      if (/\brg\s+--files\b/.test(command) || /\bfind\s+/.test(command) || /^ls(?:\s|$)/.test(command)) {
+      if (/\brg\s+--files\b/.test(executableCode) || /\bfind\s+/.test(executableCode) || /^ls(?:\s|$)/m.test(executableCode)) {
         return { kind: "search", label: "Listed files" };
       }
-      if (/\b(?:rg|grep)\b/.test(command)) {
-        const pattern = commandSearchPattern(command);
+      const searchSegment = shellSegments.find((segment) => /\b(?:rg|grep)\b/.test(segment.code));
+      if (searchSegment) {
+        const pattern = commandSearchPattern(searchSegment.raw);
         return { kind: "search", label: pattern ? `Searched code for “${pattern}”` : "Searched code" };
       }
-      if (/\bgit\s+status\b/.test(command)) return { kind: "command", label: "Checked Git status" };
-      if (/\bgit\s+diff\b/.test(command)) return { kind: "command", label: "Reviewed code changes" };
-      if (/\bgit\s+log\b/.test(command)) return { kind: "command", label: "Read Git history" };
-      if (/\b(?:cargo|pnpm|npm|yarn)\s+(?:run\s+)?test\b/.test(command)) return { kind: "command", label: "Ran tests" };
-      if (/\b(?:typecheck|tsc\b)/.test(command)) return { kind: "command", label: "Checked types" };
-      if (/\blint\b/.test(command)) return { kind: "command", label: "Checked code style" };
-      if (/\b(?:cargo|pnpm|npm|yarn)\s+(?:run\s+)?build\b/.test(command)) return { kind: "command", label: "Built the project" };
+      if (/\bgit\s+status\b/.test(executableCode)) return { kind: "command", label: "Checked Git status" };
+      if (/\bgit\s+diff\b/.test(executableCode)) return { kind: "command", label: "Reviewed code changes" };
+      if (/\bgit\s+log\b/.test(executableCode)) return { kind: "command", label: "Read Git history" };
+      if (/\b(?:cargo|pnpm|npm|yarn)\s+(?:run\s+)?test\b/.test(executableCode)) return { kind: "command", label: "Ran tests" };
+      if (/\b(?:typecheck|tsc\b)/.test(executableCode)) return { kind: "command", label: "Checked types" };
+      if (/\blint\b/.test(executableCode)) return { kind: "command", label: "Checked code style" };
+      if (/\b(?:cargo|pnpm|npm|yarn)\s+(?:run\s+)?build\b/.test(executableCode)) return { kind: "command", label: "Built the project" };
       return { kind: "command", label: `Ran ${command}` };
     }
     case "read": {
@@ -1158,6 +1173,7 @@ function activityInProgress(activity: ToolActivity): ToolActivity {
     [/^Searched /, "Searching "],
     [/^Listed /, "Listing "],
     [/^Edited /, "Editing "],
+    [/^Updated /, "Updating "],
     [/^Created /, "Creating "],
     [/^Deleted /, "Deleting "],
     [/^Ran /, "Running "],
@@ -1884,7 +1900,9 @@ export function SubagentTranscript({
   const parts = spawn.children ?? [];
   const running = spawn.state?.status === "running";
   const errored = spawn.state?.status === "error";
-  const errorMessage = (spawn.state?.error || spawn.state?.output || "").replace(/^Exit code \d+\s*/i, "").trim();
+  const errorMessage = errored
+    ? (spawn.state?.error || spawn.state?.output || "").replace(/^Exit code \d+\s*/i, "").trim()
+    : "";
   const hasRun = useRef(running);
   useEffect(() => {
     if (running) hasRun.current = true;
