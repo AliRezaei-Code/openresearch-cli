@@ -422,6 +422,10 @@ textarea::placeholder {
   margin-inline: auto;
 }
 
+.md[data-streaming="true"] .katex-error {
+  visibility: hidden;
+}
+
 .tool-target {
   text-decoration-color: var(--border-strong);
 }

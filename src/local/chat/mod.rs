@@ -945,17 +945,6 @@ fn image_ext(media_type: &str) -> Option<&'static str> {
     }
 }
 
-pub fn attachment_content_type(name: &str) -> &'static str {
-    match name.rsplit('.').next() {
-        Some("png") => "image/png",
-        Some("jpg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("pdf") => "application/pdf",
-        _ => "application/octet-stream",
-    }
-}
-
 /// Sanitize an original file name into the `<name>.<ext>` form embedded in the
 /// server-minted attachment file name — ASCII alnum / `-` / `_` only (the set
 /// the attachment route allows), canonical extension, no dots in the stem so

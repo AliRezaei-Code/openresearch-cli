@@ -1,6 +1,6 @@
 [package]
 name = "openresearch-cli"
-version = "0.1.98"
+version = "0.1.99"
 edition = "2021"
 description = "OpenResearch CLI (orx) — Rust port"
 repository = "https://github.com/alphaXiv/openresearch-cli"
@@ -46,6 +46,14 @@ sha2 = "0.10"
 # Free-space pre-check for the data-dir move (statvfs). Already in the tree
 # transitively; taken as a direct dep only on unix, where we call it.
 libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS `.app` mode (src/commands/app.rs): an NSApplication + delegate run loop
+# on the main thread so the downloadable app gets a Dock icon and click handling
+# while the dashboard server runs on background threads. macOS-only so the
+# static musl Linux builds are untouched.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

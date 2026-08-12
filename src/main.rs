@@ -871,8 +871,21 @@ pub struct PaperArgs {
     pub full: bool,
 }
 
+// The default multi-thread runtime is load-bearing for macOS app mode: it blocks
+// the main thread in the AppKit run loop while the dashboard server runs on
+// worker threads. A `current_thread` flavor would deadlock. See commands::app.
 #[tokio::main]
 async fn main() {
+    // Double-clicked as the macOS .app? Enter GUI app mode (Dock icon, dashboard
+    // server, browser) instead of parsing CLI args. Also require an empty argv so
+    // the bundled binary stays usable as a CLI (`…/MacOS/OpenResearch up`), since
+    // the bundle itself launches it with no arguments. See commands::app.
+    #[cfg(target_os = "macos")]
+    if commands::app::launched_as_app_bundle() && std::env::args_os().len() == 1 {
+        commands::app::run();
+        return;
+    }
+
     let cli = Cli::parse();
     let Some(command) = cli.command else {
         // Bare `orx`: print the command overview to stdout and exit 0.

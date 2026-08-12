@@ -16,6 +16,7 @@
 //!   return `Err(anyhow!(...))` (clap already enforces required positionals, so
 //!   most of those usage guards are unnecessary in the Rust port).
 
+pub mod app;
 pub mod artifact;
 pub mod artifacts;
 pub mod chart;
@@ -27,6 +28,7 @@ pub mod env;
 pub mod exp;
 pub mod experiments;
 pub mod explore;
+mod file_serve;
 pub mod install_skills;
 pub mod instance;
 pub mod lit;

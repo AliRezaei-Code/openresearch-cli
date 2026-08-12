@@ -1210,7 +1210,9 @@ function subagentLine(input: Record<string, unknown>): string {
 }
 
 function ToolActivityIcon({ activity, className = "" }: { activity: ToolActivity; className?: string }) {
-  if (activity.litCall) return <LitSourceLogo source={activity.litCall.source} size={16} />;
+  if (activity.litCall) {
+    return <LitSourceLogo source={activity.litCall.source} size={16} className={`tool-kind-icon shrink-0 ${className}`} />;
+  }
   const props = { size: 16, strokeWidth: 1.75, className: `tool-kind-icon shrink-0 ${className}` };
   switch (activity.kind) {
     case "read":
@@ -2050,6 +2052,7 @@ const Message = memo(function Message({
   onOpenPlan,
   onOpenSubagent,
   skills,
+  predictTextTail = false,
 }: {
   message: ChatMessage;
   pendingTailToolId?: string | null;
@@ -2065,6 +2068,7 @@ const Message = memo(function Message({
   onOpenSubagent?: (spawnPartId: string) => void;
   /** Known slash-skills, for rendering a leading `/name` as a command chip. */
   skills?: SkillInfo[];
+  predictTextTail?: boolean;
 }) {
   if (message.role === "user") {
     const text = message.parts
@@ -2125,6 +2129,7 @@ const Message = memo(function Message({
         onRespond,
         onOpenPlan,
         onOpenSubagent,
+        predictTextTail,
       })}
     </div>
   );
@@ -2147,6 +2152,7 @@ function renderParts(
     onRespond?: (answer: PromptAnswer) => void;
     onOpenPlan?: (plan: string, promptId: string) => void;
     onOpenSubagent?: (spawnPartId: string) => void;
+    predictTextTail?: boolean;
   },
 ): React.ReactNode[] {
   const {
@@ -2159,7 +2165,9 @@ function renderParts(
     onRespond,
     onOpenPlan,
     onOpenSubagent,
+    predictTextTail = false,
   } = opts;
+  const visibleTail = parts.filter(partIsVisible).at(-1);
   const rendered: React.ReactNode[] = [];
   let toolRun: ChatPart[] = [];
   const flushTools = () => {
@@ -2210,7 +2218,13 @@ function renderParts(
     // non-empty.
     if (part.type === "text")
       rendered.push(
-        <Md key={part.id} text={part.text!} onOpenFile={onOpenFile} onOpenRun={onOpenRun} />,
+        <Md
+          key={part.id}
+          text={part.text!}
+          onOpenFile={onOpenFile}
+          onOpenRun={onOpenRun}
+          predict={predictTextTail && part.id === visibleTail?.id}
+        />,
       );
     else if (part.type === "reasoning")
       rendered.push(
@@ -2280,6 +2294,7 @@ export function SubagentTranscript({
     onOpenExperiment,
     experimentName,
     onOpenSubagent,
+    predictTextTail: running,
   });
   const spawnActivity = running ? activityInProgress(toolActivity(spawn)) : toolActivity(spawn);
   return (
@@ -2462,6 +2477,8 @@ const Transcript = memo(function Transcript({
   onOpenSubagent?: (spawnPartId: string) => void;
   skills?: SkillInfo[];
 }) {
+  const visibleMessages = messages.filter(messageHasVisibleContent);
+  const activeMessage = visibleMessages.at(-1);
   const activityAnnouncement = useToolActivityAnnouncement(messages);
   const pendingTailTool = busy ? streamTailTool(messages) : null;
   return (
@@ -2469,7 +2486,7 @@ const Transcript = memo(function Transcript({
       <span className="sr-only" role="status" aria-live="polite">
         <span key={activityAnnouncement.sequence}>{activityAnnouncement.text}</span>
       </span>
-      {messages.filter(messageHasVisibleContent).map((m) => (
+      {visibleMessages.map((m) => (
         <Message
           key={m.id}
           message={m}
@@ -2483,6 +2500,7 @@ const Transcript = memo(function Transcript({
           onOpenPlan={onOpenPlan}
           onOpenSubagent={onOpenSubagent}
           skills={skills}
+          predictTextTail={busy && m === activeMessage && m.role === "assistant"}
         />
       ))}
     </>
