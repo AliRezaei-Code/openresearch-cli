@@ -425,6 +425,20 @@ textarea::placeholder {
   }
 }
 
+@media (forced-colors: active) {
+  .tool-running-shimmer {
+    color: CanvasText;
+    background: none;
+    -webkit-text-fill-color: currentColor;
+    animation: none;
+  }
+
+  .tool-running-shimmer-icon {
+    color: CanvasText;
+    animation: none;
+  }
+}
+
 @keyframes spin {
   to {
     transform: rotate(360deg);

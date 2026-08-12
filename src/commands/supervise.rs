@@ -919,7 +919,7 @@ async fn cancel_ssh(target: &ssh::SshTarget, dir: &str, run_id: &str, cancel_sen
 // comes from the platform, so the supervisor first waits for it to come online
 // (recording the SSH endpoint on the descriptor for restarts), launches the
 // payload over ssh, runs the shared watch loop, and deletes the box at the
-// end. EVERY exit path tears the box down — a leaked box bills the org.
+// end. Provisioning cleanup stays API-owned; post-readiness exits tear down here.
 
 async fn run_openresearch(
     store: Store,
@@ -972,6 +972,13 @@ async fn run_openresearch(
                     eprintln!("supervise {run_id}: cancelled during provisioning");
                     store.update_status(&run_id, "cancelled", Some(now_ms()), None)?;
                     teardown_box(&store, &lifecycle, &sandbox_id, &run_id).await;
+                    return Ok(());
+                }
+                Ok(openresearch::WaitOutcome::Failed(reason))
+                | Ok(openresearch::WaitOutcome::TimedOut(reason)) => {
+                    store.update_status(&run_id, "failed", Some(now_ms()), None)?;
+                    store
+                        .set_result_markdown(&run_id, &format!("Provisioning failed: {reason}"))?;
                     return Ok(());
                 }
                 Err(err) => {

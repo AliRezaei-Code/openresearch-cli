@@ -1073,9 +1073,12 @@ fn item_to_part(item: &Value, completed: bool, prior: &[WirePart]) -> Option<Wir
                         .and_then(|p| p.state.as_ref())
                         .and_then(|s| s.output.clone())
                 });
-            let input = serde_json::json!({
+            let mut input = serde_json::json!({
                 "command": item.get("command").map(command_string).unwrap_or_default(),
             });
+            if let Some(cwd) = item.get("cwd").and_then(Value::as_str) {
+                input["cwd"] = Value::String(cwd.to_string());
+            }
             Some(tool_part(
                 id,
                 "bash",
@@ -2664,6 +2667,7 @@ fn handle_item(ctx: &mut TurnCtx, item: &Value, next_id: &mut impl FnMut(&str) -
                     status: if failed { "error" } else { "completed" }.into(),
                     input: Some(serde_json::json!({
                         "command": item.get("command").map(command_string).unwrap_or_default(),
+                        "cwd": item.get("cwd").and_then(Value::as_str),
                     })),
                     output: item
                         .get("aggregated_output")
@@ -2847,6 +2851,7 @@ requires_openai_auth = false
             state.input.as_ref().unwrap()["command"],
             "/bin/zsh -lc 'touch /outside/probe.txt'"
         );
+        assert_eq!(state.input.as_ref().unwrap()["cwd"], "/ws");
         // Agent message: the completed item's full text wins over the deltas.
         assert_eq!(parts[2].kind, "text");
         assert_eq!(

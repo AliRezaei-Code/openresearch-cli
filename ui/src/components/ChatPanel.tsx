@@ -5,6 +5,7 @@ import {
   ChartSpline,
   Check,
   ChevronRight,
+  Clock,
   CornerDownLeft,
   FileText,
   FlaskConical,
@@ -37,6 +38,7 @@ import {
 } from "react";
 import { BrandMark } from "./Wordmark";
 import {
+  cancelQueuedMessage,
   chatAttachmentUrl,
   createChatSession,
   deleteChatSession,
@@ -61,6 +63,7 @@ import {
   type ChatSession,
   type Harness,
   type PromptAnswer,
+  type QueuedMessage,
   type SkillInfo,
 } from "../api";
 import { onChatEvent } from "../events";
@@ -142,11 +145,19 @@ const PROMPT_ACTIONS_CLASS_NAME = [
 interface ChatState {
   messagesBySession: Record<string, ChatMessage[]>;
   busySessions: Set<string>;
+  // Messages parked behind a running turn, per session, oldest first.
+  queuedBySession: Record<string, QueuedMessage[]>;
 }
 
 type Action =
   | { type: "reset" }
-  | { type: "seed"; sessionId: string; messages: ChatMessage[]; onlyIfAbsent?: boolean }
+  | {
+      type: "seed";
+      sessionId: string;
+      messages: ChatMessage[];
+      queued?: QueuedMessage[];
+      onlyIfAbsent?: boolean;
+    }
   | { type: "upsertMessage"; sessionId: string; message: ChatMessage }
   | {
       type: "optimisticUser";
@@ -158,6 +169,7 @@ type Action =
   // `known` scopes the reseed: flags for sessions outside it (other projects —
   // busy events aren't project-filtered) are carried forward, not wiped.
   | { type: "seedBusy"; sessions: string[]; known: string[] }
+  | { type: "setQueued"; sessionId: string; items: QueuedMessage[] }
   | { type: "forget"; sessionId: string };
 
 const LOCAL_PREFIX = "local-";
@@ -178,7 +190,7 @@ function upsertMessage(list: ChatMessage[], message: ChatMessage): ChatMessage[]
 function reducer(state: ChatState, action: Action): ChatState {
   switch (action.type) {
     case "reset":
-      return { messagesBySession: {}, busySessions: new Set() };
+      return { messagesBySession: {}, busySessions: new Set(), queuedBySession: {} };
     case "seed":
       // onlyIfAbsent: recover a failed fetch without clobbering messages that
       // streamed in via SSE during it (a `message` event already created the key).
@@ -186,6 +198,12 @@ function reducer(state: ChatState, action: Action): ChatState {
       return {
         ...state,
         messagesBySession: { ...state.messagesBySession, [action.sessionId]: action.messages },
+        // A seed is the authoritative snapshot, so it also (re)sets the parked
+        // queue — recovering it after a reload or an SSE gap.
+        queuedBySession: {
+          ...state.queuedBySession,
+          [action.sessionId]: action.queued ?? [],
+        },
       };
     case "upsertMessage": {
       const list = state.messagesBySession[action.sessionId] ?? [];
@@ -229,6 +247,12 @@ function reducer(state: ChatState, action: Action): ChatState {
       for (const id of state.busySessions) if (!known.has(id)) busySessions.add(id);
       return { ...state, busySessions };
     }
+    case "setQueued": {
+      return {
+        ...state,
+        queuedBySession: { ...state.queuedBySession, [action.sessionId]: action.items },
+      };
+    }
     case "forget": {
       // Deleted session: drop its transcript and busy flag so a same-id event
       // arriving late can't render stale state.
@@ -236,19 +260,14 @@ function reducer(state: ChatState, action: Action): ChatState {
       delete messagesBySession[action.sessionId];
       const busySessions = new Set(state.busySessions);
       busySessions.delete(action.sessionId);
-      return { messagesBySession, busySessions };
+      const queuedBySession = { ...state.queuedBySession };
+      delete queuedBySession[action.sessionId];
+      return { messagesBySession, busySessions, queuedBySession };
     }
   }
 }
 
 // --- rendering ---------------------------------------------------------------
-
-function toolStatusClass(status: string | undefined): string {
-  const base = "tool-status w-1.5 h-1.5 rounded-full shrink-0";
-  if (status === "error") return `${base} error bg-accent-red`;
-  if (status === "completed") return `${base} bg-muted`;
-  return `${base} running bg-accent-amber animate-[or-pulse_1.2s_ease-in-out_infinite]`;
-}
 
 function relTime(ts: number | undefined): string {
   if (!ts) return "";
@@ -288,6 +307,22 @@ function inputString(input: Record<string, unknown>, ...keys: string[]): string 
   return null;
 }
 
+function arrayInputString(input: Record<string, unknown>, key: string, field: string): string | null {
+  const values = input[key];
+  if (!Array.isArray(values)) return null;
+  for (const value of values) {
+    if (!value || typeof value !== "object" || !(field in value)) continue;
+    const candidate = value[field];
+    if (typeof candidate === "string" && candidate) return candidate;
+  }
+  return null;
+}
+
+function inputStringArray(input: Record<string, unknown>, key: string): string[] {
+  const values = input[key];
+  return Array.isArray(values) ? values.filter((value): value is string => typeof value === "string") : [];
+}
+
 function editChange(input: Record<string, unknown>): { path: string; type: string | null } | null {
   const changes = input.changes;
   if (!Array.isArray(changes)) return null;
@@ -314,41 +349,62 @@ function meaningfulCommand(command: string): string {
   if ((first === "\"" || first === "'") && body[body.length - 1] === first) {
     body = body.slice(1, -1);
   }
-  return body.replace(/\s+/g, " ").trim();
+  return stripHeredocBodies(body).replace(/[\t\r ]+/g, " ").trim();
 }
 
-function shellCommandSegment(command: string, start: number): string {
-  let segment = "";
+function heredocMarker(line: string): { delimiter: string; stripTabs: boolean } | null {
   let quote: "\"" | "'" | null = null;
   let escaped = false;
-  for (let i = start; i < command.length; i++) {
-    const char = command[i];
+  for (let index = 0; index < line.length - 1; index++) {
+    const char = line[index];
     if (escaped) {
-      segment += char;
       escaped = false;
       continue;
     }
     if (char === "\\" && quote !== "'") {
-      segment += char;
       escaped = true;
       continue;
     }
     if (quote) {
-      segment += char;
       if (char === quote) quote = null;
       continue;
     }
     if (char === "\"" || char === "'") {
       quote = char;
-      segment += char;
       continue;
     }
-    if (char === ";" || char === "|" || char === "&" || char === "<" || char === ">") {
-      return segment.replace(/\s+\d+$/, "").trim();
+    if (char !== "<" || line[index + 1] !== "<" || line[index + 2] === "<") continue;
+    index += 2;
+    const stripTabs = line[index] === "-";
+    if (stripTabs) index++;
+    while (/\s/.test(line[index] ?? "")) index++;
+    const delimiterQuote = line[index] === "\"" || line[index] === "'" ? line[index++] : null;
+    let delimiter = "";
+    while (index < line.length) {
+      const current = line[index];
+      if (delimiterQuote ? current === delimiterQuote : /\s|[;|&]/.test(current)) break;
+      delimiter += current;
+      index++;
     }
-    segment += char;
+    if (delimiter) return { delimiter, stripTabs };
   }
-  return segment.trim();
+  return null;
+}
+
+function stripHeredocBodies(command: string): string {
+  const lines = command.split("\n");
+  const kept: string[] = [];
+  let marker: { delimiter: string; stripTabs: boolean } | null = null;
+  for (const line of lines) {
+    if (marker) {
+      const candidate = marker.stripTabs ? line.replace(/^\t+/, "") : line;
+      if (candidate.trimEnd() === marker.delimiter) marker = null;
+      continue;
+    }
+    kept.push(line);
+    marker = heredocMarker(line);
+  }
+  return kept.join("\n");
 }
 
 function shellWords(input: string): string[] {
@@ -392,11 +448,31 @@ function validReadTarget(value: string | undefined): string | null {
   return value;
 }
 
-function commandReadTarget(command: string): string | null {
-  const reader = /(?:^|[^\w-])(sed|cat|head|tail)\b/.exec(command);
-  if (!reader || reader.index === undefined) return null;
-  const args = shellWords(shellCommandSegment(command, reader.index + reader[0].length));
-  const name = reader[1];
+interface ShellInvocation {
+  name: string;
+  args: string[];
+}
+
+function shellInvocation(command: string): ShellInvocation | null {
+  const words = shellWords(command);
+  let index = 0;
+  while (["do", "then", "else", "if", "while", "until"].includes(words[index])) index++;
+  while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index] ?? "")) index++;
+  if (words[index] === "command") {
+    index++;
+    while (words[index]?.startsWith("-")) index++;
+  }
+  if (words[index] === "env") {
+    index++;
+    while (words[index]?.startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index] ?? "")) index++;
+  }
+  const executable = words[index];
+  if (!executable) return null;
+  return { name: executable.split("/").pop() ?? executable, args: words.slice(index + 1) };
+}
+
+function commandReadTarget(invocation: ShellInvocation): string | null {
+  const { name, args } = invocation;
 
   if (name === "sed") {
     let index = 0;
@@ -434,39 +510,298 @@ function commandSearchPattern(command: string): string | null {
   return search?.[1] ?? search?.[2] ?? search?.[3] ?? null;
 }
 
-function commandRunIds(command: string): string[] {
-  if (!/\borx\s+logs\b/.test(command)) return [];
-  const uuid = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+function resolvePosixPath(base: string, target: string): string | null {
+  if (/[$`~]/.test(base) || /[$`~]/.test(target)) return null;
+  const absolute = target.startsWith("/") || (!target.startsWith("/") && base.startsWith("/"));
+  const parts = target.startsWith("/") ? [] : base.split("/").filter(Boolean);
+  for (const part of target.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (parts.length > 0 && parts[parts.length - 1] !== "..") parts.pop();
+      else if (!absolute) parts.push(part);
+      continue;
+    }
+    parts.push(part);
+  }
+  const resolved = `${absolute ? "/" : ""}${parts.join("/")}`;
+  return resolved || (absolute ? "/" : null);
+}
+
+function commandFilePath(
+  target: string,
+  segments: ShellCommandSegment[],
+  segmentIndex: number,
+  declaredWorkdir: string | null,
+): string | null {
+  if (target.startsWith("/")) return target;
+  let directory = declaredWorkdir ?? "";
+  for (let index = 0; index < segmentIndex; index++) {
+    const invocation = shellInvocation(segments[index].raw);
+    if (invocation?.name !== "cd") continue;
+    const next = invocation.args.find((arg) => !arg.startsWith("-"));
+    if (!next) return null;
+    const resolved = resolvePosixPath(directory, next);
+    if (!resolved) return null;
+    directory = resolved;
+  }
+  return directory ? resolvePosixPath(directory, target) : target;
+}
+
+const UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const RUN_TARGET_PATTERN = `(?:${UUID_PATTERN}|[0-9a-f]{8})`;
+
+interface ShellCommandSegment {
+  raw: string;
+  code: string;
+}
+
+function shellCommandSegments(command: string): ShellCommandSegment[] {
+  const segments: ShellCommandSegment[] = [];
+  let raw = "";
+  let code = "";
+  let quote: "\"" | "'" | null = null;
+  let escaped = false;
+  const push = () => {
+    if (raw.trim() || code.trim()) segments.push({ raw: raw.trim(), code: code.trim() });
+    raw = "";
+    code = "";
+  };
+  const scanSubstitution = (start: number): number => {
+    let depth = 1;
+    let nestedQuote: "\"" | "'" | null = null;
+    let nestedEscaped = false;
+    for (let index = start; index < command.length; index++) {
+      const char = command[index];
+      if (nestedEscaped) {
+        nestedEscaped = false;
+        continue;
+      }
+      if (char === "\\" && nestedQuote !== "'") {
+        nestedEscaped = true;
+        continue;
+      }
+      if (nestedQuote) {
+        if (char === nestedQuote) nestedQuote = null;
+        continue;
+      }
+      if (char === "\"" || char === "'") {
+        nestedQuote = char;
+        continue;
+      }
+      if (char === "(") depth++;
+      if (char === ")" && --depth === 0) return index;
+    }
+    return command.length - 1;
+  };
+  const scanBackticks = (start: number): number => {
+    let nestedEscaped = false;
+    for (let index = start; index < command.length; index++) {
+      const char = command[index];
+      if (nestedEscaped) {
+        nestedEscaped = false;
+        continue;
+      }
+      if (char === "\\") {
+        nestedEscaped = true;
+        continue;
+      }
+      if (char === "`") return index;
+    }
+    return command.length - 1;
+  };
+
+  for (let index = 0; index < command.length; index++) {
+    const char = command[index];
+    if (escaped) {
+      raw += char;
+      if (!quote) code += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\" && quote !== "'") {
+      raw += char;
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (quote === "\"" && char === "$" && command[index + 1] === "(") {
+        const end = scanSubstitution(index + 2);
+        segments.push(...shellCommandSegments(command.slice(index + 2, end)));
+        raw += command.slice(index, end + 1);
+        index = end;
+        continue;
+      }
+      if (quote === "\"" && char === "`") {
+        const end = scanBackticks(index + 1);
+        segments.push(...shellCommandSegments(command.slice(index + 1, end)));
+        raw += command.slice(index, end + 1);
+        index = end;
+        continue;
+      }
+      raw += char;
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      raw += char;
+      quote = char;
+      continue;
+    }
+    if (char === "`") {
+      const end = scanBackticks(index + 1);
+      segments.push(...shellCommandSegments(command.slice(index + 1, end)));
+      raw += command.slice(index, end + 1);
+      index = end;
+      continue;
+    }
+    if (char === ";" || char === "|" || char === "&" || char === "(" || char === ")" || char === "\n") {
+      push();
+      continue;
+    }
+    raw += char;
+    code += char;
+  }
+  push();
+  return segments;
+}
+
+function orxCommandSegments(command: string, args: string): ShellCommandSegment[] {
+  const invocation = new RegExp(`(?:^|\\b(?:do|then|else|if|while|until)\\s+)(?:[A-Za-z_][A-Za-z0-9_]*=[^\\s]+\\s+)*orx\\s+${args}\\b`, "i");
+  return shellCommandSegments(command).filter((segment) => invocation.test(segment.code));
+}
+
+function commandInvokesOrx(command: string, args: string): boolean {
+  return orxCommandSegments(command, args).length > 0;
+}
+
+function idsFromToolOutput(output: string | undefined, resource: "runs" | "experiments"): string[] {
+  if (!output) return [];
   const ids = new Set<string>();
-  for (const match of command.matchAll(new RegExp(`\\borx\\s+logs\\s+["']?(${uuid})`, "gi"))) {
-    ids.add(match[1]);
+  const patterns = resource === "runs"
+    ? [
+        new RegExp(`/runs/(${UUID_PATTERN})`, "gi"),
+        new RegExp(`\\brun(?:_|\\s+)id:\\s*(${UUID_PATTERN})`, "gi"),
+        new RegExp(`={3,}\\s*(${UUID_PATTERN})\\s*={3,}`, "gi"),
+      ]
+    : [
+        new RegExp(`/experiments/(${UUID_PATTERN})`, "gi"),
+        new RegExp(`^\\s*id:\\s*(${UUID_PATTERN})`, "gim"),
+        new RegExp(`={3,}\\s*(${UUID_PATTERN})\\s*={3,}`, "gi"),
+      ];
+  for (const pattern of patterns) {
+    for (const match of output.matchAll(pattern)) ids.add(match[1]);
   }
-  for (const match of command.matchAll(/\borx\s+logs\s+["']?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g)) {
-    const variable = match[1];
-    const assignment = command.match(
-      new RegExp(`(?:^|[\\s;])(?:export\\s+)?${variable}\\s*=\\s*["']?(${uuid})`, "i"),
-    );
-    if (assignment) ids.add(assignment[1]);
-    const loop = command.match(new RegExp(`\\bfor\\s+${variable}\\s+in\\s+([^;]+);\\s*do`, "i"));
-    if (!loop) continue;
-    for (const id of loop[1].matchAll(new RegExp(uuid, "gi"))) ids.add(id[0]);
-  }
+  const bareIdLine = new RegExp(`^\\s*(${UUID_PATTERN})\\s*$`, "gim");
+  for (const match of output.matchAll(bareIdLine)) ids.add(match[1]);
   return [...ids];
 }
 
-function commandExperimentIds(command: string): string[] {
-  if (!/\borx\s+exp\s+desc\b/.test(command)) return [];
-  const uuid = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+function invocationOffsets(command: string, invocations: ShellCommandSegment[]): Array<{ invocation: ShellCommandSegment; offset: number }> {
+  let cursor = 0;
+  return invocations.map((invocation) => {
+    const next = command.indexOf(invocation.raw, cursor);
+    const offset = next === -1 ? command.indexOf(invocation.raw) : next;
+    cursor = Math.max(cursor, offset + invocation.raw.length);
+    return { invocation, offset: Math.max(0, offset) };
+  });
+}
+
+function assignedIdsBefore(command: string, variable: string, before: number, idPattern: string): string[] {
+  const assignment = new RegExp(
+    `(?:^|[\\s;])(?:export\\s+)?${variable}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s;]+))`,
+    "gi",
+  );
+  let resolved = "";
+  for (const match of command.matchAll(assignment)) {
+    if ((match.index ?? 0) >= before) break;
+    resolved = match[1] ?? match[2] ?? match[3] ?? "";
+  }
+  return [...resolved.matchAll(new RegExp(idPattern, "gi"))].map((match) => match[0]);
+}
+
+function loopIdsBefore(command: string, variable: string, before: number, idPattern: string): string[] {
+  const loop = new RegExp(`\\bfor\\s+${variable}\\s+in\\s+([\\s\\S]*?)(?:;|\\n)\\s*do\\b`, "gi");
+  let values = "";
+  for (const match of command.matchAll(loop)) {
+    if ((match.index ?? 0) + match[0].length > before) break;
+    values = match[1];
+  }
+  return [...values.matchAll(new RegExp(idPattern, "gi"))].map((match) => match[0]);
+}
+
+function commandRunIds(command: string, output?: string, preservedIds: string[] = []): string[] {
+  const invocations = orxCommandSegments(command, "logs");
+  if (invocations.length === 0) return [];
   const ids = new Set<string>();
-  for (const match of command.matchAll(new RegExp(`\\borx\\s+exp\\s+desc\\s+["']?(${uuid})`, "gi"))) {
-    ids.add(match[1]);
+  let hasUnresolvedTarget = false;
+  for (const { invocation, offset } of invocationOffsets(command, invocations)) {
+    const logs = /\borx\s+logs\b/i.exec(invocation.raw);
+    if (!logs) continue;
+    const words = shellWords(invocation.raw.slice(logs.index + logs[0].length));
+    let target: string | null = null;
+    for (let index = 0; index < words.length; index++) {
+      const word = words[index];
+      if (word === "--head") continue;
+      if (word === "--bytes" || word === "--range") {
+        index++;
+        continue;
+      }
+      if (word.startsWith("--bytes=") || word.startsWith("--range=")) continue;
+      target = word;
+      break;
+    }
+    if (!target) {
+      hasUnresolvedTarget = true;
+      continue;
+    }
+    if (new RegExp(`^${RUN_TARGET_PATTERN}$`, "i").test(target)) {
+      ids.add(target);
+      continue;
+    }
+    const variableMatch = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(target);
+    if (!variableMatch) {
+      hasUnresolvedTarget = true;
+      continue;
+    }
+    const variable = variableMatch[1];
+    const assignmentIds = assignedIdsBefore(command, variable, offset, RUN_TARGET_PATTERN);
+    for (const id of assignmentIds) ids.add(id);
+    const loopIds = loopIdsBefore(command, variable, offset, RUN_TARGET_PATTERN);
+    for (const id of loopIds) ids.add(id);
+    if (assignmentIds.length === 0 && loopIds.length === 0) hasUnresolvedTarget = true;
   }
-  for (const match of command.matchAll(/\borx\s+exp\s+desc\s+["']?\$([A-Za-z_][A-Za-z0-9_]*)/g)) {
-    const variable = match[1];
-    const loop = command.match(new RegExp(`\\bfor\\s+${variable}\\s+in\\s+([^;]+);\\s*do`, "i"));
-    if (!loop) continue;
-    for (const id of loop[1].matchAll(new RegExp(uuid, "gi"))) ids.add(id[0]);
+  if (ids.size === 0 || hasUnresolvedTarget) idsFromToolOutput(output, "runs").forEach((id) => ids.add(id));
+  preservedIds.forEach((id) => ids.add(id));
+  return [...ids];
+}
+
+function commandExperimentIds(command: string, output?: string, preservedIds: string[] = []): string[] {
+  const invocations = orxCommandSegments(command, "exp\\s+(?:status|desc)");
+  if (invocations.length === 0) return [];
+  const ids = new Set<string>();
+  let hasUnresolvedTarget = false;
+  for (const { invocation, offset } of invocationOffsets(command, invocations)) {
+    let resolved = false;
+    for (const match of invocation.raw.matchAll(new RegExp(`\\borx\\s+exp\\s+(?:status|desc)\\s+["']?(${UUID_PATTERN})`, "gi"))) {
+      ids.add(match[1]);
+      resolved = true;
+    }
+    const match = /\borx\s+exp\s+(?:status|desc)\s+["']?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/.exec(invocation.raw);
+    if (match) {
+      const variable = match[1];
+      const assignmentIds = assignedIdsBefore(command, variable, offset, UUID_PATTERN);
+      if (assignmentIds.length > 0) {
+        for (const id of assignmentIds) ids.add(id);
+        resolved = true;
+      }
+      const loopIds = loopIdsBefore(command, variable, offset, UUID_PATTERN);
+      for (const id of loopIds) ids.add(id);
+      if (loopIds.length > 0) resolved = true;
+    }
+    if (!resolved) hasUnresolvedTarget = true;
   }
+  if (ids.size === 0 || hasUnresolvedTarget) idsFromToolOutput(output, "experiments").forEach((id) => ids.add(id));
+  preservedIds.forEach((id) => ids.add(id));
   return [...ids];
 }
 
@@ -476,13 +811,49 @@ function commandExperimentIds(command: string): string[] {
 function toolActivity(part: ChatPart): ToolActivity {
   const tool = part.tool ?? "tool";
   const input = part.state?.input ?? {};
-  const rawCommand = inputString(input, "command");
-  const filePath = inputString(input, "filePath", "file_path");
-  const description = inputString(input, "description");
-  switch (tool.toLowerCase()) {
+  const argumentsValue = input.arguments;
+  const argumentsInput = argumentsValue && typeof argumentsValue === "object" && !Array.isArray(argumentsValue)
+    ? Object.fromEntries(Object.entries(argumentsValue))
+    : {};
+  const normalizedInput = { ...input, ...argumentsInput };
+  const rawCommand = inputString(normalizedInput, "command", "cmd");
+  const toolOutput = part.state?.output || part.state?.error;
+  const preservedIds = inputStringArray(normalizedInput, "targetIds");
+  const filePath = inputString(normalizedInput, "filePath", "file_path", "notebookPath", "notebook_path", "path");
+  const description = inputString(normalizedInput, "description");
+  const toolSegments = tool.toLowerCase().split(/(?::|\.|__)+/);
+  const baseTool = toolSegments.at(-1) ?? tool.toLowerCase();
+  if (baseTool === "run" && toolSegments.includes("web")) {
+    const query = arrayInputString(normalizedInput, "search_query", "q");
+    const imageQuery = arrayInputString(normalizedInput, "image_query", "q");
+    const pattern = arrayInputString(normalizedInput, "find", "pattern");
+    if (query) return { kind: "web", label: `Searched the web for “${query}”` };
+    if (imageQuery) return { kind: "web", label: `Searched images for “${imageQuery}”` };
+    if (pattern) return { kind: "web", label: `Searched a web page for “${pattern}”` };
+    if (Array.isArray(normalizedInput.open)) return { kind: "web", label: "Opened web pages" };
+    if (Array.isArray(normalizedInput.weather)) return { kind: "web", label: "Checked the weather" };
+    if (Array.isArray(normalizedInput.finance)) return { kind: "web", label: "Checked market data" };
+    if (Array.isArray(normalizedInput.sports)) return { kind: "web", label: "Checked sports data" };
+    if (Array.isArray(normalizedInput.time)) return { kind: "web", label: "Checked local times" };
+    return { kind: "web", label: "Browsed the web" };
+  }
+  const normalizedTool = new Map([
+    ["read_file", "read"],
+    ["write_file", "write"],
+    ["edit_file", "edit"],
+    ["exec", "bash"],
+    ["exec_command", "bash"],
+    ["run_command", "bash"],
+    ["agent", "task"],
+    ["collabagenttoolcall", "subagent"],
+    ["subagentactivity", "subagent"],
+  ]).get(baseTool) ?? baseTool;
+  switch (normalizedTool) {
     case "bash": {
       if (!rawCommand) return { kind: "command", label: "Ran a command" };
-      const litCall = parseOrxLit(rawCommand);
+      const command = meaningfulCommand(rawCommand);
+      const litSegment = orxCommandSegments(command, "(?:lit|paper)")[0];
+      const litCall = litSegment ? parseOrxLit(litSegment.raw) : null;
       if (litCall) {
         const label = litCall.kind === "lit"
           ? litCall.query ? `Searched for “${litCall.query}”` : "Searched the literature"
@@ -490,84 +861,143 @@ function toolActivity(part: ChatPart): ToolActivity {
         return { kind: litCall.kind === "lit" ? "search" : "read", label, litCall };
       }
 
-      const command = meaningfulCommand(rawCommand);
-      if (/\borx\s+logs\b/.test(command)) {
-        const runIds = commandRunIds(command);
+      const shellSegments = shellCommandSegments(command);
+      const shellInvocations = shellSegments.map((segment) => shellInvocation(segment.raw));
+      const readsExperimentStatus = commandInvokesOrx(command, "exp\\s+status");
+      const readsExperimentNotes = commandInvokesOrx(command, "exp\\s+desc");
+      const updatesExperimentNotes = orxCommandSegments(command, "exp\\s+desc").some((segment) =>
+        /(?:^|\s)--(?:set(?:=|\s)|stdin\b)/.test(segment.raw),
+      );
+      const notesLabel = updatesExperimentNotes ? "Updated experiment notes" : "Read experiment notes";
+      const combinedLabel = updatesExperimentNotes
+        ? "Checked experiment status and updated notes"
+        : "Reviewed experiment status and notes";
+      if (commandInvokesOrx(command, "logs")) {
+        const runIds = commandRunIds(command, toolOutput, preservedIds);
         const label = runIds.length === 1 ? "Reviewed run log" : "Reviewed run logs";
         return { kind: "project", label, runIds };
       }
-      if (/\borx\s+exp\s+run\b/.test(command)) {
+      if (commandInvokesOrx(command, "exp\\s+run")) {
         return { kind: "project", label: "Started an experiment run" };
       }
-      if (/\borx\s+exp\s+wait\b/.test(command)) {
+      if (commandInvokesOrx(command, "exp\\s+wait")) {
         return { kind: "project", label: "Waited for an experiment run" };
       }
-      if (/\borx\s+exp\s+cancel\b/.test(command)) {
+      if (commandInvokesOrx(command, "exp\\s+cancel")) {
         return { kind: "project", label: "Cancelled an experiment run" };
       }
-      if (/\borx\s+project\s+view\b/.test(command) && /\borx\s+exp\s+(?:status|desc)\b/.test(command)) {
-        return { kind: "project", label: "Reviewed the project's experiments" };
+      const readsProject = commandInvokesOrx(command, "project\\s+view");
+      if (readsProject && readsExperimentStatus && readsExperimentNotes) {
+        return {
+          kind: "project",
+          label: combinedLabel,
+          experimentIds: commandExperimentIds(command, toolOutput, preservedIds),
+        };
       }
-      if (/\borx\s+project\s+view\b/.test(command)) {
+      if (readsProject && readsExperimentNotes) {
+        return {
+          kind: "project",
+          label: notesLabel,
+          experimentIds: commandExperimentIds(command, toolOutput, preservedIds),
+        };
+      }
+      if (readsProject && readsExperimentStatus) {
+        return {
+          kind: "project",
+          label: "Checked experiment status",
+          experimentIds: commandExperimentIds(command, toolOutput, preservedIds),
+        };
+      }
+      if (readsProject) {
         return { kind: "project", label: "Read project details" };
       }
-      if (/\borx\s+exp\s+status\b/.test(command) && /\borx\s+exp\s+desc\b/.test(command)) {
+      if (readsExperimentStatus && readsExperimentNotes) {
         return {
           kind: "project",
-          label: "Reviewed experiment status and notes",
-          experimentIds: commandExperimentIds(command),
+          label: combinedLabel,
+          experimentIds: commandExperimentIds(command, toolOutput, preservedIds),
         };
       }
-      if (/\borx\s+exp\s+status\b/.test(command)) {
-        return { kind: "project", label: "Checked experiment status" };
-      }
-      if (/\borx\s+exp\s+desc\b/.test(command)) {
+      if (readsExperimentStatus) {
         return {
           kind: "project",
-          label: "Read experiment notes",
-          experimentIds: commandExperimentIds(command),
+          label: "Checked experiment status",
+          experimentIds: commandExperimentIds(command, toolOutput, preservedIds),
         };
       }
-      if (/\borx\s+runs?\b/.test(command)) {
+      if (readsExperimentNotes) {
+        return {
+          kind: "project",
+          label: notesLabel,
+          experimentIds: commandExperimentIds(command, toolOutput, preservedIds),
+        };
+      }
+      if (commandInvokesOrx(command, "runs?")) {
         return { kind: "project", label: "Listed project runs" };
       }
 
-      const readTarget = commandReadTarget(command);
-      if (readTarget) {
+      const readSegmentIndex = shellInvocations.findIndex((invocation) =>
+        invocation != null && ["sed", "cat", "head", "tail"].includes(invocation.name),
+      );
+      const readInvocation = readSegmentIndex >= 0 ? shellInvocations[readSegmentIndex] : null;
+      const readTarget = readInvocation ? commandReadTarget(readInvocation) : null;
+      const readPath = readTarget
+        ? commandFilePath(
+            readTarget,
+            shellSegments,
+            readSegmentIndex,
+            inputString(normalizedInput, "cwd", "workdir"),
+          )
+        : null;
+      if (readTarget && readPath) {
         return {
           kind: "read",
           label: `Read ${baseName(readTarget)}`,
-          filePath: readTarget,
+          filePath: readPath,
           labelPrefix: "Read ",
           labelTarget: baseName(readTarget),
         };
       }
-      if (/\brg\s+--files\b/.test(command) || /\bfind\s+/.test(command) || /^ls(?:\s|$)/.test(command)) {
+      if (shellInvocations.some((invocation) =>
+        invocation?.name === "find"
+        || invocation?.name === "ls"
+        || (invocation?.name === "rg" && invocation.args.includes("--files")),
+      )) {
         return { kind: "search", label: "Listed files" };
       }
-      if (/\b(?:rg|grep)\b/.test(command)) {
-        const pattern = commandSearchPattern(command);
+      const searchSegmentIndex = shellInvocations.findIndex((invocation) =>
+        invocation?.name === "rg" || invocation?.name === "grep",
+      );
+      if (searchSegmentIndex >= 0) {
+        const pattern = commandSearchPattern(shellSegments[searchSegmentIndex].raw);
         return { kind: "search", label: pattern ? `Searched code for “${pattern}”` : "Searched code" };
       }
-      if (/\bgit\s+status\b/.test(command)) return { kind: "command", label: "Checked Git status" };
-      if (/\bgit\s+diff\b/.test(command)) return { kind: "command", label: "Reviewed code changes" };
-      if (/\bgit\s+log\b/.test(command)) return { kind: "command", label: "Read Git history" };
-      if (/\b(?:cargo|pnpm|npm|yarn)\s+(?:run\s+)?test\b/.test(command)) return { kind: "command", label: "Ran tests" };
-      if (/\b(?:typecheck|tsc\b)/.test(command)) return { kind: "command", label: "Checked types" };
-      if (/\blint\b/.test(command)) return { kind: "command", label: "Checked code style" };
-      if (/\b(?:cargo|pnpm|npm|yarn)\s+(?:run\s+)?build\b/.test(command)) return { kind: "command", label: "Built the project" };
+      const gitAction = shellInvocations.find((invocation) => invocation?.name === "git")?.args[0];
+      if (gitAction === "status") return { kind: "command", label: "Checked Git status" };
+      if (gitAction === "diff") return { kind: "command", label: "Reviewed code changes" };
+      if (gitAction === "log") return { kind: "command", label: "Read Git history" };
+      const packageAction = (action: string) => shellInvocations.some((invocation) => {
+        if (!invocation || !["cargo", "pnpm", "npm", "yarn"].includes(invocation.name)) return false;
+        return invocation.args[0] === action || (invocation.args[0] === "run" && invocation.args[1] === action);
+      });
+      if (packageAction("test")) return { kind: "command", label: "Ran tests" };
+      if (shellInvocations.some((invocation) => invocation?.name === "tsc") || packageAction("typecheck")) {
+        return { kind: "command", label: "Checked types" };
+      }
+      if (packageAction("lint")) return { kind: "command", label: "Checked code style" };
+      if (packageAction("build")) return { kind: "command", label: "Built the project" };
       return { kind: "command", label: `Ran ${command}` };
     }
     case "read": {
       const target = filePath ? baseName(filePath) : null;
       return target
-        ? { kind: "read", label: `Read ${target}`, filePath, labelPrefix: "Read ", labelTarget: target }
+        ? { kind: "read", label: `Read ${target}`, filePath: filePath ?? undefined, labelPrefix: "Read ", labelTarget: target }
         : { kind: "read", label: "Read a file" };
     }
     case "edit":
     case "write":
     case "notebookedit": {
-      const change = editChange(input);
+      const change = editChange(normalizedInput);
       const resolvedPath = filePath ?? change?.path ?? null;
       const target = resolvedPath ? baseName(resolvedPath) : null;
       const verb = change?.type === "add" ? "Created" : change?.type === "delete" ? "Deleted" : "Edited";
@@ -576,30 +1006,30 @@ function toolActivity(part: ChatPart): ToolActivity {
         : { kind: "edit", label: "Edited a file" };
     }
     case "grep": {
-      const pattern = inputString(input, "pattern");
+      const pattern = inputString(normalizedInput, "pattern");
       return { kind: "search", label: pattern ? `Searched code for “${pattern}”` : "Searched code" };
     }
     case "glob": {
-      const pattern = inputString(input, "pattern");
+      const pattern = inputString(normalizedInput, "pattern");
       return { kind: "search", label: pattern ? `Listed files matching ${pattern}` : "Listed files" };
     }
     case "websearch": {
-      const query = inputString(input, "query");
-      const url = inputString(input, "url");
-      const pattern = inputString(input, "pattern");
+      const query = inputString(normalizedInput, "query");
+      const url = inputString(normalizedInput, "url");
+      const pattern = inputString(normalizedInput, "pattern");
       if (query) return { kind: "web", label: `Searched the web for “${query}”` };
       if (pattern && url) return { kind: "web", label: `Searched “${pattern}” on a page` };
       if (url) return { kind: "web", label: `Opened ${url}` };
       return { kind: "web", label: description ?? "Browsed the web" };
     }
     case "webfetch": {
-      const url = inputString(input, "url");
+      const url = inputString(normalizedInput, "url");
       return { kind: "web", label: url ? `Read ${url}` : description ?? "Read a web page" };
     }
     case "task":
       return { kind: "agent", label: description ?? "Ran a subagent" };
     case "subagent":
-      return { kind: "agent", label: subagentLine(input) };
+      return { kind: "agent", label: subagentLine(normalizedInput) };
     case "error":
       return { kind: "command", label: "Tool failed" };
     case "interrupted":
@@ -609,10 +1039,6 @@ function toolActivity(part: ChatPart): ToolActivity {
       return { kind: "command", label: detail ? `${tool}: ${detail}` : tool };
     }
   }
-}
-
-function toolLine(part: ChatPart): string {
-  return toolActivity(part).label;
 }
 
 /** Readable one-liner for a Codex sub-agent spawn/activity row, from the
@@ -672,10 +1098,19 @@ function ToolTargetOverflow({
   onOpen?: (id: string) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const revealRef = useRef<HTMLSpanElement>(null);
+  const focusReveal = useRef(false);
+
+  useEffect(() => {
+    if (!open || !focusReveal.current) return;
+    focusReveal.current = false;
+    revealRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+  }, [open]);
+
   return (
     <span className="tool-target-overflow inline">
-      {open ? (
-        <span className="tool-target-reveal">
+      {open && (
+        <span className="tool-target-reveal" ref={revealRef}>
           {items.map((item, index) => (
             <span key={item.id}>
               {index > 0 && ", "}
@@ -696,19 +1131,20 @@ function ToolTargetOverflow({
             </span>
           ))}
         </span>
-      ) : (
-        <button
-          className="tool-target-more"
-          aria-expanded={false}
-          onClick={(event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            setOpen(true);
-          }}
-        >
-          + {items.length} more
-        </button>
       )}
+      {open && ", "}
+      <button
+        className="tool-target-more"
+        aria-expanded={open}
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          focusReveal.current = !open && event.detail === 0;
+          setOpen((value) => !value);
+        }}
+      >
+        {open ? "show less" : `+ ${items.length} more`}
+      </button>
     </span>
   );
 }
@@ -760,11 +1196,15 @@ function ToolActivityLabel({
     );
   }
   if (activity.runIds?.length) {
-    const multiple = activity.runIds.length > 1;
-    const visibleRunIds = activity.runIds.slice(0, 3);
-    const hiddenRuns = activity.runIds.slice(visibleRunIds.length).map((runId) => ({
+    const runIds = runExperimentName
+      ? activity.runIds.filter((runId) => Boolean(runExperimentName(runId)))
+      : activity.runIds;
+    if (runIds.length === 0) return activity.label;
+    const multiple = runIds.length > 1;
+    const visibleRunIds = runIds.slice(0, 3);
+    const hiddenRuns = runIds.slice(visibleRunIds.length).map((runId) => ({
       id: runId,
-      label: runExperimentName?.(runId) ?? "Experiment",
+      label: runExperimentName?.(runId) || "Experiment",
     }));
     return (
       <>
@@ -782,10 +1222,10 @@ function ToolActivityLabel({
                   onOpenRun(runId);
                 }}
               >
-                {runExperimentName?.(runId) ?? "Experiment"}
+                {runExperimentName?.(runId) || "Experiment"}
               </button>
             ) : (
-              <span>{runExperimentName?.(runId) ?? "Experiment"}</span>
+              <span>{runExperimentName?.(runId) || "Experiment"}</span>
             )}
           </span>
         ))}
@@ -799,10 +1239,14 @@ function ToolActivityLabel({
     );
   }
   if (activity.experimentIds?.length) {
-    const visibleExperimentIds = activity.experimentIds.slice(0, 3);
-    const hiddenExperiments = activity.experimentIds.slice(visibleExperimentIds.length).map((experimentId) => ({
+    const experimentIds = experimentName
+      ? activity.experimentIds.filter((experimentId) => Boolean(experimentName(experimentId)))
+      : activity.experimentIds;
+    if (experimentIds.length === 0) return activity.label;
+    const visibleExperimentIds = experimentIds.slice(0, 3);
+    const hiddenExperiments = experimentIds.slice(visibleExperimentIds.length).map((experimentId) => ({
       id: experimentId,
-      label: experimentName?.(experimentId) ?? "Experiment",
+      label: experimentName?.(experimentId) || "Experiment",
     }));
     return (
       <>
@@ -812,17 +1256,17 @@ function ToolActivityLabel({
             {onOpenExperiment ? (
               <button
                 className="tool-target"
-                title={`Open notes for ${experimentName?.(experimentId) ?? "experiment"}`}
+                title={`Open experiment ${experimentName?.(experimentId) || ""}`.trim()}
                 onClick={(event) => {
                   event.preventDefault();
                   event.stopPropagation();
                   onOpenExperiment(experimentId);
                 }}
               >
-                {experimentName?.(experimentId) ?? "Experiment"}
+                {experimentName?.(experimentId) || "Experiment"}
               </button>
             ) : (
-              <span>{experimentName?.(experimentId) ?? "Experiment"}</span>
+              <span>{experimentName?.(experimentId) || "Experiment"}</span>
             )}
           </span>
         ))}
@@ -868,6 +1312,7 @@ function activityInProgress(activity: ToolActivity): ToolActivity {
     [/^Searched /, "Searching "],
     [/^Listed /, "Listing "],
     [/^Edited /, "Editing "],
+    [/^Updated /, "Updating "],
     [/^Created /, "Creating "],
     [/^Deleted /, "Deleting "],
     [/^Ran /, "Running "],
@@ -897,11 +1342,13 @@ function resolvedActivityLabel(
     return `${visible.join(", ")}${remaining > 0 ? `, + ${remaining} more` : ""}`;
   };
   if (activity.runIds?.length) {
-    const names = activity.runIds.map((runId) => runExperimentName?.(runId) ?? "Experiment");
+    const names = activity.runIds.map((runId) => runExperimentName?.(runId) || "").filter(Boolean);
+    if (names.length === 0) return activity.label;
     return `${activity.label}${names.length > 1 ? " for " : " "}${summarizedNames(names)}`;
   }
   if (activity.experimentIds?.length) {
-    const names = activity.experimentIds.map((experimentId) => experimentName?.(experimentId) ?? "Experiment");
+    const names = activity.experimentIds.map((experimentId) => experimentName?.(experimentId) || "").filter(Boolean);
+    if (names.length === 0) return activity.label;
     return `${activity.label} for ${summarizedNames(names)}`;
   }
   return activity.label;
@@ -935,7 +1382,7 @@ function squashableToolPartKey(part: ChatPart): string | null {
     activity.kind,
     activity.label,
     activity.filePath ?? null,
-    activity.litCall?.id ?? null,
+    activity.litCall?.kind === "paper" ? activity.litCall.id ?? null : null,
     activity.runIds ?? null,
     activity.experimentIds ?? null,
   ]);
@@ -979,8 +1426,10 @@ function ToolRow({
   const failed = state?.status === "error";
   const errorMessage = (state?.error || state?.output || "").replace(/^Exit code \d+\s*/i, "").trim();
   const hasDetail = failed && Boolean(errorMessage);
+  const [detailOpen, setDetailOpen] = useState(false);
   const line = (
     <>
+      {failed && <span className="sr-only">Failed: </span>}
       <ToolActivityIcon
         activity={activity}
         className={`${failed ? "text-accent-red" : "text-muted"} self-start mt-[5px]`}
@@ -1008,17 +1457,27 @@ function ToolRow({
   }
 
   return (
-    <details className="tool-row tool-row-error group flex flex-col [&_summary]:flex [&_summary]:items-center [&_summary]:gap-2 [&_summary]:w-fit [&_summary]:max-w-full [&_summary]:py-[3px] [&_summary]:px-1 [&_summary]:cursor-pointer [&_summary]:list-none [&_summary]:select-none [&_summary]:min-w-0 [&_summary]:rounded-sm [&_summary:hover]:bg-surface [&_summary::-webkit-details-marker]:hidden">
-      <summary>
+    <div className="tool-row tool-row-error flex flex-col min-w-0">
+      <div className="flex items-center gap-2 w-fit max-w-full py-[3px] px-1 min-w-0 rounded-sm">
         {line}
-        <ChevronRight size={12} className="tool-row-chevron shrink-0 text-accent-red transition-transform duration-120 ease-standard group-open:rotate-90" />
-      </summary>
-      <div className="tool-detail mt-1 mr-0 mb-1 ml-6">
-        <div className="tool-output py-1.5 px-2.5 font-mono text-xs text-subtext whitespace-pre-wrap wrap-anywhere max-h-65 overflow-y-auto bg-background border border-border-variant rounded-sm">
-          {errorMessage.slice(0, 20000)}
-        </div>
+        <button
+          type="button"
+          className="tool-row-detail-toggle shrink-0 inline-flex items-center justify-center p-0.5 rounded-sm cursor-pointer hover:bg-surface"
+          aria-expanded={detailOpen}
+          aria-label={detailOpen ? "Hide error details" : "Show error details"}
+          onClick={() => setDetailOpen((current) => !current)}
+        >
+          <ChevronRight size={12} className={`text-accent-red transition-transform duration-120 ease-standard ${detailOpen ? "rotate-90" : ""}`} />
+        </button>
       </div>
-    </details>
+      {detailOpen && (
+        <div className="tool-detail mt-1 mr-0 mb-1 ml-6">
+          <div className="tool-output py-1.5 px-2.5 font-mono text-xs text-subtext whitespace-pre-wrap wrap-anywhere max-h-65 overflow-y-auto bg-background border border-border-variant rounded-sm">
+            {errorMessage.slice(0, 20000)}
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1040,19 +1499,42 @@ function ToolGroup({
   experimentName?: (experimentId: string) => string;
 }) {
   const running = parts.some((p) => p.state?.status === "running");
-  const [open, setOpen] = useState(running);
+  const failedCount = parts.filter((part) => part.state?.status === "error").length;
+  const [open, setOpen] = useState(running || failedCount > 0);
   const wasRunning = useRef(running);
+  const previousFailedCount = useRef(failedCount);
   const displayParts = squashToolParts(parts);
   const activities = displayParts.map(({ part }) => toolActivity(part));
   const runningActivity = latestRunningActivity(parts);
-
+  const summary = summarizeToolGroup(activities);
+  const iconActivity = runningActivity ?? groupIconActivity(activities);
+  const summaryLabel = runningActivity
+    ? resolvedActivityLabel(runningActivity, runExperimentName, experimentName)
+    : summary;
   useEffect(() => {
     if (running === wasRunning.current) return;
     wasRunning.current = running;
-    setOpen(running);
-  }, [running]);
+    setOpen(running || failedCount > 0);
+  }, [failedCount, running]);
+
+  useEffect(() => {
+    if (failedCount > previousFailedCount.current) setOpen(true);
+    previousFailedCount.current = failedCount;
+  }, [failedCount]);
 
   if (parts.length === 1) {
+    if (runningActivity) {
+      return (
+        <div className="tool-group my-3.5 mx-0">
+          <div className="tool-row flex items-start gap-2 min-w-0 py-[3px] px-1 text-lg text-subtext">
+            <ToolActivityIcon activity={runningActivity} className="tool-running-shimmer-icon self-start mt-[5px]" />
+            <span className="tool-running-shimmer min-w-0 whitespace-normal break-words">
+              {resolvedActivityLabel(runningActivity, runExperimentName, experimentName)}
+            </span>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="tool-group my-3.5 mx-0">
         <ToolRow
@@ -1068,24 +1550,21 @@ function ToolGroup({
   }
 
   const expanded = open;
-  const summary = summarizeToolGroup(activities);
-  const iconActivity = runningActivity ?? groupIconActivity(activities);
-  const summaryLabel = runningActivity
-    ? resolvedActivityLabel(runningActivity, runExperimentName, experimentName)
-    : summary;
-
   return (
     <div className="tool-group my-3.5 mx-0">
       <button
-        className="tool-group-summary flex items-center gap-2 w-fit max-w-full py-[3px] px-1 cursor-pointer text-lg text-subtext text-left rounded-sm [&:hover]:bg-surface"
+        className="tool-group-summary flex items-start gap-2 w-fit max-w-full py-[3px] px-1 cursor-pointer text-lg text-subtext text-left rounded-sm [&:hover]:bg-surface"
         onClick={() => setOpen((value) => !value)}
         aria-expanded={expanded}
       >
-        <ToolActivityIcon activity={iconActivity} className={running ? "tool-running-shimmer-icon" : "text-muted"} />
-        <span className={`tool-group-label min-w-0 overflow-hidden text-ellipsis whitespace-nowrap ${running ? "tool-running-shimmer" : ""}`}>
+        <ToolActivityIcon activity={iconActivity} className={`${running ? "tool-running-shimmer-icon" : "text-muted"} mt-[5px]`} />
+        <span className={`tool-group-label min-w-0 whitespace-normal break-words ${running ? "tool-running-shimmer" : ""}`}>
           {summaryLabel}
         </span>
-        <ChevronRight size={13} className={`tool-chevron shrink-0 text-muted transition-transform duration-120 ease-standard [&.open]:rotate-90 ${expanded ? "open" : ""}`} />
+        {failedCount > 0 && (
+          <span className="sr-only">Contains {failedCount} failed {failedCount === 1 ? "tool call" : "tool calls"}.</span>
+        )}
+        <ChevronRight size={13} className={`tool-chevron shrink-0 mt-[6px] text-muted transition-transform duration-120 ease-standard [&.open]:rotate-90 ${expanded ? "open" : ""}`} />
       </button>
       {expanded && (
         <div className="tool-group-rows flex flex-col gap-px mt-0.5 mr-0 mb-1 ml-6">
@@ -1327,7 +1806,7 @@ function messageHasVisibleContent(m: ChatMessage): boolean {
   return m.parts.some(partIsVisible);
 }
 
-/** Memoized: streaming re-broadcasts the whole updated message ~7x/sec, and
+/** Memoized: streaming re-broadcasts the whole updated message up to ~13x/sec, and
  * `upsertMessage` preserves object identity for every untouched message — so
  * only the message actually being streamed re-renders (and re-parses its
  * markdown/KaTeX), not the entire transcript. Callback props must stay
@@ -1583,6 +2062,10 @@ export function SubagentTranscript({
 }) {
   const parts = spawn.children ?? [];
   const running = spawn.state?.status === "running";
+  const errored = spawn.state?.status === "error";
+  const errorMessage = errored
+    ? (spawn.state?.error || spawn.state?.output || "").replace(/^Exit code \d+\s*/i, "").trim()
+    : "";
   // Gate the empty state on what actually renders, not the raw part count — a
   // stored transcript of nothing but invisible parts must still read as empty.
   const rendered = renderParts(parts, {
@@ -1594,14 +2077,20 @@ export function SubagentTranscript({
     onOpenSubagent,
     predictTextTail: running,
   });
+  const spawnActivity = running ? activityInProgress(toolActivity(spawn)) : toolActivity(spawn);
   return (
     <div className="msg-assistant text-lg leading-[1.62] text-text min-w-0">
       <div className="subagent-tab-header flex items-center gap-2 pb-2 mb-2 border-b border-b-border-variant">
-        <span className={toolStatusClass(spawn.state?.status)} />
-        <span className={TOOL_LINE_CLASS_NAME}>{toolLine(spawn)}</span>
-        {running && <span className="subagent-live shrink-0 text-xs text-accent-amber">live</span>}
+        {errored && <span className="sr-only">Failed: </span>}
+        <ToolActivityIcon activity={spawnActivity} className={running ? "tool-running-shimmer-icon" : errored ? "text-accent-red" : "text-muted"} />
+        <span className={`${TOOL_LINE_CLASS_NAME} ${running ? "tool-running-shimmer" : errored ? "text-accent-red" : ""}`}>{spawnActivity.label}</span>
       </div>
-      {rendered.length === 0 ? (
+      {errorMessage && (
+        <div className="tool-output py-1.5 px-2.5 font-mono text-xs text-subtext whitespace-pre-wrap wrap-anywhere max-h-65 overflow-y-auto bg-background border border-border-variant rounded-sm">
+          {errorMessage.slice(0, 20000)}
+        </div>
+      )}
+      {rendered.length === 0 && !errorMessage ? (
         <div className="subagent-empty py-[3px] px-1 text-md text-muted">{running ? "Working…" : "No activity"}</div>
       ) : (
         rendered
@@ -1623,18 +2112,23 @@ function SubagentBlock({
   onOpenSubagent?: (spawnPartId: string) => void;
 }) {
   const errored = part.state?.status === "error";
+  const errorMessage = (part.state?.error || part.state?.output || "").replace(/^Exit code \d+\s*/i, "").trim();
+  const running = part.state?.status === "running";
+  const activity = running ? activityInProgress(toolActivity(part)) : toolActivity(part);
   return (
-    <button
-      className={`subagent-row flex items-center gap-2 w-full my-3.5 mx-0 py-[3px] px-1 cursor-pointer text-text text-lg text-left rounded-sm [&:hover:not(:disabled)]:bg-surface [&:disabled]:cursor-default [&.has-error]:text-accent-red [&_.tool-line]:text-lg [&_.tool-line]:text-text ${errored ? "has-error" : ""}`}
-      title="Open sub-agent transcript"
-      onClick={() => onOpenSubagent?.(part.id)}
-      disabled={!onOpenSubagent}
-    >
-      <Users size={12} className="subagent-icon shrink-0 text-muted" />
-      <span className={toolStatusClass(part.state?.status)} />
-      <span className={TOOL_LINE_CLASS_NAME}>{toolLine(part)}</span>
-      <ChevronRight size={12} className="subagent-row-chevron shrink-0 text-muted" />
-    </button>
+    <>
+      <button
+        className="subagent-row flex items-center gap-2 w-full my-3.5 mx-0 py-[3px] px-1 cursor-pointer text-text text-lg text-left rounded-sm [&:hover:not(:disabled)]:bg-surface [&:disabled]:cursor-default [&_.tool-line]:text-lg"
+        title={errored && errorMessage ? errorMessage : "Open sub-agent transcript"}
+        onClick={() => onOpenSubagent?.(part.id)}
+        disabled={!onOpenSubagent}
+      >
+        {errored && <span className="sr-only">Failed: </span>}
+        <ToolActivityIcon activity={activity} className={`subagent-icon shrink-0 ${running ? "tool-running-shimmer-icon" : errored ? "text-accent-red" : "text-muted"}`} />
+        <span className={`${TOOL_LINE_CLASS_NAME} ${running ? "tool-running-shimmer" : errored ? "text-accent-red" : "text-text"}`}>{activity.label}</span>
+        <ChevronRight size={12} className="subagent-row-chevron shrink-0 text-muted" />
+      </button>
+    </>
   );
 }
 
@@ -1644,6 +2138,55 @@ function SubagentBlock({
  * referentially stable across keystrokes (memoized/useCallback, never inline)
  * or the boundary silently breaks — with that held, typing costs one shallow
  * compare instead of O(messages) work. */
+interface AnnouncedToolState {
+  status: string;
+  label: string;
+}
+
+function transcriptToolStates(messages: ChatMessage[]): Map<string, AnnouncedToolState> {
+  const states = new Map<string, AnnouncedToolState>();
+  const visit = (parts: ChatPart[], parent: string) => {
+    for (const part of parts) {
+      const path = `${parent}/${part.id}`;
+      if (part.type === "tool" && part.state?.status) {
+        states.set(path, { status: part.state.status, label: toolActivity(part).label });
+      }
+      if (part.children?.length) visit(part.children, path);
+    }
+  };
+  for (const message of messages) visit(message.parts, message.id);
+  return states;
+}
+
+function useToolActivityAnnouncement(messages: ChatMessage[]): string {
+  const [announcement, setAnnouncement] = useState("");
+  const previous = useRef<{ transcript: string; states: Map<string, AnnouncedToolState> } | null>(null);
+  useEffect(() => {
+    const transcript = messages[0]?.id ?? "";
+    const states = transcriptToolStates(messages);
+    if (!previous.current || previous.current.transcript !== transcript) {
+      previous.current = { transcript, states };
+      setAnnouncement("");
+      return;
+    }
+    const changes = [...states].filter(([path, state]) => previous.current?.states.get(path)?.status !== state.status);
+    previous.current = { transcript, states };
+    const failures = changes.filter(([, state]) => state.status === "error");
+    if (failures.length > 0) {
+      const labels = failures.slice(0, 2).map(([, state]) => state.label).join(", ");
+      setAnnouncement(`${failures.length === 1 ? "Tool activity failed" : `${failures.length} tool activities failed`}: ${labels}`);
+      return;
+    }
+    const running = changes.filter(([, state]) => state.status === "running");
+    if (running.length > 0) {
+      setAnnouncement(activityInProgress({ kind: "command", label: running.at(-1)?.[1].label ?? "Running a tool" }).label);
+      return;
+    }
+    if (changes.some(([, state]) => state.status === "completed")) setAnnouncement("Tool activity completed");
+  }, [messages]);
+  return announcement;
+}
+
 const Transcript = memo(function Transcript({
   messages,
   onOpenFile,
@@ -1671,8 +2214,10 @@ const Transcript = memo(function Transcript({
 }) {
   const visibleMessages = messages.filter(messageHasVisibleContent);
   const activeMessage = visibleMessages.at(-1);
+  const activityAnnouncement = useToolActivityAnnouncement(messages);
   return (
     <>
+      <span className="sr-only" role="status" aria-live="polite">{activityAnnouncement}</span>
       {visibleMessages.map((m) => (
         <Message
           key={m.id}
@@ -2058,6 +2603,7 @@ export function ChatPanel({
   const [state, dispatch] = useReducer(reducer, {
     messagesBySession: {},
     busySessions: new Set<string>(),
+    queuedBySession: {},
   });
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
   const [selection, setSelection] = useState<ModelSelection | null>(preferredAgent);
@@ -2354,7 +2900,9 @@ export function ChatPanel({
     if (!activeId || loadedSessions.current.has(activeId)) return;
     loadedSessions.current.add(activeId);
     getChatMessages(activeId)
-      .then((messages) => dispatch({ type: "seed", sessionId: activeId, messages }))
+      .then(({ messages, queued }) =>
+        dispatch({ type: "seed", sessionId: activeId, messages, queued }),
+      )
       .catch(() => {
         // Recover from a failed fetch to a usable state rather than a stuck
         // "Loading conversation…" spinner: seed an empty transcript (clears
@@ -2420,6 +2968,9 @@ export function ChatPanel({
         case "busy":
           dispatch({ type: "busy", sessionId: ev.sessionId, busy: ev.busy });
           break;
+        case "queued":
+          dispatch({ type: "setQueued", sessionId: ev.sessionId, items: ev.items });
+          break;
         case "usage":
           setSessions((cur) =>
             cur.map((s) => (s.id === ev.sessionId ? { ...s, contextUsage: ev.usage } : s)),
@@ -2449,8 +3000,8 @@ export function ChatPanel({
       const reseed = (allowRetry: boolean) => {
         const gen = msgGen.current;
         getChatMessages(activeId)
-          .then((messages) => {
-            dispatch({ type: "seed", sessionId: activeId, messages });
+          .then(({ messages, queued }) => {
+            dispatch({ type: "seed", sessionId: activeId, messages, queued });
             if (allowRetry && msgGen.current !== gen) reseed(false);
           })
           .catch(() => {});
@@ -2461,6 +3012,9 @@ export function ChatPanel({
 
   const messages = activeId ? (state.messagesBySession[activeId] ?? []) : [];
   const busy = activeId ? state.busySessions.has(activeId) : false;
+  // Messages the user parked behind the running turn (oldest first). Populated
+  // by chat.queued events and the seed snapshot; each runs when its turn ends.
+  const queued = activeId ? (state.queuedBySession[activeId] ?? []) : [];
   // A session whose transcript hasn't been seeded yet: its key is absent from
   // messagesBySession (vs. present-but-empty for a genuinely empty session).
   // Switching to an existing session leaves this true for the getChatMessages
@@ -2642,7 +3196,39 @@ export function ChatPanel({
       });
       return;
     }
-    if (busy) return;
+    if (busy) {
+      // A turn is already running: park this message (Claude-desktop steering)
+      // so it runs when the turn ends, instead of dropping it. The server
+      // enqueues it and echoes chat.queued to render the chip — no optimistic
+      // transcript bubble, since it hasn't run yet.
+      if (!activeId || !activeHarness?.agentReady) return;
+      const sid = activeId;
+      setDraft("");
+      setPickedSkill(null);
+      setAttachments([]);
+      setAttachError(null);
+      const turnOpts = composerSelection
+        ? {
+            model: composerSelection.model,
+            permissionMode: composerSelection.permissionMode,
+            reasoningLevel: composerSelection.reasoningLevel,
+          }
+        : {};
+      setSessionOverride({});
+      const images: ChatImageAttachment[] = pending.map((a) => ({
+        mediaType: a.mediaType,
+        dataBase64: a.dataUrl.slice(a.dataUrl.indexOf(",") + 1),
+        name: a.name,
+      }));
+      try {
+        await sendChatMessage(sid, text, turnOpts, images.length ? images : undefined);
+      } catch {
+        // Never reached the queue — restore the composer so a retry is one keypress.
+        setDraft((cur) => cur || text);
+        setAttachments((cur) => (cur.length ? cur : pending));
+      }
+      return;
+    }
     if (!activeHarness?.agentReady) return;
     // `composerSelection` already resolves to the open session's settings (+ any
     // unsent tweak) or, for a new session, the global preference.
@@ -2749,6 +3335,19 @@ export function ChatPanel({
 
   function stop() {
     if (activeId) void interruptChat(activeId);
+  }
+
+  // Optimistic: drop locally now; the server's chat.queued echo reconciles. A
+  // message that already started running server-side simply isn't found.
+  function cancelQueued(itemId: string) {
+    if (!activeId) return;
+    const sid = activeId;
+    dispatch({
+      type: "setQueued",
+      sessionId: sid,
+      items: queued.filter((q) => q.id !== itemId),
+    });
+    void cancelQueuedMessage(sid, itemId).catch(() => {});
   }
 
   // Escape stops the streaming turn and drops focus back into the composer,
@@ -2858,7 +3457,7 @@ export function ChatPanel({
           // just-started optimistic flag), so the optimistic dispatch above
           // can't wedge true after a no-op or failure.
           getChatMessages(sid)
-            .then((messages) => dispatch({ type: "seed", sessionId: sid, messages }))
+            .then(({ messages, queued }) => dispatch({ type: "seed", sessionId: sid, messages, queued }))
             .catch(() => {});
           listChatSessions(projectId)
             .then((list) =>
@@ -3211,6 +3810,31 @@ export function ChatPanel({
               respond({ promptId: pendingPlan.promptId, approve: false, note });
             }}
           />
+        )}
+        {queued.length > 0 && (
+          <div className="composer-queued flex flex-col gap-1 mb-1.5">
+            {queued.map((q) => (
+              <div
+                key={q.id}
+                className="queued-chip flex items-center gap-2 py-1.5 px-2.5 text-sm text-subtext bg-surface border border-border rounded-sm"
+                title={q.text}
+              >
+                <Clock size={13} className="shrink-0 text-muted" />
+                <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
+                  {q.text}
+                </span>
+                <span className="shrink-0 text-xs text-muted uppercase tracking-wide">Queued</span>
+                <button
+                  title="Cancel queued message"
+                  aria-label="Cancel queued message"
+                  onClick={() => cancelQueued(q.id)}
+                  className="shrink-0 inline-flex items-center justify-center w-4 h-4 p-0 border-0 rounded-full text-muted cursor-pointer [&:hover]:bg-text [&:hover]:text-background"
+                >
+                  <X size={11} />
+                </button>
+              </div>
+            ))}
+          </div>
         )}
         <div className="composer-box relative flex flex-col border border-border rounded-md bg-background" data-onboarding="composer">
           {activeHarness && !activeHarness.agentReady && (

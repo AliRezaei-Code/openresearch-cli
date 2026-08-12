@@ -1162,10 +1162,22 @@ export const renameChatSession = (sessionId: string, title: string) =>
     (r) => r.session,
   );
 
+/** A message the user sent while a turn was running, parked to run next. */
+export interface QueuedMessage {
+  id: string;
+  text: string;
+}
+
 export const getChatMessages = (sessionId: string) =>
-  get<{ messages: ChatMessage[] }>(`/api/chat/sessions/${sessionId}/messages`).then(
-    (r) => r.messages,
-  );
+  get<{ messages: ChatMessage[]; queued?: QueuedMessage[] }>(
+    `/api/chat/sessions/${sessionId}/messages`,
+  ).then((r) => ({ messages: r.messages, queued: r.queued ?? [] }));
+
+/** Cancel a still-parked message (the ✕ on a queued chip). */
+export const cancelQueuedMessage = (sessionId: string, itemId: string) =>
+  fetch(`/api/chat/sessions/${sessionId}/queue/${encodeURIComponent(itemId)}`, {
+    method: "DELETE",
+  }).then((r) => json<{ ok: boolean; removed: boolean }>(r));
 
 /** A pasted image or uploaded file riding a chat message. */
 export interface ChatImageAttachment {
