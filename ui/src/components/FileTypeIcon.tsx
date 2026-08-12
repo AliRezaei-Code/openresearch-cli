@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 
-const IMAGE_RE = /\.(png|jpe?g|gif|webp|svg)$/i;
 const MD_RE = /\.(md|mdx|markdown)$/i;
+const IMAGE_RE = /\.(apng|avif|bmp|gif|heic|heif|ico|jpe?g|jfif|jxl|pbm|pgm|png|pnm|ppm|svg|tiff?|webp)$/i;
 const SPREADSHEET_RE = /\.(csv|tsv|xlsx?|ods)$/i;
 const CODE_RE = /\.(c|cc|cpp|css|go|html?|java|js|jsx|json|mjs|py|rs|sh|toml|ts|tsx|ya?ml)$/i;
 const ARCHIVE_RE = /\.(7z|bz2|gz|rar|tar|tgz|zip)$/i;
