@@ -10,8 +10,9 @@ link becomes:
 https://github.com/alphaXiv/openresearch-cli/releases/latest/download/OpenResearch.dmg
 ```
 
-Until the secrets below are set, the release job **skips cleanly** (an unsigned
-DMG would just trip Gatekeeper, so we don't publish one).
+Until the `MACOS_SIGNING_ENABLED` variable is set (see below), the release job
+**skips cleanly** (an unsigned DMG would just trip Gatekeeper, so we don't
+publish one).
 
 ## One-time Apple setup (manual — only a human with the account can do this)
 
@@ -27,38 +28,44 @@ DMG would just trip Gatekeeper, so we don't publish one).
    identity string, e.g. `Developer ID Application: Your Org (TEAMID)`
    (`security find-identity -v -p codesigning` lists it).
 
-## GitHub repository secrets to add
+## GitHub setup
 
-Settings → Secrets and variables → Actions → New repository secret:
+The six signing secrets live in a protected **environment** (not repo secrets),
+so only the reviewed `macos-app` job can read them. A separate non-secret
+variable turns the pipeline on, so the cheap gate never touches the cert.
 
-| Secret | Value |
-| --- | --- |
-| `MACOS_CERT_P12_BASE64` | `base64 -i cert.p12` (the exported `.p12`, base64-encoded) |
-| `MACOS_CERT_PASSWORD` | the `.p12` export password |
-| `MACOS_SIGN_IDENTITY` | `Developer ID Application: Your Org (TEAMID)` |
-| `MACOS_NOTARY_APPLE_ID` | your Apple ID email |
-| `MACOS_NOTARY_TEAM_ID` | your Team ID |
-| `MACOS_NOTARY_PASSWORD` | the app-specific password from step 4 |
+1. **Create the environment.** Settings → **Environments** → New environment →
+   `release-signing`. Then:
+   - Add yourself and/or `@sox8502` under **Required reviewers** (the signing job
+     pauses for approval on every release — the cert is never used by an
+     unreviewed change).
+   - Set **Deployment branches** → **Protected branches only** (or just `main`),
+     so the job can't run from other branches.
+2. **Add the six environment secrets** (in that environment, *not* repo-wide):
 
-Once all six exist, the next published release attaches a signed + notarized
-`OpenResearch.dmg` automatically.
+   | Secret | Value |
+   | --- | --- |
+   | `MACOS_CERT_P12_BASE64` | `base64 -i cert.p12` (the exported `.p12`, base64-encoded) |
+   | `MACOS_CERT_PASSWORD` | the `.p12` export password |
+   | `MACOS_SIGN_IDENTITY` | `Developer ID Application: Your Org (TEAMID)` |
+   | `MACOS_NOTARY_APPLE_ID` | your Apple ID email |
+   | `MACOS_NOTARY_TEAM_ID` | your Team ID |
+   | `MACOS_NOTARY_PASSWORD` | the app-specific password from step 4 |
 
-## Protecting the certificate (recommended for a public repo)
+3. **Enable the pipeline.** Settings → Secrets and variables → Actions →
+   **Variables** → New repository variable: `MACOS_SIGNING_ENABLED` = `true`.
+   (Leave it unset/`false` to keep the release job a no-op.)
 
-The release job runs repo-controlled scripts with access to the Developer ID
-certificate, so guard what can reach it:
+Do **not** commit the `.p12`, and delete the local copy after base64-ing it into
+the secret.
 
-1. **Required-reviewer environment.** The `macos-app` job declares
-   `environment: release-signing`. Create it under **Settings → Environments →
-   New environment → `release-signing`**, and add yourself (or a team) under
-   **Required reviewers**. The signing job then pauses for a human approval on
-   every release — so the cert is never used by an unreviewed change. (Until you
-   add reviewers the environment exists but doesn't gate anything.)
-2. **Branch protection + CODEOWNERS.** `.github/CODEOWNERS` marks the signing
-   scripts and workflows as owned; enable **Require a pull request** + **Require
-   review from Code Owners** on the `main` branch protection rule so signing-path
-   changes can't land unreviewed. Branch protection reviews the *code*; the
-   environment gates the *cert* — do both.
+## Also protect the code path
+
+The signing job runs repo-controlled scripts, so guard what can change them:
+`.github/CODEOWNERS` marks the workflows and macOS signing scripts as owned;
+enable **Require a pull request** + **Require review from Code Owners** on the
+`main` branch protection rule. Branch protection reviews the *code*; the
+environment gates the *cert* — do both.
 
 ## Testing it locally (with your cert)
 

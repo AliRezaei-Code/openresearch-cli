@@ -10,9 +10,12 @@
 # only proceed for a successful `workflow_dispatch` run (a real release) and then
 # confirm the tag's release actually exists before uploading.
 #
-# The whole thing no-ops until the macOS signing secrets are configured, so it is
-# safe to merge before the Apple Developer account is set up. See
-# macos/DISTRIBUTION.md.
+# Signing secrets live in the `release-signing` environment (not repo secrets),
+# so only the reviewed, environment-gated `macos-app` job can read them. The
+# cheap gate keys on the non-secret repo variable MACOS_SIGNING_ENABLED and never
+# touches the certificate. Third-party actions are pinned to commit SHAs so a
+# moved tag can't inject code into the job that holds the cert. See
+# macos/DISTRIBUTION.md for setup.
 
 name: Attach macOS app to release
 
@@ -29,37 +32,25 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Cheap ubuntu gate: only a real, successful release, with all signing secrets
-  # present, and a Release that actually exists — so a macOS runner (billed 10x)
-  # never boots otherwise. Resolves the tag from the released commit.
+  # Cheap ubuntu gate: only a real, successful release with signing enabled
+  # (the non-secret MACOS_SIGNING_ENABLED variable) and a Release that actually
+  # exists — so a macOS runner (billed 10x) never boots otherwise, and no secret
+  # is ever read here. Resolves the tag from the released commit.
   check:
-    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'workflow_dispatch' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'workflow_dispatch' && vars.MACOS_SIGNING_ENABLED == 'true' }}
     runs-on: ubuntu-latest
     outputs:
       ok: ${{ steps.gate.outputs.ok }}
       tag: ${{ steps.gate.outputs.tag }}
     env:
-      MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
-      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
-      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
-      MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
-      MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
-      MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
       - id: gate
         run: |
           set -euo pipefail
-          for v in MACOS_CERT_P12_BASE64 MACOS_CERT_PASSWORD MACOS_SIGN_IDENTITY \
-                   MACOS_NOTARY_APPLE_ID MACOS_NOTARY_TEAM_ID MACOS_NOTARY_PASSWORD; do
-            if [ -z "${!v:-}" ]; then
-              echo "::notice::macOS signing secrets incomplete ($v missing) — skipping. See macos/DISTRIBUTION.md"
-              echo "ok=false" >> "$GITHUB_OUTPUT"; exit 0
-            fi
-          done
           version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
           tag="v${version}"
           if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -73,17 +64,17 @@ jobs:
     needs: check
     if: ${{ needs.check.outputs.ok == 'true' }}
     runs-on: macos-14 # Apple Silicon runner
-    # Gate the cert-using job behind the `release-signing` environment. Add
-    # required reviewers to it (Settings → Environments) so the Developer ID
-    # certificate is never used without a human approving the run — even if an
-    # unwanted change reaches main. See macos/DISTRIBUTION.md.
+    # The cert-using job. Secrets come from this environment; add required
+    # reviewers to it (Settings → Environments) so the Developer ID certificate
+    # is never used without a human approving the run — even if an unwanted change
+    # reaches main. Restrict its deployment branches to main. See DISTRIBUTION.md.
     environment: release-signing
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
 
