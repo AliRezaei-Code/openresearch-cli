@@ -331,26 +331,27 @@ pub fn record_chat_target(resource: &str, target: &str) {
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
+    if let Ok(file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .read(true)
         .open(path)
     {
-        let scope = unsafe { libc::getppid() };
-        let command = std::process::Command::new("/bin/ps")
-            .args(["-p", &scope.to_string(), "-o", "command="])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-            .unwrap_or_default();
+        let scope = std::env::var("ORX_CHAT_TOOL_SCOPE").unwrap_or_default();
+        let command = std::env::var("ORX_CHAT_TOOL_COMMAND").unwrap_or_default();
         let event = json!({
             "scope": scope.to_string(),
             "command": command,
             "resource": resource,
             "target": target,
         });
-        let _ = writeln!(file, "{event}");
+        if let Ok(mut encoded) = serde_json::to_vec(&event) {
+            encoded.push(b'\n');
+            let mut lock = fd_lock::RwLock::new(file);
+            if let Ok(mut guard) = lock.write() {
+                let _ = guard.write_all(&encoded);
+            };
+        }
     }
 }
 
@@ -430,22 +431,26 @@ fn attach_target_event(
     None
 }
 
-fn reconcile_target_file(session_id: &str) {
+fn reconcile_target_file(session_id: &str, message_id: &str) -> Option<WireMessage> {
     let path = target_event_path(session_id);
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        return;
+    let Ok(file) = std::fs::File::open(&path) else {
+        return None;
     };
-    let Ok(store) = Store::open() else { return };
+    let mut contents = String::new();
+    if file
+        .take(TOOL_TARGET_SCAN_BYTES as u64)
+        .read_to_string(&mut contents)
+        .is_err()
+    {
+        return None;
+    }
+    let Ok(store) = Store::open() else {
+        return None;
+    };
     let Ok(messages) = store.list_chat_messages(session_id) else {
-        return;
+        return None;
     };
-    let Some(stored) = messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "assistant")
-    else {
-        return;
-    };
+    let stored = messages.iter().find(|message| message.id == message_id)?;
     let mut message = stored_to_wire(stored);
     let mut bindings = HashMap::new();
     let mut claimed = HashSet::new();
@@ -477,14 +482,20 @@ fn reconcile_target_file(session_id: &str) {
             .or_insert_with(|| part_id.clone());
         claimed.insert(part_id);
     }
-    let _ = store.upsert_chat_message(&StoredChatMessage {
-        id: message.id,
-        session_id: session_id.to_string(),
-        role: message.role,
-        parts_json: serde_json::to_string(&message.parts).unwrap_or_default(),
-        created_at: message.created_at,
-    });
+    if store
+        .upsert_chat_message(&StoredChatMessage {
+            id: message.id.clone(),
+            session_id: session_id.to_string(),
+            role: message.role.clone(),
+            parts_json: serde_json::to_string(&message.parts).unwrap_or_default(),
+            created_at: message.created_at,
+        })
+        .is_err()
+    {
+        return None;
+    }
     let _ = std::fs::remove_file(path);
+    Some(message)
 }
 
 /// Find a part by id anywhere in the tree (depth-first), returning `&mut` to it.
@@ -1116,7 +1127,7 @@ pub struct ChatHost {
     /// Sessions with a turn in flight. A key present means busy; the value is
     /// the running task's abort handle, or `None` while a turn is being set up
     /// (reserved but not yet spawned — see `TurnGuard`).
-    turns: Mutex<HashMap<String, Option<tokio::task::AbortHandle>>>,
+    turns: Mutex<HashMap<String, Option<ActiveTurn>>>,
     deleting_sessions: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Per-session serialization for `respond`. Answering a prompt reads the
     /// card, delivers the answer (a non-idempotent POST for inline harnesses),
@@ -1156,6 +1167,11 @@ pub struct ChatHost {
     /// a user Stop clears the whole queue. In-memory and uncommitted — a queued
     /// message only becomes a transcript bubble once it actually runs.
     queued: std::sync::Mutex<HashMap<String, VecDeque<QueuedMessage>>>,
+}
+
+struct ActiveTurn {
+    handle: tokio::task::JoinHandle<()>,
+    message_id: String,
 }
 
 /// A user message parked while the session was busy, replayed verbatim through
@@ -1930,6 +1946,7 @@ impl ChatHost {
                 _guard.defuse();
                 return Ok(());
             }
+            let message_id = ctx.assistant.id.clone();
             let task = tokio::spawn(async move {
                 let result = match crate::local::harness::chat_harness(&ctx.harness) {
                     Some(harness) => harness.run_turn(&mut ctx).await,
@@ -1951,7 +1968,13 @@ impl ChatHost {
                 // interrupted turn never drains.
                 ctx.host.drain_queue(&ctx.session_id).await;
             });
-            turns.insert(sid, Some(task.abort_handle()));
+            turns.insert(
+                sid,
+                Some(ActiveTurn {
+                    handle: task,
+                    message_id,
+                }),
+            );
             if let Some(seed) = title_seed {
                 self.spawn_title_generation(session.id.clone(), session.harness.clone(), seed);
             }
@@ -2018,10 +2041,13 @@ impl ChatHost {
                 }
             }
         }
-        if let Some(handle) = handle {
-            handle.abort();
+        if let Some(active) = handle {
+            active.handle.abort();
+            let _ = active.handle.await;
+            if let Some(message) = reconcile_target_file(session_id, &active.message_id) {
+                self.emit("chat.message", message_json(&message, session_id));
+            }
         }
-        reconcile_target_file(session_id);
         self.finish_turn(session_id).await;
         Ok(true)
     }
@@ -2323,6 +2349,8 @@ impl ChatHost {
         let session = store.get_chat_session(session_id)?;
         store.delete_chat_session(session_id)?;
         let _ = std::fs::remove_file(target_event_path(session_id));
+        let _ =
+            std::fs::remove_dir_all(crate::store::data_dir().join("chat-shell").join(session_id));
         self.emit("chat.session.deleted", json!({ "sessionId": session_id }));
         if let Some(session) = session {
             if let Ok(Some(project)) = store.get_local_project(&session.project_id) {
@@ -3062,6 +3090,34 @@ pub fn set_chat_session_env(cmd: &mut tokio::process::Command, session_id: &str)
     }
     let _ = std::fs::remove_file(&target_path);
     cmd.env(CHAT_TARGET_FILE_ENV, target_path);
+    let shell_dir = crate::store::data_dir().join("chat-shell").join(session_id);
+    let _ = std::fs::create_dir_all(&shell_dir);
+    let original_zdotdir = std::env::var_os("ZDOTDIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    let source = original_zdotdir
+        .as_ref()
+        .map(|path| path.join(".zshenv"))
+        .filter(|path| path.is_file())
+        .map(|path| {
+            let escaped = path.to_string_lossy().replace('\'', "'\\''");
+            format!("source '{escaped}'\n")
+        })
+        .unwrap_or_default();
+    let hook = format!(
+        "{source}export ORX_CHAT_TOOL_SCOPE=\"zsh-$$\"\nexport ORX_CHAT_TOOL_COMMAND=\"$ZSH_EXECUTION_STRING\"\n"
+    );
+    let _ = std::fs::write(shell_dir.join(".zshenv"), hook);
+    if let Some(original) = original_zdotdir {
+        for name in [".zprofile", ".zshrc", ".zlogin", ".zlogout"] {
+            let path = original.join(name);
+            if path.is_file() {
+                let escaped = path.to_string_lossy().replace('\'', "'\\''");
+                let _ = std::fs::write(shell_dir.join(name), format!("source '{escaped}'\n"));
+            }
+        }
+    }
+    cmd.env("ZDOTDIR", shell_dir);
 }
 
 /// The chat session that launched this run, read from the env the harness child
