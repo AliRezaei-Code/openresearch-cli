@@ -1248,6 +1248,10 @@ export interface ChatImageAttachment {
   name?: string;
 }
 
+export interface ChatTextAnnotation {
+  text: string;
+}
+
 /** Image parts store a server-minted file name; this is where it's served. */
 export const chatAttachmentUrl = (name: string) =>
   `/api/chat/attachments/${encodeURIComponent(name)}`;
@@ -1258,6 +1262,7 @@ export const sendChatMessage = (
   text: string,
   opts: TurnOptions = {},
   images?: ChatImageAttachment[],
+  annotations?: ChatTextAnnotation[],
 ) =>
   post<{ ok: boolean }>(`/api/chat/sessions/${sessionId}/message`, {
     text,
@@ -1265,6 +1270,7 @@ export const sendChatMessage = (
     permissionMode: opts.permissionMode,
     reasoningLevel: opts.reasoningLevel,
     images,
+    annotations,
   });
 
 export const interruptChat = (sessionId: string) =>
@@ -1279,6 +1285,7 @@ export interface PromptAnswer {
   /** Chosen option labels (questions). */
   answers?: string[];
   note?: string;
+  annotations?: ChatTextAnnotation[];
 }
 
 export const respondChat = (sessionId: string, answer: PromptAnswer) =>

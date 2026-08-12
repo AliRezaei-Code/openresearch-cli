@@ -14,6 +14,7 @@ import {
   GitBranch,
   Globe,
   HelpCircle,
+  MessageSquareQuote,
   MoreHorizontal,
   PanelLeft,
   Paperclip,
@@ -62,6 +63,7 @@ import {
   type ChatPart,
   type ChatPrompt,
   type ChatSession,
+  type ChatTextAnnotation,
   type Harness,
   type PromptAnswer,
   type QueuedMessage,
@@ -94,6 +96,167 @@ const TOOL_LINE_CLASS_NAME = [
 const TOOL_TARGET_LIMIT = 256;
 const TOOL_TARGET_INSPECTION_LIMIT = 1_024;
 const TOOL_OUTPUT_SCAN_LIMIT = 20_000;
+
+interface ComposerAnnotation extends ChatTextAnnotation {
+  id: string;
+}
+
+interface SelectionAction {
+  text: string;
+  x: number;
+  y: number;
+  placement: "above" | "below";
+}
+
+function elementForNode(node: Node): Element | null {
+  return node instanceof Element ? node : node.parentElement;
+}
+
+function currentTranscriptSelection(root: HTMLElement): SelectionAction | null {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) return null;
+  const range = selection.getRangeAt(0);
+  const focusNode = selection.focusNode;
+  if (!focusNode) return null;
+  const commonElement = elementForNode(range.commonAncestorContainer);
+  const focusElement = elementForNode(focusNode);
+  if (!commonElement || !root.contains(commonElement)) return null;
+  if (!focusElement || !root.contains(focusElement)) return null;
+  const text = selection
+    .toString()
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (!text) return null;
+
+  const focusRange = document.createRange();
+  focusRange.setStart(focusNode, selection.focusOffset);
+  focusRange.collapse(true);
+  const selectionRects = Array.from(range.getClientRects());
+  const focusAtEnd =
+    focusNode === range.endContainer && selection.focusOffset === range.endOffset;
+  const rect =
+    focusRange.getClientRects()[0] ??
+    (focusAtEnd ? selectionRects.at(-1) : selectionRects[0]) ??
+    range.getBoundingClientRect();
+  const placement = rect.top >= 52 ? "above" : "below";
+  return {
+    text,
+    x: Math.min(window.innerWidth - 88, Math.max(88, rect.left + rect.width / 2)),
+    y: placement === "above" ? rect.top - 8 : rect.bottom + 8,
+    placement,
+  };
+}
+
+function useTranscriptSelection(
+  rootRef: React.RefObject<HTMLDivElement | null>,
+  onAdd: (text: string) => void,
+) {
+  const [action, setAction] = useState<SelectionAction | null>(null);
+  const update = useCallback(() => {
+    const root = rootRef.current;
+    setAction(root ? currentTranscriptSelection(root) : null);
+  }, [rootRef]);
+
+  useEffect(() => {
+    document.addEventListener("selectionchange", update);
+    return () => document.removeEventListener("selectionchange", update);
+  }, [update]);
+
+  useEffect(() => {
+    if (!action) return;
+    const dismiss = (event: MouseEvent) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest(".chat-selection-action")) return;
+      setAction(null);
+    };
+    document.addEventListener("mousedown", dismiss, true);
+    window.addEventListener("resize", update);
+    return () => {
+      document.removeEventListener("mousedown", dismiss, true);
+      window.removeEventListener("resize", update);
+    };
+  }, [action, update]);
+
+  const add = useCallback(() => {
+    if (!action) return;
+    onAdd(action.text);
+    setAction(null);
+    window.getSelection()?.removeAllRanges();
+  }, [action, onAdd]);
+  const dismiss = useCallback(() => setAction(null), []);
+
+  return { action, add, dismiss };
+}
+
+function ComposerAnnotations({
+  annotations,
+  onClear,
+  onRemove,
+}: {
+  annotations: ComposerAnnotation[];
+  onClear: () => void;
+  onRemove: (id: string) => void;
+}) {
+  const popover = usePopover();
+  return (
+    <div className="composer-annotations relative flex w-fit pt-2 px-3 pb-0" ref={popover.ref}>
+      <div className="inline-flex items-center border border-border rounded-md bg-background overflow-hidden">
+        <button
+          type="button"
+          className="inline-flex items-center gap-2 py-1.5 pl-2.5 pr-2 text-sm font-medium text-text [&:hover]:bg-surface"
+          aria-expanded={popover.open}
+          aria-haspopup="dialog"
+          onClick={() => popover.setOpen((open) => !open)}
+        >
+          <MessageSquareQuote size={15} className="text-muted" />
+          {annotations.length} {annotations.length === 1 ? "annotation" : "annotations"}
+        </button>
+        <button
+          type="button"
+          className="inline-flex items-center justify-center self-stretch w-7 text-muted border-l border-border [&:hover]:bg-surface [&:hover]:text-text"
+          title="Clear annotations"
+          aria-label="Clear annotations"
+          onClick={onClear}
+        >
+          <X size={14} />
+        </button>
+      </div>
+      {popover.open && (
+        <div
+          className="annotation-menu absolute bottom-[calc(100%_+_8px)] left-3 z-50 w-[min(440px,_calc(100vw_-_48px))] max-h-80 overflow-y-auto bg-background border border-border rounded-lg shadow-[0_12px_32px_rgba(0,_0,_0,_0.18)] p-2"
+          role="dialog"
+          aria-label="Selected chat text"
+        >
+          {annotations.map((annotation, index) => (
+            <div
+              key={annotation.id}
+              className="annotation-item grid grid-cols-[24px_minmax(0,_1fr)_24px] gap-2 py-2 px-1 [&+&]:border-t [&+&]:border-border-variant"
+            >
+              <span className="text-sm text-muted text-right">{index + 1}.</span>
+              <div className="min-w-0">
+                <div className="text-sm text-muted mb-1">Selected text:</div>
+                <div className="text-md leading-normal text-text whitespace-pre-wrap wrap-anywhere max-h-24 overflow-hidden">
+                  {annotation.text}
+                </div>
+              </div>
+              <button
+                type="button"
+                className="inline-flex items-center justify-center w-6 h-6 rounded-sm text-muted [&:hover]:bg-surface [&:hover]:text-text"
+                title="Remove annotation"
+                aria-label={`Remove annotation ${index + 1}`}
+                onClick={() => onRemove(annotation.id)}
+              >
+                <X size={13} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 const PROMPT_COLLAPSED_CLASS_NAME = [
   "prompt-collapsed text-muted text-lg font-[375] my-3.5 mx-0 [&_summary]:flex",
@@ -2863,6 +3026,10 @@ export function ChatPanel({
   const [unreadSessionIds, setUnreadSessionIds] = useState<ReadonlySet<string>>(new Set());
   const [sessionFilter, setSessionFilter] = useState<SessionFilter>("active");
   const [draft, setDraft] = useState("");
+  const [annotations, setAnnotations] = useState<ComposerAnnotation[]>([]);
+  const annotationId = useRef(0);
+  const composerScopeRef = useRef({ projectId, activeId });
+  composerScopeRef.current = { projectId, activeId };
   // Pasted/dropped/uploaded attachments waiting in the composer, as data URLs.
   const [attachments, setAttachments] = useState<
     { dataUrl: string; mediaType: string; name?: string; size: number }[]
@@ -2909,6 +3076,20 @@ export function ChatPanel({
   // Consolidated chat-settings popover (permissions/reasoning/sources), opened
   // by the switch icon in the composer footer.
   const chatSettings = usePopover();
+  const addTranscriptSelection = useCallback((text: string) => {
+    annotationId.current += 1;
+    setAnnotations((current) => [
+      ...current,
+      { id: `annotation-${annotationId.current}`, text },
+    ]);
+    composerRef.current?.focus();
+  }, []);
+  const transcriptSelection = useTranscriptSelection(threadInnerRef, addTranscriptSelection);
+
+  useEffect(() => {
+    setAnnotations([]);
+    transcriptSelection.dismiss();
+  }, [activeId, projectId, transcriptSelection.dismiss]);
 
   // Slash-skills: menu state is derived from the draft — open while the first
   // token is an unfinished `/command` (no whitespace yet) with matches.
@@ -3451,18 +3632,37 @@ export function ChatPanel({
     // the backend's slash expansion and the transcript both see only text.
     const text = pickedSkill ? `/${pickedSkill.name}${args ? ` ${args}` : ""}` : args;
     const pending = attachments;
-    if (!text && pending.length === 0) return;
+    const pendingAnnotations = annotations;
+    const sourceProjectId = projectId;
+    let sourceSessionId = activeId;
+    const inSourceScope = () => {
+      const current = composerScopeRef.current;
+      return current.projectId === sourceProjectId && current.activeId === sourceSessionId;
+    };
+    const restoreComposer = () => {
+      if (!inSourceScope()) return;
+      setDraft((current) => current || text);
+      setAttachments((current) => (current.length ? current : pending));
+      setAnnotations((current) => (current.length ? current : pendingAnnotations));
+    };
+    if (!text && pending.length === 0 && pendingAnnotations.length === 0) return;
     // A pending question card owns plain typed text as a custom answer
     // (Claude-desktop behavior). This also works while the turn is HELD on
     // the card — where a new message would be rejected as busy and silently
     // dropped. A failed answer restores the draft so the text isn't lost.
     // (Auto-convert is off while a card is pending; a chip picked from the
     // menu or left over just serializes into the note text, same as typing it.)
-    if (text && pendingQuestion && pending.length === 0) {
+    if ((text || pendingAnnotations.length > 0) && pendingQuestion && pending.length === 0) {
       setDraft("");
       setPickedSkill(null);
-      void respond({ promptId: pendingQuestion, answers: [], note: text }).then((ok) => {
-        if (!ok) setDraft((cur) => cur || text);
+      setAnnotations([]);
+      void respond({
+        promptId: pendingQuestion,
+        answers: [],
+        note: text || undefined,
+        annotations: pendingAnnotations,
+      }).then((ok) => {
+        if (!ok) restoreComposer();
       });
       return;
     }
@@ -3476,6 +3676,7 @@ export function ChatPanel({
       setDraft("");
       setPickedSkill(null);
       setAttachments([]);
+      setAnnotations([]);
       setAttachError(null);
       const turnOpts = composerSelection
         ? {
@@ -3491,11 +3692,16 @@ export function ChatPanel({
         name: a.name,
       }));
       try {
-        await sendChatMessage(sid, text, turnOpts, images.length ? images : undefined);
+        await sendChatMessage(
+          sid,
+          text,
+          turnOpts,
+          images.length ? images : undefined,
+          pendingAnnotations,
+        );
       } catch {
         // Never reached the queue — restore the composer so a retry is one keypress.
-        setDraft((cur) => cur || text);
-        setAttachments((cur) => (cur.length ? cur : pending));
+        restoreComposer();
       }
       return;
     }
@@ -3503,28 +3709,31 @@ export function ChatPanel({
     // `composerSelection` already resolves to the open session's settings (+ any
     // unsent tweak) or, for a new session, the global preference.
     const effective = composerSelection;
-    if (!effective && !activeId) return; // no harness available at all
+    if (!effective) return;
     setDraft("");
     setPickedSkill(null);
     setAttachments([]);
+    setAnnotations([]);
     setAttachError(null);
     let sid = activeId;
     try {
       if (!sid) {
-        const session = await createChatSession(projectId, effective!.harness, {
-          model: effective!.model,
-          permissionMode: effective!.permissionMode,
-          reasoningLevel: effective!.reasoningLevel,
+        const session = await createChatSession(projectId, effective.harness, {
+          model: effective.model,
+          permissionMode: effective.permissionMode,
+          reasoningLevel: effective.reasoningLevel,
         });
         loadedSessions.current.add(session.id);
         setSessions((cur) => [session, ...cur]);
         setActiveId(session.id);
         sid = session.id;
+        sourceSessionId = session.id;
+        composerScopeRef.current = { projectId, activeId: session.id };
       }
       dispatch({
         type: "optimisticUser",
         sessionId: sid,
-        text,
+        text: text || "Asked about selected text",
         attachments: pending.map((a) => ({ url: a.dataUrl, mediaType: a.mediaType, name: a.name })),
       });
       dispatch({ type: "busy", sessionId: sid, busy: true });
@@ -3549,12 +3758,17 @@ export function ChatPanel({
         dataBase64: a.dataUrl.slice(a.dataUrl.indexOf(",") + 1),
         name: a.name,
       }));
-      await sendChatMessage(sid, text, turnOpts, images.length ? images : undefined);
+      await sendChatMessage(
+        sid,
+        text,
+        turnOpts,
+        images.length ? images : undefined,
+        pendingAnnotations,
+      );
     } catch (err) {
       // The message never reached a turn — put it back in the composer so a
       // retry is one keypress, whichever branch below applies.
-      setDraft((cur) => cur || text);
-      setAttachments((cur) => (cur.length ? cur : pending));
+      restoreComposer();
       if (!sid) return; // session creation failed; no transcript to annotate
       const msg = err instanceof Error ? err.message : String(err);
       // A *network* failure does not prove no turn started — the backend
@@ -3569,8 +3783,11 @@ export function ChatPanel({
           .catch(() => false);
         if (busyNow) {
           // The turn is real and streaming — undo the restore, nothing failed.
-          setDraft((cur) => (cur === text ? "" : cur));
-          setAttachments((cur) => (cur === pending ? [] : cur));
+          if (inSourceScope()) {
+            setDraft((cur) => (cur === text ? "" : cur));
+            setAttachments((cur) => (cur === pending ? [] : cur));
+            setAnnotations((cur) => (cur === pendingAnnotations ? [] : cur));
+          }
           return;
         }
       }
@@ -4021,6 +4238,7 @@ export function ChatPanel({
           onScroll={(e) => {
             const el = e.currentTarget;
             stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+            transcriptSelection.dismiss();
           }}
         >
           <div className="chat-thread-inner max-w-readable my-0 mx-auto pt-4 px-4 pb-8 flex flex-col gap-4" ref={threadInnerRef}>
@@ -4047,6 +4265,26 @@ export function ChatPanel({
               ))}
           </div>
         </div>
+      )}
+
+      {transcriptSelection.action && (
+        <button
+          type="button"
+          className="chat-selection-action fixed z-50 inline-flex items-center gap-1.5 py-1.5 px-3 border border-border rounded-md bg-background text-text text-sm font-medium shadow-[0_8px_24px_rgba(0,_0,_0,_0.18)] whitespace-nowrap [&:hover]:bg-surface"
+          style={{
+            left: transcriptSelection.action.x,
+            top: transcriptSelection.action.y,
+            transform:
+              transcriptSelection.action.placement === "above"
+                ? "translate(-50%, -100%)"
+                : "translateX(-50%)",
+          }}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={transcriptSelection.add}
+        >
+          <MessageSquareQuote size={14} />
+          Ask about this
+        </button>
       )}
 
       {/* Docked while a plan awaits a decision, so the approval controls never
@@ -4119,6 +4357,15 @@ export function ChatPanel({
               activeIndex={activeSkillIdx}
               onPick={pickSkill}
               onHover={setSkillIdx}
+            />
+          )}
+          {annotations.length > 0 && (
+            <ComposerAnnotations
+              annotations={annotations}
+              onClear={() => setAnnotations([])}
+              onRemove={(id) =>
+                setAnnotations((current) => current.filter((annotation) => annotation.id !== id))
+              }
             />
           )}
           {attachments.length > 0 && (
@@ -4360,7 +4607,10 @@ export function ChatPanel({
                 onClick={() => void send()}
                 disabled={
                   !activeHarness?.agentReady ||
-                  (!pickedSkill && !draft.trim() && attachments.length === 0)
+                  (!pickedSkill &&
+                    !draft.trim() &&
+                    attachments.length === 0 &&
+                    annotations.length === 0)
                 }
               >
                 <CornerDownLeft size={16} />
