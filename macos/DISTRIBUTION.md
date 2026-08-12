@@ -1,91 +1,56 @@
 # Distributing OpenResearch.app
 
-The macOS app is built by `scripts/build-macos-app.sh` and packaged into a
-signed, notarized DMG by `scripts/package-macos-app.sh`. In CI,
-`.github/workflows/release-macos-app.yml` does both after cargo-dist's "Release"
-workflow completes and attaches `OpenResearch.dmg` to that release — the download
-link becomes:
+`scripts/build-macos-app.sh` builds the app; `scripts/package-macos-app.sh`
+signs, notarizes, and packages it into a DMG. CI
+(`.github/workflows/release-macos-app.yml`) runs both after each release and
+attaches `OpenResearch.dmg`:
 
 ```
 https://github.com/alphaXiv/openresearch-cli/releases/latest/download/OpenResearch.dmg
 ```
 
-Until the `MACOS_SIGNING_ENABLED` variable is set (see below), the release job
-**skips cleanly** (an unsigned DMG would just trip Gatekeeper, so we don't
-publish one).
+The release job is a no-op until the `MACOS_SIGNING_ENABLED` variable is `true`.
 
-## One-time Apple setup (manual — only a human with the account can do this)
+## Configure signing (CI)
 
-1. **Enrol in the Apple Developer Program** ($99/yr). Approval can take up to a day.
-2. **Create a "Developer ID Application" certificate** (Xcode → Settings →
-   Accounts → Manage Certificates → +, or the Developer portal). This is the
-   cert for distributing *outside* the App Store.
-3. **Export it as a `.p12`** (Keychain Access → your "Developer ID Application"
-   cert → right-click → Export), setting an export password.
-4. **Create an app-specific password** for the notary service at
-   <https://account.apple.com> → Sign-In and Security → App-Specific Passwords.
-5. Note your **Team ID** (Developer portal → Membership) and the exact signing
-   identity string, e.g. `Developer ID Application: Your Org (TEAMID)`
-   (`security find-identity -v -p codesigning` lists it).
+Needs an Apple Developer Program account with a **Developer ID Application**
+certificate (see Apple's [notarizing docs](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)).
+From it you produce the six values below.
 
-## GitHub setup
-
-The six signing secrets live in a protected **environment** (not repo secrets),
-so only the reviewed `macos-app` job can read them. A separate non-secret
-variable turns the pipeline on, so the cheap gate never touches the cert.
-
-1. **Create the environment.** Settings → **Environments** → New environment →
-   `release-signing`. Then:
-   - Add yourself and/or `@sox8502` under **Required reviewers** (the signing job
-     pauses for approval on every release — the cert is never used by an
-     unreviewed change).
-   - Set **Deployment branches** → **Protected branches only** (or just `main`),
-     so the job can't run from other branches.
-2. **Add the six environment secrets** (in that environment, *not* repo-wide):
+1. Create the **`release-signing` environment** (Settings → Environments): add
+   **required reviewers** and set **Deployment branches → `main`**. Add these as
+   **environment** secrets (not repo-wide):
 
    | Secret | Value |
    | --- | --- |
-   | `MACOS_CERT_P12_BASE64` | `base64 -i cert.p12` (the exported `.p12`, base64-encoded) |
+   | `MACOS_CERT_P12_BASE64` | `base64 -i cert.p12` of the exported Developer ID cert |
    | `MACOS_CERT_PASSWORD` | the `.p12` export password |
-   | `MACOS_SIGN_IDENTITY` | `Developer ID Application: Your Org (TEAMID)` |
+   | `MACOS_SIGN_IDENTITY` | `Developer ID Application: <name> (TEAMID)` — `security find-identity -v -p codesigning` |
    | `MACOS_NOTARY_APPLE_ID` | your Apple ID email |
    | `MACOS_NOTARY_TEAM_ID` | your Team ID |
-   | `MACOS_NOTARY_PASSWORD` | the app-specific password from step 4 |
+   | `MACOS_NOTARY_PASSWORD` | an app-specific password (account.apple.com) |
 
-3. **Enable the pipeline.** Settings → Secrets and variables → Actions →
-   **Variables** → New repository variable: `MACOS_SIGNING_ENABLED` = `true`.
-   (Leave it unset/`false` to keep the release job a no-op.)
+2. Set repo **variable** `MACOS_SIGNING_ENABLED = true` to switch the pipeline on.
 
-Do **not** commit the `.p12`, and delete the local copy after base64-ing it into
-the secret.
+Also enable **Require a pull request** + **Require review from Code Owners** on
+`main` (see `.github/CODEOWNERS`) so the signing scripts can't change unreviewed.
+Never commit the `.p12`.
 
-## Also protect the code path
-
-The signing job runs repo-controlled scripts, so guard what can change them:
-`.github/CODEOWNERS` marks the workflows and macOS signing scripts as owned;
-enable **Require a pull request** + **Require review from Code Owners** on the
-`main` branch protection rule. Branch protection reviews the *code*; the
-environment gates the *cert* — do both.
-
-## Testing it locally (with your cert)
+## Build / sign locally
 
 ```bash
-rustup target add aarch64-apple-darwin x86_64-apple-darwin  # one-time, for universal
+rustup target add aarch64-apple-darwin x86_64-apple-darwin   # once, for universal
 ORX_APP_UNIVERSAL=1 bash scripts/build-macos-app.sh
-# one-time: cache notary creds in your keychain
 xcrun notarytool store-credentials orx-notary \
   --apple-id you@example.com --team-id TEAMID --password <app-specific-password>
-MACOS_SIGN_IDENTITY="Developer ID Application: Your Org (TEAMID)" \
-MACOS_NOTARY_PROFILE=orx-notary \
-  bash scripts/package-macos-app.sh
+MACOS_SIGN_IDENTITY="Developer ID Application: <name> (TEAMID)" \
+  MACOS_NOTARY_PROFILE=orx-notary bash scripts/package-macos-app.sh
 ```
 
-Without `MACOS_SIGN_IDENTITY` / `MACOS_NOTARY_PROFILE`, `package-macos-app.sh`
-still produces an **unsigned** `dist/OpenResearch.dmg` for local testing (open it
-with right-click → Open, or `xattr -dr com.apple.quarantine OpenResearch.app`).
+Without the two `MACOS_*` vars, `package-macos-app.sh` still makes an **unsigned**
+`dist/OpenResearch.dmg` for quick local testing.
 
 ## Not yet automated
 
-- **A nicer DMG layout** (background image + drag-to-Applications alias) — the
-  current DMG just contains the `.app`. `create-dmg` is the usual tool.
-- Publishing the download link anywhere other than GitHub Releases.
+- A nicer DMG layout (background + drag-to-Applications alias); `create-dmg` is
+  the usual tool.
