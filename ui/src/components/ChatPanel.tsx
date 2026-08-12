@@ -652,10 +652,8 @@ function idsFromToolOutput(output: string | undefined, resource: "runs" | "exper
   for (const pattern of patterns) {
     for (const match of output.matchAll(pattern)) ids.add(match[1]);
   }
-  if (ids.size === 0) {
-    const bareId = new RegExp(`(?:^|\\s)(${UUID_PATTERN})(?=\\s|$)`, "gim");
-    for (const match of output.matchAll(bareId)) ids.add(match[1]);
-  }
+  const bareIdLine = new RegExp(`^\\s*(${UUID_PATTERN})\\s*$`, "gim");
+  for (const match of output.matchAll(bareIdLine)) ids.add(match[1]);
   return [...ids];
 }
 
@@ -737,7 +735,9 @@ function toolActivity(part: ChatPart): ToolActivity {
   switch (tool.toLowerCase()) {
     case "bash": {
       if (!rawCommand) return { kind: "command", label: "Ran a command" };
-      const litCall = parseOrxLit(rawCommand);
+      const command = meaningfulCommand(rawCommand);
+      const litSegment = orxCommandSegments(command, "(?:lit|paper)")[0];
+      const litCall = litSegment ? parseOrxLit(litSegment.raw) : null;
       if (litCall) {
         const label = litCall.kind === "lit"
           ? litCall.query ? `Searched for “${litCall.query}”` : "Searched the literature"
@@ -745,7 +745,6 @@ function toolActivity(part: ChatPart): ToolActivity {
         return { kind: litCall.kind === "lit" ? "search" : "read", label, litCall };
       }
 
-      const command = meaningfulCommand(rawCommand);
       const shellSegments = shellCommandSegments(command);
       const executableCode = shellSegments.map((segment) => segment.code).join("\n");
       const readsExperimentStatus = commandInvokesOrx(command, "exp\\s+status");

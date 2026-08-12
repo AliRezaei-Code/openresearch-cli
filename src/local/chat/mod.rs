@@ -2301,9 +2301,11 @@ impl TurnCtx {
     /// Persist + broadcast the assistant message, rate-limited mid-turn.
     pub fn maybe_flush(&mut self) {
         let tool_states = tool_state_signature(&self.assistant.parts);
-        if tool_states != self.last_flushed_tool_states
-            || self.last_flush.elapsed() >= FLUSH_INTERVAL
-        {
+        let state_changed = tool_states != self.last_flushed_tool_states;
+        if state_changed || self.last_flush.elapsed() >= FLUSH_INTERVAL {
+            if state_changed {
+                self.last_flushed_tool_states = tool_states;
+            }
             let _ = self.flush();
         }
     }
