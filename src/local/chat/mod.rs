@@ -3377,8 +3377,6 @@ pub fn set_chat_session_env(cmd: &mut tokio::process::Command, session_id: &str)
     cmd.env(LOCAL_SESSION_ENV, "1");
     cmd.env_remove(CHAT_TARGET_FILE_ENV);
     cmd.env_remove(CHAT_TARGET_POINTER_ENV);
-    cmd.env_remove("BASH_ENV");
-    cmd.env_remove("ZDOTDIR");
 
     let shell_dir = shell_hook_dir(session_id);
     if std::fs::create_dir_all(&shell_dir).is_err() {
