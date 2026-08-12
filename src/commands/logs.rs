@@ -23,9 +23,7 @@ fn parse_integer(s: &str) -> Option<i64> {
 /// want); `--head` reads from the start, `--range <start>:<end>` an exact byte
 /// window (offsets come from `orx search-logs`).
 pub async fn run(args: crate::LogsArgs) -> Result<()> {
-    if std::env::var_os(crate::local::chat::CHAT_SESSION_ENV).is_some() {
-        eprintln!("[orx-run:{}]", args.run_id);
-    }
+    crate::local::chat::record_chat_target("runs", &args.run_id);
     let mut mode: &str = if args.head { "head" } else { "tail" };
     let mut start_byte: Option<i64> = None;
     let mut end_byte: Option<i64> = None;

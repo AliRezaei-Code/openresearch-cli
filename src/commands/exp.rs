@@ -28,7 +28,7 @@ pub async fn run(args: crate::ExpArgs) -> Result<()> {
     let store = Store::open()?;
     match args.command {
         ExpCommand::Status { exp_id } => {
-            emit_chat_experiment_target(&exp_id);
+            crate::local::chat::record_chat_target("experiments", &exp_id);
             resolve_experiment(store, &exp_id)?
                 .experiment_status()
                 .await
@@ -39,7 +39,7 @@ pub async fn run(args: crate::ExpArgs) -> Result<()> {
                 .await
         }
         ExpCommand::Desc { exp_id, set, stdin } => {
-            emit_chat_experiment_target(&exp_id);
+            crate::local::chat::record_chat_target("experiments", &exp_id);
             resolve_experiment(store, &exp_id)?
                 .experiment_desc(set, stdin)
                 .await
@@ -57,12 +57,6 @@ pub async fn run(args: crate::ExpArgs) -> Result<()> {
             timeout,
             interval,
         } => wait(store, exp_id, project, timeout, interval).await,
-    }
-}
-
-fn emit_chat_experiment_target(exp_id: &str) {
-    if std::env::var_os(crate::local::chat::CHAT_SESSION_ENV).is_some() {
-        eprintln!("[orx-experiment:{exp_id}]");
     }
 }
 

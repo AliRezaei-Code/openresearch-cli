@@ -1439,6 +1439,7 @@ async fn delete_project(State(state): State<AppState>, Path(id): Path<String>) -
     }
     store.delete_local_project(&id)?;
     for session in &sessions {
+        local::chat::cleanup_session_transcript_artifacts(&session.id);
         local::chat::cleanup_session_worktree(&project, &session.id);
     }
     Ok(Json(json!({ "ok": true })))
