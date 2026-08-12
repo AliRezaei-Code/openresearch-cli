@@ -1862,25 +1862,26 @@ impl ChatHost {
             // runs when the turn ends, instead of rejecting it. System/resume
             // sends pass `queue_if_busy = false` and keep the old rejection.
             None if queue_if_busy && !(text.trim().is_empty() && images.is_empty()) => {
-                if matches!(
-                    self.turns.lock().await.get(session_id),
-                    Some(TurnState::Cancelling)
-                ) {
-                    return Err(anyhow!("session is stopping — send again once it is idle"));
-                }
-                self.queued
-                    .lock()
-                    .unwrap()
-                    .entry(session_id.to_string())
-                    .or_default()
-                    .push_back(QueuedMessage {
-                        id: format!("q_{}", uuid::Uuid::new_v4()),
-                        text,
-                        overrides,
-                        images,
-                    });
+                let idle = {
+                    let turns = self.turns.lock().await;
+                    if matches!(turns.get(session_id), Some(TurnState::Cancelling)) {
+                        return Err(anyhow!("session is stopping — send again once it is idle"));
+                    }
+                    self.queued
+                        .lock()
+                        .unwrap()
+                        .entry(session_id.to_string())
+                        .or_default()
+                        .push_back(QueuedMessage {
+                            id: format!("q_{}", uuid::Uuid::new_v4()),
+                            text,
+                            overrides,
+                            images,
+                        });
+                    !turns.contains_key(session_id)
+                };
                 self.emit_queued(session_id);
-                if !self.is_busy(session_id).await {
+                if idle {
                     self.drain_queue(session_id).await;
                 }
                 return Ok(());
@@ -2256,6 +2257,7 @@ impl ChatHost {
         if !self.interrupt(session_id).await? {
             return Ok(());
         }
+        self.clear_queue(session_id);
         let msg = WireMessage {
             id: format!("msg_{}", uuid::Uuid::new_v4()),
             role: "assistant".into(),
