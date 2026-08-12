@@ -41,6 +41,7 @@ const TOOL_TARGET_CAP: usize = 256;
 const TOOL_TARGET_INSPECTION_CAP: usize = 1_024;
 const TOOL_TARGET_SCAN_BYTES: usize = 256_000;
 const CHAT_TARGET_FILE_ENV: &str = "ORX_CHAT_TARGET_FILE";
+const CHAT_TARGET_POINTER_ENV: &str = "ORX_CHAT_TARGET_POINTER";
 
 /// Keep the head and tail of `text` within [`TOOL_TEXT_CAP`] chars, marking
 /// the omitted middle. Idempotent — an already-capped string is left alone.
@@ -302,19 +303,44 @@ fn preserve_tool_targets(state: &mut WireToolState) {
     }
 }
 
-fn target_event_path(session_id: &str) -> PathBuf {
-    let safe = session_id
+fn safe_session_name(session_id: &str) -> String {
+    session_id
         .chars()
         .filter(|char| char.is_ascii_alphanumeric() || matches!(char, '-' | '_'))
-        .collect::<String>();
-    crate::store::data_dir()
-        .join("chat-targets")
-        .join(format!("{safe}.events"))
+        .collect()
 }
 
-fn target_event_start(session_id: &str) -> (PathBuf, u64) {
-    let path = target_event_path(session_id);
+fn target_event_path(session_id: &str, message_id: &str) -> PathBuf {
+    let safe = safe_session_name(session_id);
+    let message = safe_session_name(message_id);
+    crate::store::data_dir()
+        .join("chat-targets")
+        .join(format!("{safe}-{message}.events"))
+}
+
+fn target_event_pointer(session_id: &str) -> PathBuf {
+    crate::store::data_dir()
+        .join("chat-targets")
+        .join(format!("{}.current", safe_session_name(session_id)))
+}
+
+fn shell_hook_dir(session_id: &str) -> PathBuf {
+    crate::store::data_dir()
+        .join("chat-shell")
+        .join(safe_session_name(session_id))
+}
+
+fn target_event_start(session_id: &str, message_id: &str) -> (PathBuf, u64) {
+    let path = target_event_path(session_id, message_id);
     let _ = std::fs::remove_file(&path);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::File::create(&path);
+    let _ = std::fs::write(
+        target_event_pointer(session_id),
+        path.to_string_lossy().as_bytes(),
+    );
     (path, 0)
 }
 
@@ -339,9 +365,14 @@ pub fn record_chat_target(resource: &str, target: &str) {
     {
         let scope = std::env::var("ORX_CHAT_TOOL_SCOPE").unwrap_or_default();
         let command = std::env::var("ORX_CHAT_TOOL_COMMAND").unwrap_or_default();
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let event = json!({
             "scope": scope.to_string(),
             "command": command,
+            "cwd": cwd,
             "resource": resource,
             "target": target,
         });
@@ -355,56 +386,69 @@ pub fn record_chat_target(resource: &str, target: &str) {
     }
 }
 
-fn attach_target_event(
-    parts: &mut [WirePart],
-    bound_part_id: Option<&str>,
-    claimed_part_ids: &HashSet<String>,
+fn target_command_matches(command: &str, command_hint: &str, resource: &str) -> bool {
+    let resource_matches = if resource == "runs" {
+        command.contains("orx logs")
+    } else {
+        command.contains("orx exp status") || command.contains("orx exp desc")
+    };
+    resource_matches
+        && (command_hint.is_empty()
+            || command.contains(command_hint)
+            || command_hint.contains(command))
+}
+
+fn target_candidates(
+    parts: &[WirePart],
     command_hint: &str,
     resource: &str,
-    target: &str,
-) -> Option<String> {
-    for part in parts.iter_mut().rev() {
-        if let Some(part_id) = attach_target_event(
-            &mut part.children,
-            bound_part_id,
-            claimed_part_ids,
-            command_hint,
-            resource,
-            target,
-        ) {
-            return Some(part_id);
-        }
-        let Some(state) = part.state.as_mut() else {
+    candidates: &mut Vec<(String, String, Option<String>)>,
+) {
+    for part in parts.iter().rev() {
+        target_candidates(&part.children, command_hint, resource, candidates);
+        let Some(input) = part
+            .state
+            .as_ref()
+            .and_then(|state| state.input.as_ref())
+            .and_then(Value::as_object)
+        else {
             continue;
         };
-        let Some(input) = state.input.as_mut().and_then(Value::as_object_mut) else {
-            continue;
-        };
-        let command = tool_command(input).to_ascii_lowercase();
-        let normalized_hint = command_hint
+        let command = tool_command(input)
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
             .to_ascii_lowercase();
-        if !normalized_hint.is_empty()
-            && !command.contains(&normalized_hint)
-            && !normalized_hint.contains(&command)
-        {
+        if target_command_matches(&command, command_hint, resource) {
+            let cwd = input
+                .get("cwd")
+                .or_else(|| input.get("workdir"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            candidates.push((part.id.clone(), command, cwd));
+        }
+    }
+}
+
+fn attach_target_to_ids(
+    parts: &mut [WirePart],
+    part_ids: &HashSet<String>,
+    resource: &str,
+    target: &str,
+) {
+    for part in parts {
+        attach_target_to_ids(&mut part.children, part_ids, resource, target);
+        if !part_ids.contains(&part.id) {
             continue;
         }
-        let matches = if resource == "runs" {
-            command.contains("orx logs")
-        } else {
-            command.contains("orx exp status") || command.contains("orx exp desc")
+        let Some(input) = part
+            .state
+            .as_mut()
+            .and_then(|state| state.input.as_mut())
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
         };
-        if !matches {
-            continue;
-        }
-        if bound_part_id.is_some_and(|id| id != part.id)
-            || (bound_part_id.is_none() && claimed_part_ids.contains(&part.id))
-        {
-            continue;
-        }
         let key = if resource == "runs" {
             "runTargetIds"
         } else {
@@ -426,23 +470,60 @@ fn attach_target_event(
         push_tool_target(&mut targets, &mut seen, target);
         input.insert(key.into(), json!(targets));
         input.insert(format!("{key}Authoritative"), Value::Bool(true));
-        return Some(part.id.clone());
     }
-    None
+}
+
+fn attach_target_event(
+    parts: &mut [WirePart],
+    bound_part_ids: Option<&[String]>,
+    claimed_part_ids: &HashSet<String>,
+    command_hint: &str,
+    cwd_hint: &str,
+    resource: &str,
+    target: &str,
+) -> Vec<String> {
+    let ids = if let Some(bound) = bound_part_ids {
+        bound.iter().cloned().collect::<HashSet<_>>()
+    } else {
+        let normalized_hint = command_hint
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        let mut candidates = Vec::new();
+        target_candidates(parts, &normalized_hint, resource, &mut candidates);
+        if !cwd_hint.is_empty()
+            && candidates
+                .iter()
+                .any(|(_, _, cwd)| cwd.as_deref() == Some(cwd_hint))
+        {
+            candidates.retain(|(_, _, cwd)| cwd.as_deref() == Some(cwd_hint));
+        }
+        let Some((_, selected_command, _)) = candidates
+            .iter()
+            .find(|(id, _, _)| !claimed_part_ids.contains(id))
+            .or_else(|| candidates.first())
+        else {
+            return Vec::new();
+        };
+        let selected_command = selected_command.clone();
+        candidates
+            .into_iter()
+            .filter(|(_, command, _)| command == &selected_command)
+            .map(|(id, _, _)| id)
+            .collect::<HashSet<_>>()
+    };
+    attach_target_to_ids(parts, &ids, resource, target);
+    ids.into_iter().collect()
 }
 
 fn reconcile_target_file(session_id: &str, message_id: &str) -> Option<WireMessage> {
-    let path = target_event_path(session_id);
-    let Ok(file) = std::fs::File::open(&path) else {
-        return None;
-    };
+    let path = target_event_path(session_id, message_id);
     let mut contents = String::new();
-    if file
-        .take(TOOL_TARGET_SCAN_BYTES as u64)
-        .read_to_string(&mut contents)
-        .is_err()
-    {
-        return None;
+    if let Ok(file) = std::fs::File::open(&path) {
+        let _ = file
+            .take(TOOL_TARGET_SCAN_BYTES as u64)
+            .read_to_string(&mut contents);
     }
     let Ok(store) = Store::open() else {
         return None;
@@ -466,22 +547,26 @@ fn reconcile_target_file(session_id: &str, message_id: &str) -> Option<WireMessa
         ) else {
             continue;
         };
-        let bound = bindings.get(scope).map(String::as_str);
-        let Some(part_id) = attach_target_event(
+        let cwd = event.get("cwd").and_then(Value::as_str).unwrap_or_default();
+        let bound = bindings.get(scope).map(Vec::as_slice);
+        let part_ids = attach_target_event(
             &mut message.parts,
             bound,
             &claimed,
             command,
+            cwd,
             resource,
             target,
-        ) else {
+        );
+        if part_ids.is_empty() {
             continue;
-        };
+        }
         bindings
             .entry(scope.to_string())
-            .or_insert_with(|| part_id.clone());
-        claimed.insert(part_id);
+            .or_insert_with(|| part_ids.clone());
+        claimed.extend(part_ids);
     }
+    settle_interrupted_tool_parts(&mut message.parts);
     if store
         .upsert_chat_message(&StoredChatMessage {
             id: message.id.clone(),
@@ -495,7 +580,30 @@ fn reconcile_target_file(session_id: &str, message_id: &str) -> Option<WireMessa
         return None;
     }
     let _ = std::fs::remove_file(path);
+    remove_target_pointer_if_matches(session_id, message_id);
     Some(message)
+}
+
+fn settle_interrupted_tool_parts(parts: &mut [WirePart]) {
+    for part in parts {
+        settle_interrupted_tool_parts(&mut part.children);
+        if let Some(state) = part.state.as_mut() {
+            if state.status == "running" {
+                state.status = "interrupted".into();
+            }
+        }
+    }
+}
+
+fn remove_target_pointer_if_matches(session_id: &str, message_id: &str) {
+    let pointer = target_event_pointer(session_id);
+    let expected = target_event_path(session_id, message_id);
+    if std::fs::read_to_string(&pointer)
+        .ok()
+        .is_some_and(|path| PathBuf::from(path) == expected)
+    {
+        let _ = std::fs::remove_file(pointer);
+    }
 }
 
 /// Find a part by id anywhere in the tree (depth-first), returning `&mut` to it.
@@ -1898,7 +2006,9 @@ impl ChatHost {
         }
 
         let sid = session.id.clone();
-        let (target_path, target_event_offset) = target_event_start(&session.id);
+        let assistant_message_id = format!("msg_{}", uuid::Uuid::new_v4());
+        let (target_path, target_event_offset) =
+            target_event_start(&session.id, &assistant_message_id);
         let mut ctx = TurnCtx {
             host: self.clone(),
             session_id: session.id.clone(),
@@ -1914,7 +2024,7 @@ impl ChatHost {
             project,
             text: turn_text,
             assistant: WireMessage {
-                id: format!("msg_{}", uuid::Uuid::new_v4()),
+                id: assistant_message_id,
                 role: "assistant".into(),
                 parts: Vec::new(),
                 created_at: now_ms(),
@@ -1956,7 +2066,10 @@ impl ChatHost {
                     ctx.push_error(format!("{err}"));
                 }
                 let _ = ctx.flush();
-                let _ = std::fs::remove_file(target_event_path(&ctx.session_id));
+                if let Some(path) = ctx.target_event_path.as_ref() {
+                    let _ = std::fs::remove_file(path);
+                }
+                remove_target_pointer_if_matches(&ctx.session_id, &ctx.assistant.id);
                 if let Some(usage) = &ctx.context_usage {
                     if let (Ok(store), Ok(json)) = (Store::open(), serde_json::to_string(usage)) {
                         let _ = store.set_chat_session_context_usage(&ctx.session_id, &json);
@@ -2348,9 +2461,8 @@ impl ChatHost {
         let store = Store::open()?;
         let session = store.get_chat_session(session_id)?;
         store.delete_chat_session(session_id)?;
-        let _ = std::fs::remove_file(target_event_path(session_id));
-        let _ =
-            std::fs::remove_dir_all(crate::store::data_dir().join("chat-shell").join(session_id));
+        let _ = std::fs::remove_file(target_event_pointer(session_id));
+        let _ = std::fs::remove_dir_all(shell_hook_dir(session_id));
         self.emit("chat.session.deleted", json!({ "sessionId": session_id }));
         if let Some(session) = session {
             if let Ok(Some(project)) = store.get_local_project(&session.project_id) {
@@ -2626,8 +2738,8 @@ pub struct TurnCtx {
     last_attempted_tool_states: Vec<(String, String)>,
     target_event_path: Option<PathBuf>,
     target_event_offset: u64,
-    pending_target_events: Vec<(String, String, String, String)>,
-    target_event_bindings: HashMap<String, String>,
+    pending_target_events: Vec<(String, String, String, String, String)>,
+    target_event_bindings: HashMap<String, Vec<String>>,
 }
 
 impl TurnCtx {
@@ -2712,11 +2824,16 @@ impl TurnCtx {
                                     ) else {
                                         continue;
                                     };
+                                    let cwd = event
+                                        .get("cwd")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default();
                                     if self.pending_target_events.len() < TOOL_TARGET_INSPECTION_CAP
                                     {
                                         self.pending_target_events.push((
                                             scope.to_string(),
                                             command.to_string(),
+                                            cwd.to_string(),
                                             resource.to_string(),
                                             target.to_string(),
                                         ));
@@ -2733,25 +2850,30 @@ impl TurnCtx {
             .target_event_bindings
             .values()
             .cloned()
+            .flatten()
             .collect::<HashSet<_>>();
         let mut remaining = Vec::new();
-        for (scope, command, resource, target) in std::mem::take(&mut self.pending_target_events) {
-            let bound = self.target_event_bindings.get(&scope).map(String::as_str);
-            let Some(part_id) = attach_target_event(
+        for (scope, command, cwd, resource, target) in
+            std::mem::take(&mut self.pending_target_events)
+        {
+            let bound = self.target_event_bindings.get(&scope).map(Vec::as_slice);
+            let part_ids = attach_target_event(
                 &mut self.assistant.parts,
                 bound,
                 &claimed,
                 &command,
+                &cwd,
                 &resource,
                 &target,
-            ) else {
-                remaining.push((scope, command, resource, target));
+            );
+            if part_ids.is_empty() {
+                remaining.push((scope, command, cwd, resource, target));
                 continue;
-            };
+            }
             self.target_event_bindings
                 .entry(scope)
-                .or_insert_with(|| part_id.clone());
-            claimed.insert(part_id);
+                .or_insert_with(|| part_ids.clone());
+            claimed.extend(part_ids);
         }
         self.pending_target_events = remaining;
     }
@@ -3078,46 +3200,97 @@ pub const CHAT_SESSION_ENV: &str = "ORX_CHAT_SESSION_ID";
 /// attribution — presence of a session id alone no longer implies local.
 pub const LOCAL_SESSION_ENV: &str = "ORX_LOCAL_SESSION";
 
+fn shell_single_quote(path: &std::path::Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+fn zsh_startup_wrapper(name: &str) -> String {
+    format!(
+        "_ORX_CHAT_SHIM_ZDOTDIR=$ZDOTDIR\n\
+         ZDOTDIR=$_ORX_CHAT_USER_ZDOTDIR\n\
+         [[ -r \"$ZDOTDIR/{name}\" ]] && source \"$ZDOTDIR/{name}\"\n\
+         _ORX_CHAT_USER_ZDOTDIR=$ZDOTDIR\n\
+         ZDOTDIR=$_ORX_CHAT_SHIM_ZDOTDIR\n"
+    )
+}
+
 /// Stamp the launching session id onto a harness child's env. Call *after*
 /// `prepare_env` so a dashboard-synced value can't shadow it. Harness children
 /// are one-per-session, so this is unambiguous.
 pub fn set_chat_session_env(cmd: &mut tokio::process::Command, session_id: &str) {
     cmd.env(CHAT_SESSION_ENV, session_id);
     cmd.env(LOCAL_SESSION_ENV, "1");
-    let target_path = target_event_path(session_id);
-    if let Some(parent) = target_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+
+    let shell_dir = shell_hook_dir(session_id);
+    if std::fs::create_dir_all(&shell_dir).is_err() {
+        return;
     }
-    let _ = std::fs::remove_file(&target_path);
-    cmd.env(CHAT_TARGET_FILE_ENV, target_path);
-    let shell_dir = crate::store::data_dir().join("chat-shell").join(session_id);
-    let _ = std::fs::create_dir_all(&shell_dir);
     let original_zdotdir = std::env::var_os("ZDOTDIR")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
-    let source = original_zdotdir
-        .as_ref()
-        .map(|path| path.join(".zshenv"))
-        .filter(|path| path.is_file())
-        .map(|path| {
-            let escaped = path.to_string_lossy().replace('\'', "'\\''");
-            format!("source '{escaped}'\n")
-        })
-        .unwrap_or_default();
-    let hook = format!(
-        "{source}export ORX_CHAT_TOOL_SCOPE=\"zsh-$$\"\nexport ORX_CHAT_TOOL_COMMAND=\"$ZSH_EXECUTION_STRING\"\n"
+    let Some(original_zdotdir) = original_zdotdir else {
+        return;
+    };
+    let pointer = target_event_pointer(session_id);
+    let zshenv = format!(
+        "_ORX_CHAT_SHIM_ZDOTDIR=$ZDOTDIR\n\
+         _ORX_CHAT_USER_ZDOTDIR={}\n\
+         ZDOTDIR=$_ORX_CHAT_USER_ZDOTDIR\n\
+         [[ -r \"$ZDOTDIR/.zshenv\" ]] && source \"$ZDOTDIR/.zshenv\"\n\
+         _ORX_CHAT_USER_ZDOTDIR=$ZDOTDIR\n\
+         ZDOTDIR=$_ORX_CHAT_SHIM_ZDOTDIR\n\
+         export ORX_CHAT_TOOL_SCOPE=\"zsh-$$\"\n\
+         export ORX_CHAT_TOOL_COMMAND=\"$ZSH_EXECUTION_STRING\"\n\
+         if [[ -r \"$ORX_CHAT_TARGET_POINTER\" ]]; then\n\
+           export ORX_CHAT_TARGET_FILE=$(<\"$ORX_CHAT_TARGET_POINTER\")\n\
+         else\n\
+           unset ORX_CHAT_TARGET_FILE\n\
+         fi\n",
+        shell_single_quote(&original_zdotdir)
     );
-    let _ = std::fs::write(shell_dir.join(".zshenv"), hook);
-    if let Some(original) = original_zdotdir {
-        for name in [".zprofile", ".zshrc", ".zlogin", ".zlogout"] {
-            let path = original.join(name);
-            if path.is_file() {
-                let escaped = path.to_string_lossy().replace('\'', "'\\''");
-                let _ = std::fs::write(shell_dir.join(name), format!("source '{escaped}'\n"));
-            }
-        }
+    let mut hooks = vec![(".zshenv", zshenv)];
+    hooks.extend(
+        [".zprofile", ".zshrc", ".zlogin", ".zlogout"]
+            .into_iter()
+            .map(|name| (name, zsh_startup_wrapper(name))),
+    );
+    if hooks
+        .iter()
+        .any(|(name, contents)| std::fs::write(shell_dir.join(name), contents).is_err())
+    {
+        return;
     }
+
+    let bash_env = shell_dir.join("bash_env");
+    let original_bash_env = std::env::var_os("BASH_ENV")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .map(|path| format!("source {}\n", shell_single_quote(&path)))
+        .unwrap_or_default();
+    let bash_hook = format!(
+        "{original_bash_env}\
+         export ORX_CHAT_TOOL_SCOPE=\"bash-$$\"\n\
+         if [[ -r \"$ORX_CHAT_TARGET_POINTER\" ]]; then\n\
+           export ORX_CHAT_TARGET_FILE=$(<\"$ORX_CHAT_TARGET_POINTER\")\n\
+         else\n\
+           unset ORX_CHAT_TARGET_FILE\n\
+         fi\n\
+         _ORX_CHAT_PRIOR_DEBUG=$(trap -p DEBUG)\n\
+         _ORX_CHAT_PRIOR_DEBUG=${{_ORX_CHAT_PRIOR_DEBUG#trap -- \\'}}\n\
+         _ORX_CHAT_PRIOR_DEBUG=${{_ORX_CHAT_PRIOR_DEBUG%\\' DEBUG}}\n\
+         _orx_chat_debug() {{\n\
+           export ORX_CHAT_TOOL_COMMAND=\"$BASH_COMMAND\"\n\
+           [[ -n \"$_ORX_CHAT_PRIOR_DEBUG\" ]] && eval \"$_ORX_CHAT_PRIOR_DEBUG\"\n\
+         }}\n\
+         trap _orx_chat_debug DEBUG\n"
+    );
+    if std::fs::write(&bash_env, bash_hook).is_err() {
+        return;
+    }
+
+    cmd.env(CHAT_TARGET_POINTER_ENV, pointer);
     cmd.env("ZDOTDIR", shell_dir);
+    cmd.env("BASH_ENV", bash_env);
 }
 
 /// The chat session that launched this run, read from the env the harness child
@@ -3426,18 +3599,128 @@ mod cap_tests {
             children: Vec::new(),
         }];
 
-        assert!(attach_target_event(
+        assert!(!attach_target_event(
             &mut parts,
             None,
             &HashSet::new(),
             "id=$(lookup); orx logs \"$id\"",
+            "",
             "runs",
             target,
         )
-        .is_some());
+        .is_empty());
         let input = parts[0].state.as_ref().unwrap().input.as_ref().unwrap();
         assert_eq!(input["runTargetIds"], json!([target]));
         assert_eq!(input["runTargetIdsAuthoritative"], true);
+    }
+
+    #[test]
+    fn identical_parallel_commands_share_authoritative_targets() {
+        let first = "11111111-1111-1111-1111-111111111111";
+        let second = "22222222-2222-2222-2222-222222222222";
+        let make_part = |id: &str| WirePart {
+            id: id.into(),
+            kind: "tool".into(),
+            text: None,
+            tool: Some("bash".into()),
+            state: Some(WireToolState {
+                status: "completed".into(),
+                input: Some(json!({ "command": "orx logs \"$id\"" })),
+                output: None,
+                error: None,
+                title: None,
+            }),
+            prompt: None,
+            children: Vec::new(),
+        };
+        let mut parts = vec![make_part("one"), make_part("two")];
+        let mut claimed = HashSet::new();
+        let ids = attach_target_event(
+            &mut parts,
+            None,
+            &claimed,
+            "orx logs \"$id\"",
+            "",
+            "runs",
+            first,
+        );
+        claimed.extend(ids);
+        assert!(!attach_target_event(
+            &mut parts,
+            None,
+            &claimed,
+            "orx logs \"$id\"",
+            "",
+            "runs",
+            second,
+        )
+        .is_empty());
+
+        for part in parts {
+            let input = part.state.unwrap().input.unwrap();
+            assert_eq!(input["runTargetIds"], json!([first, second]));
+        }
+    }
+
+    #[test]
+    fn target_cwd_disambiguates_parallel_commands() {
+        let target = "11111111-1111-1111-1111-111111111111";
+        let make_part = |id: &str, cwd: &str| WirePart {
+            id: id.into(),
+            kind: "tool".into(),
+            text: None,
+            tool: Some("bash".into()),
+            state: Some(WireToolState {
+                status: "completed".into(),
+                input: Some(json!({ "command": "orx logs \"$id\"", "cwd": cwd })),
+                output: None,
+                error: None,
+                title: None,
+            }),
+            prompt: None,
+            children: Vec::new(),
+        };
+        let mut parts = vec![make_part("one", "/one"), make_part("two", "/two")];
+        let mut ids = attach_target_event(
+            &mut parts,
+            None,
+            &HashSet::new(),
+            "orx logs \"$id\"",
+            "/one",
+            "runs",
+            target,
+        );
+
+        ids.sort();
+        assert_eq!(ids, vec!["one"]);
+        assert_eq!(
+            parts[0].state.as_ref().unwrap().input.as_ref().unwrap()["runTargetIds"],
+            json!([target])
+        );
+        assert!(parts[1].state.as_ref().unwrap().input.as_ref().unwrap()["runTargetIds"].is_null());
+    }
+
+    #[test]
+    fn interrupted_reconciliation_settles_running_tools() {
+        let mut parts = vec![WirePart {
+            id: "running".into(),
+            kind: "tool".into(),
+            text: None,
+            tool: Some("bash".into()),
+            state: Some(WireToolState {
+                status: "running".into(),
+                input: None,
+                output: None,
+                error: None,
+                title: None,
+            }),
+            prompt: None,
+            children: Vec::new(),
+        }];
+
+        settle_interrupted_tool_parts(&mut parts);
+
+        assert_eq!(parts[0].state.as_ref().unwrap().status, "interrupted");
     }
 
     #[test]
