@@ -469,9 +469,12 @@ function idsFromToolOutput(output: string | undefined, resource: "runs" | "exper
         new RegExp(`^\\s*id:\\s*(${UUID_PATTERN})`, "gim"),
         new RegExp(`={3,}\\s*(${UUID_PATTERN})\\s*={3,}`, "gi"),
       ];
-  patterns.push(new RegExp(`(?:^|\\s)(${UUID_PATTERN})(?=\\s|$)`, "gim"));
   for (const pattern of patterns) {
     for (const match of output.matchAll(pattern)) ids.add(match[1]);
+  }
+  if (ids.size === 0) {
+    const bareId = new RegExp(`(?:^|\\s)(${UUID_PATTERN})(?=\\s|$)`, "gim");
+    for (const match of output.matchAll(bareId)) ids.add(match[1]);
   }
   return [...ids];
 }
