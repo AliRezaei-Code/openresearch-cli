@@ -218,7 +218,6 @@ fn preserve_tool_targets(state: &mut WireToolState) {
     let texts = [state.output.as_deref(), state.error.as_deref()]
         .into_iter()
         .flatten()
-        .map(bounded_tool_scan)
         .collect::<Vec<_>>();
     let mut marker_targets = Vec::new();
     let mut marker_seen = HashSet::new();
@@ -255,7 +254,7 @@ fn preserve_tool_targets(state: &mut WireToolState) {
         }
         if !authoritative {
             for text in &texts {
-                heuristic_tool_targets(text, resource, &mut targets, &mut seen);
+                heuristic_tool_targets(bounded_tool_scan(text), resource, &mut targets, &mut seen);
             }
         }
     }
@@ -3019,6 +3018,29 @@ mod cap_tests {
         );
         let expected = format!("first line\n/runs/{mentioned}\n");
         assert_eq!(state.output.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn semantic_markers_beyond_legacy_scan_limit_are_preserved() {
+        let target = "11111111-1111-1111-1111-111111111111";
+        let mut state = WireToolState {
+            status: "completed".into(),
+            input: Some(json!({ "command": "orx logs $id" })),
+            output: Some(format!(
+                "{}\n[orx-run:{target}]\n",
+                "x".repeat(TOOL_TARGET_SCAN_BYTES + 1)
+            )),
+            error: None,
+            title: None,
+        };
+
+        preserve_tool_targets(&mut state);
+
+        assert_eq!(
+            state.input.as_ref().unwrap()["runTargetIds"],
+            json!([target])
+        );
+        assert!(!state.output.as_ref().unwrap().contains("[orx-run:"));
     }
 
     #[test]
