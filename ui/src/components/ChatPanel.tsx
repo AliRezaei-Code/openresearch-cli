@@ -1210,7 +1210,9 @@ function subagentLine(input: Record<string, unknown>): string {
 }
 
 function ToolActivityIcon({ activity, className = "" }: { activity: ToolActivity; className?: string }) {
-  if (activity.litCall) return <LitSourceLogo source={activity.litCall.source} size={16} />;
+  if (activity.litCall) {
+    return <LitSourceLogo source={activity.litCall.source} size={16} className={`tool-kind-icon shrink-0 ${className}`} />;
+  }
   const props = { size: 16, strokeWidth: 1.75, className: `tool-kind-icon shrink-0 ${className}` };
   switch (activity.kind) {
     case "read":
