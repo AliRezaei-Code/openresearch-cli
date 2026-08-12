@@ -2,9 +2,6 @@
 # protection rule to be enforced. Owners must have write access.
 # Swap these handles for a team (e.g. @alphaXiv/maintainers) when one exists.
 
-# Fallback owner for everything.
-*                               @myles332 @sox8502
-
 # Security-sensitive: release CI and the macOS signing pipeline handle (or can
 # reach) the Developer ID certificate. Changes here must be reviewed.
 /.github/workflows/             @myles332 @sox8502
