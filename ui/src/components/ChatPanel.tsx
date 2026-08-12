@@ -318,6 +318,11 @@ function arrayInputString(input: Record<string, unknown>, key: string, field: st
   return null;
 }
 
+function inputStringArray(input: Record<string, unknown>, key: string): string[] {
+  const values = input[key];
+  return Array.isArray(values) ? values.filter((value): value is string => typeof value === "string") : [];
+}
+
 function editChange(input: Record<string, unknown>): { path: string; type: string | null } | null {
   const changes = input.changes;
   if (!Array.isArray(changes)) return null;
@@ -724,7 +729,7 @@ function loopIdsBefore(command: string, variable: string, before: number, idPatt
   return [...values.matchAll(new RegExp(idPattern, "gi"))].map((match) => match[0]);
 }
 
-function commandRunIds(command: string, output?: string): string[] {
+function commandRunIds(command: string, output?: string, preservedIds: string[] = []): string[] {
   const invocations = orxCommandSegments(command, "logs");
   if (invocations.length === 0) return [];
   const ids = new Set<string>();
@@ -766,10 +771,11 @@ function commandRunIds(command: string, output?: string): string[] {
     if (assignmentIds.length === 0 && loopIds.length === 0) hasUnresolvedTarget = true;
   }
   if (ids.size === 0 || hasUnresolvedTarget) idsFromToolOutput(output, "runs").forEach((id) => ids.add(id));
+  preservedIds.forEach((id) => ids.add(id));
   return [...ids];
 }
 
-function commandExperimentIds(command: string, output?: string): string[] {
+function commandExperimentIds(command: string, output?: string, preservedIds: string[] = []): string[] {
   const invocations = orxCommandSegments(command, "exp\\s+(?:status|desc)");
   if (invocations.length === 0) return [];
   const ids = new Set<string>();
@@ -795,6 +801,7 @@ function commandExperimentIds(command: string, output?: string): string[] {
     if (!resolved) hasUnresolvedTarget = true;
   }
   if (ids.size === 0 || hasUnresolvedTarget) idsFromToolOutput(output, "experiments").forEach((id) => ids.add(id));
+  preservedIds.forEach((id) => ids.add(id));
   return [...ids];
 }
 
@@ -811,6 +818,7 @@ function toolActivity(part: ChatPart): ToolActivity {
   const normalizedInput = { ...input, ...argumentsInput };
   const rawCommand = inputString(normalizedInput, "command", "cmd");
   const toolOutput = part.state?.output || part.state?.error;
+  const preservedIds = inputStringArray(normalizedInput, "targetIds");
   const filePath = inputString(normalizedInput, "filePath", "file_path", "notebookPath", "notebook_path", "path");
   const description = inputString(normalizedInput, "description");
   const toolSegments = tool.toLowerCase().split(/(?::|\.|__)+/);
@@ -865,7 +873,7 @@ function toolActivity(part: ChatPart): ToolActivity {
         ? "Checked experiment status and updated notes"
         : "Reviewed experiment status and notes";
       if (commandInvokesOrx(command, "logs")) {
-        const runIds = commandRunIds(command, toolOutput);
+        const runIds = commandRunIds(command, toolOutput, preservedIds);
         const label = runIds.length === 1 ? "Reviewed run log" : "Reviewed run logs";
         return { kind: "project", label, runIds };
       }
@@ -883,21 +891,21 @@ function toolActivity(part: ChatPart): ToolActivity {
         return {
           kind: "project",
           label: combinedLabel,
-          experimentIds: commandExperimentIds(command, toolOutput),
+          experimentIds: commandExperimentIds(command, toolOutput, preservedIds),
         };
       }
       if (readsProject && readsExperimentNotes) {
         return {
           kind: "project",
           label: notesLabel,
-          experimentIds: commandExperimentIds(command, toolOutput),
+          experimentIds: commandExperimentIds(command, toolOutput, preservedIds),
         };
       }
       if (readsProject && readsExperimentStatus) {
         return {
           kind: "project",
           label: "Checked experiment status",
-          experimentIds: commandExperimentIds(command, toolOutput),
+          experimentIds: commandExperimentIds(command, toolOutput, preservedIds),
         };
       }
       if (readsProject) {
@@ -907,21 +915,21 @@ function toolActivity(part: ChatPart): ToolActivity {
         return {
           kind: "project",
           label: combinedLabel,
-          experimentIds: commandExperimentIds(command, toolOutput),
+          experimentIds: commandExperimentIds(command, toolOutput, preservedIds),
         };
       }
       if (readsExperimentStatus) {
         return {
           kind: "project",
           label: "Checked experiment status",
-          experimentIds: commandExperimentIds(command, toolOutput),
+          experimentIds: commandExperimentIds(command, toolOutput, preservedIds),
         };
       }
       if (readsExperimentNotes) {
         return {
           kind: "project",
           label: notesLabel,
-          experimentIds: commandExperimentIds(command, toolOutput),
+          experimentIds: commandExperimentIds(command, toolOutput, preservedIds),
         };
       }
       if (commandInvokesOrx(command, "runs?")) {
@@ -1495,7 +1503,6 @@ function ToolGroup({
   const [open, setOpen] = useState(running || failedCount > 0);
   const wasRunning = useRef(running);
   const previousFailedCount = useRef(failedCount);
-  const hasRun = useRef(running);
   const displayParts = squashToolParts(parts);
   const activities = displayParts.map(({ part }) => toolActivity(part));
   const runningActivity = latestRunningActivity(parts);
@@ -1504,16 +1511,6 @@ function ToolGroup({
   const summaryLabel = runningActivity
     ? resolvedActivityLabel(runningActivity, runExperimentName, experimentName)
     : summary;
-  const liveMessage = running
-    ? summaryLabel
-    : failedCount > 0
-      ? `Tool activity completed with ${failedCount} ${failedCount === 1 ? "failure" : "failures"}`
-      : hasRun.current ? "Tool activity completed" : "";
-
-  useEffect(() => {
-    if (running) hasRun.current = true;
-  }, [running]);
-
   useEffect(() => {
     if (running === wasRunning.current) return;
     wasRunning.current = running;
@@ -1535,7 +1532,6 @@ function ToolGroup({
               {resolvedActivityLabel(runningActivity, runExperimentName, experimentName)}
             </span>
           </div>
-          <span className="sr-only" role="status" aria-live="polite">{liveMessage}</span>
         </div>
       );
     }
@@ -1549,7 +1545,6 @@ function ToolGroup({
           onOpenExperiment={onOpenExperiment}
           experimentName={experimentName}
         />
-        <span className="sr-only" role="status" aria-live="polite">{liveMessage}</span>
       </div>
     );
   }
@@ -1566,9 +1561,11 @@ function ToolGroup({
         <span className={`tool-group-label min-w-0 whitespace-normal break-words ${running ? "tool-running-shimmer" : ""}`}>
           {summaryLabel}
         </span>
+        {failedCount > 0 && (
+          <span className="sr-only">Contains {failedCount} failed {failedCount === 1 ? "tool call" : "tool calls"}.</span>
+        )}
         <ChevronRight size={13} className={`tool-chevron shrink-0 mt-[6px] text-muted transition-transform duration-120 ease-standard [&.open]:rotate-90 ${expanded ? "open" : ""}`} />
       </button>
-      <span className="sr-only" role="status" aria-live="polite">{liveMessage}</span>
       {expanded && (
         <div className="tool-group-rows flex flex-col gap-px mt-0.5 mr-0 mb-1 ml-6">
           {displayParts.map(({ part, count }) => (
@@ -2104,10 +2101,6 @@ function SubagentBlock({
   const errored = part.state?.status === "error";
   const errorMessage = (part.state?.error || part.state?.output || "").replace(/^Exit code \d+\s*/i, "").trim();
   const running = part.state?.status === "running";
-  const hasRun = useRef(running);
-  useEffect(() => {
-    if (running) hasRun.current = true;
-  }, [running]);
   const activity = running ? activityInProgress(toolActivity(part)) : toolActivity(part);
   return (
     <>
@@ -2122,9 +2115,6 @@ function SubagentBlock({
         <span className={`${TOOL_LINE_CLASS_NAME} ${running ? "tool-running-shimmer" : errored ? "text-accent-red" : "text-text"}`}>{activity.label}</span>
         <ChevronRight size={12} className="subagent-row-chevron shrink-0 text-muted" />
       </button>
-      <span className="sr-only" role="status" aria-live="polite">
-        {running ? activity.label : errored ? "Sub-agent activity failed" : hasRun.current ? "Sub-agent activity completed" : ""}
-      </span>
     </>
   );
 }
@@ -2135,6 +2125,55 @@ function SubagentBlock({
  * referentially stable across keystrokes (memoized/useCallback, never inline)
  * or the boundary silently breaks — with that held, typing costs one shallow
  * compare instead of O(messages) work. */
+interface AnnouncedToolState {
+  status: string;
+  label: string;
+}
+
+function transcriptToolStates(messages: ChatMessage[]): Map<string, AnnouncedToolState> {
+  const states = new Map<string, AnnouncedToolState>();
+  const visit = (parts: ChatPart[], parent: string) => {
+    for (const part of parts) {
+      const path = `${parent}/${part.id}`;
+      if (part.type === "tool" && part.state?.status) {
+        states.set(path, { status: part.state.status, label: toolActivity(part).label });
+      }
+      if (part.children?.length) visit(part.children, path);
+    }
+  };
+  for (const message of messages) visit(message.parts, message.id);
+  return states;
+}
+
+function useToolActivityAnnouncement(messages: ChatMessage[]): string {
+  const [announcement, setAnnouncement] = useState("");
+  const previous = useRef<{ transcript: string; states: Map<string, AnnouncedToolState> } | null>(null);
+  useEffect(() => {
+    const transcript = messages[0]?.id ?? "";
+    const states = transcriptToolStates(messages);
+    if (!previous.current || previous.current.transcript !== transcript) {
+      previous.current = { transcript, states };
+      setAnnouncement("");
+      return;
+    }
+    const changes = [...states].filter(([path, state]) => previous.current?.states.get(path)?.status !== state.status);
+    previous.current = { transcript, states };
+    const failures = changes.filter(([, state]) => state.status === "error");
+    if (failures.length > 0) {
+      const labels = failures.slice(0, 2).map(([, state]) => state.label).join(", ");
+      setAnnouncement(`${failures.length === 1 ? "Tool activity failed" : `${failures.length} tool activities failed`}: ${labels}`);
+      return;
+    }
+    const running = changes.filter(([, state]) => state.status === "running");
+    if (running.length > 0) {
+      setAnnouncement(activityInProgress({ kind: "command", label: running.at(-1)?.[1].label ?? "Running a tool" }).label);
+      return;
+    }
+    if (changes.some(([, state]) => state.status === "completed")) setAnnouncement("Tool activity completed");
+  }, [messages]);
+  return announcement;
+}
+
 const Transcript = memo(function Transcript({
   messages,
   onOpenFile,
@@ -2158,8 +2197,10 @@ const Transcript = memo(function Transcript({
   onOpenSubagent?: (spawnPartId: string) => void;
   skills?: SkillInfo[];
 }) {
+  const activityAnnouncement = useToolActivityAnnouncement(messages);
   return (
     <>
+      <span className="sr-only" role="status" aria-live="polite">{activityAnnouncement}</span>
       {messages.filter(messageHasVisibleContent).map((m) => (
         <Message
           key={m.id}

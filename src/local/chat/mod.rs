@@ -67,6 +67,67 @@ fn cap_tool_text(text: &mut String) {
     *text = capped;
 }
 
+fn uuid_targets(text: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    for window in text.as_bytes().windows(36) {
+        let valid = window.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        });
+        if !valid {
+            continue;
+        }
+        let target = String::from_utf8_lossy(window).to_ascii_lowercase();
+        if seen.insert(target.clone()) {
+            targets.push(target);
+        }
+    }
+    targets
+}
+
+fn preserve_tool_targets(state: &mut WireToolState) {
+    let Some(input) = state.input.as_mut().and_then(Value::as_object_mut) else {
+        return;
+    };
+    let command = input
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !command.contains("orx logs")
+        && !command.contains("orx exp status")
+        && !command.contains("orx exp desc")
+    {
+        return;
+    }
+    let mut targets = input
+        .get("targetIds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut seen = targets.iter().cloned().collect::<HashSet<_>>();
+    for text in [state.output.as_deref(), state.error.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        for target in uuid_targets(text) {
+            if seen.insert(target.clone()) {
+                targets.push(target);
+            }
+        }
+    }
+    if !targets.is_empty() {
+        input.insert("targetIds".into(), json!(targets));
+    }
+}
+
 /// Find a part by id anywhere in the tree (depth-first), returning `&mut` to it.
 /// Shared by the harnesses that route sub-agent events into a spawn part's
 /// `children`.
@@ -103,6 +164,7 @@ pub fn upsert_preserving_children(parts: &mut Vec<WirePart>, mut part: WirePart)
 fn cap_tool_parts(parts: &mut [WirePart]) {
     for part in parts.iter_mut() {
         if let Some(state) = part.state.as_mut() {
+            preserve_tool_targets(state);
             if let Some(output) = state.output.as_mut() {
                 cap_tool_text(output);
             }
@@ -2699,6 +2761,45 @@ mod cap_tests {
         assert_eq!(
             child_state.output.as_ref().unwrap().chars().count(),
             TOOL_TEXT_CAP
+        );
+    }
+
+    #[test]
+    fn cap_tool_parts_preserves_semantic_targets() {
+        let first = "11111111-1111-1111-1111-111111111111";
+        let middle = "22222222-2222-2222-2222-222222222222";
+        let last = "33333333-3333-3333-3333-333333333333";
+        let output = format!(
+            "{first}\n{}\n{middle}\n{}\n{last}",
+            "x".repeat(20_000),
+            "y".repeat(20_000)
+        );
+        let mut parts = vec![WirePart {
+            id: "logs".into(),
+            kind: "tool".into(),
+            text: None,
+            tool: Some("bash".into()),
+            state: Some(WireToolState {
+                status: "completed".into(),
+                input: Some(json!({ "command": "orx logs $id" })),
+                output: Some(output),
+                error: None,
+                title: None,
+            }),
+            prompt: None,
+            children: Vec::new(),
+        }];
+
+        cap_tool_parts(&mut parts);
+
+        let state = parts[0].state.as_ref().unwrap();
+        assert_eq!(
+            state.output.as_ref().unwrap().chars().count(),
+            TOOL_TEXT_CAP
+        );
+        assert_eq!(
+            state.input.as_ref().unwrap()["targetIds"],
+            json!([first, middle, last])
         );
     }
 }
