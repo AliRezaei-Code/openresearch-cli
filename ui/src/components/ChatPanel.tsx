@@ -295,13 +295,17 @@ type ToolActivityKind = "read" | "search" | "edit" | "web" | "agent" | "project"
 interface ToolActivity {
   kind: ToolActivityKind;
   label: string;
+  searchPattern?: string;
   filePath?: string;
+  fileRef?: string;
   labelPrefix?: string;
   labelTarget?: string;
   litCall?: NonNullable<ReturnType<typeof parseOrxLit>>;
   runIds?: string[];
   experimentIds?: string[];
 }
+
+type OpenTranscriptFile = (path: string, line?: number, exp?: string, ref?: string) => void;
 
 function inputString(input: Record<string, unknown>, ...keys: string[]): string | null {
   for (const key of keys) {
@@ -476,13 +480,34 @@ function shellWords(input: string): string[] {
 }
 
 function validReadTarget(value: string | undefined): string | null {
-  if (!value || value === "-" || /^\d+$/.test(value) || /[$`]/.test(value)) return null;
-  return value;
+  const target = value?.replace(/[)'\"]+$/, "");
+  if (!target || target === "-" || /^\d+$/.test(target) || /[$`]/.test(target)) return null;
+  return target;
+}
+
+function likelyPathReadTarget(value: string | undefined): string | null {
+  const target = validReadTarget(value);
+  if (!target) return null;
+  const name = baseName(target);
+  if (
+    target.includes("/")
+    || target.startsWith(".")
+    || /\.[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name)
+    || /^(?:Dockerfile|Makefile|README|LICENSE|NOTICE|CHANGELOG)$/i.test(name)
+  ) {
+    return target;
+  }
+  return null;
 }
 
 interface ShellInvocation {
   name: string;
   args: string[];
+}
+
+interface GitShowTarget {
+  ref: string;
+  path: string;
 }
 
 function shellInvocation(command: string): ShellInvocation | null {
@@ -517,7 +542,12 @@ function commandReadTarget(invocation: ShellInvocation): string | null {
       }
     }
     if (!scriptProvidedByOption) index++;
-    return validReadTarget(args.slice(index).find((arg) => !arg.startsWith("-")));
+    for (const arg of args.slice(index)) {
+      if (arg.startsWith("-")) continue;
+      const target = likelyPathReadTarget(arg);
+      if (target) return target;
+    }
+    return null;
   }
 
   const files: string[] = [];
@@ -535,6 +565,16 @@ function commandReadTarget(invocation: ShellInvocation): string | null {
     files.push(arg);
   }
   return validReadTarget(files[0]);
+}
+
+function commandGitShowTarget(invocation: ShellInvocation | null): GitShowTarget | null {
+  if (invocation?.name !== "git" || invocation.args[0] !== "show") return null;
+  const object = invocation.args.slice(1).find((arg) => !arg.startsWith("-") && arg.includes(":"));
+  if (!object) return null;
+  const separator = object.indexOf(":");
+  const ref = object.slice(0, separator);
+  const path = object.slice(separator + 1);
+  return ref && likelyPathReadTarget(path) ? { ref, path } : null;
 }
 
 function commandSearchPattern(command: string): string | null {
@@ -703,7 +743,8 @@ function orxCommandSegments(command: string, args: string): ShellCommandSegment[
 }
 
 function commandInvokesOrx(command: string, args: string): boolean {
-  return orxCommandSegments(command, args).length > 0;
+  if (orxCommandSegments(command, args).length > 0) return true;
+  return new RegExp(`(?:^|[\\s($;])orx\\s+${args}\\b`, "i").test(command);
 }
 
 function idsFromToolOutput(output: string | undefined, resource: "runs" | "experiments"): string[] {
@@ -714,6 +755,7 @@ function idsFromToolOutput(output: string | undefined, resource: "runs" | "exper
     ? [
         new RegExp(`/runs/(${UUID_PATTERN})`, "gi"),
         new RegExp(`\\brun(?:_|\\s+)id:\\s*(${UUID_PATTERN})`, "gi"),
+        new RegExp(`^\\s*RUN\\s+(${UUID_PATTERN})\\b`, "gim"),
         new RegExp(`={3,}\\s*(${UUID_PATTERN})\\s*={3,}`, "gi"),
       ]
     : [
@@ -727,7 +769,7 @@ function idsFromToolOutput(output: string | undefined, resource: "runs" | "exper
       if (ids.size >= TOOL_TARGET_LIMIT) return [...ids];
     }
   }
-  const bareIdLine = new RegExp(`^\\s*(${UUID_PATTERN})\\s*$`, "gim");
+  const bareIdLine = new RegExp(`^\\s*(${UUID_PATTERN})(?:\\s|$)`, "gim");
   for (const match of boundedOutput.matchAll(bareIdLine)) {
     ids.add(match[1]);
     if (ids.size >= TOOL_TARGET_LIMIT) break;
@@ -768,13 +810,22 @@ function loopIdsBefore(command: string, variable: string, before: number, idPatt
     if (headerEnd <= before && /\bdone\b/.test(command.slice(headerEnd, before))) continue;
     values = match[1];
   }
+  if (/\$\(|`/.test(values)) return [];
   return [...values.matchAll(new RegExp(idPattern, "gi"))].map((match) => match[0]);
 }
 
 function commandRunIds(command: string, output?: string, preservedIds: string[] = [], legacyIds: string[] = []): string[] {
   const invocations = orxCommandSegments(command, "logs");
-  if (invocations.length === 0) return [];
   const ids = new Set<string>();
+  if (invocations.length === 0) {
+    if (!commandInvokesOrx(command, "logs")) return [];
+    const outputIds = preservedIds.length > 0 ? [] : idsFromToolOutput(output, "runs");
+    for (const id of preservedIds.length > 0 ? preservedIds : outputIds.length > 0 ? outputIds : legacyIds) {
+      ids.add(id);
+      if (ids.size >= TOOL_TARGET_LIMIT) break;
+    }
+    return normalizedTargetIds([...ids]);
+  }
   let hasUnresolvedTarget = false;
   for (const { invocation, offset } of invocationOffsets(command, invocations)) {
     const logs = /\borx\s+logs\b/i.exec(invocation.raw);
@@ -992,6 +1043,20 @@ function toolActivity(part: ChatPart): ToolActivity {
         return { kind: "project", label: "Listed project runs" };
       }
 
+      const gitShowTarget = shellInvocations
+        .map(commandGitShowTarget)
+        .find((target) => target != null);
+      if (gitShowTarget) {
+        return {
+          kind: "read",
+          label: `Read ${baseName(gitShowTarget.path)}`,
+          filePath: gitShowTarget.path,
+          fileRef: gitShowTarget.ref,
+          labelPrefix: "Read ",
+          labelTarget: baseName(gitShowTarget.path),
+        };
+      }
+
       const readSegmentIndex = shellInvocations.findIndex((invocation) =>
         invocation != null && ["sed", "cat", "head", "tail"].includes(invocation.name),
       );
@@ -1026,9 +1091,23 @@ function toolActivity(part: ChatPart): ToolActivity {
       );
       if (searchSegmentIndex >= 0) {
         const pattern = commandSearchPattern(shellSegments[searchSegmentIndex].raw);
-        return { kind: "search", label: pattern ? `Searched code for “${pattern}”` : "Searched code" };
+        return {
+          kind: "search",
+          label: pattern ? `Searched code for “${pattern}”` : "Searched code",
+          searchPattern: pattern ?? undefined,
+        };
       }
-      const gitAction = shellInvocations.find((invocation) => invocation?.name === "git")?.args[0];
+      const gitInvocation = shellInvocations.find((invocation) => invocation?.name === "git");
+      const gitAction = gitInvocation?.args[0];
+      if (gitAction === "grep") {
+        const pattern = gitInvocation?.args.slice(1).find((arg) => !arg.startsWith("-"));
+        return {
+          kind: "search",
+          label: pattern ? `Searched code for “${pattern}”` : "Searched code",
+          searchPattern: pattern,
+        };
+      }
+      if (readInvocation) return { kind: "read", label: "Read a file" };
       if (gitAction === "status") return { kind: "command", label: "Checked Git status" };
       if (gitAction === "diff") return { kind: "command", label: "Reviewed code changes" };
       if (gitAction === "log") return { kind: "command", label: "Read Git history" };
@@ -1063,7 +1142,11 @@ function toolActivity(part: ChatPart): ToolActivity {
     }
     case "grep": {
       const pattern = inputString(normalizedInput, "pattern");
-      return { kind: "search", label: pattern ? `Searched code for “${pattern}”` : "Searched code" };
+      return {
+        kind: "search",
+        label: pattern ? `Searched code for “${pattern}”` : "Searched code",
+        searchPattern: pattern ?? undefined,
+      };
     }
     case "glob": {
       const pattern = inputString(normalizedInput, "pattern");
@@ -1217,12 +1300,31 @@ function ToolActivityLabel({
   experimentName,
 }: {
   activity: ToolActivity;
-  onOpenFile?: (path: string) => void;
+  onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
   runExperimentName?: (runId: string) => string;
   onOpenExperiment?: (experimentId: string) => void;
   experimentName?: (experimentId: string) => string;
 }) {
+  if (activity.searchPattern) {
+    const patternStart = activity.label.indexOf(activity.searchPattern);
+    const prefix = patternStart >= 0 ? activity.label.slice(0, patternStart) : "Searched code for “";
+    const suffix = patternStart >= 0
+      ? activity.label.slice(patternStart + activity.searchPattern.length)
+      : "”";
+    return (
+      <>
+        {prefix}
+        {activity.searchPattern.split(/([|/_-])/).map((segment, index) => (
+          <span key={`${index}-${segment}`}>
+            {segment}
+            {/^[|/_-]$/.test(segment) && <wbr />}
+          </span>
+        ))}
+        {suffix}
+      </>
+    );
+  }
   if (activity.litCall?.kind === "paper" && activity.litCall.id) {
     return (
       <a
@@ -1246,7 +1348,7 @@ function ToolActivityLabel({
           onClick={(event) => {
             event.preventDefault();
             event.stopPropagation();
-            onOpenFile(filePath);
+            onOpenFile(filePath, undefined, undefined, activity.fileRef);
           }}
         >
           {activity.labelTarget}
@@ -1413,11 +1515,23 @@ function resolvedActivityLabel(
   return activity.label;
 }
 
-function latestRunningActivity(parts: ChatPart[]): ToolActivity | null {
-  for (let index = parts.length - 1; index >= 0; index--) {
-    if (parts[index].state?.status === "running") return activityInProgress(toolActivity(parts[index]));
-  }
-  return null;
+const TOOL_TAIL_SHIMMER_DELAY_MS = 160;
+function useDelayedToolShimmer(active: boolean): boolean {
+  const [visible, setVisible] = useState(false);
+
+  useEffect(() => {
+    if (!active) {
+      setVisible(false);
+      return;
+    }
+    const timeout = window.setTimeout(
+      () => setVisible(true),
+      TOOL_TAIL_SHIMMER_DELAY_MS,
+    );
+    return () => window.clearTimeout(timeout);
+  }, [active]);
+
+  return active && visible;
 }
 
 function groupIconActivity(activities: ToolActivity[]): ToolActivity {
@@ -1441,6 +1555,7 @@ function squashableToolPartKey(part: ChatPart): string | null {
     activity.kind,
     activity.label,
     activity.filePath ?? null,
+    activity.fileRef ?? null,
     activity.litCall?.kind === "paper" ? activity.litCall.id ?? null : null,
     activity.runIds ?? null,
     activity.experimentIds ?? null,
@@ -1474,7 +1589,7 @@ function ToolRow({
 }: {
   part: ChatPart;
   repeatCount?: number;
-  onOpenFile?: (path: string) => void;
+  onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
   runExperimentName?: (runId: string) => string;
   onOpenExperiment?: (experimentId: string) => void;
@@ -1547,6 +1662,7 @@ function ToolRow({
  * aggregate description and a collapsible list of semantic rows. */
 function ToolGroup({
   parts,
+  pendingTail,
   onOpenFile,
   onOpenRun,
   runExperimentName,
@@ -1554,38 +1670,44 @@ function ToolGroup({
   experimentName,
 }: {
   parts: ChatPart[];
-  onOpenFile?: (path: string) => void;
+  pendingTail?: boolean;
+  onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
   runExperimentName?: (runId: string) => string;
   onOpenExperiment?: (experimentId: string) => void;
   experimentName?: (experimentId: string) => string;
 }) {
-  const running = parts.some((p) => p.state?.status === "running");
-  const failedCount = parts.filter((part) => part.state?.status === "error").length;
-  const [open, setOpen] = useState(running);
-  const wasRunning = useRef(running);
+  const [open, setOpen] = useState(false);
   const displayParts = squashToolParts(parts);
   const activities = displayParts.map(({ part }) => toolActivity(part));
-  const runningActivity = latestRunningActivity(parts);
+  const tailPart = pendingTail ? parts.at(-1) : undefined;
+  const pendingActivity = tailPart?.state?.status !== "error"
+    ? tailPart && activityInProgress(toolActivity(tailPart))
+    : null;
+  const shimmering = useDelayedToolShimmer(pendingActivity != null);
   const summary = summarizeToolGroup(activities);
-  const iconActivity = runningActivity ?? groupIconActivity(activities);
-  const summaryLabel = runningActivity
-    ? resolvedActivityLabel(runningActivity, runExperimentName, experimentName)
+  const iconActivity = pendingActivity ?? groupIconActivity(activities);
+  const summaryLabel = pendingActivity
+    ? resolvedActivityLabel(pendingActivity, runExperimentName, experimentName)
     : summary;
-  useEffect(() => {
-    if (running === wasRunning.current) return;
-    wasRunning.current = running;
-    setOpen(running);
-  }, [running]);
-
   if (parts.length === 1) {
-    if (runningActivity) {
+    if (pendingActivity) {
       return (
         <div className="tool-group my-3.5 mx-0">
           <div className="tool-row flex items-start gap-2 min-w-0 py-[3px] px-1 text-lg text-subtext">
-            <ToolActivityIcon activity={runningActivity} className="tool-running-shimmer-icon self-start mt-[5px]" />
-            <span className="tool-running-shimmer min-w-0 whitespace-normal break-words">
-              {resolvedActivityLabel(runningActivity, runExperimentName, experimentName)}
+            <ToolActivityIcon activity={pendingActivity} className={`${shimmering ? "tool-running-shimmer-icon" : "text-muted"} self-start mt-[5px]`} />
+            <span
+              className={`${shimmering ? "tool-running-shimmer" : ""} tool-active-label min-w-0 whitespace-normal break-words`}
+              title={summaryLabel}
+            >
+              <ToolActivityLabel
+                activity={pendingActivity}
+                onOpenFile={onOpenFile}
+                onOpenRun={onOpenRun}
+                runExperimentName={runExperimentName}
+                onOpenExperiment={onOpenExperiment}
+                experimentName={experimentName}
+              />
             </span>
           </div>
         </div>
@@ -1608,42 +1730,64 @@ function ToolGroup({
   const expanded = open;
   return (
     <div className="tool-group my-3.5 mx-0">
-      <button
-        className="tool-group-summary flex items-start gap-2 w-fit max-w-full py-[3px] px-1 cursor-pointer text-lg text-subtext text-left rounded-sm [&:hover]:bg-surface"
-        onClick={() => setOpen((value) => !value)}
-        aria-expanded={expanded}
-      >
-        <ToolActivityIcon activity={iconActivity} className={`${running ? "tool-running-shimmer-icon" : "text-muted"} mt-[5px]`} />
-        <span className={`tool-group-label min-w-0 whitespace-normal break-words ${running ? "tool-running-shimmer" : ""}`}>
-          {summaryLabel}
-        </span>
-        {failedCount > 0 && (
+      <div className="tool-group-summary flex items-start gap-2 w-fit max-w-full py-[3px] px-1 text-lg text-subtext text-left">
+        <ToolActivityIcon activity={iconActivity} className={`${shimmering ? "tool-running-shimmer-icon" : "text-muted"} mt-[5px]`} />
+        {pendingActivity ? (
           <span
-            className="shrink-0 mt-[5px] text-muted"
-            title={`${failedCount} failed ${failedCount === 1 ? "tool call" : "tool calls"}`}
+            className={`tool-group-label tool-active-label min-w-0 whitespace-normal break-words ${shimmering ? "tool-running-shimmer" : ""}`}
+            title={summaryLabel}
           >
-            <CircleX size={15} strokeWidth={1.75} aria-hidden="true" />
-            <span className="sr-only">Contains {failedCount} failed {failedCount === 1 ? "tool call" : "tool calls"}.</span>
-          </span>
-        )}
-        <ChevronRight size={13} className={`tool-chevron shrink-0 mt-[6px] text-muted transition-transform duration-120 ease-standard [&.open]:rotate-90 ${expanded ? "open" : ""}`} />
-      </button>
-      {expanded && (
-        <div className="tool-group-rows flex flex-col gap-px mt-0.5 mr-0 mb-1 ml-6">
-          {displayParts.map(({ part, count }) => (
-            <ToolRow
-              key={part.id}
-              part={part}
-              repeatCount={count}
+            <ToolActivityLabel
+              activity={pendingActivity}
               onOpenFile={onOpenFile}
               onOpenRun={onOpenRun}
               runExperimentName={runExperimentName}
               onOpenExperiment={onOpenExperiment}
               experimentName={experimentName}
             />
-          ))}
+          </span>
+        ) : (
+          <button
+            type="button"
+            className="tool-group-label min-w-0 whitespace-normal break-words cursor-pointer text-left"
+            onClick={() => setOpen((value) => !value)}
+            aria-expanded={expanded}
+          >
+            {summaryLabel}
+          </button>
+        )}
+        <button
+          type="button"
+          className="tool-group-chevron-button inline-flex items-center justify-center self-center shrink-0 p-px cursor-pointer rounded-sm"
+          onClick={() => setOpen((value) => !value)}
+          aria-expanded={expanded}
+          aria-label={expanded ? "Collapse tool activity" : "Expand tool activity"}
+        >
+          <ChevronRight size={16} className={`tool-chevron text-muted transition-[transform,color] duration-120 ease-standard [&.open]:rotate-90 ${expanded ? "open" : ""}`} />
+        </button>
+      </div>
+      <div
+        className={`tool-group-disclosure ${expanded ? "open" : ""}`}
+        aria-hidden={!expanded}
+        inert={!expanded}
+      >
+        <div className="tool-group-disclosure-inner">
+          <div className="tool-group-rows flex flex-col gap-px mt-0.5 mr-0 mb-1 ml-6">
+            {displayParts.map(({ part, count }) => (
+              <ToolRow
+                key={part.id}
+                part={part}
+                repeatCount={count}
+                onOpenFile={onOpenFile}
+                onOpenRun={onOpenRun}
+                runExperimentName={runExperimentName}
+                onOpenExperiment={onOpenExperiment}
+                experimentName={experimentName}
+              />
+            ))}
+          </div>
         </div>
-      )}
+      </div>
     </div>
   );
 }
@@ -1661,7 +1805,7 @@ function PromptCard({
 }: {
   part: ChatPart;
   onRespond?: (answer: PromptAnswer) => void;
-  onOpenFile?: (path: string, line?: number, exp?: string) => void;
+  onOpenFile?: OpenTranscriptFile;
   onOpenPlan?: (plan: string, promptId: string) => void;
 }) {
   const p = part.prompt as ChatPrompt;
@@ -1896,6 +2040,7 @@ function attachmentPartView(p: ChatPart): { src: string; isPdf: boolean; name: s
 
 const Message = memo(function Message({
   message,
+  pendingTailToolId,
   onOpenFile,
   onOpenRun,
   runExperimentName,
@@ -1907,7 +2052,8 @@ const Message = memo(function Message({
   skills,
 }: {
   message: ChatMessage;
-  onOpenFile?: (path: string, line?: number, exp?: string) => void;
+  pendingTailToolId?: string | null;
+  onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
   runExperimentName?: (runId: string) => string;
   onOpenExperiment?: (experimentId: string) => void;
@@ -1970,6 +2116,7 @@ const Message = memo(function Message({
   return (
     <div className="msg-assistant text-lg leading-[1.62] text-text min-w-0">
       {renderParts(message.parts, {
+        pendingTailToolId,
         onOpenFile,
         onOpenRun,
         runExperimentName,
@@ -1991,7 +2138,8 @@ const Message = memo(function Message({
 function renderParts(
   parts: ChatPart[],
   opts: {
-    onOpenFile?: (path: string, line?: number, exp?: string) => void;
+    pendingTailToolId?: string | null;
+    onOpenFile?: OpenTranscriptFile;
     onOpenRun?: (runId: string) => void;
     runExperimentName?: (runId: string) => string;
     onOpenExperiment?: (experimentId: string) => void;
@@ -2002,6 +2150,7 @@ function renderParts(
   },
 ): React.ReactNode[] {
   const {
+    pendingTailToolId,
     onOpenFile,
     onOpenRun,
     runExperimentName,
@@ -2019,6 +2168,7 @@ function renderParts(
       <ToolGroup
         key={`tg-${toolRun[0].id}`}
         parts={toolRun}
+        pendingTail={toolRun.some((part) => part.id === pendingTailToolId)}
         onOpenFile={onOpenFile}
         onOpenRun={onOpenRun}
         runExperimentName={runExperimentName}
@@ -2042,7 +2192,12 @@ function renderParts(
     if (part.type === "tool" && (part.tool === "subagent" || (part.children?.length ?? 0) > 0)) {
       flushTools();
       rendered.push(
-        <SubagentBlock key={part.id} part={part} onOpenSubagent={onOpenSubagent} />,
+        <SubagentBlock
+          key={part.id}
+          part={part}
+          pendingTail={part.id === pendingTailToolId}
+          onOpenSubagent={onOpenSubagent}
+        />,
       );
       continue;
     }
@@ -2103,7 +2258,7 @@ export function SubagentTranscript({
   onOpenSubagent,
 }: {
   spawn: ChatPart;
-  onOpenFile?: (path: string, line?: number, exp?: string) => void;
+  onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
   runExperimentName?: (runId: string) => string;
   onOpenExperiment?: (experimentId: string) => void;
@@ -2159,15 +2314,19 @@ export function SubagentTranscript({
  * running (pulsing dot) or done. */
 function SubagentBlock({
   part,
+  pendingTail,
   onOpenSubagent,
 }: {
   part: ChatPart;
+  pendingTail?: boolean;
   onOpenSubagent?: (spawnPartId: string) => void;
 }) {
   const errored = part.state?.status === "error";
   const errorMessage = cleanToolError(part.state?.error || part.state?.output || "");
-  const running = part.state?.status === "running";
-  const activity = running ? activityInProgress(toolActivity(part)) : toolActivity(part);
+  const activity = pendingTail && !errored
+    ? activityInProgress(toolActivity(part))
+    : toolActivity(part);
+  const shimmering = useDelayedToolShimmer(Boolean(pendingTail && !errored));
   return (
     <>
       <button
@@ -2180,9 +2339,9 @@ function SubagentBlock({
         {errored ? (
           <CircleX size={16} strokeWidth={1.75} className="subagent-icon shrink-0 text-accent-red" aria-hidden="true" />
         ) : (
-          <ToolActivityIcon activity={activity} className={`subagent-icon shrink-0 ${running ? "tool-running-shimmer-icon" : "text-muted"}`} />
+          <ToolActivityIcon activity={activity} className={`subagent-icon shrink-0 ${shimmering ? "tool-running-shimmer-icon" : "text-muted"}`} />
         )}
-        <span className={`${TOOL_LINE_CLASS_NAME} ${running ? "tool-running-shimmer" : errored ? "text-accent-red" : "text-text"}`}>{activity.label}</span>
+        <span className={`${TOOL_LINE_CLASS_NAME} ${shimmering ? "tool-running-shimmer" : errored ? "text-accent-red" : "text-text"}`}>{activity.label}</span>
         <ChevronRight size={12} className="subagent-row-chevron shrink-0 text-muted" />
       </button>
     </>
@@ -2266,8 +2425,21 @@ function useToolActivityAnnouncement(messages: ChatMessage[]): ToolAnnouncement 
   return announcement;
 }
 
+function streamTailTool(messages: ChatMessage[]): { messageId: string; toolId: string } | null {
+  const message = messages.at(-1);
+  if (message?.role !== "assistant") return null;
+  for (let index = message.parts.length - 1; index >= 0; index--) {
+    const part = message.parts[index];
+    if (!partIsVisible(part)) continue;
+    if (part.type !== "tool" || part.state?.status === "error") return null;
+    return { messageId: message.id, toolId: part.id };
+  }
+  return null;
+}
+
 const Transcript = memo(function Transcript({
   messages,
+  busy,
   onOpenFile,
   onOpenRun,
   runExperimentName,
@@ -2279,7 +2451,8 @@ const Transcript = memo(function Transcript({
   skills,
 }: {
   messages: ChatMessage[];
-  onOpenFile?: (path: string, line?: number, exp?: string) => void;
+  busy: boolean;
+  onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
   runExperimentName?: (runId: string) => string;
   onOpenExperiment?: (experimentId: string) => void;
@@ -2290,6 +2463,7 @@ const Transcript = memo(function Transcript({
   skills?: SkillInfo[];
 }) {
   const activityAnnouncement = useToolActivityAnnouncement(messages);
+  const pendingTailTool = busy ? streamTailTool(messages) : null;
   return (
     <>
       <span className="sr-only" role="status" aria-live="polite">
@@ -2299,6 +2473,7 @@ const Transcript = memo(function Transcript({
         <Message
           key={m.id}
           message={m}
+          pendingTailToolId={pendingTailTool?.messageId === m.id ? pendingTailTool.toolId : null}
           onOpenFile={onOpenFile}
           onOpenRun={onOpenRun}
           runExperimentName={runExperimentName}
@@ -2638,7 +2813,7 @@ export function ChatPanel({
   /** Open a project file in the right pane (chat tool rows are clickable).
    * `sessionId` is the chat session the click came from, so relative paths
    * can resolve against that session's worktree. */
-  onOpenFile?: (path: string, sessionId?: string, line?: number, exp?: string) => void;
+  onOpenFile?: (path: string, sessionId?: string, line?: number, exp?: string, ref?: string) => void;
   /** Open a run's logs in the right pane (agent-emitted `<run>` evidence chips).
    * Run ids are globally unique, so no session context is needed. */
   onOpenRun?: (runId: string) => void;
@@ -3088,6 +3263,7 @@ export function ChatPanel({
 
   const messages = activeId ? (state.messagesBySession[activeId] ?? []) : [];
   const busy = activeId ? state.busySessions.has(activeId) : false;
+  const hasPendingTailTool = busy && streamTailTool(messages) != null;
   // Messages the user parked behind the running turn (oldest first). Populated
   // by chat.queued events and the seed snapshot; each runs when its turn ends.
   const queued = activeId ? (state.queuedBySession[activeId] ?? []) : [];
@@ -3208,8 +3384,8 @@ export function ChatPanel({
   const openFileInSession = useMemo(
     () =>
       onOpenFile &&
-      ((path: string, line?: number, exp?: string) =>
-        onOpenFile(path, activeId ?? undefined, line, exp)),
+      ((path: string, line?: number, exp?: string, ref?: string) =>
+        onOpenFile(path, activeId ?? undefined, line, exp, ref)),
     [onOpenFile, activeId],
   );
 
@@ -3832,6 +4008,7 @@ export function ChatPanel({
           <div className="chat-thread-inner max-w-readable my-0 mx-auto pt-4 px-4 pb-8 flex flex-col gap-4" ref={threadInnerRef}>
             <Transcript
               messages={messages}
+              busy={busy}
               onOpenFile={openFileInSession}
               onOpenRun={onOpenRun}
               runExperimentName={runExperimentName}
@@ -3847,7 +4024,7 @@ export function ChatPanel({
                 <div className="working flex items-center gap-2 text-subtext text-md pt-0.5 px-0 pb-2 [&.awaiting]:italic awaiting">Waiting for your input…</div>
               ) : (
                 <div className="working flex items-center gap-2 text-subtext text-md pt-0.5 px-0 pb-2 [&.awaiting]:italic">
-                  <span className={SPINNER_CLASS_NAME} /> Working…
+                  <span className={SPINNER_CLASS_NAME} /> {hasPendingTailTool ? "Working…" : "Thinking…"}
                 </div>
               ))}
           </div>

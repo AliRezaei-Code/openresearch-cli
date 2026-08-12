@@ -776,13 +776,11 @@ export default function App() {
     [projects, projectId, selectRightTab],
   );
 
-  // Chat file chips carry an optional target line (`file:line`) and cited
-  // experiment (`exp`), never a branch ref — adapt to openFileTab's
-  // (path, session, ref, line, exp) shape while staying referentially stable
-  // for ChatPanel's memoized transcript.
+  // Chat file chips may carry a target line, cited experiment, or an exact Git
+  // ref from a `git show ref:path` tool call.
   const openChatFile = useCallback(
-    (path: string, sessionId?: string, line?: number, exp?: string) =>
-      openFileTab(path, sessionId, undefined, line, exp),
+    (path: string, sessionId?: string, line?: number, exp?: string, ref?: string) =>
+      openFileTab(path, sessionId, ref, line, exp),
     [openFileTab],
   );
 
