@@ -28,6 +28,7 @@ pub async fn run(args: crate::ExpArgs) -> Result<()> {
     let store = Store::open()?;
     match args.command {
         ExpCommand::Status { exp_id } => {
+            crate::local::chat::record_chat_target("experiments", &exp_id);
             resolve_experiment(store, &exp_id)?
                 .experiment_status()
                 .await
@@ -38,6 +39,7 @@ pub async fn run(args: crate::ExpArgs) -> Result<()> {
                 .await
         }
         ExpCommand::Desc { exp_id, set, stdin } => {
+            crate::local::chat::record_chat_target("experiments", &exp_id);
             resolve_experiment(store, &exp_id)?
                 .experiment_desc(set, stdin)
                 .await

@@ -1618,7 +1618,13 @@ function ToolGroup({
           {summaryLabel}
         </span>
         {failedCount > 0 && (
-          <span className="sr-only">Contains {failedCount} failed {failedCount === 1 ? "tool call" : "tool calls"}.</span>
+          <span
+            className="shrink-0 mt-[5px] text-muted"
+            title={`${failedCount} failed ${failedCount === 1 ? "tool call" : "tool calls"}`}
+          >
+            <CircleX size={15} strokeWidth={1.75} aria-hidden="true" />
+            <span className="sr-only">Contains {failedCount} failed {failedCount === 1 ? "tool call" : "tool calls"}.</span>
+          </span>
         )}
         <ChevronRight size={13} className={`tool-chevron shrink-0 mt-[6px] text-muted transition-transform duration-120 ease-standard [&.open]:rotate-90 ${expanded ? "open" : ""}`} />
       </button>

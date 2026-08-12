@@ -9,6 +9,8 @@
 //! the message and broadcasts it as a `chat.message` SSE event.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,6 +40,7 @@ const TOOL_TEXT_TRUNCATION_MARKER: &str = "\n… [output truncated]";
 const TOOL_TARGET_CAP: usize = 256;
 const TOOL_TARGET_INSPECTION_CAP: usize = 1_024;
 const TOOL_TARGET_SCAN_BYTES: usize = 256_000;
+const CHAT_TARGET_FILE_ENV: &str = "ORX_CHAT_TARGET_FILE";
 
 /// Keep the head and tail of `text` within [`TOOL_TEXT_CAP`] chars, marking
 /// the omitted middle. Idempotent — an already-capped string is left alone.
@@ -297,6 +300,99 @@ fn preserve_tool_targets(state: &mut WireToolState) {
     if let Some(error) = state.error.as_mut() {
         strip_tool_target_markers(error);
     }
+}
+
+fn target_event_path(session_id: &str) -> PathBuf {
+    let safe = session_id
+        .chars()
+        .filter(|char| char.is_ascii_alphanumeric() || matches!(char, '-' | '_'))
+        .collect::<String>();
+    crate::store::data_dir()
+        .join("chat-targets")
+        .join(format!("{safe}.events"))
+}
+
+fn target_event_start(session_id: &str) -> (PathBuf, u64) {
+    let path = target_event_path(session_id);
+    let offset = std::fs::metadata(&path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    (path, offset)
+}
+
+pub fn record_chat_target(resource: &str, target: &str) {
+    let path = std::env::var_os(CHAT_TARGET_FILE_ENV)
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var(CHAT_SESSION_ENV)
+                .ok()
+                .map(|id| target_event_path(&id))
+        });
+    let Some(path) = path else {
+        return;
+    };
+    if !matches!(resource, "runs" | "experiments") || !valid_tool_target(target) {
+        return;
+    }
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{resource}\t{target}");
+    }
+}
+
+fn attach_target_event(parts: &mut [WirePart], resource: &str, target: &str) -> bool {
+    for part in parts.iter_mut().rev() {
+        if attach_target_event(&mut part.children, resource, target) {
+            return true;
+        }
+        let Some(state) = part.state.as_mut() else {
+            continue;
+        };
+        let Some(input) = state.input.as_mut().and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let command = tool_command(input).to_ascii_lowercase();
+        let matches = if resource == "runs" {
+            command.contains("orx logs")
+        } else {
+            command.contains("orx exp status") || command.contains("orx exp desc")
+        };
+        if !matches {
+            continue;
+        }
+        let key = if resource == "runs" {
+            "runTargetIds"
+        } else {
+            "experimentTargetIds"
+        };
+        let mut targets = input
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .take(TOOL_TARGET_INSPECTION_CAP)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let mut seen = targets
+            .iter()
+            .map(|value| value.to_ascii_lowercase())
+            .collect();
+        push_tool_target(&mut targets, &mut seen, target);
+        input.insert(key.into(), json!(targets));
+        input.insert(format!("{key}Authoritative"), Value::Bool(true));
+        return true;
+    }
+    false
 }
 
 /// Find a part by id anywhere in the tree (depth-first), returning `&mut` to it.
@@ -1674,6 +1770,7 @@ impl ChatHost {
         }
 
         let sid = session.id.clone();
+        let (target_event_path, target_event_offset) = target_event_start(&session.id);
         let mut ctx = TurnCtx {
             host: self.clone(),
             session_id: session.id.clone(),
@@ -1704,6 +1801,9 @@ impl ChatHost {
             last_flush: Instant::now() - FLUSH_INTERVAL,
             last_flushed_tool_states: Vec::new(),
             last_attempted_tool_states: Vec::new(),
+            target_event_path: Some(target_event_path),
+            target_event_offset,
+            pending_target_events: Vec::new(),
         };
         // Upgrade the reservation None→Some(handle), atomically re-checking that
         // it's still ours: an `interrupt` racing the prologue above may have
@@ -2380,6 +2480,9 @@ pub struct TurnCtx {
     last_flush: Instant,
     last_flushed_tool_states: Vec<(String, String)>,
     last_attempted_tool_states: Vec<(String, String)>,
+    target_event_path: Option<PathBuf>,
+    target_event_offset: u64,
+    pending_target_events: Vec<(String, String)>,
 }
 
 impl TurnCtx {
@@ -2430,7 +2533,47 @@ impl TurnCtx {
             last_flush: Instant::now(),
             last_flushed_tool_states: Vec::new(),
             last_attempted_tool_states: Vec::new(),
+            target_event_path: None,
+            target_event_offset: 0,
+            pending_target_events: Vec::new(),
         }
+    }
+
+    fn apply_target_events(&mut self) {
+        if let Some(path) = self.target_event_path.as_ref() {
+            if let Ok(mut file) = std::fs::File::open(path) {
+                if let Ok(length) = file.metadata().map(|metadata| metadata.len()) {
+                    if length < self.target_event_offset {
+                        self.target_event_offset = 0;
+                    }
+                    if file.seek(SeekFrom::Start(self.target_event_offset)).is_ok() {
+                        let mut pending = String::new();
+                        if file
+                            .take(TOOL_TARGET_SCAN_BYTES as u64)
+                            .read_to_string(&mut pending)
+                            .is_ok()
+                        {
+                            if let Some(complete_end) = pending.rfind('\n').map(|index| index + 1) {
+                                for line in pending[..complete_end].lines() {
+                                    let Some((resource, target)) = line.split_once('\t') else {
+                                        continue;
+                                    };
+                                    if self.pending_target_events.len() < TOOL_TARGET_INSPECTION_CAP
+                                    {
+                                        self.pending_target_events
+                                            .push((resource.to_string(), target.to_string()));
+                                    }
+                                }
+                                self.target_event_offset += complete_end as u64;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.pending_target_events.retain(|(resource, target)| {
+            !attach_target_event(&mut self.assistant.parts, resource, target)
+        });
     }
 
     /// Record the harness's own session id (CLIs mint/rotate them per turn).
@@ -2563,6 +2706,7 @@ impl TurnCtx {
         if self.assistant.parts.is_empty() {
             return Ok(());
         }
+        self.apply_target_events();
         cap_tool_parts(&mut self.assistant.parts);
         let store = Store::open()?;
         // A prompt card the harness surfaced mid-turn (opencode's inline
@@ -2763,6 +2907,12 @@ pub const LOCAL_SESSION_ENV: &str = "ORX_LOCAL_SESSION";
 pub fn set_chat_session_env(cmd: &mut tokio::process::Command, session_id: &str) {
     cmd.env(CHAT_SESSION_ENV, session_id);
     cmd.env(LOCAL_SESSION_ENV, "1");
+    let target_path = target_event_path(session_id);
+    if let Some(parent) = target_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::remove_file(&target_path);
+    cmd.env(CHAT_TARGET_FILE_ENV, target_path);
 }
 
 /// The chat session that launched this run, read from the env the harness child
@@ -3050,6 +3200,31 @@ mod cap_tests {
             json!([target])
         );
         assert!(!state.output.as_ref().unwrap().contains("[orx-run:"));
+    }
+
+    #[test]
+    fn out_of_band_target_attaches_to_latest_matching_tool() {
+        let target = "11111111-1111-1111-1111-111111111111";
+        let mut parts = vec![WirePart {
+            id: "logs".into(),
+            kind: "tool".into(),
+            text: None,
+            tool: Some("bash".into()),
+            state: Some(WireToolState {
+                status: "completed".into(),
+                input: Some(json!({ "command": "id=$(lookup); orx logs \"$id\"" })),
+                output: Some("ordinary log content".into()),
+                error: None,
+                title: None,
+            }),
+            prompt: None,
+            children: Vec::new(),
+        }];
+
+        assert!(attach_target_event(&mut parts, "runs", target));
+        let input = parts[0].state.as_ref().unwrap().input.as_ref().unwrap();
+        assert_eq!(input["runTargetIds"], json!([target]));
+        assert_eq!(input["runTargetIdsAuthoritative"], true);
     }
 
     #[test]
