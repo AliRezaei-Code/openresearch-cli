@@ -611,6 +611,7 @@ function commandRunIds(command: string, output?: string): string[] {
     const logs = /\borx\s+logs\b/i.exec(invocation.raw);
     if (!logs) continue;
     const words = shellWords(invocation.raw.slice(logs.index + logs[0].length));
+    let target: string | null = null;
     for (let index = 0; index < words.length; index++) {
       const word = words[index];
       if (word === "--head") continue;
@@ -618,14 +619,18 @@ function commandRunIds(command: string, output?: string): string[] {
         index++;
         continue;
       }
-      if (new RegExp(`^${UUID_PATTERN}$`, "i").test(word)) ids.add(word);
+      if (word.startsWith("--bytes=") || word.startsWith("--range=")) continue;
+      target = word;
       break;
     }
-  }
-  for (const invocation of invocations) {
-    const match = /\borx\s+logs\s+["']?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/.exec(invocation.raw);
-    if (!match) continue;
-    const variable = match[1];
+    if (!target) continue;
+    if (new RegExp(`^${UUID_PATTERN}$`, "i").test(target)) {
+      ids.add(target);
+      continue;
+    }
+    const variableMatch = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(target);
+    if (!variableMatch) continue;
+    const variable = variableMatch[1];
     const assignment = command.match(
       new RegExp(`(?:^|[\\s;])(?:export\\s+)?${variable}\\s*=\\s*["']?(${UUID_PATTERN})`, "i"),
     );
