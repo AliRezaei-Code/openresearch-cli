@@ -549,7 +549,11 @@ function toolActivity(part: ChatPart): ToolActivity {
         return { kind: "project", label: "Cancelled an experiment run" };
       }
       if (/\borx\s+project\s+view\b/.test(command) && /\borx\s+exp\s+(?:status|desc)\b/.test(command)) {
-        return { kind: "project", label: "Reviewed the project's experiments" };
+        return {
+          kind: "project",
+          label: "Reviewed experiment status and notes",
+          experimentIds: commandExperimentIds(command, toolOutput),
+        };
       }
       if (/\borx\s+project\s+view\b/.test(command)) {
         return { kind: "project", label: "Read project details" };
