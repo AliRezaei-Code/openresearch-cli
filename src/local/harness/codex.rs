@@ -1364,8 +1364,11 @@ fn apply_sub_notification(
         "item/started" | "item/completed" => {
             if let Some(item) = params.get("item") {
                 let completed = method == "item/completed";
-                if let Some(mut part) = item_to_part(item, completed, bucket) {
-                    part.id = namespaced_part_id(tid, &part.id);
+                let mut scoped_item = item.clone();
+                if let Some(id) = item.get("id").and_then(Value::as_str) {
+                    scoped_item["id"] = Value::String(namespaced_part_id(tid, id));
+                }
+                if let Some(part) = item_to_part(&scoped_item, completed, bucket) {
                     // A grandchild spawn: register its threads under this part.
                     if part.tool.as_deref() == Some("subagent") {
                         for gtid in subagent_thread_ids(item) {
@@ -3086,6 +3089,41 @@ requires_openai_auth = false
         assert_eq!(
             ctx.assistant.parts[0].state.as_ref().unwrap().status,
             "completed"
+        );
+    }
+
+    #[test]
+    fn subagent_command_completion_preserves_streamed_state() {
+        let mut bucket = Vec::new();
+        apply_sub_notification(
+            &mut bucket,
+            "sub",
+            "item/started",
+            &json!({"item":{"type":"commandExecution","id":"c1","command":"orx logs $id","status":"inProgress"}}),
+        );
+        apply_sub_notification(
+            &mut bucket,
+            "sub",
+            "item/commandExecution/outputDelta",
+            &json!({"itemId":"c1","delta":"streamed\n"}),
+        );
+        let input = bucket[0].state.as_mut().unwrap().input.as_mut().unwrap();
+        input["runTargetIds"] = json!(["11111111-1111-1111-1111-111111111111"]);
+        input["runTargetIdsAuthoritative"] = json!(true);
+
+        apply_sub_notification(
+            &mut bucket,
+            "sub",
+            "item/completed",
+            &json!({"item":{"type":"commandExecution","id":"c1","command":"orx logs $id","status":"completed","exitCode":0}}),
+        );
+
+        let state = bucket[0].state.as_ref().unwrap();
+        assert_eq!(bucket[0].id, "sub:c1");
+        assert_eq!(state.output.as_deref(), Some("streamed\n"));
+        assert_eq!(
+            state.input.as_ref().unwrap()["runTargetIds"],
+            json!(["11111111-1111-1111-1111-111111111111"])
         );
     }
 
