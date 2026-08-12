@@ -1374,6 +1374,28 @@ impl TurnGuard {
     fn defuse(mut self) {
         self.armed = false;
     }
+
+    async fn release(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let removed = {
+            let mut turns = self.host.turns.lock().await;
+            if matches!(turns.get(&self.session_id), Some(TurnState::Reserved)) {
+                turns.remove(&self.session_id);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            self.host.emit(
+                "chat.busy",
+                json!({ "sessionId": &self.session_id, "busy": false }),
+            );
+        }
+    }
 }
 
 impl Drop for TurnGuard {
@@ -1806,6 +1828,12 @@ impl ChatHost {
                 .send_message_showing(session_id, text, None, overrides, images, false)
                 .await
             {
+                while matches!(
+                    self.turns.lock().await.get(session_id),
+                    Some(TurnState::Reserved)
+                ) {
+                    tokio::task::yield_now().await;
+                }
                 // Re-park only for the genuine race: a fresh send claimed the
                 // slot in the gap after `finish_turn` freed it (session busy
                 // again), so restore the messages up front and let that turn
@@ -1861,7 +1889,7 @@ impl ChatHost {
         // reservation happen under one lock so two concurrent sends (or a
         // send racing a /respond resume) can't both spawn a turn against the
         // same session. `_guard` releases the reservation on any early error.
-        let _guard = match TurnGuard::claim(self, session_id).await {
+        let mut guard = match TurnGuard::claim(self, session_id).await {
             Some(guard) => guard,
             // Busy: park a genuine user send (Claude-desktop steering) so it
             // runs when the turn ends, instead of rejecting it. System/resume
@@ -2092,7 +2120,8 @@ impl ChatHost {
             if self.deleting_sessions.lock().unwrap().contains(&sid)
                 || !matches!(turns.get(&sid), Some(TurnState::Reserved))
             {
-                _guard.defuse();
+                drop(turns);
+                guard.release().await;
                 return Ok(());
             }
             let (target_path, target_event_offset) =
@@ -2136,7 +2165,7 @@ impl ChatHost {
             if let Some(seed) = title_seed {
                 self.spawn_title_generation(session.id.clone(), session.harness.clone(), seed);
             }
-            _guard.defuse();
+            guard.defuse();
         }
         Ok(())
     }
@@ -3347,6 +3376,9 @@ pub fn set_chat_session_env(cmd: &mut tokio::process::Command, session_id: &str)
     cmd.env(CHAT_SESSION_ENV, session_id);
     cmd.env(LOCAL_SESSION_ENV, "1");
     cmd.env_remove(CHAT_TARGET_FILE_ENV);
+    cmd.env_remove(CHAT_TARGET_POINTER_ENV);
+    cmd.env_remove("BASH_ENV");
+    cmd.env_remove("ZDOTDIR");
 
     let shell_dir = shell_hook_dir(session_id);
     if std::fs::create_dir_all(&shell_dir).is_err() {
