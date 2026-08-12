@@ -200,6 +200,10 @@ the wake-up to reconcile and continue the loop.)
 
 ## Citing evidence
 
+Use conventional Markdown math delimiters: `$...$` for inline math and
+`$$...$$` for display math. Escape literal currency dollar signs, for example
+write `\$10` rather than `$10`, so prices are never interpreted as math.
+
 Every substantive factual or quantitative claim you make in chat should carry an
 evidence chip the reader can click to see the source — a number, a "we found X",
 a "the harness caps Y" is not trustworthy on its own. Put the chip right after

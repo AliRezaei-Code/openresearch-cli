@@ -25,7 +25,8 @@ import {
 } from "../api";
 import { CodeView } from "./CodeView";
 import { FileTypeIcon, isImageFile, isMarkdownFile } from "./FileTypeIcon";
-import { mdCodeComponents, normalizeMathDelimiters, remarkMathOptions } from "./Md";
+import { normalizeMathDelimiters } from "../markdownNormalization";
+import { mdCodeComponents, remarkMathOptions } from "./Md";
 import { ICON_BUTTON_BASE_CLASS_NAME, ICON_BUTTON_CLASS_NAME, SETTINGS_LOADING_CLASS_NAME, SPINNER_CLASS_NAME } from "../styleClasses";
 
 const TOOLTIP_ICON_BUTTON_CLASS_NAME = `${ICON_BUTTON_CLASS_NAME} tip-up [&[data-tip]::after]:top-auto [&[data-tip]::after]:bottom-[calc(100%_+_6px)]`;

@@ -1364,6 +1364,7 @@ const Message = memo(function Message({
   onOpenPlan,
   onOpenSubagent,
   skills,
+  predictTextTail = false,
 }: {
   message: ChatMessage;
   onOpenFile?: (path: string, line?: number, exp?: string) => void;
@@ -1378,6 +1379,7 @@ const Message = memo(function Message({
   onOpenSubagent?: (spawnPartId: string) => void;
   /** Known slash-skills, for rendering a leading `/name` as a command chip. */
   skills?: SkillInfo[];
+  predictTextTail?: boolean;
 }) {
   if (message.role === "user") {
     const text = message.parts
@@ -1437,6 +1439,7 @@ const Message = memo(function Message({
         onRespond,
         onOpenPlan,
         onOpenSubagent,
+        predictTextTail,
       })}
     </div>
   );
@@ -1458,6 +1461,7 @@ function renderParts(
     onRespond?: (answer: PromptAnswer) => void;
     onOpenPlan?: (plan: string, promptId: string) => void;
     onOpenSubagent?: (spawnPartId: string) => void;
+    predictTextTail?: boolean;
   },
 ): React.ReactNode[] {
   const {
@@ -1469,7 +1473,9 @@ function renderParts(
     onRespond,
     onOpenPlan,
     onOpenSubagent,
+    predictTextTail = false,
   } = opts;
+  const visibleTail = parts.filter(partIsVisible).at(-1);
   const rendered: React.ReactNode[] = [];
   let toolRun: ChatPart[] = [];
   const flushTools = () => {
@@ -1514,7 +1520,13 @@ function renderParts(
     // non-empty.
     if (part.type === "text")
       rendered.push(
-        <Md key={part.id} text={part.text!} onOpenFile={onOpenFile} onOpenRun={onOpenRun} />,
+        <Md
+          key={part.id}
+          text={part.text!}
+          onOpenFile={onOpenFile}
+          onOpenRun={onOpenRun}
+          predict={predictTextTail && part.id === visibleTail?.id}
+        />,
       );
     else if (part.type === "reasoning")
       rendered.push(
@@ -1580,6 +1592,7 @@ export function SubagentTranscript({
     onOpenExperiment,
     experimentName,
     onOpenSubagent,
+    predictTextTail: running,
   });
   return (
     <div className="msg-assistant text-lg leading-[1.62] text-text min-w-0">
@@ -1642,6 +1655,7 @@ const Transcript = memo(function Transcript({
   onOpenPlan,
   onOpenSubagent,
   skills,
+  busy,
 }: {
   messages: ChatMessage[];
   onOpenFile?: (path: string, line?: number, exp?: string) => void;
@@ -1653,10 +1667,13 @@ const Transcript = memo(function Transcript({
   onOpenPlan?: (plan: string, promptId: string) => void;
   onOpenSubagent?: (spawnPartId: string) => void;
   skills?: SkillInfo[];
+  busy: boolean;
 }) {
+  const visibleMessages = messages.filter(messageHasVisibleContent);
+  const activeMessage = visibleMessages.at(-1);
   return (
     <>
-      {messages.filter(messageHasVisibleContent).map((m) => (
+      {visibleMessages.map((m) => (
         <Message
           key={m.id}
           message={m}
@@ -1669,6 +1686,7 @@ const Transcript = memo(function Transcript({
           onOpenPlan={onOpenPlan}
           onOpenSubagent={onOpenSubagent}
           skills={skills}
+          predictTextTail={busy && m === activeMessage && m.role === "assistant"}
         />
       ))}
     </>
@@ -3139,6 +3157,7 @@ export function ChatPanel({
           <div className="chat-thread-inner max-w-readable my-0 mx-auto pt-4 px-4 pb-8 flex flex-col gap-4" ref={threadInnerRef}>
             <Transcript
               messages={messages}
+              busy={busy}
               onOpenFile={openFileInSession}
               onOpenRun={onOpenRun}
               runExperimentName={runExperimentName}
