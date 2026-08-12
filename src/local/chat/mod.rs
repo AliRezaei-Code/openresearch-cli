@@ -1381,21 +1381,26 @@ impl Drop for TurnGuard {
         if !self.armed {
             return;
         }
-        // Setup failed before a turn was spawned: release the reservation. Only
-        // remove if it's still the unspawned reservation (None), never a live
-        // handle (some other path may have taken over).
-        //
-        // `try_lock` is safe here rather than a leak risk: an armed guard only
-        // drops on an early return from send_message's prologue, which never
-        // holds the `turns` lock (claim releases it immediately, and it's only
-        // re-acquired at the final upgrade after the guard is defused). So the
-        // lock is always free when an armed guard drops — the fallible lock can't
-        // actually fail in this path.
-        if let Ok(mut turns) = self.host.turns.try_lock() {
-            if matches!(turns.get(&self.session_id), Some(TurnState::Reserved)) {
-                turns.remove(&self.session_id);
+        let host = self.host.clone();
+        let session_id = self.session_id.clone();
+        tokio::spawn(async move {
+            let removed = {
+                let mut turns = host.turns.lock().await;
+                if matches!(turns.get(&session_id), Some(TurnState::Reserved)) {
+                    turns.remove(&session_id);
+                    true
+                } else {
+                    false
+                }
+            };
+            if removed {
+                host.emit(
+                    "chat.busy",
+                    json!({ "sessionId": &session_id, "busy": false }),
+                );
+                host.drain_queue(&session_id).await;
             }
-        }
+        });
     }
 }
 
@@ -3515,6 +3520,35 @@ mod cap_tests {
         );
         assert_eq!(String::from_utf8_lossy(&output.stdout), "yes");
         assert!(zshenv_hook(std::path::Path::new("/tmp")).contains("${ORX_CHAT_TARGET_FILE-}"));
+    }
+
+    #[tokio::test]
+    async fn failed_setup_releases_reservation_after_lock_contention() {
+        let host = Arc::new(ChatHost::new(
+            Arc::new(AgentHost::new(None)),
+            Arc::new(crate::local::codex::CodexHost::new()),
+            Arc::new(crate::local::claude::ClaudeHost::new()),
+        ));
+        host.turns
+            .lock()
+            .await
+            .insert("session".into(), TurnState::Reserved);
+        let guard = TurnGuard {
+            host: host.clone(),
+            session_id: "session".into(),
+            armed: true,
+        };
+        let turns = host.turns.lock().await;
+        drop(guard);
+        drop(turns);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while host.turns.lock().await.contains_key("session") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[test]
