@@ -604,7 +604,7 @@ fn remove_target_pointer_if_matches(session_id: &str, message_id: &str) {
     let expected = target_event_path(session_id, message_id);
     if std::fs::read_to_string(&pointer)
         .ok()
-        .is_some_and(|path| PathBuf::from(path) == expected)
+        .is_some_and(|path| path == expected.to_string_lossy())
     {
         let _ = std::fs::remove_file(pointer);
     }
@@ -2954,8 +2954,8 @@ impl TurnCtx {
         let mut claimed = self
             .target_event_bindings
             .values()
-            .cloned()
             .flatten()
+            .cloned()
             .collect::<HashSet<_>>();
         let mut remaining = Vec::new();
         for (scope, command, cwd, resource, target) in
