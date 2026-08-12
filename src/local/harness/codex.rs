@@ -1079,6 +1079,24 @@ fn item_to_part(item: &Value, completed: bool, prior: &[WirePart]) -> Option<Wir
             if let Some(cwd) = item.get("cwd").and_then(Value::as_str) {
                 input["cwd"] = Value::String(cwd.to_string());
             }
+            if let Some(prior_input) = prior
+                .iter()
+                .find(|part| part.id == id)
+                .and_then(|part| part.state.as_ref())
+                .and_then(|state| state.input.as_ref())
+            {
+                for key in [
+                    "runTargetIds",
+                    "runTargetIdsAuthoritative",
+                    "experimentTargetIds",
+                    "experimentTargetIdsAuthoritative",
+                    "targetIds",
+                ] {
+                    if let Some(value) = prior_input.get(key) {
+                        input[key] = value.clone();
+                    }
+                }
+            }
             Some(tool_part(
                 id,
                 "bash",
@@ -3192,6 +3210,17 @@ requires_openai_auth = false
                 &serde_json::json!({"itemId":"c1","delta":delta}),
             );
         }
+        {
+            let input = ctx.assistant.parts[0]
+                .state
+                .as_mut()
+                .unwrap()
+                .input
+                .as_mut()
+                .unwrap();
+            input["runTargetIds"] = serde_json::json!(["11111111-1111-1111-1111-111111111111"]);
+            input["runTargetIdsAuthoritative"] = serde_json::json!(true);
+        }
         // No aggregatedOutput on the completed item → streamed output survives.
         apply_notification(
             &mut ctx,
@@ -3201,6 +3230,14 @@ requires_openai_auth = false
         let state = ctx.assistant.parts[0].state.as_ref().unwrap();
         assert_eq!(state.status, "completed");
         assert_eq!(state.output.as_deref(), Some("a\nb\n"));
+        assert_eq!(
+            state.input.as_ref().unwrap()["runTargetIds"],
+            serde_json::json!(["11111111-1111-1111-1111-111111111111"])
+        );
+        assert_eq!(
+            state.input.as_ref().unwrap()["runTargetIdsAuthoritative"],
+            true
+        );
 
         // With aggregatedOutput present, it is authoritative.
         apply_notification(

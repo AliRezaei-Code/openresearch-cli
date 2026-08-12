@@ -36,6 +36,8 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(75);
 const TOOL_TEXT_CAP: usize = 16_000;
 const TOOL_TEXT_TRUNCATION_MARKER: &str = "\n… [output truncated]";
 const TOOL_TARGET_CAP: usize = 256;
+const TOOL_TARGET_INSPECTION_CAP: usize = 1_024;
+const TOOL_TARGET_SCAN_BYTES: usize = 256_000;
 
 /// Keep the head and tail of `text` within [`TOOL_TEXT_CAP`] chars, marking
 /// the omitted middle. Idempotent — an already-capped string is left alone.
@@ -66,6 +68,17 @@ fn cap_tool_text(text: &mut String) {
     capped.push_str(TOOL_TEXT_TRUNCATION_MARKER);
     capped.push_str(&text[tail_start..]);
     *text = capped;
+}
+
+fn bounded_tool_scan(text: &str) -> &str {
+    if text.len() <= TOOL_TARGET_SCAN_BYTES {
+        return text;
+    }
+    let mut end = TOOL_TARGET_SCAN_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 fn valid_tool_target(value: &str) -> bool {
@@ -108,19 +121,17 @@ fn push_tool_target(targets: &mut Vec<String>, seen: &mut HashSet<String>, value
     }
 }
 
-fn structured_tool_targets(
+fn marker_tool_targets(
     text: &str,
     resource: &str,
     targets: &mut Vec<String>,
     seen: &mut HashSet<String>,
 ) {
-    let endpoint = format!("/{resource}/");
     let marker = if resource == "runs" {
         "[orx-run:"
     } else {
         "[orx-experiment:"
     };
-    let initial_len = targets.len();
     for line in text.lines() {
         if targets.len() >= TOOL_TARGET_CAP {
             break;
@@ -132,9 +143,15 @@ fn structured_tool_targets(
             }
         }
     }
-    if targets.len() > initial_len || initial_len > 0 {
-        return;
-    }
+}
+
+fn heuristic_tool_targets(
+    text: &str,
+    resource: &str,
+    targets: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    let endpoint = format!("/{resource}/");
     for line in text.lines() {
         if targets.len() >= TOOL_TARGET_CAP {
             break;
@@ -197,26 +214,74 @@ fn preserve_tool_targets(state: &mut WireToolState) {
     } else {
         "experimentTargetIds"
     };
+    let authority_key = format!("{key}Authoritative");
+    let texts = [state.output.as_deref(), state.error.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(bounded_tool_scan)
+        .collect::<Vec<_>>();
+    let mut marker_targets = Vec::new();
+    let mut marker_seen = HashSet::new();
+    for text in &texts {
+        marker_tool_targets(text, resource, &mut marker_targets, &mut marker_seen);
+    }
+    let previously_authoritative = input
+        .get(&authority_key)
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let authoritative = !marker_targets.is_empty() || previously_authoritative;
     let existing = input
         .get(key)
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
+        .take(TOOL_TARGET_INSPECTION_CAP)
         .collect::<Vec<_>>();
     let mut targets = Vec::new();
     let mut seen = HashSet::new();
-    for target in existing {
-        push_tool_target(&mut targets, &mut seen, target);
-    }
-    for text in [state.output.as_deref(), state.error.as_deref()]
-        .into_iter()
-        .flatten()
-    {
-        structured_tool_targets(text, resource, &mut targets, &mut seen);
+    if !marker_targets.is_empty() {
+        if previously_authoritative {
+            for target in existing {
+                push_tool_target(&mut targets, &mut seen, target);
+            }
+        }
+        for target in marker_targets {
+            push_tool_target(&mut targets, &mut seen, &target);
+        }
+    } else {
+        for target in existing {
+            push_tool_target(&mut targets, &mut seen, target);
+        }
+        if !authoritative {
+            for text in &texts {
+                heuristic_tool_targets(text, resource, &mut targets, &mut seen);
+            }
+        }
     }
     if !targets.is_empty() {
         input.insert(key.into(), json!(targets));
+    }
+    if authoritative {
+        input.insert(authority_key, Value::Bool(true));
+    }
+    if let Some(legacy) = input.get("targetIds").and_then(Value::as_array) {
+        let mut normalized = Vec::new();
+        let mut legacy_seen = HashSet::new();
+        for target in legacy
+            .iter()
+            .take(TOOL_TARGET_INSPECTION_CAP)
+            .filter_map(Value::as_str)
+        {
+            push_tool_target(&mut normalized, &mut legacy_seen, target);
+        }
+        input.insert("targetIds".into(), json!(normalized));
+    }
+    if let Some(output) = state.output.as_mut() {
+        cap_tool_text(output);
+    }
+    if let Some(error) = state.error.as_mut() {
+        cap_tool_text(error);
     }
     if let Some(output) = state.output.as_mut() {
         strip_tool_target_markers(output);
@@ -661,12 +726,14 @@ fn message_json(m: &WireMessage, session_id: &str) -> Value {
 }
 
 fn stored_to_wire(m: &StoredChatMessage) -> WireMessage {
-    WireMessage {
+    let mut message = WireMessage {
         id: m.id.clone(),
         role: m.role.clone(),
         parts: serde_json::from_str(&m.parts_json).unwrap_or_default(),
         created_at: m.created_at,
-    }
+    };
+    cap_tool_parts(&mut message.parts);
+    message
 }
 
 fn is_initial_chat_message(transcript_text: Option<&str>, has_messages: bool) -> bool {
@@ -2891,10 +2958,9 @@ mod cap_tests {
         cap_tool_parts(&mut parts);
 
         let state = parts[0].state.as_ref().unwrap();
-        assert_eq!(
-            state.output.as_ref().unwrap().chars().count(),
-            TOOL_TEXT_CAP
-        );
+        let output = state.output.as_ref().unwrap();
+        assert!(output.chars().count() <= TOOL_TEXT_CAP);
+        assert!(output.contains(TOOL_TEXT_TRUNCATION_MARKER));
         assert_eq!(
             state.input.as_ref().unwrap()["runTargetIds"],
             json!([first, middle, last])
@@ -2953,6 +3019,41 @@ mod cap_tests {
         );
         let expected = format!("first line\n/runs/{mentioned}\n");
         assert_eq!(state.output.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn later_marker_replaces_heuristic_targets() {
+        let target = "11111111-1111-1111-1111-111111111111";
+        let mentioned = "22222222-2222-2222-2222-222222222222";
+        let mut state = WireToolState {
+            status: "running".into(),
+            input: Some(json!({ "command": "orx logs $id" })),
+            output: Some(format!("/runs/{mentioned}\n")),
+            error: None,
+            title: None,
+        };
+
+        preserve_tool_targets(&mut state);
+        assert_eq!(
+            state.input.as_ref().unwrap()["runTargetIds"],
+            json!([mentioned])
+        );
+
+        state
+            .output
+            .as_mut()
+            .unwrap()
+            .push_str(&format!("[orx-run:{target}]\n"));
+        preserve_tool_targets(&mut state);
+
+        assert_eq!(
+            state.input.as_ref().unwrap()["runTargetIds"],
+            json!([target])
+        );
+        assert_eq!(
+            state.input.as_ref().unwrap()["runTargetIdsAuthoritative"],
+            true
+        );
     }
 }
 
