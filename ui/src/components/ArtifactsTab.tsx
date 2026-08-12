@@ -18,13 +18,16 @@ import remarkMath from "remark-math";
 import {
   artifactUrl,
   deleteArtifact,
+  FILE_PREVIEW_BYTES,
   fmtBytes,
+  getArtifactFileText,
   type ArtifactEntry,
   type Project,
   type ProjectArtifacts,
 } from "../api";
 import { CodeView } from "./CodeView";
-import { FileTypeIcon, isImageFile, isMarkdownFile } from "./FileTypeIcon";
+import { FileTypeIcon, isMarkdownFile } from "./FileTypeIcon";
+import { MediaPreview, mediaPreviewKind, type MediaPreviewKind } from "./MediaPreview";
 import { mdCodeComponents, normalizeMathDelimiters, remarkMathOptions } from "./Md";
 import { ICON_BUTTON_BASE_CLASS_NAME, ICON_BUTTON_CLASS_NAME, SETTINGS_LOADING_CLASS_NAME, SPINNER_CLASS_NAME } from "../styleClasses";
 
@@ -73,9 +76,6 @@ function stripFrontmatter(md: string): string {
   const end = md.indexOf("\n---", 3);
   return end === -1 ? md : md.slice(end + 4).replace(/^\r?\n/, "");
 }
-
-/** Raw text preview cap — matches the repo file viewer's truncation cap. */
-const MAX_TEXT_PREVIEW = 512 * 1024;
 
 /** Tree pane width: draggable divider, persisted across reloads. */
 const TREE_WIDTH_KEY = "orx:files-tree-width";
@@ -175,23 +175,22 @@ export function ArtifactMarkdown({
   );
 }
 
-type PreviewKind = "markdown" | "image" | "pdf" | "text";
+type PreviewKind = "markdown" | MediaPreviewKind | "text" | "download";
 
 function previewKind(entry: ArtifactEntry): PreviewKind {
-  if (isMarkdownFile(entry.name)) return "markdown";
-  if (isImageFile(entry.name)) return "image";
-  if (/\.pdf$/i.test(entry.name)) return "pdf";
-  return "text";
+  if (entry.presentation === "text" && isMarkdownFile(entry.name)) return "markdown";
+  return mediaPreviewKind(entry.presentation) ??
+    (entry.presentation === "text" || entry.presentation === "unknown" ? "text" : "download");
 }
 
-/** Fetched body for kinds that need text: markdown or raw text.
- * `binary` flags NUL bytes so we don't dump garbage into a <pre>. */
+/** Fetched body for kinds that need text: markdown or raw text. */
 function useTextBody(projectId: string, entry: ArtifactEntry, kind: PreviewKind) {
   const [text, setText] = useState<string | null>(null);
   const [binary, setBinary] = useState(false);
+  const [truncated, setTruncated] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const wantsText = kind === "markdown" || (kind === "text" && entry.size <= MAX_TEXT_PREVIEW);
+  const wantsText = kind === "markdown" || (kind === "text" && entry.size <= FILE_PREVIEW_BYTES);
 
   useEffect(() => {
     // Reset before the wantsText guard: a refire on the same mounted entry
@@ -199,18 +198,20 @@ function useTextBody(projectId: string, entry: ArtifactEntry, kind: PreviewKind)
     // previous body or binary/error flags behind.
     setText(null);
     setBinary(false);
+    setTruncated(false);
     setError(null);
     if (!wantsText) return;
     let cancelled = false;
-    const load = fetch(artifactUrl(projectId, entry.path)).then((r) => {
-      if (!r.ok) throw new Error(`Failed to load artifact (${r.status})`);
-      return r.text();
+    const load = getArtifactFileText(projectId, entry.path).then((body) => {
+      if (!body) throw new Error("Artifact not found");
+      return body;
     });
     load
       .then((body) => {
         if (cancelled) return;
-        if (body.includes("\u0000")) setBinary(true);
-        else setText(body);
+        if (body.binary) setBinary(true);
+        else setText(body.content);
+        setTruncated(body.truncated);
       })
       .catch((e) => {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
@@ -220,7 +221,7 @@ function useTextBody(projectId: string, entry: ArtifactEntry, kind: PreviewKind)
     };
   }, [projectId, entry.path, entry.modifiedAt, kind, wantsText]);
 
-  return { text, binary, error, wantsText };
+  return { text, binary, truncated, error, wantsText };
 }
 
 /** Right pane: the selected artifact rendered inline — markdown as a document,
@@ -235,27 +236,28 @@ function PreviewPane({
   onDelete: (path: string) => void;
 }) {
   const kind = previewKind(entry);
-  const { text, binary, error, wantsText } = useTextBody(projectId, entry, kind);
+  const { text, binary, truncated, error, wantsText } = useTextBody(projectId, entry, kind);
   const [showSource, setShowSource] = useState(false);
   const isDoc = kind === "markdown";
   const mdFolder = entry.path.split("/").slice(0, -1).join("/");
-  const rawUrl = artifactUrl(projectId, entry.path);
+  const rawUrl = `${artifactUrl(projectId, entry.path)}&v=${entry.modifiedAt}`;
 
   let body: ReactNode;
-  if (kind === "image") {
-    body = (
-      <a className="fpreview-image flex items-start justify-center p-6 [&_img]:max-w-full [&_img]:h-auto [&_img]:border [&_img]:border-border [&_img]:rounded-sm" href={rawUrl} target="_blank" rel="noopener noreferrer">
-        <img src={rawUrl} alt={entry.name} />
-      </a>
-    );
-  } else if (kind === "pdf") {
-    body = <iframe className="fpreview-pdf block w-full h-full border-0" title={entry.name} src={rawUrl} />;
-  } else if (!wantsText || binary) {
+  if (kind === "image" || kind === "audio" || kind === "video" || kind === "pdf") {
+    body = <MediaPreview kind={kind} url={rawUrl} name={entry.name} />;
+  } else if (kind === "download" || !wantsText || binary) {
     body = (
       <div className="file-view-note py-2.5 px-4 text-sm text-muted">
-        {binary ? "Binary file — no inline preview." : "File too large to preview inline."}{" "}
-        <a href={rawUrl} target="_blank" rel="noopener noreferrer">
-          Open raw
+        {kind === "download" || binary
+          ? "Binary or unsupported file — no inline preview."
+          : "File too large to preview inline."}{" "}
+        <a
+          href={rawUrl}
+          {...(kind === "download" || binary
+            ? { download: entry.name }
+            : { target: "_blank", rel: "noopener noreferrer" })}
+        >
+          {kind === "download" || binary ? "Download" : "Open raw"}
         </a>
       </div>
     );
@@ -288,7 +290,7 @@ function PreviewPane({
             timeStyle: "short",
           })}
         </span>
-        {kind === "text" && (
+        {(kind === "text" || kind === "download") && (
           <span className="fpreview-size text-xs text-muted whitespace-nowrap shrink-0">{fmtBytes(entry.size)}</span>
         )}
         {isDoc && (
@@ -326,7 +328,14 @@ function PreviewPane({
           <Trash2 size={13} />
         </button>
       </div>
-      <div className={`fpreview-body flex-1 min-h-0 overflow-auto [&.doc]:pt-4.5 [&.doc]:px-7 [&.doc]:pb-12 [&.doc_.artifact-md]:max-w-readable [&.doc_.artifact-md]:my-0 [&.doc_.artifact-md]:mx-auto ${isDoc && !showSource ? "doc" : ""}`}>{body}</div>
+      <div className={`fpreview-body flex-1 min-h-0 overflow-auto [&.doc]:pt-4.5 [&.doc]:px-7 [&.doc]:pb-12 [&.doc_.artifact-md]:max-w-readable [&.doc_.artifact-md]:my-0 [&.doc_.artifact-md]:mx-auto ${isDoc && !showSource ? "doc" : ""}`}>
+        {body}
+        {truncated && (
+          <div className="file-view-note py-2.5 px-4 text-sm text-muted">
+            File truncated — showing the first 512 KB.
+          </div>
+        )}
+      </div>
     </div>
   );
 }

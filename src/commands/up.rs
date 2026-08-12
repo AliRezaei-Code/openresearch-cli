@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{header, StatusCode, Uri};
+use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -301,6 +301,7 @@ fn router(state: AppState) -> Router {
         .route("/api/projects/{id}/working-tree", get(project_working_tree))
         .route("/api/projects/{id}/code-tree", get(project_code_tree))
         .route("/api/projects/{id}/file", get(project_file))
+        .route("/api/projects/{id}/file/raw", get(project_raw_file))
         .route(
             "/api/projects/{id}/files",
             get(list_artifacts).delete(delete_artifact),
@@ -1960,28 +1961,259 @@ struct ProjectFileQuery {
     r#ref: Option<String>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectFileResponse {
+    path: String,
+    content: String,
+    truncated: bool,
+    binary: bool,
+    not_found: bool,
+    root: &'static str,
+    presentation: local::files::FilePresentation,
+}
+
+impl ProjectFileResponse {
+    fn missing(
+        path: String,
+        root: &'static str,
+        presentation: local::files::FilePresentation,
+    ) -> Self {
+        Self {
+            path,
+            content: String::new(),
+            truncated: false,
+            binary: false,
+            not_found: true,
+            root,
+            presentation,
+        }
+    }
+
+    fn non_text(
+        path: String,
+        root: &'static str,
+        presentation: local::files::FilePresentation,
+    ) -> Self {
+        Self {
+            path,
+            content: String::new(),
+            truncated: false,
+            binary: true,
+            not_found: false,
+            root,
+            presentation,
+        }
+    }
+
+    fn text(
+        path: String,
+        root: &'static str,
+        content: String,
+        truncated: bool,
+        binary: bool,
+        presentation: local::files::FilePresentation,
+    ) -> Self {
+        Self {
+            path,
+            content,
+            truncated,
+            binary,
+            not_found: false,
+            root,
+            presentation,
+        }
+    }
+}
+
+fn validated_project_file_path(
+    path: &str,
+) -> std::result::Result<(String, std::path::PathBuf), ApiError> {
+    let rel = path.trim().trim_start_matches("./").to_string();
+    if rel.is_empty() || rel.len() > 1024 {
+        return Err(bad_request("invalid path"));
+    }
+    let rel_path = std::path::PathBuf::from(&rel);
+    let traversal = rel_path.is_absolute()
+        || rel_path
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)));
+    if traversal {
+        return Err(bad_request("path must be repo-relative"));
+    }
+    Ok((rel, rel_path))
+}
+
+fn decode_project_file_text(bytes: Vec<u8>, truncated: bool) -> (String, bool) {
+    if bytes.contains(&0) {
+        return (String::new(), true);
+    }
+    match String::from_utf8(bytes) {
+        Ok(content) => (content, false),
+        Err(error) if truncated && error.utf8_error().error_len().is_none() => {
+            let valid_up_to = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            bytes.truncate(valid_up_to);
+            (String::from_utf8(bytes).unwrap_or_default(), false)
+        }
+        Err(_) => (String::new(), true),
+    }
+}
+
 /// One file for the UI file viewer. With `ref`: the committed content on that
 /// branch (a streamed, capped `git cat-file` read), independent of any
 /// checkout. Without: the project's checkout — the chat session's worktree
 /// when `sessionId` is given, else the hub clone. Path is repo-relative;
 /// traversal outside the checkout is rejected. The response's `root` says
 /// which source actually answered, so the UI can flag fallback.
-async fn project_file(Path(id): Path<String>, Query(q): Query<ProjectFileQuery>) -> ApiResult {
-    blocking_api(move || {
+async fn project_file(
+    Path(id): Path<String>,
+    Query(q): Query<ProjectFileQuery>,
+) -> std::result::Result<Json<ProjectFileResponse>, ApiError> {
+    tokio::task::spawn_blocking(move || {
         use std::io::Read as _;
-        let rel = q.path.trim().trim_start_matches("./").to_string();
-        if rel.is_empty() || rel.len() > 1024 {
-            return Err(bad_request("invalid path"));
-        }
-        let rel_path = std::path::Path::new(&rel);
-        let traversal = rel_path.is_absolute()
-            || rel_path
-                .components()
-                .any(|c| !matches!(c, std::path::Component::Normal(_)));
-        if traversal {
-            return Err(bad_request("path must be repo-relative"));
-        }
+        let (rel, rel_path) = validated_project_file_path(&q.path)?;
 
+        let store = Store::open()?;
+        let project = store
+            .get_local_project(&id)?
+            .ok_or_else(|| not_found("project"))?;
+        let presentation = local::files::presentation_for_path(&rel);
+        let ref_name = q.r#ref.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        if let Some(name) = ref_name {
+            let (root, _) = resolve_checkout_root(&store, &project, None)?;
+            let sha = local::git::resolve_branch_commit(&root, name)?
+                .ok_or_else(|| not_found("branch"))?;
+            if !matches!(
+                presentation,
+                local::files::FilePresentation::Text | local::files::FilePresentation::Unknown
+            ) {
+                return if local::git::file_size_at(&root, &sha, &rel)?.is_some() {
+                    Ok(Json(ProjectFileResponse::non_text(
+                        rel,
+                        "branch",
+                        presentation,
+                    )))
+                } else {
+                    Ok(Json(ProjectFileResponse::missing(
+                        rel,
+                        "branch",
+                        presentation,
+                    )))
+                };
+            }
+            // Streamed + capped: a committed multi-GB blob must not become a
+            // multi-GB allocation. Missing path is an exit-code check inside
+            // the helper (`cat-file -e`) — no error-message parsing.
+            return match local::git::file_bytes_at_capped(&root, &sha, &rel, FILE_READ_LIMIT)? {
+                Some((bytes, truncated)) => {
+                    let (content, binary) = decode_project_file_text(bytes, truncated);
+                    let presentation = if binary {
+                        local::files::FilePresentation::Download
+                    } else {
+                        local::files::FilePresentation::Text
+                    };
+                    Ok(Json(ProjectFileResponse::text(
+                        rel,
+                        "branch",
+                        content,
+                        truncated,
+                        binary,
+                        presentation,
+                    )))
+                }
+                None => Ok(Json(ProjectFileResponse::missing(
+                    rel,
+                    "branch",
+                    presentation,
+                ))),
+            };
+        }
+        let (root, root_kind) = resolve_checkout_root(&store, &project, q.session_id.as_deref())?;
+        // Canonicalize so symlinks can't escape the checkout.
+        let full = match std::fs::canonicalize(root.join(&rel_path)) {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Json(ProjectFileResponse::missing(
+                    rel,
+                    root_kind,
+                    presentation,
+                )))
+            }
+            Err(e) => return Err(ApiError::from(anyhow!("read failed: {e}"))),
+        };
+        if !full.starts_with(&root) {
+            return Err(bad_request("path escapes repository"));
+        }
+        if full.is_dir() {
+            return Err(bad_request("path is a directory"));
+        }
+        if !matches!(
+            presentation,
+            local::files::FilePresentation::Text | local::files::FilePresentation::Unknown
+        ) {
+            return Ok(Json(ProjectFileResponse::non_text(
+                rel,
+                root_kind,
+                presentation,
+            )));
+        }
+        let file = match std::fs::File::open(&full) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Json(ProjectFileResponse::missing(
+                    rel,
+                    root_kind,
+                    presentation,
+                )))
+            }
+            Err(e) => return Err(ApiError::from(anyhow!("read failed: {e}"))),
+        };
+        let mut buf = Vec::new();
+        std::io::Read::take(file, FILE_READ_LIMIT + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| ApiError::from(anyhow!("read failed: {e}")))?;
+        let truncated = buf.len() as u64 > FILE_READ_LIMIT;
+        buf.truncate(FILE_READ_LIMIT as usize);
+        let (content, binary) = decode_project_file_text(buf, truncated);
+        let presentation = if binary {
+            local::files::FilePresentation::Download
+        } else {
+            local::files::FilePresentation::Text
+        };
+        Ok(Json(ProjectFileResponse::text(
+            rel,
+            root_kind,
+            content,
+            truncated,
+            binary,
+            presentation,
+        )))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("file task failed: {e}")))?
+}
+
+enum RawProjectFileSource {
+    Disk(std::fs::File),
+    Git {
+        repo: std::path::PathBuf,
+        spec: String,
+        size: u64,
+    },
+}
+
+/// Byte-exact checkout file for browser-native media previews. It resolves the
+/// same worktree/clone/branch source as `project_file`, but streams instead of
+/// decoding or buffering the file in the API process.
+async fn project_raw_file(
+    Path(id): Path<String>,
+    Query(q): Query<ProjectFileQuery>,
+    method: Method,
+    headers: HeaderMap,
+) -> std::result::Result<Response, ApiError> {
+    let source = tokio::task::spawn_blocking(move || {
+        let (rel, rel_path) = validated_project_file_path(&q.path)?;
         let store = Store::open()?;
         let project = store
             .get_local_project(&id)?
@@ -1991,56 +2223,66 @@ async fn project_file(Path(id): Path<String>, Query(q): Query<ProjectFileQuery>)
             let (root, _) = resolve_checkout_root(&store, &project, None)?;
             let sha = local::git::resolve_branch_commit(&root, name)?
                 .ok_or_else(|| not_found("branch"))?;
-            // Streamed + capped: a committed multi-GB blob must not become a
-            // multi-GB allocation. Missing path is an exit-code check inside
-            // the helper (`cat-file -e`) — no error-message parsing.
-            return match local::git::file_at_capped(&root, &sha, &rel, FILE_READ_LIMIT)? {
-                Some((content, truncated)) => Ok(Json(json!({
-                    "path": rel, "content": content, "truncated": truncated,
-                    "notFound": false, "root": "branch",
-                }))),
-                None => Ok(Json(json!({
-                    "path": rel, "content": "", "truncated": false,
-                    "notFound": true, "root": "branch",
-                }))),
-            };
+            let size =
+                local::git::file_size_at(&root, &sha, &rel)?.ok_or_else(|| not_found("file"))?;
+            return Ok((
+                rel.clone(),
+                RawProjectFileSource::Git {
+                    repo: root,
+                    spec: format!("{sha}:{rel}"),
+                    size,
+                },
+            ));
         }
-        let (root, root_kind) = resolve_checkout_root(&store, &project, q.session_id.as_deref())?;
-        let not_found_json = json!({
-            "path": rel, "content": "", "truncated": false, "notFound": true, "root": root_kind,
-        });
-        // Canonicalize so symlinks can't escape the checkout.
-        let full = match std::fs::canonicalize(root.join(rel_path)) {
-            Ok(p) => p,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Json(not_found_json)),
-            Err(e) => return Err(ApiError::from(anyhow!("read failed: {e}"))),
-        };
+
+        let (root, _) = resolve_checkout_root(&store, &project, q.session_id.as_deref())?;
+        let full = std::fs::canonicalize(root.join(rel_path)).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                not_found("file")
+            } else {
+                ApiError::from(anyhow!("read failed: {e}"))
+            }
+        })?;
         if !full.starts_with(&root) {
             return Err(bad_request("path escapes repository"));
         }
         if full.is_dir() {
             return Err(bad_request("path is a directory"));
         }
-        let file = match std::fs::File::open(&full) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Json(not_found_json)),
-            Err(e) => return Err(ApiError::from(anyhow!("read failed: {e}"))),
-        };
-        let mut buf = Vec::new();
-        std::io::Read::take(file, FILE_READ_LIMIT + 1)
-            .read_to_end(&mut buf)
-            .map_err(|e| ApiError::from(anyhow!("read failed: {e}")))?;
-        let truncated = buf.len() as u64 > FILE_READ_LIMIT;
-        buf.truncate(FILE_READ_LIMIT as usize);
-        Ok(Json(json!({
-            "path": rel,
-            "content": String::from_utf8_lossy(&buf).into_owned(),
-            "truncated": truncated,
-            "notFound": false,
-            "root": root_kind,
-        })))
+        let file =
+            std::fs::File::open(&full).map_err(|e| ApiError::from(anyhow!("read failed: {e}")))?;
+        Ok((rel, RawProjectFileSource::Disk(file)))
     })
     .await
+    .map_err(|e| ApiError::from(anyhow!("file task failed: {e}")))??;
+
+    let (display_path, source) = source;
+    let presentation = local::files::presentation_for_path(&display_path);
+    match source {
+        RawProjectFileSource::Disk(file) => crate::commands::file_serve::disk_response(
+            &display_path,
+            file,
+            presentation,
+            &method,
+            &headers,
+            "no-cache",
+        )
+        .await
+        .map_err(ApiError::from),
+        RawProjectFileSource::Git { repo, spec, size } => {
+            crate::commands::file_serve::git_response(
+                &display_path,
+                repo,
+                spec,
+                size,
+                presentation,
+                &method,
+                &headers,
+            )
+            .await
+            .map_err(ApiError::from)
+        }
+    }
 }
 
 // --- project artifacts ----------------------------------------------------
@@ -2087,25 +2329,38 @@ async fn delete_artifact(
 async fn serve_artifact(
     Path(id): Path<String>,
     Query(q): Query<ArtifactPathQuery>,
+    method: Method,
+    headers: HeaderMap,
 ) -> std::result::Result<Response, ApiError> {
-    tokio::task::spawn_blocking(move || {
+    let display_path = q.path.clone();
+    let file = tokio::task::spawn_blocking(move || {
         let store = Store::open()?;
         let project = store
             .get_local_project(&id)?
             .ok_or_else(|| not_found("project"))?;
-        let bytes = local::files::read_file(&project, &q.path).map_err(|_| not_found("file"))?;
-        let content_type = local::files::content_type_for_path(&q.path);
-        Ok((
-            [
-                (header::CONTENT_TYPE, content_type),
-                (header::CACHE_CONTROL, "no-cache"),
-            ],
-            bytes,
-        )
-            .into_response())
+        let path = local::files::file_path(&project, &q.path).map_err(|_| not_found("file"))?;
+        let file = std::fs::File::open(&path).map_err(|_| not_found("file"))?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| ApiError::from(anyhow!("stat failed: {e}")))?;
+        if !metadata.is_file() {
+            return Err(not_found("file"));
+        }
+        Ok(file)
     })
     .await
-    .map_err(|e| ApiError::from(anyhow!("file task failed: {e}")))?
+    .map_err(|e| ApiError::from(anyhow!("file task failed: {e}")))??;
+    let presentation = local::files::presentation_for_path(&display_path);
+    crate::commands::file_serve::disk_response(
+        &display_path,
+        file,
+        presentation,
+        &method,
+        &headers,
+        "no-cache",
+    )
+    .await
+    .map_err(ApiError::from)
 }
 
 // --- HF token settings ------------------------------------------------------
@@ -3929,7 +4184,11 @@ async fn send_chat_message(
 }
 
 /// Raw bytes of a chat attachment (image or PDF), by bare file name.
-async fn chat_attachment(Path(name): Path<String>) -> std::result::Result<Response, ApiError> {
+async fn chat_attachment(
+    Path(name): Path<String>,
+    method: Method,
+    headers: HeaderMap,
+) -> std::result::Result<Response, ApiError> {
     // Names are server-minted (att-<uuid>__<name>.<ext>); anything else is rejected.
     if !name
         .chars()
@@ -3938,23 +4197,28 @@ async fn chat_attachment(Path(name): Path<String>) -> std::result::Result<Respon
     {
         return Err(bad_request("invalid attachment name"));
     }
-    tokio::task::spawn_blocking(move || {
+    let display_name = name.clone();
+    let file = tokio::task::spawn_blocking(move || {
         let path = local::chat::attachments_dir()?.join(&name);
-        let bytes = std::fs::read(&path).map_err(|_| not_found("attachment"))?;
-        Ok((
-            [
-                (
-                    header::CONTENT_TYPE,
-                    local::chat::attachment_content_type(&name),
-                ),
-                (header::CACHE_CONTROL, "max-age=31536000, immutable"),
-            ],
-            bytes,
-        )
-            .into_response())
+        let file = std::fs::File::open(&path).map_err(|_| not_found("attachment"))?;
+        let metadata = file.metadata().map_err(|_| not_found("attachment"))?;
+        if !metadata.is_file() {
+            return Err(not_found("attachment"));
+        }
+        Ok(file)
     })
     .await
-    .map_err(|e| ApiError::from(anyhow!("attachment task failed: {e}")))?
+    .map_err(|e| ApiError::from(anyhow!("attachment task failed: {e}")))??;
+    crate::commands::file_serve::disk_response(
+        &display_name,
+        file,
+        local::files::presentation_for_path(&display_name),
+        &method,
+        &headers,
+        "max-age=31536000, immutable",
+    )
+    .await
+    .map_err(ApiError::from)
 }
 
 async fn interrupt_chat(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
@@ -4435,6 +4699,42 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with("files/demo"));
+    }
+
+    #[test]
+    fn project_file_text_never_lossily_decodes_binary_bytes() {
+        let (content, binary) = decode_project_file_text(b"plain text\n".to_vec(), false);
+        assert_eq!(content, "plain text\n");
+        assert!(!binary);
+
+        for bytes in [b"header\0payload".to_vec(), vec![0x89, b'P', b'N', b'G']] {
+            let (content, binary) = decode_project_file_text(bytes, false);
+            assert!(content.is_empty());
+            assert!(binary);
+        }
+
+        let mut split_utf8 = b"prefix".to_vec();
+        split_utf8.push(0xe2);
+        let (content, binary) = decode_project_file_text(split_utf8, true);
+        assert_eq!(content, "prefix");
+        assert!(!binary);
+    }
+
+    #[test]
+    fn project_file_paths_reject_traversal() {
+        assert_eq!(
+            validated_project_file_path("./figures/chart.png")
+                .map_err(|error| error.1)
+                .unwrap()
+                .0,
+            "figures/chart.png"
+        );
+        for path in ["", "../secret", "/etc/passwd", "figures/../secret"] {
+            assert!(
+                validated_project_file_path(path).is_err(),
+                "accepted {path:?}"
+            );
+        }
     }
 
     fn no_key(path: Option<&str>) -> SshReadiness {

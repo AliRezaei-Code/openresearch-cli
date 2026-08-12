@@ -284,8 +284,10 @@ export interface ProjectFile {
   path: string;
   content: string;
   truncated: boolean;
+  binary: boolean;
   notFound: boolean;
   root: CheckoutRoot;
+  presentation: FilePresentation;
 }
 
 /** One file from the project — a branch's committed copy when `ref` is given,
@@ -295,6 +297,10 @@ export const getProjectFile = (projectId: string, path: string, opts: CheckoutRe
   get<ProjectFile>(
     `/api/projects/${projectId}/file?${checkoutQuery(opts, new URLSearchParams({ path }))}`,
   );
+
+/** Byte-exact checkout file for browser-native media rendering or download. */
+export const projectFileUrl = (projectId: string, path: string, opts: CheckoutRef = {}) =>
+  `/api/projects/${projectId}/file/raw?${checkoutQuery(opts, new URLSearchParams({ path }))}`;
 
 export interface CodeTree {
   root: CheckoutRoot;
@@ -650,8 +656,11 @@ export interface ArtifactEntry {
   /** 0 for directories. */
   size: number;
   modifiedAt: number;
+  presentation?: FilePresentation;
   children?: ArtifactEntry[];
 }
+
+export type FilePresentation = "image" | "audio" | "video" | "pdf" | "text" | "unknown" | "download";
 
 /** Listing of the project's on-disk artifacts directory. */
 export interface ProjectArtifacts {
@@ -673,16 +682,68 @@ export const deleteArtifact = (projectId: string, path: string) =>
 export const artifactUrl = (projectId: string, path: string) =>
   `/api/projects/${projectId}/files/file?path=${encodeURIComponent(path)}`;
 
-/** Text body of an artifact (raw bytes decoded as UTF-8), or `null` when
- *  the file is missing (404). The endpoint returns bytes, not JSON, so this
- *  bypasses the `get`/`json` helpers; a 404 is a normal "not found", not an
- *  error to surface. */
-export const getArtifactFileText = (projectId: string, path: string): Promise<string | null> =>
-  fetch(artifactUrl(projectId, path)).then((r) => {
+export interface FileTextBody {
+  content: string;
+  binary: boolean;
+  truncated: boolean;
+}
+
+export const FILE_PREVIEW_BYTES = 512_000;
+
+/** Decode a raw response only when it is valid, NUL-free UTF-8. */
+const decodeFileText = (bytes: ArrayBuffer, truncated: boolean): FileTextBody => {
+  const view = new Uint8Array(bytes);
+  if (view.includes(0)) return { content: "", binary: true, truncated };
+  try {
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    const content = decoder.decode(view, { stream: truncated });
+    return { content, binary: false, truncated };
+  } catch {
+    return { content: "", binary: true, truncated };
+  }
+};
+
+/** Text-safe body of an artifact, or `null` when the file is missing. */
+export const getArtifactFileText = (
+  projectId: string,
+  path: string,
+): Promise<FileTextBody | null> => {
+  return fetch(artifactUrl(projectId, path), {
+    headers: { Range: `bytes=0-${FILE_PREVIEW_BYTES - 1}` },
+  }).then((r) => {
     if (r.status === 404) return null;
+    if (r.status === 416 && r.headers.get("content-range") === "bytes */0") {
+      return { content: "", binary: false, truncated: false };
+    }
     // Bare message — the viewer prefixes "Failed to load file:" itself.
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return r.text();
+    const total = Number(r.headers.get("content-range")?.split("/").pop());
+    return r.arrayBuffer().then((bytes) => decodeFileText(bytes, Number.isFinite(total) && total > bytes.byteLength));
+  });
+};
+
+const isFilePresentation = (value: string | null): value is FilePresentation =>
+  value === "image" || value === "audio" || value === "video" || value === "pdf" ||
+  value === "text" || value === "unknown" || value === "download";
+
+export interface ArtifactFileMetadata {
+  size: number;
+  presentation: FilePresentation;
+}
+
+/** Lightweight existence/type probe used before an artifact preview. */
+export const getArtifactFileMetadata = (
+  projectId: string,
+  path: string,
+): Promise<ArtifactFileMetadata | null> =>
+  fetch(artifactUrl(projectId, path), { method: "HEAD" }).then((r) => {
+    if (r.status === 404) return null;
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const presentation = r.headers.get("x-openresearch-presentation");
+    return {
+      size: Number(r.headers.get("content-length")) || 0,
+      presentation: isFilePresentation(presentation) ? presentation : "download",
+    };
   });
 
 export interface GitSettings {
