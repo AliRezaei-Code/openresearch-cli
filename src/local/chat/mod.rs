@@ -1251,10 +1251,10 @@ pub struct ChatHost {
     pub claude: Arc<crate::local::claude::ClaudeHost>,
     http: reqwest::Client,
     events: broadcast::Sender<(&'static str, Value)>,
-    /// Sessions with a turn in flight. A key present means busy; the value is
-    /// the running task's abort handle, or `None` while a turn is being set up
-    /// (reserved but not yet spawned — see `TurnGuard`).
-    turns: Mutex<HashMap<String, Option<ActiveTurn>>>,
+    /// Sessions with a turn reserved, running, or settling after interruption.
+    /// A key remains present throughout the lifecycle, so a replacement turn
+    /// cannot race native shutdown for the preceding one.
+    turns: Mutex<HashMap<String, TurnState>>,
     deleting_sessions: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Per-session serialization for `respond`. Answering a prompt reads the
     /// card, delivers the answer (a non-idempotent POST for inline harnesses),
@@ -1299,6 +1299,12 @@ pub struct ChatHost {
 struct ActiveTurn {
     handle: tokio::task::JoinHandle<()>,
     message_id: String,
+}
+
+enum TurnState {
+    Reserved,
+    Active(ActiveTurn),
+    Cancelling,
 }
 
 /// A user message parked while the session was busy, replayed verbatim through
@@ -1355,7 +1361,7 @@ impl TurnGuard {
         {
             return None;
         }
-        turns.insert(session_id.to_string(), None);
+        turns.insert(session_id.to_string(), TurnState::Reserved);
         Some(Self {
             host: host.clone(),
             session_id: session_id.to_string(),
@@ -1385,7 +1391,7 @@ impl Drop for TurnGuard {
         // lock is always free when an armed guard drops — the fallible lock can't
         // actually fail in this path.
         if let Ok(mut turns) = self.host.turns.try_lock() {
-            if matches!(turns.get(&self.session_id), Some(None)) {
+            if matches!(turns.get(&self.session_id), Some(TurnState::Reserved)) {
                 turns.remove(&self.session_id);
             }
         }
@@ -2026,8 +2032,6 @@ impl ChatHost {
 
         let sid = session.id.clone();
         let assistant_message_id = format!("msg_{}", uuid::Uuid::new_v4());
-        let (target_path, target_event_offset) =
-            target_event_start(&session.id, &assistant_message_id);
         let mut ctx = TurnCtx {
             host: self.clone(),
             session_id: session.id.clone(),
@@ -2058,23 +2062,27 @@ impl ChatHost {
             last_flush: Instant::now() - FLUSH_INTERVAL,
             last_flushed_tool_states: Vec::new(),
             last_attempted_tool_states: Vec::new(),
-            target_event_path: Some(target_path),
-            target_event_offset,
+            target_event_path: None,
+            target_event_offset: 0,
             pending_target_events: Vec::new(),
             target_event_bindings: HashMap::new(),
         };
-        // Upgrade the reservation None→Some(handle), atomically re-checking that
+        // Upgrade the reservation to a live handle, atomically re-checking that
         // it's still ours: an `interrupt` racing the prologue above may have
         // removed the reservation, while deletion also closes admission before
         // it interrupts. In either case no harness task may start.
         {
             let mut turns = self.turns.lock().await;
             if self.deleting_sessions.lock().unwrap().contains(&sid)
-                || !matches!(turns.get(&sid), Some(None))
+                || !matches!(turns.get(&sid), Some(TurnState::Reserved))
             {
                 _guard.defuse();
                 return Ok(());
             }
+            let (target_path, target_event_offset) =
+                target_event_start(&session.id, &ctx.assistant.id);
+            ctx.target_event_path = Some(target_path);
+            ctx.target_event_offset = target_event_offset;
             let message_id = ctx.assistant.id.clone();
             let task = tokio::spawn(async move {
                 let result = match crate::local::harness::chat_harness(&ctx.harness) {
@@ -2095,7 +2103,7 @@ impl ChatHost {
                     }
                 }
                 ctx.host
-                    .finish_turn(&ctx.session_id, &ctx.assistant.id)
+                    .finish_turn(&ctx.session_id, Some(&ctx.assistant.id))
                     .await;
                 // Natural completion only: a user Stop aborts this task before
                 // it reaches here (and clears the queue itself), so an
@@ -2104,7 +2112,7 @@ impl ChatHost {
             });
             turns.insert(
                 sid,
-                Some(ActiveTurn {
+                TurnState::Active(ActiveTurn {
                     handle: task,
                     message_id,
                 }),
@@ -2118,16 +2126,21 @@ impl ChatHost {
     }
 
     /// Turn cleanup: drop the handle, bump the session, broadcast idle.
-    async fn finish_turn(&self, session_id: &str, message_id: &str) {
+    async fn finish_turn(&self, session_id: &str, message_id: Option<&str>) {
         let should_finish = {
             let mut turns = self.turns.lock().await;
-            match turns.get(session_id) {
-                Some(Some(active)) if active.message_id == message_id => {
-                    turns.remove(session_id);
-                    true
+            let matches = match (turns.get(session_id), message_id) {
+                (Some(TurnState::Active(active)), Some(message_id)) => {
+                    active.message_id == message_id
                 }
-                None => true,
+                (Some(TurnState::Cancelling), None) => true,
                 _ => false,
+            };
+            if matches {
+                turns.remove(session_id);
+                true
+            } else {
+                false
             }
         };
         if !should_finish {
@@ -2156,12 +2169,21 @@ impl ChatHost {
     /// stops generating. Returns whether a turn (or a reservation) was
     /// actually aborted — `false` means the session was already idle.
     pub async fn interrupt(&self, session_id: &str) -> Result<bool> {
-        // Outer None: not busy. Inner None: reserved but not yet spawned — the
-        // reservation is now cleared, so send_message's guard will abort setup.
-        let Some(handle) = self.turns.lock().await.remove(session_id) else {
-            return Ok(false);
+        let active = {
+            let mut turns = self.turns.lock().await;
+            let Some(state) = turns.get_mut(session_id) else {
+                return Ok(false);
+            };
+            match std::mem::replace(state, TurnState::Cancelling) {
+                TurnState::Active(active) => Some(active),
+                TurnState::Reserved => None,
+                TurnState::Cancelling => return Ok(false),
+            }
         };
         self.cancel_pending_permissions(session_id);
+        if let Some(active) = active.as_ref() {
+            active.handle.abort();
+        }
         if let Ok(store) = Store::open() {
             if let Ok(Some(session)) = store.get_chat_session(session_id) {
                 if session.harness == "opencode" {
@@ -2189,18 +2211,15 @@ impl ChatHost {
                 }
             }
         }
-        if let Some(active) = handle {
-            active.handle.abort();
+        if let Some(active) = active {
             let _ = active.handle.await;
             if let Some(message) = reconcile_target_file(session_id, &active.message_id) {
                 self.emit("chat.message", message_json(&message, session_id));
             }
             let _ = std::fs::remove_file(target_event_path(session_id, &active.message_id));
             remove_target_pointer_if_matches(session_id, &active.message_id);
-            self.finish_turn(session_id, &active.message_id).await;
-        } else {
-            self.finish_turn(session_id, "").await;
         }
+        self.finish_turn(session_id, None).await;
         Ok(true)
     }
 
@@ -3253,6 +3272,14 @@ fn zsh_startup_wrapper(name: &str) -> String {
     )
 }
 
+fn child_env_value(key: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(key).or_else(|| {
+        crate::config::list_synced_env()
+            .into_iter()
+            .find_map(|(candidate, value)| (candidate == key).then(|| value.into()))
+    })
+}
+
 /// Stamp the launching session id onto a harness child's env. Call *after*
 /// `prepare_env` so a dashboard-synced value can't shadow it. Harness children
 /// are one-per-session, so this is unambiguous.
@@ -3264,9 +3291,9 @@ pub fn set_chat_session_env(cmd: &mut tokio::process::Command, session_id: &str)
     if std::fs::create_dir_all(&shell_dir).is_err() {
         return;
     }
-    let original_zdotdir = std::env::var_os("ZDOTDIR")
+    let original_zdotdir = child_env_value("ZDOTDIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+        .or_else(|| child_env_value("HOME").map(PathBuf::from));
     let Some(original_zdotdir) = original_zdotdir else {
         return;
     };
@@ -3301,10 +3328,15 @@ pub fn set_chat_session_env(cmd: &mut tokio::process::Command, session_id: &str)
     }
 
     let bash_env = shell_dir.join("bash_env");
-    let original_bash_env = std::env::var_os("BASH_ENV")
+    let original_bash_env = child_env_value("BASH_ENV")
         .map(PathBuf::from)
-        .filter(|path| path.is_file())
-        .map(|path| format!("source {}\n", shell_single_quote(&path)))
+        .map(|path| {
+            format!(
+                "[[ -r {} ]] && source {}\n",
+                shell_single_quote(&path),
+                shell_single_quote(&path)
+            )
+        })
         .unwrap_or_default();
     let bash_hook = format!(
         "{original_bash_env}\
