@@ -314,21 +314,12 @@ fn target_event_path(session_id: &str) -> PathBuf {
 
 fn target_event_start(session_id: &str) -> (PathBuf, u64) {
     let path = target_event_path(session_id);
-    let offset = std::fs::metadata(&path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    (path, offset)
+    let _ = std::fs::remove_file(&path);
+    (path, 0)
 }
 
 pub fn record_chat_target(resource: &str, target: &str) {
-    let path = std::env::var_os(CHAT_TARGET_FILE_ENV)
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var(CHAT_SESSION_ENV)
-                .ok()
-                .map(|id| target_event_path(&id))
-        });
-    let Some(path) = path else {
+    let Some(path) = std::env::var_os(CHAT_TARGET_FILE_ENV).map(PathBuf::from) else {
         return;
     };
     if !matches!(resource, "runs" | "experiments") || !valid_tool_target(target) {
@@ -345,14 +336,27 @@ pub fn record_chat_target(resource: &str, target: &str) {
         .append(true)
         .open(path)
     {
-        let _ = writeln!(file, "{resource}\t{target}");
+        let scope = unsafe { libc::getppid() };
+        let _ = writeln!(file, "{scope}\t{resource}\t{target}");
     }
 }
 
-fn attach_target_event(parts: &mut [WirePart], resource: &str, target: &str) -> bool {
+fn attach_target_event(
+    parts: &mut [WirePart],
+    bound_part_id: Option<&str>,
+    claimed_part_ids: &HashSet<String>,
+    resource: &str,
+    target: &str,
+) -> Option<String> {
     for part in parts.iter_mut().rev() {
-        if attach_target_event(&mut part.children, resource, target) {
-            return true;
+        if let Some(part_id) = attach_target_event(
+            &mut part.children,
+            bound_part_id,
+            claimed_part_ids,
+            resource,
+            target,
+        ) {
+            return Some(part_id);
         }
         let Some(state) = part.state.as_mut() else {
             continue;
@@ -367,6 +371,11 @@ fn attach_target_event(parts: &mut [WirePart], resource: &str, target: &str) -> 
             command.contains("orx exp status") || command.contains("orx exp desc")
         };
         if !matches {
+            continue;
+        }
+        if bound_part_id.is_some_and(|id| id != part.id)
+            || (bound_part_id.is_none() && claimed_part_ids.contains(&part.id))
+        {
             continue;
         }
         let key = if resource == "runs" {
@@ -390,9 +399,9 @@ fn attach_target_event(parts: &mut [WirePart], resource: &str, target: &str) -> 
         push_tool_target(&mut targets, &mut seen, target);
         input.insert(key.into(), json!(targets));
         input.insert(format!("{key}Authoritative"), Value::Bool(true));
-        return true;
+        return Some(part.id.clone());
     }
-    false
+    None
 }
 
 /// Find a part by id anywhere in the tree (depth-first), returning `&mut` to it.
@@ -419,6 +428,26 @@ pub fn upsert_preserving_children(parts: &mut Vec<WirePart>, mut part: WirePart)
         Some(existing) => {
             if part.children.is_empty() {
                 part.children = std::mem::take(&mut existing.children);
+            }
+            if let (Some(incoming), Some(previous)) = (part.state.as_mut(), existing.state.as_ref())
+            {
+                if let (Some(incoming_input), Some(previous_input)) =
+                    (incoming.input.as_mut(), previous.input.as_ref())
+                {
+                    for key in [
+                        "runTargetIds",
+                        "runTargetIdsAuthoritative",
+                        "experimentTargetIds",
+                        "experimentTargetIdsAuthoritative",
+                        "targetIds",
+                    ] {
+                        if incoming_input.get(key).is_none() {
+                            if let Some(value) = previous_input.get(key) {
+                                incoming_input[key] = value.clone();
+                            }
+                        }
+                    }
+                }
             }
             *existing = part;
         }
@@ -1804,6 +1833,7 @@ impl ChatHost {
             target_event_path: Some(target_event_path),
             target_event_offset,
             pending_target_events: Vec::new(),
+            target_event_bindings: HashMap::new(),
         };
         // Upgrade the reservation None→Some(handle), atomically re-checking that
         // it's still ours: an `interrupt` racing the prologue above may have
@@ -2207,6 +2237,7 @@ impl ChatHost {
         let store = Store::open()?;
         let session = store.get_chat_session(session_id)?;
         store.delete_chat_session(session_id)?;
+        let _ = std::fs::remove_file(target_event_path(session_id));
         self.emit("chat.session.deleted", json!({ "sessionId": session_id }));
         if let Some(session) = session {
             if let Ok(Some(project)) = store.get_local_project(&session.project_id) {
@@ -2482,7 +2513,8 @@ pub struct TurnCtx {
     last_attempted_tool_states: Vec<(String, String)>,
     target_event_path: Option<PathBuf>,
     target_event_offset: u64,
-    pending_target_events: Vec<(String, String)>,
+    pending_target_events: Vec<(String, String, String)>,
+    target_event_bindings: HashMap<String, String>,
 }
 
 impl TurnCtx {
@@ -2536,6 +2568,7 @@ impl TurnCtx {
             target_event_path: None,
             target_event_offset: 0,
             pending_target_events: Vec::new(),
+            target_event_bindings: HashMap::new(),
         }
     }
 
@@ -2555,13 +2588,19 @@ impl TurnCtx {
                         {
                             if let Some(complete_end) = pending.rfind('\n').map(|index| index + 1) {
                                 for line in pending[..complete_end].lines() {
-                                    let Some((resource, target)) = line.split_once('\t') else {
+                                    let mut fields = line.splitn(3, '\t');
+                                    let (Some(scope), Some(resource), Some(target)) =
+                                        (fields.next(), fields.next(), fields.next())
+                                    else {
                                         continue;
                                     };
                                     if self.pending_target_events.len() < TOOL_TARGET_INSPECTION_CAP
                                     {
-                                        self.pending_target_events
-                                            .push((resource.to_string(), target.to_string()));
+                                        self.pending_target_events.push((
+                                            scope.to_string(),
+                                            resource.to_string(),
+                                            target.to_string(),
+                                        ));
                                     }
                                 }
                                 self.target_event_offset += complete_end as u64;
@@ -2571,9 +2610,24 @@ impl TurnCtx {
                 }
             }
         }
-        self.pending_target_events.retain(|(resource, target)| {
-            !attach_target_event(&mut self.assistant.parts, resource, target)
-        });
+        let claimed = self.target_event_bindings.values().cloned().collect();
+        self.pending_target_events
+            .retain(|(scope, resource, target)| {
+                let bound = self.target_event_bindings.get(scope).map(String::as_str);
+                let Some(part_id) = attach_target_event(
+                    &mut self.assistant.parts,
+                    bound,
+                    &claimed,
+                    resource,
+                    target,
+                ) else {
+                    return true;
+                };
+                self.target_event_bindings
+                    .entry(scope.clone())
+                    .or_insert(part_id);
+                false
+            });
     }
 
     /// Record the harness's own session id (CLIs mint/rotate them per turn).
@@ -3221,7 +3275,52 @@ mod cap_tests {
             children: Vec::new(),
         }];
 
-        assert!(attach_target_event(&mut parts, "runs", target));
+        assert!(attach_target_event(&mut parts, None, &HashSet::new(), "runs", target).is_some());
+        let input = parts[0].state.as_ref().unwrap().input.as_ref().unwrap();
+        assert_eq!(input["runTargetIds"], json!([target]));
+        assert_eq!(input["runTargetIdsAuthoritative"], true);
+    }
+
+    #[test]
+    fn tool_upsert_preserves_out_of_band_targets() {
+        let target = "11111111-1111-1111-1111-111111111111";
+        let mut parts = vec![WirePart {
+            id: "logs".into(),
+            kind: "tool".into(),
+            text: None,
+            tool: Some("bash".into()),
+            state: Some(WireToolState {
+                status: "running".into(),
+                input: Some(json!({
+                    "command": "orx logs $id",
+                    "runTargetIds": [target],
+                    "runTargetIdsAuthoritative": true
+                })),
+                output: None,
+                error: None,
+                title: None,
+            }),
+            prompt: None,
+            children: Vec::new(),
+        }];
+        let replacement = WirePart {
+            id: "logs".into(),
+            kind: "tool".into(),
+            text: None,
+            tool: Some("bash".into()),
+            state: Some(WireToolState {
+                status: "completed".into(),
+                input: Some(json!({ "command": "orx logs $id" })),
+                output: Some("done".into()),
+                error: None,
+                title: None,
+            }),
+            prompt: None,
+            children: Vec::new(),
+        };
+
+        upsert_preserving_children(&mut parts, replacement);
+
         let input = parts[0].state.as_ref().unwrap().input.as_ref().unwrap();
         assert_eq!(input["runTargetIds"], json!([target]));
         assert_eq!(input["runTargetIdsAuthoritative"], true);
