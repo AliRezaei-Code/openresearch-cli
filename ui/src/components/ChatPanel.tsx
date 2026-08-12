@@ -471,6 +471,49 @@ function shellCommandSegments(command: string): ShellCommandSegment[] {
     raw = "";
     code = "";
   };
+  const scanSubstitution = (start: number): number => {
+    let depth = 1;
+    let nestedQuote: "\"" | "'" | null = null;
+    let nestedEscaped = false;
+    for (let index = start; index < command.length; index++) {
+      const char = command[index];
+      if (nestedEscaped) {
+        nestedEscaped = false;
+        continue;
+      }
+      if (char === "\\" && nestedQuote !== "'") {
+        nestedEscaped = true;
+        continue;
+      }
+      if (nestedQuote) {
+        if (char === nestedQuote) nestedQuote = null;
+        continue;
+      }
+      if (char === "\"" || char === "'") {
+        nestedQuote = char;
+        continue;
+      }
+      if (char === "(") depth++;
+      if (char === ")" && --depth === 0) return index;
+    }
+    return command.length - 1;
+  };
+  const scanBackticks = (start: number): number => {
+    let nestedEscaped = false;
+    for (let index = start; index < command.length; index++) {
+      const char = command[index];
+      if (nestedEscaped) {
+        nestedEscaped = false;
+        continue;
+      }
+      if (char === "\\") {
+        nestedEscaped = true;
+        continue;
+      }
+      if (char === "`") return index;
+    }
+    return command.length - 1;
+  };
 
   for (let index = 0; index < command.length; index++) {
     const char = command[index];
@@ -486,6 +529,20 @@ function shellCommandSegments(command: string): ShellCommandSegment[] {
       continue;
     }
     if (quote) {
+      if (quote === "\"" && char === "$" && command[index + 1] === "(") {
+        const end = scanSubstitution(index + 2);
+        segments.push(...shellCommandSegments(command.slice(index + 2, end)));
+        raw += command.slice(index, end + 1);
+        index = end;
+        continue;
+      }
+      if (quote === "\"" && char === "`") {
+        const end = scanBackticks(index + 1);
+        segments.push(...shellCommandSegments(command.slice(index + 1, end)));
+        raw += command.slice(index, end + 1);
+        index = end;
+        continue;
+      }
       raw += char;
       if (char === quote) quote = null;
       continue;
@@ -493,6 +550,13 @@ function shellCommandSegments(command: string): ShellCommandSegment[] {
     if (char === "\"" || char === "'") {
       raw += char;
       quote = char;
+      continue;
+    }
+    if (char === "`") {
+      const end = scanBackticks(index + 1);
+      segments.push(...shellCommandSegments(command.slice(index + 1, end)));
+      raw += command.slice(index, end + 1);
+      index = end;
       continue;
     }
     if (char === ";" || char === "|" || char === "&" || char === "(" || char === ")" || char === "\n") {
@@ -1197,7 +1261,6 @@ function ToolGroup({
   const [open, setOpen] = useState(running);
   const wasRunning = useRef(running);
   const hasRun = useRef(running);
-  if (running) hasRun.current = true;
   const displayParts = squashToolParts(parts);
   const activities = displayParts.map(({ part }) => toolActivity(part));
   const runningActivity = latestRunningActivity(parts);
@@ -1207,6 +1270,10 @@ function ToolGroup({
     ? resolvedActivityLabel(runningActivity, runExperimentName, experimentName)
     : summary;
   const liveMessage = running ? summaryLabel : hasRun.current ? "Tool activity completed" : "";
+
+  useEffect(() => {
+    if (running) hasRun.current = true;
+  }, [running]);
 
   useEffect(() => {
     if (running === wasRunning.current) return;
@@ -1743,7 +1810,9 @@ export function SubagentTranscript({
   const parts = spawn.children ?? [];
   const running = spawn.state?.status === "running";
   const hasRun = useRef(running);
-  if (running) hasRun.current = true;
+  useEffect(() => {
+    if (running) hasRun.current = true;
+  }, [running]);
   // Gate the empty state on what actually renders, not the raw part count — a
   // stored transcript of nothing but invisible parts must still read as empty.
   const rendered = renderParts(parts, {
@@ -1788,7 +1857,9 @@ function SubagentBlock({
   const errored = part.state?.status === "error";
   const running = part.state?.status === "running";
   const hasRun = useRef(running);
-  if (running) hasRun.current = true;
+  useEffect(() => {
+    if (running) hasRun.current = true;
+  }, [running]);
   const activity = running ? activityInProgress(toolActivity(part)) : toolActivity(part);
   return (
     <>
