@@ -1457,6 +1457,7 @@ impl ChatHost {
                 .and_then(|json| serde_json::from_str(json).ok()),
             last_flush: Instant::now() - FLUSH_INTERVAL,
             last_flushed_tool_states: Vec::new(),
+            last_attempted_tool_states: Vec::new(),
         };
         // Upgrade the reservation None→Some(handle), atomically re-checking that
         // it's still ours: an `interrupt` racing the prologue above may have
@@ -2132,6 +2133,7 @@ pub struct TurnCtx {
     pub context_usage: Option<ContextUsage>,
     last_flush: Instant,
     last_flushed_tool_states: Vec<(String, String)>,
+    last_attempted_tool_states: Vec<(String, String)>,
 }
 
 impl TurnCtx {
@@ -2181,6 +2183,7 @@ impl TurnCtx {
             context_usage: None,
             last_flush: Instant::now(),
             last_flushed_tool_states: Vec::new(),
+            last_attempted_tool_states: Vec::new(),
         }
     }
 
@@ -2301,11 +2304,10 @@ impl TurnCtx {
     /// Persist + broadcast the assistant message, rate-limited mid-turn.
     pub fn maybe_flush(&mut self) {
         let tool_states = tool_state_signature(&self.assistant.parts);
-        let state_changed = tool_states != self.last_flushed_tool_states;
-        if state_changed || self.last_flush.elapsed() >= FLUSH_INTERVAL {
-            if state_changed {
-                self.last_flushed_tool_states = tool_states;
-            }
+        let unattempted_state = tool_states != self.last_flushed_tool_states
+            && tool_states != self.last_attempted_tool_states;
+        if unattempted_state || self.last_flush.elapsed() >= FLUSH_INTERVAL {
+            self.last_attempted_tool_states = tool_states;
             let _ = self.flush();
         }
     }
@@ -2348,6 +2350,7 @@ impl TurnCtx {
             message_json(&self.assistant, &self.session_id),
         );
         self.last_flushed_tool_states = tool_state_signature(&self.assistant.parts);
+        self.last_attempted_tool_states = self.last_flushed_tool_states.clone();
         Ok(())
     }
 

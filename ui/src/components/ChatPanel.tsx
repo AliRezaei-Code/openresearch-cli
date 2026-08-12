@@ -657,11 +657,44 @@ function idsFromToolOutput(output: string | undefined, resource: "runs" | "exper
   return [...ids];
 }
 
+function invocationOffsets(command: string, invocations: ShellCommandSegment[]): Array<{ invocation: ShellCommandSegment; offset: number }> {
+  let cursor = 0;
+  return invocations.map((invocation) => {
+    const next = command.indexOf(invocation.raw, cursor);
+    const offset = next === -1 ? command.indexOf(invocation.raw) : next;
+    cursor = Math.max(cursor, offset + invocation.raw.length);
+    return { invocation, offset: Math.max(0, offset) };
+  });
+}
+
+function assignedIdBefore(command: string, variable: string, before: number, idPattern: string): string | null {
+  const assignment = new RegExp(
+    `(?:^|[\\s;])(?:export\\s+)?${variable}\\s*=\\s*["']?(${idPattern})`,
+    "gi",
+  );
+  let resolved: string | null = null;
+  for (const match of command.matchAll(assignment)) {
+    if ((match.index ?? 0) >= before) break;
+    resolved = match[1];
+  }
+  return resolved;
+}
+
+function loopIdsBefore(command: string, variable: string, before: number, idPattern: string): string[] {
+  const loop = new RegExp(`\\bfor\\s+${variable}\\s+in\\s+([\\s\\S]*?)(?:;|\\n)\\s*do\\b`, "gi");
+  let values = "";
+  for (const match of command.matchAll(loop)) {
+    if ((match.index ?? 0) + match[0].length > before) break;
+    values = match[1];
+  }
+  return [...values.matchAll(new RegExp(idPattern, "gi"))].map((match) => match[0]);
+}
+
 function commandRunIds(command: string, output?: string): string[] {
   const invocations = orxCommandSegments(command, "logs");
   if (invocations.length === 0) return [];
   const ids = new Set<string>();
-  for (const invocation of invocations) {
+  for (const { invocation, offset } of invocationOffsets(command, invocations)) {
     const logs = /\borx\s+logs\b/i.exec(invocation.raw);
     if (!logs) continue;
     const words = shellWords(invocation.raw.slice(logs.index + logs[0].length));
@@ -685,13 +718,9 @@ function commandRunIds(command: string, output?: string): string[] {
     const variableMatch = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(target);
     if (!variableMatch) continue;
     const variable = variableMatch[1];
-    const assignment = command.match(
-      new RegExp(`(?:^|[\\s;])(?:export\\s+)?${variable}\\s*=\\s*["']?(${RUN_TARGET_PATTERN})`, "i"),
-    );
-    if (assignment) ids.add(assignment[1]);
-    const loop = command.match(new RegExp(`\\bfor\\s+${variable}\\s+in\\s+([\\s\\S]*?)(?:;|\\n)\\s*do\\b`, "i"));
-    if (!loop) continue;
-    for (const id of loop[1].matchAll(new RegExp(RUN_TARGET_PATTERN, "gi"))) ids.add(id[0]);
+    const assignment = assignedIdBefore(command, variable, offset, RUN_TARGET_PATTERN);
+    if (assignment) ids.add(assignment);
+    for (const id of loopIdsBefore(command, variable, offset, RUN_TARGET_PATTERN)) ids.add(id);
   }
   if (ids.size === 0) idsFromToolOutput(output, "runs").forEach((id) => ids.add(id));
   return [...ids];
@@ -701,22 +730,18 @@ function commandExperimentIds(command: string, output?: string): string[] {
   const invocations = orxCommandSegments(command, "exp\\s+(?:status|desc)");
   if (invocations.length === 0) return [];
   const ids = new Set<string>();
-  for (const invocation of invocations) {
+  for (const { invocation } of invocationOffsets(command, invocations)) {
     for (const match of invocation.raw.matchAll(new RegExp(`\\borx\\s+exp\\s+(?:status|desc)\\s+["']?(${UUID_PATTERN})`, "gi"))) {
       ids.add(match[1]);
     }
   }
-  for (const invocation of invocations) {
+  for (const { invocation, offset } of invocationOffsets(command, invocations)) {
     const match = /\borx\s+exp\s+(?:status|desc)\s+["']?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/.exec(invocation.raw);
     if (!match) continue;
     const variable = match[1];
-    const assignment = command.match(
-      new RegExp(`(?:^|[\\s;])(?:export\\s+)?${variable}\\s*=\\s*["']?(${UUID_PATTERN})`, "i"),
-    );
-    if (assignment) ids.add(assignment[1]);
-    const loop = command.match(new RegExp(`\\bfor\\s+${variable}\\s+in\\s+([\\s\\S]*?)(?:;|\\n)\\s*do\\b`, "i"));
-    if (!loop) continue;
-    for (const id of loop[1].matchAll(new RegExp(UUID_PATTERN, "gi"))) ids.add(id[0]);
+    const assignment = assignedIdBefore(command, variable, offset, UUID_PATTERN);
+    if (assignment) ids.add(assignment);
+    for (const id of loopIdsBefore(command, variable, offset, UUID_PATTERN)) ids.add(id);
   }
   if (ids.size === 0) idsFromToolOutput(output, "experiments").forEach((id) => ids.add(id));
   return [...ids];
@@ -728,11 +753,25 @@ function commandExperimentIds(command: string, output?: string): string[] {
 function toolActivity(part: ChatPart): ToolActivity {
   const tool = part.tool ?? "tool";
   const input = part.state?.input ?? {};
-  const rawCommand = inputString(input, "command");
+  const argumentsValue = input.arguments;
+  const argumentsInput = argumentsValue && typeof argumentsValue === "object" && !Array.isArray(argumentsValue)
+    ? Object.fromEntries(Object.entries(argumentsValue))
+    : {};
+  const normalizedInput = { ...input, ...argumentsInput };
+  const rawCommand = inputString(normalizedInput, "command", "cmd");
   const toolOutput = part.state?.output || part.state?.error;
-  const filePath = inputString(input, "filePath", "file_path");
-  const description = inputString(input, "description");
-  switch (tool.toLowerCase()) {
+  const filePath = inputString(normalizedInput, "filePath", "file_path", "path");
+  const description = inputString(normalizedInput, "description");
+  const baseTool = tool.toLowerCase().split(":").at(-1) ?? tool.toLowerCase();
+  const normalizedTool = new Map([
+    ["read_file", "read"],
+    ["write_file", "write"],
+    ["edit_file", "edit"],
+    ["exec", "bash"],
+    ["exec_command", "bash"],
+    ["run_command", "bash"],
+  ]).get(baseTool) ?? baseTool;
+  switch (normalizedTool) {
     case "bash": {
       if (!rawCommand) return { kind: "command", label: "Ran a command" };
       const command = meaningfulCommand(rawCommand);
@@ -857,7 +896,7 @@ function toolActivity(part: ChatPart): ToolActivity {
     case "edit":
     case "write":
     case "notebookedit": {
-      const change = editChange(input);
+      const change = editChange(normalizedInput);
       const resolvedPath = filePath ?? change?.path ?? null;
       const target = resolvedPath ? baseName(resolvedPath) : null;
       const verb = change?.type === "add" ? "Created" : change?.type === "delete" ? "Deleted" : "Edited";
@@ -866,30 +905,30 @@ function toolActivity(part: ChatPart): ToolActivity {
         : { kind: "edit", label: "Edited a file" };
     }
     case "grep": {
-      const pattern = inputString(input, "pattern");
+      const pattern = inputString(normalizedInput, "pattern");
       return { kind: "search", label: pattern ? `Searched code for “${pattern}”` : "Searched code" };
     }
     case "glob": {
-      const pattern = inputString(input, "pattern");
+      const pattern = inputString(normalizedInput, "pattern");
       return { kind: "search", label: pattern ? `Listed files matching ${pattern}` : "Listed files" };
     }
     case "websearch": {
-      const query = inputString(input, "query");
-      const url = inputString(input, "url");
-      const pattern = inputString(input, "pattern");
+      const query = inputString(normalizedInput, "query");
+      const url = inputString(normalizedInput, "url");
+      const pattern = inputString(normalizedInput, "pattern");
       if (query) return { kind: "web", label: `Searched the web for “${query}”` };
       if (pattern && url) return { kind: "web", label: `Searched “${pattern}” on a page` };
       if (url) return { kind: "web", label: `Opened ${url}` };
       return { kind: "web", label: description ?? "Browsed the web" };
     }
     case "webfetch": {
-      const url = inputString(input, "url");
+      const url = inputString(normalizedInput, "url");
       return { kind: "web", label: url ? `Read ${url}` : description ?? "Read a web page" };
     }
     case "task":
       return { kind: "agent", label: description ?? "Ran a subagent" };
     case "subagent":
-      return { kind: "agent", label: subagentLine(input) };
+      return { kind: "agent", label: subagentLine(normalizedInput) };
     case "error":
       return { kind: "command", label: "Tool failed" };
     case "interrupted":
@@ -1288,6 +1327,7 @@ function ToolRow({
   const hasDetail = failed && Boolean(errorMessage);
   const line = (
     <>
+      {failed && <span className="sr-only">Failed: </span>}
       <ToolActivityIcon
         activity={activity}
         className={`${failed ? "text-accent-red" : "text-muted"} self-start mt-[5px]`}
@@ -1347,6 +1387,7 @@ function ToolGroup({
   experimentName?: (experimentId: string) => string;
 }) {
   const running = parts.some((p) => p.state?.status === "running");
+  const failedCount = parts.filter((part) => part.state?.status === "error").length;
   const [open, setOpen] = useState(running);
   const wasRunning = useRef(running);
   const hasRun = useRef(running);
@@ -1358,7 +1399,13 @@ function ToolGroup({
   const summaryLabel = runningActivity
     ? resolvedActivityLabel(runningActivity, runExperimentName, experimentName)
     : summary;
-  const liveMessage = running ? summaryLabel : hasRun.current ? "Tool activity completed" : "";
+  const liveMessage = running
+    ? summaryLabel
+    : hasRun.current
+      ? failedCount > 0
+        ? `Tool activity completed with ${failedCount} ${failedCount === 1 ? "failure" : "failures"}`
+        : "Tool activity completed"
+      : "";
 
   useEffect(() => {
     if (running) hasRun.current = true;
@@ -1367,8 +1414,8 @@ function ToolGroup({
   useEffect(() => {
     if (running === wasRunning.current) return;
     wasRunning.current = running;
-    setOpen(running);
-  }, [running]);
+    setOpen(running || failedCount > 0);
+  }, [failedCount, running]);
 
   if (parts.length === 1) {
     if (runningActivity) {
@@ -1920,17 +1967,19 @@ export function SubagentTranscript({
   return (
     <div className="msg-assistant text-lg leading-[1.62] text-text min-w-0">
       <div className="subagent-tab-header flex items-center gap-2 pb-2 mb-2 border-b border-b-border-variant">
+        {errored && <span className="sr-only">Failed: </span>}
         <ToolActivityIcon activity={spawnActivity} className={running ? "tool-running-shimmer-icon" : errored ? "text-accent-red" : "text-muted"} />
         <span className={`${TOOL_LINE_CLASS_NAME} ${running ? "tool-running-shimmer" : errored ? "text-accent-red" : ""}`}>{spawnActivity.label}</span>
       </div>
       <span className="sr-only" role="status" aria-live="polite">
-        {running ? spawnActivity.label : hasRun.current ? "Sub-agent activity completed" : ""}
+        {running ? spawnActivity.label : hasRun.current ? errored ? "Sub-agent activity failed" : "Sub-agent activity completed" : ""}
       </span>
-      {errorMessage ? (
+      {errorMessage && (
         <div className="tool-output py-1.5 px-2.5 font-mono text-xs text-subtext whitespace-pre-wrap wrap-anywhere max-h-65 overflow-y-auto bg-background border border-border-variant rounded-sm">
           {errorMessage.slice(0, 20000)}
         </div>
-      ) : rendered.length === 0 ? (
+      )}
+      {rendered.length === 0 && !errorMessage ? (
         <div className="subagent-empty py-[3px] px-1 text-md text-muted">{running ? "Working…" : "No activity"}</div>
       ) : (
         rendered
@@ -1967,12 +2016,13 @@ function SubagentBlock({
         onClick={() => onOpenSubagent?.(part.id)}
         disabled={!onOpenSubagent}
       >
+        {errored && <span className="sr-only">Failed: </span>}
         <ToolActivityIcon activity={activity} className={`subagent-icon shrink-0 ${running ? "tool-running-shimmer-icon" : errored ? "text-accent-red" : "text-muted"}`} />
         <span className={`${TOOL_LINE_CLASS_NAME} ${running ? "tool-running-shimmer" : errored ? "text-accent-red" : "text-text"}`}>{activity.label}</span>
         <ChevronRight size={12} className="subagent-row-chevron shrink-0 text-muted" />
       </button>
       <span className="sr-only" role="status" aria-live="polite">
-        {running ? activity.label : hasRun.current ? "Sub-agent activity completed" : ""}
+        {running ? activity.label : hasRun.current ? errored ? "Sub-agent activity failed" : "Sub-agent activity completed" : ""}
       </span>
     </>
   );
