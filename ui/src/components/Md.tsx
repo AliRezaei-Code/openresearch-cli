@@ -7,6 +7,7 @@
 import { Check, Copy, FileCode, ScrollText } from "lucide-react";
 import { memo, useMemo, useState, type ReactNode } from "react";
 import { Markdown as StreamingMarkdown } from "@clo/react-markdown";
+import { defaultUrlTransform } from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -58,6 +59,11 @@ interface MdastPoint {
 interface MdastPosition {
   end: MdastPoint;
   start: MdastPoint;
+}
+
+interface HastNode {
+  children?: HastNode[];
+  properties?: Record<string, unknown>;
 }
 
 /** Pull `name="value"` (or single-quoted) attributes off a tag's attribute run. */
@@ -154,7 +160,7 @@ function replaceMentions(parent: MdastNode) {
       }
     }
     if (child.type === "inlineCode" && typeof child.value === "string") {
-      const replacement = parseMentionHtml(child);
+      const replacement = parseMentionHtml({ ...child, position: undefined });
       if (replacement?.length === 1 && replacement[0]?.type.endsWith("Mention")) {
         children.splice(i, 1, replacement[0]);
         continue;
@@ -166,6 +172,20 @@ function replaceMentions(parent: MdastNode) {
 
 function remarkMentions() {
   return (tree: MdastNode) => replaceMentions(tree);
+}
+
+function rehypeSafeUrls() {
+  return (tree: HastNode) => {
+    const visit = (node: HastNode) => {
+      for (const key of ["href", "src"]) {
+        if (node.properties && Object.hasOwn(node.properties, key)) {
+          node.properties[key] = defaultUrlTransform(String(node.properties[key] || ""));
+        }
+      }
+      node.children?.forEach(visit);
+    };
+    visit(tree);
+  };
 }
 
 function FileChip({
@@ -230,6 +250,7 @@ const markdownProcessor = unified()
   .use(remarkMath, remarkMathOptions)
   .use(remarkMentions)
   .use(remarkRehype)
+  .use(rehypeSafeUrls)
   .use(rehypeKatex);
 
 /** A link target that is a file path rather than a web URL. */
