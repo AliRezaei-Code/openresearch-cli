@@ -200,10 +200,16 @@ the wake-up to reconcile and continue the loop.)
 
 ## Citing evidence
 
+Use conventional Markdown math delimiters: `$...$` for inline math and
+`$$...$$` for display math. Escape literal currency dollar signs, for example
+write `\$10` rather than `$10`, so prices are never interpreted as math.
+
 Every substantive factual or quantitative claim you make in chat should carry an
 evidence chip the reader can click to see the source — a number, a "we found X",
 a "the harness caps Y" is not trustworthy on its own. Put the chip right after
-the claim (it renders as a small pill):
+the claim (it renders as a small pill). Emit evidence tags as raw tags; never
+surround them with backticks or a code fence, which prevents them from becoming
+clickable:
 
 - **Code fact** (a value, a bug, a behavior in the source): wrap the source file
   so OpenResearch links it to the project — `<file path="relative/path.py" />`,

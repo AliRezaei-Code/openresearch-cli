@@ -28,7 +28,8 @@ import {
 import { CodeView } from "./CodeView";
 import { FileTypeIcon, isMarkdownFile } from "./FileTypeIcon";
 import { MediaPreview, mediaPreviewKind, type MediaPreviewKind } from "./MediaPreview";
-import { mdCodeComponents, normalizeMathDelimiters, remarkMathOptions } from "./Md";
+import { normalizeMarkdownForRendering } from "../markdownNormalization";
+import { mdCodeComponents, remarkMathOptions } from "./Md";
 import { ICON_BUTTON_BASE_CLASS_NAME, ICON_BUTTON_CLASS_NAME, SETTINGS_LOADING_CLASS_NAME, SPINNER_CLASS_NAME } from "../styleClasses";
 
 const TOOLTIP_ICON_BUTTON_CLASS_NAME = `${ICON_BUTTON_CLASS_NAME} tip-up [&[data-tip]::after]:top-auto [&[data-tip]::after]:bottom-[calc(100%_+_6px)]`;
@@ -169,7 +170,7 @@ export function ArtifactMarkdown({
           ...mdCodeComponents,
         }}
       >
-        {normalizeMathDelimiters(stripFrontmatter(markdown))}
+        {normalizeMarkdownForRendering(stripFrontmatter(markdown))}
       </ReactMarkdown>
     </div>
   );
