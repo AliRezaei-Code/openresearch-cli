@@ -2165,11 +2165,16 @@ impl ChatHost {
         );
     }
 
+    async fn finish_interruption(self: &Arc<Self>, session_id: &str) {
+        self.finish_turn(session_id, None).await;
+        self.drain_queue(session_id).await;
+    }
+
     /// Abort an in-flight turn. Child processes die via kill_on_drop; the
     /// opencode adapter additionally gets a native abort so the serve process
     /// stops generating. Returns whether a turn (or a reservation) was
     /// actually aborted — `false` means the session was already idle.
-    pub async fn interrupt(&self, session_id: &str) -> Result<bool> {
+    pub async fn interrupt(self: &Arc<Self>, session_id: &str) -> Result<bool> {
         let active = {
             let mut turns = self.turns.lock().await;
             let Some(state) = turns.get_mut(session_id) else {
@@ -2181,46 +2186,44 @@ impl ChatHost {
                 TurnState::Cancelling => return Ok(false),
             }
         };
-        self.cancel_pending_permissions(session_id);
-        if let Some(active) = active.as_ref() {
-            active.handle.abort();
-        }
-        if let Ok(store) = Store::open() {
-            if let Ok(Some(session)) = store.get_chat_session(session_id) {
-                if session.harness == "opencode" {
-                    if let (Some(nid), Some(port)) = (
-                        &session.native_session_id,
-                        self.opencode.port_for(session_id).await,
-                    ) {
-                        let url = format!("http://127.0.0.1:{port}/session/{nid}/abort");
-                        let _ = self.http.post(url).body("{}").send().await;
+        let host = self.clone();
+        let session_id = session_id.to_string();
+        let settlement = tokio::spawn(async move {
+            host.cancel_pending_permissions(&session_id);
+            let native_shutdown = async {
+                if let Ok(store) = Store::open() {
+                    if let Ok(Some(session)) = store.get_chat_session(&session_id) {
+                        if session.harness == "opencode" {
+                            if let (Some(nid), Some(port)) = (
+                                &session.native_session_id,
+                                host.opencode.port_for(&session_id).await,
+                            ) {
+                                let url = format!("http://127.0.0.1:{port}/session/{nid}/abort");
+                                let _ = host.http.post(url).body("{}").send().await;
+                            }
+                        } else if session.harness == "codex" {
+                            host.codex.interrupt_session(&session_id).await;
+                        } else if session.harness == "claude-code" {
+                            host.claude.kill_session(&session_id).await;
+                        }
                     }
-                } else if session.harness == "codex" {
-                    // Native turn/interrupt so the app-server stops generating
-                    // (and settles the turn as "interrupted" in its rollout)
-                    // instead of only losing its orx-side listener.
-                    self.codex.interrupt_session(session_id).await;
-                } else if session.harness == "claude-code" {
-                    // The load-bearing change: a resident claude child survives
-                    // task-abort/kill_on_drop, so aborting the turn task leaves
-                    // it generating with no listener. Kill it — v1 has no
-                    // reliable native interrupt (the control request gave no
-                    // response). The next turn respawns with `--resume`,
-                    // recovering this session's context (today-identical
-                    // semantics).
-                    self.claude.kill_session(session_id).await;
                 }
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(10), native_shutdown).await;
+            if let Some(active) = active.as_ref() {
+                active.handle.abort();
             }
-        }
-        if let Some(active) = active {
-            let _ = active.handle.await;
-            if let Some(message) = reconcile_target_file(session_id, &active.message_id) {
-                self.emit("chat.message", message_json(&message, session_id));
+            if let Some(active) = active {
+                let _ = active.handle.await;
+                if let Some(message) = reconcile_target_file(&session_id, &active.message_id) {
+                    host.emit("chat.message", message_json(&message, &session_id));
+                }
+                let _ = std::fs::remove_file(target_event_path(&session_id, &active.message_id));
+                remove_target_pointer_if_matches(&session_id, &active.message_id);
             }
-            let _ = std::fs::remove_file(target_event_path(session_id, &active.message_id));
-            remove_target_pointer_if_matches(session_id, &active.message_id);
-        }
-        self.finish_turn(session_id, None).await;
+            host.finish_interruption(&session_id).await;
+        });
+        let _ = settlement.await;
         Ok(true)
     }
 
@@ -2232,7 +2235,7 @@ impl ChatHost {
     /// Internal interrupts (plan-approval resume, session/project delete) stay
     /// markerless on purpose: their stories are told elsewhere (the resolved
     /// card, the row disappearing).
-    pub async fn interrupt_by_user(&self, session_id: &str) -> Result<()> {
+    pub async fn interrupt_by_user(self: &Arc<Self>, session_id: &str) -> Result<()> {
         // Stamped before the abort: a fast resend can claim the freed slot and
         // persist its user message before this runs, and a later timestamp
         // would sort the marker after that new bubble. (The live broadcast can
@@ -2504,7 +2507,7 @@ impl ChatHost {
         Ok(self.emit_session(store.get_chat_session(session_id)?).await)
     }
 
-    pub async fn delete_session(&self, session_id: &str) -> Result<()> {
+    pub async fn delete_session(self: &Arc<Self>, session_id: &str) -> Result<()> {
         let _deleting = self
             .begin_session_delete(session_id)
             .ok_or_else(|| anyhow!("session deletion is already in progress"))?;
@@ -3307,9 +3310,9 @@ pub fn set_chat_session_env(cmd: &mut tokio::process::Command, session_id: &str)
          ZDOTDIR=$_ORX_CHAT_SHIM_ZDOTDIR\n\
          export ORX_CHAT_TOOL_SCOPE=\"zsh-$$\"\n\
          export ORX_CHAT_TOOL_COMMAND=\"$ZSH_EXECUTION_STRING\"\n\
-         if [[ -r \"$ORX_CHAT_TARGET_POINTER\" ]]; then\n\
+         if [[ -z \"$ORX_CHAT_TARGET_FILE\" && -r \"$ORX_CHAT_TARGET_POINTER\" ]]; then\n\
            export ORX_CHAT_TARGET_FILE=$(<\"$ORX_CHAT_TARGET_POINTER\")\n\
-         else\n\
+         elif [[ -z \"$ORX_CHAT_TARGET_FILE\" ]]; then\n\
            unset ORX_CHAT_TARGET_FILE\n\
          fi\n",
         shell_single_quote(&original_zdotdir)
@@ -3329,12 +3332,13 @@ pub fn set_chat_session_env(cmd: &mut tokio::process::Command, session_id: &str)
 
     let bash_env = shell_dir.join("bash_env");
     let original_bash_env = child_env_value("BASH_ENV")
-        .map(PathBuf::from)
-        .map(|path| {
+        .map(|value| value.to_string_lossy().into_owned())
+        .map(|value| {
             format!(
-                "[[ -r {} ]] && source {}\n",
-                shell_single_quote(&path),
-                shell_single_quote(&path)
+                "_ORX_CHAT_USER_BASH_ENV={}\n\
+                 _ORX_CHAT_USER_BASH_ENV=$(eval printf '%s' \"$_ORX_CHAT_USER_BASH_ENV\")\n\
+                 [[ -r \"$_ORX_CHAT_USER_BASH_ENV\" ]] && source \"$_ORX_CHAT_USER_BASH_ENV\"\n",
+                shell_single_quote(std::path::Path::new(&value))
             )
         })
         .unwrap_or_default();
@@ -3342,9 +3346,9 @@ pub fn set_chat_session_env(cmd: &mut tokio::process::Command, session_id: &str)
         "{original_bash_env}\
          export ORX_CHAT_TOOL_SCOPE=\"bash-$$\"\n\
          export ORX_CHAT_TOOL_COMMAND=\"$BASH_EXECUTION_STRING\"\n\
-         if [[ -r \"$ORX_CHAT_TARGET_POINTER\" ]]; then\n\
+         if [[ -z \"$ORX_CHAT_TARGET_FILE\" && -r \"$ORX_CHAT_TARGET_POINTER\" ]]; then\n\
            export ORX_CHAT_TARGET_FILE=$(<\"$ORX_CHAT_TARGET_POINTER\")\n\
-         else\n\
+         elif [[ -z \"$ORX_CHAT_TARGET_FILE\" ]]; then\n\
            unset ORX_CHAT_TARGET_FILE\n\
          fi\n"
     );
