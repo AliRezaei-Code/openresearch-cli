@@ -711,10 +711,17 @@ function ToolTargetOverflow({
   onOpen?: (id: string) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const revealRef = useRef<HTMLSpanElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    revealRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+  }, [open]);
+
   return (
     <span className="tool-target-overflow inline">
       {open && (
-        <span className="tool-target-reveal">
+        <span className="tool-target-reveal" ref={revealRef}>
           {items.map((item, index) => (
             <span key={item.id}>
               {index > 0 && ", "}
@@ -736,6 +743,7 @@ function ToolTargetOverflow({
           ))}
         </span>
       )}
+      {open && ", "}
       <button
         className="tool-target-more"
         aria-expanded={open}
@@ -1090,9 +1098,17 @@ function ToolGroup({
   const running = parts.some((p) => p.state?.status === "running");
   const [open, setOpen] = useState(running);
   const wasRunning = useRef(running);
+  const hasRun = useRef(running);
+  if (running) hasRun.current = true;
   const displayParts = squashToolParts(parts);
   const activities = displayParts.map(({ part }) => toolActivity(part));
   const runningActivity = latestRunningActivity(parts);
+  const summary = summarizeToolGroup(activities);
+  const iconActivity = runningActivity ?? groupIconActivity(activities);
+  const summaryLabel = runningActivity
+    ? resolvedActivityLabel(runningActivity, runExperimentName, experimentName)
+    : summary;
+  const liveMessage = running ? summaryLabel : hasRun.current ? "Tool activity completed" : "";
 
   useEffect(() => {
     if (running === wasRunning.current) return;
@@ -1104,12 +1120,13 @@ function ToolGroup({
     if (runningActivity) {
       return (
         <div className="tool-group my-3.5 mx-0">
-          <div className="tool-row flex items-start gap-2 min-w-0 py-[3px] px-1 text-lg text-subtext" role="status" aria-live="polite">
+          <div className="tool-row flex items-start gap-2 min-w-0 py-[3px] px-1 text-lg text-subtext">
             <ToolActivityIcon activity={runningActivity} className="tool-running-shimmer-icon self-start mt-[5px]" />
             <span className="tool-running-shimmer min-w-0 whitespace-normal break-words">
               {resolvedActivityLabel(runningActivity, runExperimentName, experimentName)}
             </span>
           </div>
+          <span className="sr-only" role="status" aria-live="polite">{liveMessage}</span>
         </div>
       );
     }
@@ -1123,17 +1140,12 @@ function ToolGroup({
           onOpenExperiment={onOpenExperiment}
           experimentName={experimentName}
         />
+        <span className="sr-only" role="status" aria-live="polite">{liveMessage}</span>
       </div>
     );
   }
 
   const expanded = open;
-  const summary = summarizeToolGroup(activities);
-  const iconActivity = runningActivity ?? groupIconActivity(activities);
-  const summaryLabel = runningActivity
-    ? resolvedActivityLabel(runningActivity, runExperimentName, experimentName)
-    : summary;
-
   return (
     <div className="tool-group my-3.5 mx-0">
       <button
@@ -1142,11 +1154,12 @@ function ToolGroup({
         aria-expanded={expanded}
       >
         <ToolActivityIcon activity={iconActivity} className={`${running ? "tool-running-shimmer-icon" : "text-muted"} mt-[5px]`} />
-        <span className={`tool-group-label min-w-0 whitespace-normal break-words ${running ? "tool-running-shimmer" : ""}`} role={running ? "status" : undefined} aria-live={running ? "polite" : undefined}>
+        <span className={`tool-group-label min-w-0 whitespace-normal break-words ${running ? "tool-running-shimmer" : ""}`}>
           {summaryLabel}
         </span>
         <ChevronRight size={13} className={`tool-chevron shrink-0 mt-[6px] text-muted transition-transform duration-120 ease-standard [&.open]:rotate-90 ${expanded ? "open" : ""}`} />
       </button>
+      <span className="sr-only" role="status" aria-live="polite">{liveMessage}</span>
       {expanded && (
         <div className="tool-group-rows flex flex-col gap-px mt-0.5 mr-0 mb-1 ml-6">
           {displayParts.map(({ part, count }) => (
@@ -1631,6 +1644,8 @@ export function SubagentTranscript({
 }) {
   const parts = spawn.children ?? [];
   const running = spawn.state?.status === "running";
+  const hasRun = useRef(running);
+  if (running) hasRun.current = true;
   // Gate the empty state on what actually renders, not the raw part count — a
   // stored transcript of nothing but invisible parts must still read as empty.
   const rendered = renderParts(parts, {
@@ -1644,10 +1659,13 @@ export function SubagentTranscript({
   const spawnActivity = running ? activityInProgress(toolActivity(spawn)) : toolActivity(spawn);
   return (
     <div className="msg-assistant text-lg leading-[1.62] text-text min-w-0">
-      <div className="subagent-tab-header flex items-center gap-2 pb-2 mb-2 border-b border-b-border-variant" role={running ? "status" : undefined} aria-live={running ? "polite" : undefined}>
+      <div className="subagent-tab-header flex items-center gap-2 pb-2 mb-2 border-b border-b-border-variant">
         <ToolActivityIcon activity={spawnActivity} className={running ? "tool-running-shimmer-icon" : "text-muted"} />
         <span className={`${TOOL_LINE_CLASS_NAME} ${running ? "tool-running-shimmer" : ""}`}>{spawnActivity.label}</span>
       </div>
+      <span className="sr-only" role="status" aria-live="polite">
+        {running ? spawnActivity.label : hasRun.current ? "Sub-agent activity completed" : ""}
+      </span>
       {rendered.length === 0 ? (
         <div className="subagent-empty py-[3px] px-1 text-md text-muted">{running ? "Working…" : "No activity"}</div>
       ) : (
@@ -1671,18 +1689,25 @@ function SubagentBlock({
 }) {
   const errored = part.state?.status === "error";
   const running = part.state?.status === "running";
+  const hasRun = useRef(running);
+  if (running) hasRun.current = true;
   const activity = running ? activityInProgress(toolActivity(part)) : toolActivity(part);
   return (
-    <button
-      className={`subagent-row flex items-center gap-2 w-full my-3.5 mx-0 py-[3px] px-1 cursor-pointer text-text text-lg text-left rounded-sm [&:hover:not(:disabled)]:bg-surface [&:disabled]:cursor-default [&.has-error]:text-accent-red [&_.tool-line]:text-lg [&_.tool-line]:text-text ${errored ? "has-error" : ""}`}
-      title="Open sub-agent transcript"
-      onClick={() => onOpenSubagent?.(part.id)}
-      disabled={!onOpenSubagent}
-    >
-      <ToolActivityIcon activity={activity} className={`subagent-icon shrink-0 ${running ? "tool-running-shimmer-icon" : "text-muted"}`} />
-      <span className={`${TOOL_LINE_CLASS_NAME} ${running ? "tool-running-shimmer" : ""}`} role={running ? "status" : undefined} aria-live={running ? "polite" : undefined}>{activity.label}</span>
-      <ChevronRight size={12} className="subagent-row-chevron shrink-0 text-muted" />
-    </button>
+    <>
+      <button
+        className={`subagent-row flex items-center gap-2 w-full my-3.5 mx-0 py-[3px] px-1 cursor-pointer text-text text-lg text-left rounded-sm [&:hover:not(:disabled)]:bg-surface [&:disabled]:cursor-default [&.has-error]:text-accent-red [&_.tool-line]:text-lg [&_.tool-line]:text-text ${errored ? "has-error" : ""}`}
+        title="Open sub-agent transcript"
+        onClick={() => onOpenSubagent?.(part.id)}
+        disabled={!onOpenSubagent}
+      >
+        <ToolActivityIcon activity={activity} className={`subagent-icon shrink-0 ${running ? "tool-running-shimmer-icon" : "text-muted"}`} />
+        <span className={`${TOOL_LINE_CLASS_NAME} ${running ? "tool-running-shimmer" : ""}`}>{activity.label}</span>
+        <ChevronRight size={12} className="subagent-row-chevron shrink-0 text-muted" />
+      </button>
+      <span className="sr-only" role="status" aria-live="polite">
+        {running ? activity.label : hasRun.current ? "Sub-agent activity completed" : ""}
+      </span>
+    </>
   );
 }
 
