@@ -96,6 +96,7 @@ const TOOL_LINE_CLASS_NAME = [
 const TOOL_TARGET_LIMIT = 256;
 const TOOL_TARGET_INSPECTION_LIMIT = 1_024;
 const TOOL_OUTPUT_SCAN_LIMIT = 20_000;
+const SELECTION_ACTION_GAP_PX = 8;
 
 interface ComposerAnnotation extends ChatTextAnnotation {
   id: string;
@@ -104,7 +105,7 @@ interface ComposerAnnotation extends ChatTextAnnotation {
 interface SelectionAction {
   text: string;
   x: number;
-  y: number;
+  bottom: number;
 }
 
 function elementForNode(node: Node): Element | null {
@@ -143,7 +144,7 @@ function currentTranscriptSelection(root: HTMLElement): SelectionAction | null {
   return {
     text,
     x: left + (right - left) / 2,
-    y: top - 8,
+    bottom: window.innerHeight - top + SELECTION_ACTION_GAP_PX,
   };
 }
 
@@ -4268,11 +4269,11 @@ export function ChatPanel({
       {transcriptSelection.action && (
         <button
           type="button"
-          className="chat-selection-action fixed z-50 inline-flex items-center gap-1.5 py-1.5 px-3 border border-border rounded-md bg-background text-text text-sm font-medium shadow-[0_8px_24px_rgba(0,_0,_0,_0.18)] whitespace-nowrap [&:hover]:bg-surface"
+          className="chat-selection-action fixed z-50 inline-flex items-center gap-1.5 py-1.5 px-3 border border-border rounded-md bg-background text-text text-sm font-medium shadow-[0_2px_8px_rgba(0,_0,_0,_0.10)] whitespace-nowrap [&:hover]:bg-surface"
           style={{
             left: transcriptSelection.action.x,
-            top: transcriptSelection.action.y,
-            transform: "translate(-50%, -100%)",
+            bottom: transcriptSelection.action.bottom,
+            transform: "translateX(-50%)",
           }}
           onMouseDown={(event) => event.preventDefault()}
           onClick={transcriptSelection.add}
