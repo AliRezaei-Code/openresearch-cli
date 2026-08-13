@@ -2,14 +2,32 @@
 
 `scripts/build-macos-app.sh` builds the app; `scripts/package-macos-app.sh`
 signs, notarizes, and packages it into a DMG. CI
-(`.github/workflows/release-macos-app.yml`) runs both after each release and
-attaches `OpenResearch.dmg`:
+(`.github/workflows/release-macos-app.yml`) runs both after a release (see the
+trigger caveat below) and attaches `OpenResearch.dmg`:
 
 ```
 https://github.com/alphaXiv/openresearch-cli/releases/latest/download/OpenResearch.dmg
 ```
 
-The release job is a no-op until the `MACOS_SIGNING_ENABLED` variable is `true`.
+The release job is a no-op until the **repository** variable
+`MACOS_SIGNING_ENABLED` is `true` (a repo variable, not an environment one — the
+cheap gate job has no `environment:` and only sees repo/org variables).
+
+The attach runs automatically only when the `Release` workflow was dispatched by
+a PAT (see below); GitHub suppresses the `workflow_run` cascade for runs authored
+by `GITHUB_TOKEN`. To attach a DMG to a release that missed it, run the **Attach
+macOS app to release** workflow manually (Actions → Run workflow → enter the tag,
+e.g. `v0.1.99`), or:
+
+```bash
+gh workflow run release-macos-app.yml -f tag=v0.1.99
+```
+
+The manual path checks out `inputs.tag` and runs the signing scripts under the
+`release-signing` environment, so the **required reviewer approving the run is
+the real gate on the certificate** — verify the tag points at trusted code (the
+`main`-only deployment-branch restriction covers the workflow file, not the
+checked-out tag).
 
 ## Configure signing (CI)
 
@@ -31,6 +49,14 @@ From it you produce the six values below.
    | `MACOS_NOTARY_PASSWORD` | an app-specific password (account.apple.com) |
 
 2. Set repo **variable** `MACOS_SIGNING_ENABLED = true` to switch the pipeline on.
+
+3. Add repo **secret** `RELEASE_DISPATCH_TOKEN` — a fine-grained PAT scoped to
+   this repo with **Actions: read and write** (classic: `repo` + `workflow`).
+   `release-on-bump.yml` dispatches `release.yml` with it so the Release run is
+   owned by a real token and its completion cascades to the macOS attach. If it's
+   missing or invalid, releases still ship but the DMG is a manual dispatch.
+   Fine-grained PATs expire (≤1yr) — rotate it before then, or releases keep
+   shipping without the auto-attach until it's renewed.
 
 Also enable **Require a pull request** + **Require review from Code Owners** on
 `main` (see `.github/CODEOWNERS`) so the signing scripts can't change unreviewed.
