@@ -94,6 +94,31 @@ const TOOL_LINE_CLASS_NAME = [
 const TOOL_TARGET_LIMIT = 256;
 const TOOL_TARGET_INSPECTION_LIMIT = 1_024;
 const TOOL_OUTPUT_SCAN_LIMIT = 20_000;
+const PERMISSION_EDIT_TOOLS = new Set([
+  "edit",
+  "edit_file",
+  "filechange",
+  "multiedit",
+  "notebookedit",
+  "write",
+  "write_file",
+]);
+const PERMISSION_COMMAND_TOOLS = new Set([
+  "bash",
+  "command",
+  "exec",
+  "exec_command",
+  "run_command",
+  "shell",
+]);
+
+function permissionToolPresentation(tool?: string): { kind: "edit" | "command" | "other"; label: string } {
+  const rawTool = tool?.trim() || "";
+  const baseTool = rawTool.toLowerCase().split(/(?::|\.|__)+/).at(-1) || "";
+  if (PERMISSION_EDIT_TOOLS.has(baseTool)) return { kind: "edit", label: "File change" };
+  if (PERMISSION_COMMAND_TOOLS.has(baseTool)) return { kind: "command", label: "Command" };
+  return { kind: "other", label: rawTool || "Action" };
+}
 
 const PROMPT_COLLAPSED_CLASS_NAME = [
   "prompt-collapsed text-muted text-lg font-[375] my-3.5 mx-0 [&_summary]:flex",
@@ -1925,27 +1950,59 @@ function PromptCard({
     // carry nothing else) — show it so the user knows what they're granting.
     const reason =
       (typeof p.toolInput?.reason === "string" && p.toolInput.reason) || "";
+    const toolPresentation = permissionToolPresentation(p.tool);
+    const PermissionIcon = toolPresentation.kind === "edit" ? Pencil : toolPresentation.kind === "command" ? SquareTerminal : Blocks;
+    const toolLabel = toolPresentation.label;
+    const headingId = `permission-heading-${part.id}`;
     return (
-      <div className={`prompt-card my-2 mx-0 py-3 px-3.5 border border-border border-l-[3px] border-l-border rounded-sm bg-surface flex flex-col gap-[9px] [&.plan]:border-l-accent-blue [&.permission]:border-l-accent-amber [&.question]:border-l-accent-purple [&.readonly]:opacity-60 permission ${done ? "readonly" : ""}`}>
-        <div className={PROMPT_HEAD_CLASS_NAME}>
-          Permission needed: <code>{p.tool}</code>
+      <div
+        className={`prompt-card permission my-3 w-full max-w-2xl overflow-hidden rounded-md border border-border bg-background shadow-[0_1px_2px_rgb(0_0_0_/_4%)] [&.readonly]:opacity-60 ${done ? "readonly" : ""}`}
+        role="group"
+        aria-labelledby={headingId}
+      >
+        <div className="flex items-center gap-2.5 border-b border-border-variant px-3.5 py-2.5">
+          <span className="flex size-7 shrink-0 items-center justify-center rounded-md bg-accent-amber-subtle text-accent-amber">
+            <PermissionIcon size={15} strokeWidth={1.8} aria-hidden="true" />
+          </span>
+          <span id={headingId} className="text-md font-semibold text-text">Approval required</span>
+          <span
+            className="ml-auto max-w-[45%] truncate rounded-sm bg-surface px-2 py-0.5 text-xs font-medium text-subtext"
+            title={toolLabel}
+          >
+            {toolLabel}
+          </span>
         </div>
-        {summary && <div className="prompt-sub text-sm text-subtext wrap-anywhere">{summary}</div>}
-        {reason && <div className="prompt-sub text-sm text-subtext wrap-anywhere">{reason}</div>}
-        {!done && (
-          // No resumeMode: the harness picks the right one for an approval.
-          // Claude resumes under `bypass` (the only mode that actually grants a
-          // blocked tool — acceptEdits would re-deny Bash); inline harnesses
-          // (opencode) reply once/reject keyed off `approve`. Deny denies either way.
-          <div className={PROMPT_ACTIONS_CLASS_NAME}>
-            <button className="btn-primary" onClick={() => respond({ approve: true })}>
-              Allow
-            </button>
-            <button className="btn-ghost" onClick={() => respond({ approve: false })}>
-              Deny
-            </button>
-          </div>
-        )}
+        <div className="flex flex-col gap-3 px-3.5 py-3">
+          {reason && <div className="prompt-sub text-md leading-normal text-text wrap-anywhere">{reason}</div>}
+          {summary && (
+            <code className="prompt-command block max-h-36 overflow-auto whitespace-pre-wrap wrap-anywhere rounded-md border border-border-variant bg-surface px-3 py-2 font-mono text-sm leading-relaxed text-subtext">
+              {summary}
+            </code>
+          )}
+          {!reason && !summary && (
+            <div className="text-md text-subtext">This action needs permission to continue.</div>
+          )}
+          {!done && (
+            // No resumeMode: the harness picks the right one for an approval.
+            // Claude resumes under `bypass` (the only mode that actually grants a
+            // blocked tool — acceptEdits would re-deny Bash); inline harnesses
+            // (opencode) reply once/reject keyed off `approve`. Deny denies either way.
+            <div className="prompt-actions flex items-center justify-end gap-2 pt-0.5">
+              <button
+                className="rounded-sm border border-transparent bg-transparent px-3 py-1.5 text-sm font-semibold text-subtext transition-[background,color] duration-80 ease-standard hover:bg-surface hover:text-text"
+                onClick={() => respond({ approve: false })}
+              >
+                Deny
+              </button>
+              <button
+                className="rounded-sm border border-text bg-text px-3 py-1.5 text-sm font-semibold text-background transition-opacity duration-80 ease-standard hover:opacity-85"
+                onClick={() => respond({ approve: true })}
+              >
+                Allow
+              </button>
+            </div>
+          )}
+        </div>
       </div>
     );
   }
@@ -2396,25 +2453,68 @@ function latestToolStates(messages: ChatMessage[]): { messageId: string; states:
   return { messageId: message.id, states };
 }
 
-interface ToolAnnouncement {
+function latestPendingPermission(messages: ChatMessage[]): { path: string; label: string } | null {
+  let message: ChatMessage | undefined;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (messages[index].role !== "assistant") continue;
+    message = messages[index];
+    break;
+  }
+  if (!message) return null;
+  const visit = (parts: ChatPart[], parent: string): { path: string; label: string } | null => {
+    for (let index = parts.length - 1; index >= 0; index--) {
+      const part = parts[index];
+      if (part.children?.length) {
+        const nested = visit(part.children, `${parent}/${part.id}`);
+        if (nested) return nested;
+      }
+      const prompt = part.prompt;
+      if (part.type !== "prompt" || prompt?.kind !== "permission" || prompt.resolved) continue;
+      const reason = typeof prompt.toolInput?.reason === "string" ? prompt.toolInput.reason : "";
+      const label = reason || `${permissionToolPresentation(prompt.tool).label} needs approval`;
+      return { path: `${parent}/${part.id}`, label };
+    }
+    return null;
+  };
+  return visit(message.parts, message.id);
+}
+
+interface TranscriptAnnouncement {
   text: string;
   sequence: number;
 }
 
-function useToolActivityAnnouncement(messages: ChatMessage[]): ToolAnnouncement {
-  const [announcement, setAnnouncement] = useState<ToolAnnouncement>({ text: "", sequence: 0 });
-  const previous = useRef<{ transcript: string; messageId: string; states: Map<string, AnnouncedToolState> } | null>(null);
+function useTranscriptAnnouncement(messages: ChatMessage[]): TranscriptAnnouncement {
+  const [announcement, setAnnouncement] = useState<TranscriptAnnouncement>({ text: "", sequence: 0 });
+  const previous = useRef<{
+    transcript: string;
+    messageId: string;
+    states: Map<string, AnnouncedToolState>;
+    permissionPath: string | null;
+  } | null>(null);
   useEffect(() => {
     const transcript = messages[0]?.id ?? "";
     const { messageId, states } = latestToolStates(messages);
+    const pendingPermission = latestPendingPermission(messages);
     if (!previous.current || previous.current.transcript !== transcript) {
-      previous.current = { transcript, messageId, states };
-      setAnnouncement((current) => ({ text: "", sequence: current.sequence + 1 }));
+      previous.current = { transcript, messageId, states, permissionPath: pendingPermission?.path ?? null };
+      setAnnouncement((current) => ({
+        text: pendingPermission ? `Approval required: ${pendingPermission.label}` : "",
+        sequence: current.sequence + 1,
+      }));
       return;
     }
     const previousStates = previous.current.messageId === messageId ? previous.current.states : new Map<string, AnnouncedToolState>();
+    const previousPermissionPath = previous.current.permissionPath;
     const changes = [...states].filter(([path, state]) => previousStates.get(path)?.status !== state.status);
-    previous.current = { transcript, messageId, states };
+    previous.current = { transcript, messageId, states, permissionPath: pendingPermission?.path ?? null };
+    if (pendingPermission && pendingPermission.path !== previousPermissionPath) {
+      setAnnouncement((current) => ({
+        text: `Approval required: ${pendingPermission.label}`,
+        sequence: current.sequence + 1,
+      }));
+      return;
+    }
     const failures = changes.filter(([, state]) => state.status === "error");
     if (failures.length > 0) {
       const labels = failures.slice(0, 2).map(([, state]) => toolActivity(state.part).label).join(", ");
@@ -2479,12 +2579,12 @@ const Transcript = memo(function Transcript({
 }) {
   const visibleMessages = messages.filter(messageHasVisibleContent);
   const activeMessage = visibleMessages.at(-1);
-  const activityAnnouncement = useToolActivityAnnouncement(messages);
+  const transcriptAnnouncement = useTranscriptAnnouncement(messages);
   const pendingTailTool = busy ? streamTailTool(messages) : null;
   return (
     <>
       <span className="sr-only" role="status" aria-live="polite">
-        <span key={activityAnnouncement.sequence}>{activityAnnouncement.text}</span>
+        <span key={transcriptAnnouncement.sequence}>{transcriptAnnouncement.text}</span>
       </span>
       {visibleMessages.map((m) => (
         <Message

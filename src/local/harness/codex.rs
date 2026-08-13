@@ -7,13 +7,13 @@
 //! streamed as JSON-RPC notifications. The playbook rides
 //! `developerInstructions` (a real instruction channel — no more first-turn
 //! `<system-context>` text wrapping), and the sandbox policy travels per turn
-//! (`sandboxPolicy` with writable roots + network). Auto runs
-//! `approvalPolicy: on-request`: a command that needs to escalate past the
-//! sandbox arrives as a server→client approval request, surfaced as a
-//! permission card and answered inline over the same connection
+//! (`sandboxPolicy` with writable roots + network). Auto uses Codex's built-in
+//! approval reviewer for first-party providers; requests left to the client are
+//! surfaced as permission cards and answered inline over the same connection
 //! (`resume_from_prompt` → `{"decision": accept|decline}`). Verified against
-//! codex-cli 0.144.0 via `codex app-server generate-json-schema` plus a live
-//! spike; the fixture transcript in the tests pins the wire shapes.
+//! codex-cli 0.144.0 via
+//! `codex app-server generate-json-schema` plus a live spike; the fixture
+//! transcript in the tests pins the wire shapes.
 //!
 //! Older codex (< 0.144) falls back to the legacy exec path for one release:
 //! one `codex exec --json` process per turn, JSONL events on stdout,
@@ -558,11 +558,8 @@ impl Harness for Codex {
         //     (workspace-write + on-request), restricted only by the prompt-level
         //     plan template (see `codex_policies` for the parity gap vs Claude's
         //     hook-gated plan mode).
-        //   * Auto  — workspace-write + `on-request` approvals: the writable
-        //     roots (orx data dir, hub `.git` — see `sandbox_policy_json`)
-        //     plus network keep routine work prompt-free, and anything past
-        //     the sandbox surfaces as a permission card. On the exec fallback
-        //     approvals stay off (denials fail to the model).
+        //   * Auto  — workspace-write + `on-request` approvals, using Codex's
+        //     built-in reviewer when the active provider supports it.
         //   * Bypass— full access, approvals off.
         HarnessOptions::none()
             .with_permission_modes(
@@ -742,28 +739,63 @@ async fn app_server_supported() -> bool {
         .await
 }
 
-/// Session mode → (thread `sandbox` mode, `approvalPolicy`). Auto runs
-/// `on-request`: the sandbox is still the boundary for routine work (the
-/// writable roots keep orx traffic prompt-free), and anything that needs to
-/// escalate past it arrives as an approval request we surface as a permission
-/// card (verified live: 0.144 asks *before* running an out-of-sandbox
-/// command). Bypass drops the sandbox, so there is nothing to escalate —
-/// approvals stay off.
-fn codex_policies(mode: Option<PermissionMode>) -> (&'static str, &'static str) {
+/// Session mode → thread sandbox, approval policy, and approval reviewer.
+/// Custom providers stay human-reviewed because Codex's hidden auto-review
+/// model is not generally available through third-party model endpoints.
+fn codex_policies(
+    mode: Option<PermissionMode>,
+    auto_review_supported: bool,
+) -> (&'static str, &'static str, &'static str) {
     match mode.unwrap_or(PermissionMode::Auto) {
-        PermissionMode::Bypass => ("danger-full-access", "never"),
+        PermissionMode::Bypass => ("danger-full-access", "never", "user"),
         // Plan runs the SAME sandbox as Auto (workspace-write + on-request).
         // Native plan mode restricts *at the prompt level* — codex's built-in
         // plan.md template tells the model to propose without editing — not at
         // the sandbox level, so this is the parity gap vs Claude's hook-gated
         // plan mode: an off-script write inside the workspace would not prompt
         // (user-accepted). This arm is the variation point if we ever want a
-        // harder read-only floor: swap to `("read-only", "on-request")` here
-        // and nowhere else. AcceptEdits/Ask still collapse to the balanced
+        // harder read-only floor: change this arm's sandbox to `read-only`.
+        // AcceptEdits/Ask still collapse to the balanced
         // default (mirrors `codex_sandbox` on the exec path).
-        PermissionMode::Plan => ("workspace-write", "on-request"),
-        _ => ("workspace-write", "on-request"),
+        PermissionMode::Plan => ("workspace-write", "on-request", "user"),
+        PermissionMode::Auto if auto_review_supported => {
+            ("workspace-write", "on-request", "auto_review")
+        }
+        _ => ("workspace-write", "on-request", "user"),
     }
+}
+
+fn config_supports_auto_review(response: &Value) -> bool {
+    let Some(config) = response.get("config").and_then(Value::as_object) else {
+        return false;
+    };
+    let first_party_provider = match config.get("model_provider") {
+        Some(Value::Null) => true,
+        Some(Value::String(provider)) => provider == "openai",
+        _ => false,
+    };
+    let first_party_url = match config.get("openai_base_url") {
+        Some(Value::Null) => true,
+        Some(Value::String(url)) => url.trim().is_empty(),
+        _ => false,
+    };
+    first_party_provider && first_party_url
+}
+
+async fn codex_auto_review_supported(client: &CodexClient, workspace: &Path) -> bool {
+    let Ok(Ok(response)) = client
+        .try_request(
+            "config/read",
+            serde_json::json!({
+                "cwd": workspace.to_string_lossy(),
+                "includeLayers": false,
+            }),
+        )
+        .await
+    else {
+        return false;
+    };
+    config_supports_auto_review(&response) && super::detect::api_key("OPENAI_BASE_URL").is_none()
 }
 
 /// The per-turn `sandboxPolicy` object. workspace-write carries the same
@@ -898,6 +930,11 @@ fn apply_notification(ctx: &mut TurnCtx, method: &str, params: &Value) -> Option
                 .unwrap_or(false);
             if !will_retry {
                 ctx.push_error(error_message(params.get("error")));
+            }
+        }
+        "guardianWarning" => {
+            if let Some(message) = params.get("message").and_then(Value::as_str) {
+                ctx.push_error(message.to_string());
             }
         }
         "turn/completed" => {
@@ -1629,7 +1666,14 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
     let playbook_md = std::fs::read_to_string(&playbook).unwrap_or_default();
 
     let client = ctx.host.codex.ensure(&ctx.session_id).await?;
-    let (sandbox_mode, approval_policy) = codex_policies(ctx.permission_mode);
+    let auto_review_supported =
+        if ctx.permission_mode.unwrap_or(PermissionMode::Auto) == PermissionMode::Auto {
+            codex_auto_review_supported(&client, &repo).await
+        } else {
+            false
+        };
+    let (sandbox_mode, approval_policy, approvals_reviewer) =
+        codex_policies(ctx.permission_mode, auto_review_supported);
 
     // Thread bring-up: reuse the thread this child already carries, resume a
     // persisted one on a fresh child (after an orx up restart or child crash),
@@ -1641,6 +1685,7 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
         "cwd": repo.to_string_lossy(),
         "sandbox": sandbox_mode,
         "approvalPolicy": approval_policy,
+        "approvalsReviewer": approvals_reviewer,
         "developerInstructions": playbook_md,
     });
     if let Some(model) = &ctx.model {
@@ -1687,6 +1732,7 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
         // Explicit per turn — the composer can change mode/model mid-session,
         // and `sandboxPolicy` is the only carrier of writable roots.
         "approvalPolicy": approval_policy,
+        "approvalsReviewer": approvals_reviewer,
         "sandboxPolicy": sandbox_policy_json(ctx.permission_mode, &repo).await,
     });
     if let Some(model) = &ctx.model {
@@ -2798,23 +2844,46 @@ requires_openai_auth = false
     #[test]
     fn policies_map_modes_to_thread_params() {
         // Every non-bypass mode is the balanced sandbox with on-request
-        // approvals (escalations become permission cards); Bypass drops the
-        // sandbox, so approvals stay off — nothing to escalate.
-        assert_eq!(codex_policies(None), ("workspace-write", "on-request"));
+        // approvals; Bypass drops the sandbox, so approvals stay off.
         assert_eq!(
-            codex_policies(Some(PermissionMode::Auto)),
-            ("workspace-write", "on-request")
+            codex_policies(None, true),
+            ("workspace-write", "on-request", "auto_review")
+        );
+        assert_eq!(
+            codex_policies(Some(PermissionMode::Auto), true),
+            ("workspace-write", "on-request", "auto_review")
+        );
+        assert_eq!(
+            codex_policies(Some(PermissionMode::Auto), false),
+            ("workspace-write", "on-request", "user")
         );
         // Plan runs the SAME sandbox as Auto — native plan mode restricts at the
         // prompt level (the plan.md template), not the sandbox level.
         assert_eq!(
-            codex_policies(Some(PermissionMode::Plan)),
-            ("workspace-write", "on-request")
+            codex_policies(Some(PermissionMode::Plan), true),
+            ("workspace-write", "on-request", "user")
         );
         assert_eq!(
-            codex_policies(Some(PermissionMode::Bypass)),
-            ("danger-full-access", "never")
+            codex_policies(Some(PermissionMode::Bypass), true),
+            ("danger-full-access", "never", "user")
         );
+
+        assert!(config_supports_auto_review(&serde_json::json!({
+            "config": {"model_provider": null, "openai_base_url": null}
+        })));
+        assert!(!config_supports_auto_review(&serde_json::json!({
+            "config": {"model_provider": "custom", "openai_base_url": null}
+        })));
+        assert!(!config_supports_auto_review(&serde_json::json!({
+            "config": {"model_provider": "openai", "openai_base_url": "https://gateway.test/v1"}
+        })));
+        assert!(!config_supports_auto_review(&serde_json::json!({})));
+        assert!(!config_supports_auto_review(&serde_json::json!({
+            "config": {"model_provider": null}
+        })));
+        assert!(!config_supports_auto_review(&serde_json::json!({
+            "config": {"model_provider": 42, "openai_base_url": null}
+        })));
     }
 
     /// Fold a trimmed live transcript (captured from the 0.144 spike, ids
@@ -3422,6 +3491,21 @@ requires_openai_auth = false
         assert_eq!(ctx.assistant.parts.len(), 1);
         let state = ctx.assistant.parts[0].state.as_ref().unwrap();
         assert_eq!(state.status, "error");
+    }
+
+    #[test]
+    fn guardian_warning_surfaces_message() {
+        let mut ctx = TurnCtx::test_stub();
+        apply_notification(
+            &mut ctx,
+            "guardianWarning",
+            &serde_json::json!({"message":"Automatic review stopped this turn."}),
+        );
+        let warning = ctx.assistant.parts[0].state.as_ref().unwrap();
+        assert_eq!(
+            warning.error.as_deref(),
+            Some("Automatic review stopped this turn.")
+        );
     }
 
     #[test]
