@@ -10,8 +10,16 @@
 # GITHUB_TOKEN don't trigger other workflows (GitHub's anti-recursion rule),
 # so a GITHUB_TOKEN-pushed tag would never start release.yml. workflow_dispatch
 # is the documented exception ("workflow_dispatch and repository_dispatch
-# events always create workflow runs"), so the default token is sufficient and
-# no PAT/secret is needed.
+# events always create workflow runs").
+#
+# Why a PAT (RELEASE_DISPATCH_TOKEN) and not the default GITHUB_TOKEN: the
+# Release run's *completion* must cascade to release-macos-app.yml via
+# workflow_run, and GitHub applies the same anti-recursion rule there — a run
+# authored by GITHUB_TOKEN does not fire workflow_run. Dispatching with a PAT
+# makes the Release run owned by a real token, so its completion triggers the
+# macOS attach. The PAT needs Actions: read and write (to dispatch release.yml).
+# If the secret is missing or invalid, releases still publish but the DMG must be
+# attached manually via release-macos-app.yml's workflow_dispatch. See DISTRIBUTION.md.
 #
 # This never increments a version: the version is always a human decision made
 # in a reviewed PR, and "merge a PR that bumps Cargo.toml" is the release act.
@@ -29,7 +37,7 @@ concurrency:
 
 permissions:
   contents: read
-  actions: write # to dispatch release.yml
+  actions: write # github.token fallback path dispatches release.yml
 
 jobs:
   dispatch:
@@ -40,7 +48,12 @@ jobs:
 
       - name: Dispatch the release workflow
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Dispatching with the PAT makes the Release run cascade to the macOS
+          # attach (see header). GITHUB_TOKEN is the fallback so a missing OR
+          # invalid/expired PAT never blocks a release — it just ships without
+          # the auto-attach (recover via release-macos-app.yml's workflow_dispatch).
+          DISPATCH_PAT: ${{ secrets.RELEASE_DISPATCH_TOKEN }}
+          FALLBACK_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -56,6 +69,11 @@ jobs:
           fi
 
           echo "Dispatching release.yml with tag=${tag} (version is unreleased)."
-          gh workflow run release.yml --ref main -f tag="${tag}"
-          echo "Dispatched. The release will appear at:"
+          if [ -n "$DISPATCH_PAT" ] && GH_TOKEN="$DISPATCH_PAT" gh workflow run release.yml --ref main -f tag="${tag}"; then
+            echo "Dispatched with RELEASE_DISPATCH_TOKEN — the macOS DMG will attach automatically."
+          else
+            [ -n "$DISPATCH_PAT" ] && echo "::warning::RELEASE_DISPATCH_TOKEN failed; used GITHUB_TOKEN. Release ships but the DMG won't auto-attach — run release-macos-app.yml manually for ${tag}."
+            GH_TOKEN="$FALLBACK_TOKEN" gh workflow run release.yml --ref main -f tag="${tag}"
+          fi
+          echo "The release will appear at:"
           echo "  https://github.com/${GITHUB_REPOSITORY}/actions/workflows/release.yml"
