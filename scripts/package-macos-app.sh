@@ -48,9 +48,64 @@ if [[ -n "${MACOS_NOTARY_PROFILE:-}" ]]; then
   rm -f "$APP_ZIP"
 fi
 
-echo "==> Creating DMG"
+echo "==> Creating styled DMG (drag-to-Applications installer window)"
 rm -f "$DMG"
-hdiutil create -volname "OpenResearch" -srcfolder "$APP" -ov -format UDZO "$DMG" >/dev/null
+VOLNAME="OpenResearch"
+# WIN_W/WIN_H must match the canvas hardcoded in generate-dmg-background.mjs, and
+# APP_X/APPS_X the arrow gap it draws — change these together.
+WIN_W=640 WIN_H=400 ICON=128
+APP_X=160 APPS_X=480 ICON_Y=170     # Finder icon-center positions in the window
+
+STAGE="$(mktemp -d)"
+BUILD="$(mktemp -d)"
+# Detach first so a failure between attach and convert doesn't leak a mount whose
+# backing image we're about to delete.
+trap '{ [[ -n "${DEV:-}" ]] && hdiutil detach "$DEV" -force >/dev/null 2>&1; } || true; rm -rf "$STAGE" "$BUILD"' EXIT
+cp -R "$APP" "$STAGE/"
+ln -s /Applications "$STAGE/Applications"
+mkdir "$STAGE/.background"
+# HiDPI background: 1x + 2x combined into one multi-representation TIFF.
+node "$ROOT/scripts/generate-dmg-background.mjs" "$BUILD/bg.png" 1 >/dev/null
+node "$ROOT/scripts/generate-dmg-background.mjs" "$BUILD/bg@2x.png" 2 >/dev/null
+tiffutil -cathidpicheck "$BUILD/bg.png" "$BUILD/bg@2x.png" -out "$STAGE/.background/background.tiff" >/dev/null
+
+# Lay the window out on a writable image, then convert to the compressed final.
+RW="$BUILD/rw.dmg"
+hdiutil create -volname "$VOLNAME" -srcfolder "$STAGE" -fs HFS+ -format UDRW -ov "$RW" >/dev/null
+ATTACH="$(hdiutil attach "$RW" -readwrite -noverify -noautoopen)"
+DEV="$(echo "$ATTACH" | grep -Eo '^/dev/disk[0-9]+' | head -1)"
+MNT="$(echo "$ATTACH" | grep -Eo '/Volumes/.*$' | head -1)"
+BG_POSIX="$MNT/.background/background.tiff"
+# Styling needs a Finder session; if it fails (e.g. headless), still ship a
+# functional DMG (the app + Applications alias are already on the image).
+STYLED=1
+osascript >/dev/null <<APPLESCRIPT || STYLED=0
+tell application "Finder"
+  tell disk "$VOLNAME"
+    open
+    delay 1
+    set current view of container window to icon view
+    set toolbar visible of container window to false
+    set statusbar visible of container window to false
+    set the bounds of container window to {200, 140, 200 + $WIN_W, 140 + $WIN_H}
+    set opts to the icon view options of container window
+    set arrangement of opts to not arranged
+    set icon size of opts to $ICON
+    set text size of opts to 13
+    set background picture of opts to POSIX file "$BG_POSIX"
+    set position of item "$(basename "$APP")" of container window to {$APP_X, $ICON_Y}
+    set position of item "Applications" of container window to {$APPS_X, $ICON_Y}
+    close
+    open
+    update without registering applications
+    delay 2
+  end tell
+end tell
+APPLESCRIPT
+[[ "$STYLED" == 1 ]] || echo "==> WARNING: Finder styling step failed — shipping a functional but unstyled DMG."
+sync
+hdiutil detach "$DEV" >/dev/null || { sleep 2; hdiutil detach "$DEV" -force >/dev/null; }
+hdiutil convert "$RW" -format UDZO -imagekey zlib-level=9 -o "$DMG" >/dev/null
 [[ -n "${MACOS_SIGN_IDENTITY:-}" ]] && codesign --force --timestamp --sign "$MACOS_SIGN_IDENTITY" "$DMG"
 
 if [[ -n "${MACOS_NOTARY_PROFILE:-}" ]]; then

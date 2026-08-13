@@ -1,14 +1,15 @@
-# Attaches the signed, notarized OpenResearch.app (as a DMG) to each GitHub
-# Release. cargo-dist's "Release" workflow (release.yml) creates the Release with
-# the default GITHUB_TOKEN, and GitHub's anti-recursion rule blocks a
-# `release: published` event from a GITHUB_TOKEN action from triggering other
-# workflows (the same constraint release-on-bump.yml documents). So we trigger on
-# the Release workflow *completing* via `workflow_run`, which fires regardless of
-# what authored the upstream run.
+# Attaches the signed, notarized OpenResearch.app (as a DMG) to a GitHub Release.
 #
-# release.yml also runs on pull_request (a dry-run that publishes nothing), so we
-# only proceed for a successful `workflow_dispatch` run (a real release) and then
-# confirm the tag's release actually exists before uploading.
+# Two triggers:
+#  - workflow_run: fires when the "Release" workflow (release.yml) completes —
+#    the automatic path. IMPORTANT: GitHub suppresses workflow_run when the
+#    upstream run was authored by GITHUB_TOKEN (its anti-recursion rule), so
+#    release.yml must be dispatched by a PAT (see release-on-bump.yml) for this
+#    to fire on a real release. release.yml also runs on pull_request (a dry-run
+#    that publishes nothing), so we only proceed for a successful
+#    `workflow_dispatch` run and then confirm the tag's release actually exists.
+#  - workflow_dispatch: manually re-attach the DMG for a given tag — the recovery
+#    path, and how a release cut before this pipeline worked gets its DMG.
 #
 # Signing secrets live in the `release-signing` environment (not repo secrets),
 # so only the reviewed, environment-gated `macos-app` job can read them. The
@@ -23,6 +24,12 @@ on:
   workflow_run:
     workflows: ["Release"]
     types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to attach the macOS app to (e.g. v0.1.99)
+        required: true
+        type: string
 
 permissions:
   contents: write # upload release assets
@@ -32,12 +39,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Cheap ubuntu gate: only a real, successful release with signing enabled
-  # (the non-secret MACOS_SIGNING_ENABLED variable) and a Release that actually
-  # exists — so a macOS runner (billed 10x) never boots otherwise, and no secret
-  # is ever read here. Resolves the tag from the released commit.
+  # Cheap ubuntu gate: only proceed for signing-enabled runs that map to a real
+  # release — an automatic workflow_run from a successful workflow_dispatch
+  # Release, or a manual workflow_dispatch of this workflow. Keys on the
+  # non-secret MACOS_SIGNING_ENABLED variable and confirms the release exists, so
+  # a macOS runner (billed 10x) never boots otherwise and no secret is read here.
   check:
-    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'workflow_dispatch' && vars.MACOS_SIGNING_ENABLED == 'true' }}
+    if: ${{ vars.MACOS_SIGNING_ENABLED == 'true' && (github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'workflow_dispatch')) }}
     runs-on: ubuntu-latest
     outputs:
       ok: ${{ steps.gate.outputs.ok }}
@@ -47,12 +55,20 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.event.workflow_run.head_sha || inputs.tag }}
       - id: gate
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
-          tag="v${version}"
+          # Manual dispatch names the tag; the automatic path derives it from the
+          # released commit's Cargo.toml.
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          else
+            version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+            tag="v${version}"
+          fi
           if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "::notice::No release $tag found (dry-run dispatch?) — nothing to attach."
             echo "ok=false" >> "$GITHUB_OUTPUT"; exit 0
@@ -64,6 +80,7 @@ jobs:
     needs: check
     if: ${{ needs.check.outputs.ok == 'true' }}
     runs-on: macos-14 # Apple Silicon runner
+    timeout-minutes: 45 # bound the 10x-billed runner (build + notarize + Finder styling)
     # The cert-using job. Secrets come from this environment; add required
     # reviewers to it (Settings → Environments) so the Developer ID certificate
     # is never used without a human approving the run — even if an unwanted change
@@ -72,7 +89,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.event.workflow_run.head_sha || inputs.tag }}
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
