@@ -45,7 +45,7 @@ const PROMPT_ACTIONS_CLASS_NAME = [
  *    detour through the main composer.
  *  - Accept and auto mode (primary): approve + resume under Auto — the
  *    default accept action. The caret menu holds Accept and bypass all
- *    (skip every gate, not just Auto's). No plain "accept-edits" tier here —
+ *    (skip every gate, not just Auto's). No plain Accept edits tier here —
  *    the app has no story for partial (edits-only) approval.
  *  - Open plan: link in the title row → the right-pane plan tab. */
 export function PlanStrip({
@@ -53,6 +53,7 @@ export function PlanStrip({
   agentLabel,
   onView,
   onApprove,
+  showResumeModes,
   onReject,
   onRevise,
 }: {
@@ -62,7 +63,10 @@ export function PlanStrip({
    * "Codex"); falls back to a generic label when the harness is unknown. */
   agentLabel: string;
   onView: () => void;
-  onApprove: (resumeMode: "auto" | "bypass") => void;
+  onApprove: (resumeMode?: "auto" | "bypassPermissions") => void;
+  /** Claude approval chooses its next permission mode; Codex preserves the
+   * current permission choice and only leaves the independent Plan axis. */
+  showResumeModes: boolean;
   onReject: () => void;
   /** Revision feedback; always non-empty (a blank submit sends a generic
    * "please revise" — note presence is what distinguishes revise from
@@ -156,30 +160,36 @@ export function PlanStrip({
             Revise…
           </button>
           <span className="plan-strip-spacer flex-1" />
-          <div className="plan-strip-approve relative flex [&_.btn-primary:first-child]:rounded-tr-none [&_.btn-primary:first-child]:rounded-br-none" ref={menuRef}>
-            <button className="btn-primary plan-strip-primary" onClick={() => onApprove("auto")}>
-              Accept and auto mode
+          {showResumeModes ? (
+            <div className="plan-strip-approve relative flex [&_.btn-primary:first-child]:rounded-tr-none [&_.btn-primary:first-child]:rounded-br-none" ref={menuRef}>
+              <button className="btn-primary plan-strip-primary" onClick={() => onApprove("auto")}>
+                Accept and auto mode
+              </button>
+              <button
+                className="btn-primary plan-strip-primary plan-strip-caret"
+                aria-label="More approval options"
+                onClick={() => setMenuOpen((o) => !o)}
+              >
+                <ChevronDown size={13} />
+              </button>
+              {menuOpen && (
+                <div className="plan-strip-menu absolute right-0 bottom-[calc(100%_+_4px)] flex flex-col min-w-47.5 p-1 border border-border rounded-md bg-surface shadow-[0_6px_20px_rgb(0_0_0_/_12%)] z-6 [&_button]:text-left [&_button]:py-[7px] [&_button]:px-[9px] [&_button]:border-0 [&_button]:rounded-sm [&_button]:bg-transparent [&_button]:text-text [&_button]:text-md [&_button]:cursor-pointer [&_button:hover]:bg-[var(--surface-2,_rgb(0_0_0_/_5%))]">
+                  <button
+                    onClick={() => {
+                      setMenuOpen(false);
+                      onApprove("bypassPermissions");
+                    }}
+                  >
+                    Accept and bypass all
+                  </button>
+                </div>
+              )}
+            </div>
+          ) : (
+            <button className="btn-primary plan-strip-primary" onClick={() => onApprove()}>
+              Accept plan
             </button>
-            <button
-              className="btn-primary plan-strip-primary plan-strip-caret"
-              aria-label="More approval options"
-              onClick={() => setMenuOpen((o) => !o)}
-            >
-              <ChevronDown size={13} />
-            </button>
-            {menuOpen && (
-              <div className="plan-strip-menu absolute right-0 bottom-[calc(100%_+_4px)] flex flex-col min-w-47.5 p-1 border border-border rounded-md bg-surface shadow-[0_6px_20px_rgb(0_0_0_/_12%)] z-6 [&_button]:text-left [&_button]:py-[7px] [&_button]:px-[9px] [&_button]:border-0 [&_button]:rounded-sm [&_button]:bg-transparent [&_button]:text-text [&_button]:text-md [&_button]:cursor-pointer [&_button:hover]:bg-[var(--surface-2,_rgb(0_0_0_/_5%))]">
-                <button
-                  onClick={() => {
-                    setMenuOpen(false);
-                    onApprove("bypass");
-                  }}
-                >
-                  Accept and bypass all
-                </button>
-              </div>
-            )}
-          </div>
+          )}
         </div>
       )}
     </div>

@@ -159,7 +159,8 @@ fn is_valid_slug(name: &str) -> bool {
 /// (bare or prefixed), and the composer's slash-skill catalog. Rejected so an
 /// upload can never shadow or be shadowed by a built-in.
 fn is_reserved(name: &str) -> bool {
-    name.starts_with("orx-")
+    name == "plan"
+        || name.starts_with("orx-")
         || crate::local::agent_skills::find(name, SkillSet::Full).is_some()
         || crate::local::agent_skills::find(name, SkillSet::Local).is_some()
         || crate::local::skills::CATALOG.iter().any(|s| s.name == name)
@@ -739,6 +740,7 @@ mod tests {
         assert!(is_reserved("orx-git"));
         assert!(is_reserved("compute"));
         assert!(is_reserved("lit-review"));
+        assert!(is_reserved("plan"));
         assert!(!is_reserved("haiku-writer"));
     }
 

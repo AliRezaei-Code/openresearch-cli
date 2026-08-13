@@ -13,9 +13,8 @@
 //! still open — the turn is paused, not finished. We surface those as
 //! `permission` / `question` cards and reply over the live session
 //! (`resume_from_prompt` → [`ResumeAction::Handled`]), which unblocks the same
-//! POST. `Bypass` mode auto-resolves permission cards (replies "always" without
-//! a blocking card); `Auto`/`Plan` surface them. Questions always need a human,
-//! so they always surface regardless of mode.
+//! POST. Auto-approve resolves native `ask` requests without a card; Default
+//! surfaces them. Questions always need a human, so they always surface.
 //!
 //! Detection: opencode's `auth.json` is `{provider: {type}}`; the signed-in
 //! providers are its account line, and `opencode models --verbose` is the model
@@ -31,7 +30,9 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 
 use super::detect::{bin_version, read_json, HarnessInfo};
-use super::options::{HarnessOptions, PermissionMode, REASONING_DEFAULT_ID};
+use super::options::{
+    HarnessOptions, OptionChoice, PermissionMode, PlanActivation, REASONING_DEFAULT_ID,
+};
 use super::{Harness, ResumeAction};
 use crate::error::{anyhow, Result};
 use crate::local::chat::{
@@ -122,31 +123,29 @@ impl Harness for OpenCode {
     }
 
     fn options(&self) -> HarnessOptions {
-        // Two native OpenCode axes folded onto the one Mode toggle:
-        //  * which built-in agent runs — `plan` (read-only: allows inspection
-        //    like `orx …`, denies edits) vs `build` (the default). A real, clean
-        //    plan mode, unlike Claude/Codex — verified live.
-        //  * how a `permission.asked` is answered. NOTE opencode's default is
-        //    permissive (`allow *`); it only prompts on a few risky cases
-        //    (runaway loops, out-of-workspace writes, `.env` reads), so a
-        //    dedicated "ask for everything" mode would be hollow (cards would
-        //    almost never fire). So we don't offer one:
-        //      * Plan   → plan agent, and surface the rare cards that do fire.
-        //      * Auto   → build agent, opencode's permissive default (still
-        //                 surfaces those rare cards / questions).
-        //      * Bypass → build agent, auto-approve even those.
+        // OpenCode's agent (plan/build) is independent of permission handling.
+        // Default honors configured allow/ask/deny rules; Auto-approve answers
+        // only native `ask` requests and never overrides explicit denies.
         // Reasoning IS a model property in opencode, so there is no meaningful
         // harness-wide list: the real choices are each model's `variants`, read
         // from `opencode models --verbose` in `detect` and attached per-model.
         // Leaving this axis empty means a model with no variants shows no
         // picker at all, rather than falling back to a bogus union.
-        HarnessOptions::none().with_permission_modes(
-            &[
-                PermissionMode::Plan,
-                PermissionMode::Auto,
-                PermissionMode::Bypass,
+        HarnessOptions::none().with_permission_choices(
+            vec![
+                OptionChoice::described(
+                    "default",
+                    "Default",
+                    "Ask before actions that need your approval",
+                ),
+                OptionChoice::described(
+                    "auto-approve",
+                    "Auto-approve",
+                    "Approve requests automatically, except actions you have denied",
+                ),
             ],
-            PermissionMode::Auto,
+            "default",
+            PlanActivation::Command,
         )
     }
 
@@ -160,8 +159,20 @@ impl Harness for OpenCode {
         prompt: &WirePrompt,
         answer: &PromptAnswer,
     ) -> Result<ResumeAction> {
+        let plan_mode = plan_exit_transition(prompt, answer);
+        if let Some(plan_mode) = plan_mode {
+            // Persist the native answer's Plan transition before OpenCode
+            // consumes it. If delivery fails, restore the active Plan state so
+            // the still-actionable card and ORX continue to agree.
+            ctx.host.set_plan_mode(&ctx.session_id, plan_mode).await?;
+            if let Err(err) = reply_inline(ctx, prompt, answer).await {
+                let _ = ctx.host.set_plan_mode(&ctx.session_id, true).await;
+                return Err(err);
+            }
+            return Ok(ResumeAction::Handled { plan_mode: None });
+        }
         reply_inline(ctx, prompt, answer).await?;
-        Ok(ResumeAction::Handled)
+        Ok(ResumeAction::Handled { plan_mode: None })
     }
 
     fn config_home(&self) -> Option<PathBuf> {
@@ -476,7 +487,7 @@ fn permission_card(props: &Value) -> Option<WirePrompt> {
 /// is the same shape as Claude's AskUserQuestion, so it maps 1:1. Only the first
 /// question is surfaced (the composer answers one at a time); its request id
 /// rides on `native_id` for `POST /question/{id}/reply`.
-fn question_card(props: &Value) -> Option<WirePrompt> {
+fn question_card(props: &Value, plan_exit_calls: &HashSet<String>) -> Option<WirePrompt> {
     let id = props.get("id").and_then(Value::as_str)?.to_string();
     let q = props
         .get("questions")
@@ -508,6 +519,11 @@ fn question_card(props: &Value) -> Option<WirePrompt> {
         header: q.get("header").and_then(Value::as_str).map(str::to_string),
         options,
         multi_select: q.get("multiple").and_then(Value::as_bool).unwrap_or(false),
+        plan_exit: props
+            .get("tool")
+            .and_then(|tool| tool.get("callID"))
+            .and_then(Value::as_str)
+            .is_some_and(|call_id| plan_exit_calls.contains(call_id)),
         native_id: Some(id),
         ..Default::default()
     })
@@ -605,14 +621,34 @@ async fn reply_inline(ctx: &ResumeCtx, prompt: &WirePrompt, answer: &PromptAnswe
 /// `plan` agent (denies edits, allows inspection); everything else runs the
 /// default `build` agent. The permission-reply behavior (surface vs auto-reply)
 /// is a separate axis handled in `handle_prompt_event`.
-fn opencode_agent(mode: Option<PermissionMode>) -> &'static str {
-    match mode {
-        Some(PermissionMode::Plan) => "plan",
-        _ => "build",
+fn opencode_agent(plan_mode: bool) -> &'static str {
+    if plan_mode {
+        "plan"
+    } else {
+        "build"
     }
 }
 
+fn opencode_auto_approve(mode: Option<PermissionMode>) -> bool {
+    matches!(mode, Some(PermissionMode::Auto))
+}
+
+fn plan_exit_transition(prompt: &WirePrompt, answer: &PromptAnswer) -> Option<bool> {
+    prompt.plan_exit.then(|| {
+        !answer
+            .answers
+            .iter()
+            .any(|choice| choice.eq_ignore_ascii_case("yes"))
+    })
+}
+
 async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
+    // Native permission and question requests die with their turn. Clear any
+    // crash/restart leftovers before a new live request can be surfaced.
+    ctx.host
+        .resolve_stale_prompts(&ctx.session_id, true)
+        .await?;
+
     // Lazy bring-up: spawns serve in this session's worktree or reuses the
     // session's live child.
     let status = ctx
@@ -663,7 +699,7 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
         // read-only planning agent — allows inspection, denies edits) vs `build`
         // (the default). The message endpoint takes `agent` directly (verified),
         // so no separate switch call is needed.
-        "agent": opencode_agent(ctx.permission_mode),
+        "agent": opencode_agent(ctx.plan_mode),
     });
     if let Some(model) = &ctx.model {
         if let Some((provider, model_id)) = model.split_once('/') {
@@ -691,6 +727,9 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     // sessionID → the task spawn part's id. Their events (a foreign sessionID)
     // route into that part's `children` instead of being dropped.
     let mut sub_sessions: HashMap<String, String> = HashMap::new();
+    // Native plan exit is an ordinary `question.asked`; connect it to the
+    // preceding `plan_exit` tool through the question's `tool.callID`.
+    let mut plan_exit_calls: HashSet<String> = HashSet::new();
     let mut buf = String::new();
 
     loop {
@@ -705,10 +744,31 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
                     buf.drain(..=pos);
                     let Some(data) = line.strip_prefix("data: ") else { continue };
                     let Ok(event) = serde_json::from_str::<Value>(data) else { continue };
+                    if let Some(part) = event
+                        .get("properties")
+                        .and_then(|props| props.get("part"))
+                        .filter(|part| {
+                            part.get("sessionID").and_then(Value::as_str) == Some(native_id.as_str())
+                                && part.get("type").and_then(Value::as_str) == Some("tool")
+                                && part.get("tool").and_then(Value::as_str) == Some("plan_exit")
+                        })
+                    {
+                        if let Some(call_id) = part.get("callID").and_then(Value::as_str) {
+                            plan_exit_calls.insert(call_id.to_string());
+                        }
+                    }
                     // Interactive prompts (permission/question) pause the turn and
                     // are handled async (emit a card, or auto-reply per mode); all
                     // other events are message/part updates handled synchronously.
-                    if !handle_prompt_event(ctx, &native_id, &base, &event).await? {
+                    if !handle_prompt_event(
+                        ctx,
+                        &native_id,
+                        &base,
+                        &event,
+                        &plan_exit_calls,
+                    )
+                    .await?
+                    {
                         handle_event(ctx, &native_id, &event, &mut assistant_msgs, &mut sub_sessions);
                     }
                 }
@@ -903,10 +963,9 @@ fn surface_card(ctx: &mut TurnCtx, card: WirePrompt) {
 /// for this session. Returns `true` if it consumed the event (so the caller
 /// skips `handle_event`), `false` otherwise.
 ///
-/// Permissions honor the session's mode: only `Bypass` auto-replies `always`
-/// over the live session (no blocking card); `Auto`/`Plan` (and anything else)
-/// surface a card and pause — opencode's default is already permissive, so the
-/// rare card it raises is worth showing. Questions always surface — there's no
+/// Permissions honor the session's policy: Auto-approve replies `always` to an
+/// `ask` request, while Default surfaces a card. Explicit denies never emit an
+/// approval request, so neither policy overrides them. Questions always surface — there's no
 /// sensible auto-answer. A single flaky auto-reply must not lose the whole turn,
 /// so on POST failure we fall back to surfacing the card rather than erroring.
 async fn handle_prompt_event(
@@ -914,6 +973,7 @@ async fn handle_prompt_event(
     native_id: &str,
     base: &str,
     event: &Value,
+    plan_exit_calls: &HashSet<String>,
 ) -> Result<bool> {
     let props = event.get("properties").unwrap_or(&Value::Null);
     // Only this session's prompts (the /event stream is global across sessions).
@@ -931,10 +991,8 @@ async fn handle_prompt_event(
                 let _ = ctx.flush();
                 return Ok(true);
             };
-            // Only Bypass auto-approves. Auto is opencode's permissive default —
-            // the rare card it does raise (out-of-workspace write, `.env` read)
-            // is worth surfacing; Plan surfaces them too.
-            let auto_approve = matches!(ctx.permission_mode, Some(PermissionMode::Bypass));
+            // Auto-approve handles native `ask` requests; Default surfaces them.
+            let auto_approve = opencode_auto_approve(ctx.permission_mode);
             match (auto_approve, card.native_id.as_deref()) {
                 (true, Some(id)) => {
                     // Reply without surfacing a card — keep the turn flowing. If
@@ -952,7 +1010,7 @@ async fn handle_prompt_event(
             Ok(true)
         }
         Some("question.asked") => {
-            match question_card(props) {
+            match question_card(props, plan_exit_calls) {
                 Some(card) => surface_card(ctx, card),
                 None => {
                     ctx.push_error("opencode asked a question we couldn't parse".into());
@@ -1160,12 +1218,21 @@ opencode/glm-5
 
     #[test]
     fn plan_mode_uses_the_plan_agent_others_build() {
-        assert_eq!(opencode_agent(Some(PermissionMode::Plan)), "plan");
-        assert_eq!(opencode_agent(Some(PermissionMode::Ask)), "build");
-        assert_eq!(opencode_agent(Some(PermissionMode::Auto)), "build");
-        assert_eq!(opencode_agent(Some(PermissionMode::Bypass)), "build");
-        // No mode set → the default build agent, never plan.
-        assert_eq!(opencode_agent(None), "build");
+        assert_eq!(opencode_agent(true), "plan");
+        assert_eq!(opencode_agent(false), "build");
+    }
+
+    #[test]
+    fn plan_and_permissions_form_four_independent_combinations() {
+        for (plan_mode, permission_mode, agent, auto_approve) in [
+            (false, Some(PermissionMode::Ask), "build", false),
+            (false, Some(PermissionMode::Auto), "build", true),
+            (true, Some(PermissionMode::Ask), "plan", false),
+            (true, Some(PermissionMode::Auto), "plan", true),
+        ] {
+            assert_eq!(opencode_agent(plan_mode), agent);
+            assert_eq!(opencode_auto_approve(permission_mode), auto_approve);
+        }
     }
 
     // `properties` payloads shaped exactly like the live `permission.asked` /
@@ -1213,7 +1280,7 @@ opencode/glm-5
                 "multiple": true
             }]
         });
-        let card = question_card(&props).expect("should parse");
+        let card = question_card(&props, &HashSet::new()).expect("should parse");
         assert_eq!(card.kind, "question");
         assert_eq!(card.native_id.as_deref(), Some("que_xyz"));
         assert_eq!(card.question.as_deref(), Some("Which backend?"));
@@ -1228,9 +1295,51 @@ opencode/glm-5
             "id": "que_1",
             "questions": [{ "question": "q", "header": "h", "options": [], "multiSelect": true }]
         });
-        assert!(!question_card(&claude_shaped).unwrap().multi_select);
+        assert!(
+            !question_card(&claude_shaped, &HashSet::new())
+                .unwrap()
+                .multi_select
+        );
         // No questions → no card.
-        assert!(question_card(&json!({ "id": "que_1" })).is_none());
+        assert!(question_card(&json!({ "id": "que_1" }), &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn question_card_recognizes_plan_exit_by_tool_call_id() {
+        let props = json!({
+            "id": "que_exit",
+            "tool": { "messageID": "m1", "callID": "call_plan" },
+            "questions": [{
+                "question": "Switch to build?",
+                "header": "Build Agent",
+                "options": [{ "label": "Yes" }, { "label": "No" }],
+                "multiple": false
+            }]
+        });
+        let calls = HashSet::from(["call_plan".to_string()]);
+        assert!(question_card(&props, &calls).unwrap().plan_exit);
+        assert!(!question_card(&props, &HashSet::new()).unwrap().plan_exit);
+    }
+
+    #[test]
+    fn native_plan_exit_yes_leaves_plan_no_keeps_it() {
+        let mut prompt = WirePrompt {
+            plan_exit: true,
+            ..Default::default()
+        };
+        let response = |choice: &str| PromptAnswer {
+            session_id: "session".into(),
+            prompt_id: "question".into(),
+            approve: true,
+            resume_mode: None,
+            answers: vec![choice.into()],
+            note: None,
+            annotations: Vec::new(),
+        };
+        assert_eq!(plan_exit_transition(&prompt, &response("Yes")), Some(false));
+        assert_eq!(plan_exit_transition(&prompt, &response("No")), Some(true));
+        prompt.plan_exit = false;
+        assert_eq!(plan_exit_transition(&prompt, &response("Yes")), None);
     }
 
     #[test]

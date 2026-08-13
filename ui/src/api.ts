@@ -906,6 +906,7 @@ export const harnessModelLabel = (m: HarnessModel) => m.displayName ?? modelLabe
 export interface OptionChoice {
   id: string;
   label: string;
+  description?: string;
 }
 
 /**
@@ -917,6 +918,7 @@ export interface OptionChoice {
 export interface HarnessOptions {
   permissionModes: OptionChoice[];
   defaultPermissionMode?: string | null;
+  planActivation?: "permission" | "command" | null;
   reasoningLevels: OptionChoice[];
   defaultReasoningLevel?: string | null;
 }
@@ -1016,8 +1018,8 @@ export interface SkillInfo {
   name: string;
   description: string;
   argHint: string;
-  /** "builtin" = bundled catalog; "user" = uploaded via the Skills tab. */
-  source?: "builtin" | "user";
+  /** Built-in composer commands share the menu with harness/user skills. */
+  source?: "builtin" | "user" | "command";
 }
 
 export const getSkills = (projectId?: string) =>
@@ -1126,6 +1128,7 @@ export interface ChatPrompt {
   header?: string;
   options?: ChatQuestionOption[];
   multiSelect?: boolean;
+  planExit?: boolean;
   /** Answer echo, stamped on resolve: chosen labels (questions), whether the
    * card was approved (plan/permission), and any freeform note. Absent on
    * cards resolved without an answer (stale-card cleanup). */
@@ -1177,6 +1180,8 @@ export interface ChatSession {
   titleSource?: string | null;
   model: string | null;
   permissionMode: string | null;
+  /** Independent Plan axis for Codex/OpenCode. */
+  planMode: boolean;
   reasoningLevel: string | null;
   /** Hidden from the default Recents list, but fully intact and resumable. */
   archived: boolean;
@@ -1195,6 +1200,7 @@ export const listChatSessions = (projectId: string) =>
 export interface TurnOptions {
   model?: string | null;
   permissionMode?: string | null;
+  planMode?: boolean;
   reasoningLevel?: string | null;
 }
 
@@ -1224,10 +1230,22 @@ export const renameChatSession = (sessionId: string, title: string) =>
     (r) => r.session,
   );
 
+/** Enter/leave the session-specific Plan axis used by Codex/OpenCode. */
+export const setChatSessionPlanMode = (sessionId: string, planMode: boolean) =>
+  patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { planMode }).then(
+    (r) => r.session,
+  );
+
+export const setChatSessionPermissionMode = (sessionId: string, permissionMode: string) =>
+  patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { permissionMode }).then(
+    (r) => r.session,
+  );
+
 /** A message the user sent while a turn was running, parked to run next. */
 export interface QueuedMessage {
   id: string;
   text: string;
+  planMode?: boolean;
 }
 
 export const getChatMessages = (sessionId: string) =>
@@ -1269,6 +1287,7 @@ export const sendChatMessage = (
     text,
     model: opts.model,
     permissionMode: opts.permissionMode,
+    planMode: opts.planMode,
     reasoningLevel: opts.reasoningLevel,
     images,
     annotations,

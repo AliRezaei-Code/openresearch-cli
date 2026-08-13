@@ -44,7 +44,8 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::error::{anyhow, Result};
 use crate::local::harness::claude::{
-    claude_permission_mode, find_claude, write_mcp_config, write_plan_settings,
+    claude_permission_mode, find_claude, uses_permission_bridge, write_mcp_config,
+    write_plan_settings,
 };
 use crate::local::harness::{HarnessAuthState, PermissionMode};
 
@@ -376,13 +377,18 @@ async fn spawn_client(spec: &SpawnSpec, auth_generation: u64) -> Result<Arc<Clau
                 );
             }
         }
+    }
+    if uses_permission_bridge(spec.config.permission_mode) {
         // The gate token is minted HERE and ONLY here — once per child, riding
         // the mcp-gate bridge for the child's whole life. Re-minting mid-child
         // (e.g. per turn) would strand a live bridge: `request_permission`
         // equality-checks the token with no expiry (chat/mod.rs), so a fresh
         // token invalidates the resident bridge child's held requests.
         if let Some(port) = spec.chat.up_port() {
-            let token = spec.chat.mint_gate_token(&spec.session_id);
+            let token = spec.chat.mint_gate_token(
+                &spec.session_id,
+                spec.config.permission_mode == Some(PermissionMode::Plan),
+            );
             match write_mcp_config(&spec.repo, port, &spec.session_id, &token) {
                 Ok(path) => {
                     cmd.arg("--mcp-config").arg(path);

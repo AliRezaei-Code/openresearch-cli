@@ -1285,7 +1285,7 @@ export default function App() {
             </div>
           ) : rightTab === "experiments" ? (
             <div className={TAB_BODY_CLASS_NAME}>
-              <div className={`pane-toolbar flex items-center gap-2 flex-wrap pt-2.5 px-3 pb-0 shrink-0 bg-background [&.table-view]:pb-3${view === "table" ? " table-view" : ""}`}>
+              <div className="pane-toolbar flex shrink-0 flex-wrap items-center gap-2 bg-background px-3 pt-2.5 pb-2">
                 <span style={{ flex: 1 }} />
                 <div className="experiments-toolbar-controls inline-flex items-center gap-[5px]">
                   <div className="option-picker relative inline-flex" ref={scopeMenuRef}>

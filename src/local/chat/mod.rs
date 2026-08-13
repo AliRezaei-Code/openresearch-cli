@@ -791,6 +791,10 @@ pub struct WirePrompt {
     pub options: Vec<WireQuestionOption>,
     #[serde(default)]
     pub multi_select: bool,
+    /// OpenCode question emitted by its native `plan_exit` tool. The adapter
+    /// uses the tool call id to distinguish this from ordinary Yes/No prompts.
+    #[serde(default)]
+    pub plan_exit: bool,
     /// The harness-native id used to reply over a live protocol (opencode's
     /// permission/question request id, the Claude bridge's held request id).
     /// The backend resume path routes on it; the UI reads only its *presence*
@@ -1070,7 +1074,11 @@ pub fn session_json(s: &StoredChatSession, busy: bool) -> Value {
         // to tell one from a placeholder or a user rename.
         "titleSource": s.title_source,
         "model": s.model,
-        "permissionMode": s.permission_mode,
+        "permissionMode": crate::local::harness::effective_permission_id(
+            &s.harness,
+            s.permission_mode.as_deref(),
+        ),
+        "planMode": s.plan_mode,
         "reasoningLevel": s.reasoning_level,
         "archived": s.archived,
         "createdAt": s.created_at,
@@ -1084,7 +1092,7 @@ fn message_json(m: &WireMessage, session_id: &str) -> Value {
     json!({ "sessionId": session_id, "message": m })
 }
 
-fn stored_to_wire(m: &StoredChatMessage) -> WireMessage {
+pub(crate) fn stored_to_wire(m: &StoredChatMessage) -> WireMessage {
     let mut message = WireMessage {
         id: m.id.clone(),
         role: m.role.clone(),
@@ -1371,12 +1379,21 @@ pub struct ChatHost {
     /// Outstanding permission-bridge requests, keyed by the prompt part id the
     /// card was surfaced under. Sync mutex, never held across an await.
     pending_permissions: std::sync::Mutex<HashMap<String, PendingPermission>>,
-    /// Per-session bridge token, minted once per plan-mode child spawn (the
+    /// Claude can ask to run parallel tools in one model response. Review stays
+    /// sequential: each session holds this gate from card creation through the
+    /// user's answer, so later bridge requests cannot surface alongside it.
+    permission_review_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Per-session bridge token and immutable spawn-time Plan policy, minted
+    /// once per bridged child spawn (the
     /// resident bridge carries it for the child's whole life — re-minting
     /// mid-child would strand it). The rest of the localhost API is
     /// unauthenticated, but this endpoint *grants tool permissions*, so the
     /// bridge must echo the token its child was spawned with.
-    gate_tokens: std::sync::Mutex<HashMap<String, String>>,
+    gate_tokens: std::sync::Mutex<HashMap<String, GateToken>>,
+    /// Latest explicit Plan transition per session. The monotonic revision
+    /// lets a detached queue item defer to a newer Enter/Exit operation.
+    plan_changes: std::sync::Mutex<HashMap<String, (u64, bool)>>,
+    permission_changes: std::sync::Mutex<HashMap<String, (u64, String)>>,
     /// Sessions whose running turn surfaced a bridge card — checked (and
     /// cleared) by the synthesized-plan-card fallback so it never double-cards
     /// a turn the bridge already carded.
@@ -1395,8 +1412,14 @@ struct ActiveTurn {
     message_id: String,
 }
 
+struct GateToken {
+    value: String,
+    plan_mode: bool,
+}
+
 enum TurnState {
     Reserved,
+    Draining,
     Active(ActiveTurn),
     Cancelling,
 }
@@ -1422,6 +1445,12 @@ struct AnnotatedText {
 struct TranscriptDisplay {
     text: Option<String>,
     annotations: Option<Vec<TextAnnotation>>,
+}
+
+enum TurnAdmission {
+    QueueIfBusy,
+    RejectIfBusy,
+    Preclaimed(TurnGuard),
 }
 
 fn contextualize_messages(
@@ -1473,8 +1502,20 @@ impl Drop for SessionDeletionLease {
 }
 
 impl TurnGuard {
+    fn adopt(host: &Arc<ChatHost>, session_id: &str) -> Self {
+        Self {
+            host: host.clone(),
+            session_id: session_id.to_string(),
+            armed: true,
+        }
+    }
+
     /// `Some` if the slot was free and is now reserved; `None` if already busy.
-    async fn claim(host: &Arc<ChatHost>, session_id: &str) -> Option<Self> {
+    async fn claim(
+        host: &Arc<ChatHost>,
+        session_id: &str,
+        overrides: Option<&mut TurnOverrides>,
+    ) -> Option<Self> {
         if host.deleting_sessions.lock().unwrap().contains(session_id) {
             return None;
         }
@@ -1485,6 +1526,16 @@ impl TurnGuard {
             return None;
         }
         turns.insert(session_id.to_string(), TurnState::Reserved);
+        if let Some(overrides) = overrides {
+            let mut plan_changes = host.plan_changes.lock().unwrap();
+            let mut permission_changes = host.permission_changes.lock().unwrap();
+            stamp_turn_revisions(
+                overrides,
+                session_id,
+                &mut plan_changes,
+                &mut permission_changes,
+            );
+        }
         Some(Self {
             host: host.clone(),
             session_id: session_id.to_string(),
@@ -1566,7 +1617,10 @@ impl ChatHost {
             respond_locks: Mutex::new(HashMap::new()),
             msg_write: std::sync::Mutex::new(()),
             pending_permissions: std::sync::Mutex::new(HashMap::new()),
+            permission_review_locks: Mutex::new(HashMap::new()),
             gate_tokens: std::sync::Mutex::new(HashMap::new()),
+            plan_changes: std::sync::Mutex::new(HashMap::new()),
+            permission_changes: std::sync::Mutex::new(HashMap::new()),
             bridge_prompted: std::sync::Mutex::new(HashSet::new()),
             up_port: std::sync::OnceLock::new(),
             queued: std::sync::Mutex::new(HashMap::new()),
@@ -1585,7 +1639,7 @@ impl ChatHost {
         self.up_port.get().copied()
     }
 
-    /// Mint (and remember) the bridge token for a session's plan-mode child.
+    /// Mint the bridge token and capture that child's immutable Plan policy.
     /// One token per *child* now, minted at spawn (not per turn): the resident
     /// claude child — and its bridge — live across turns, so a live plan child
     /// keeps its token until a config-change/interrupt/crash respawn mints a new
@@ -1594,12 +1648,15 @@ impl ChatHost {
     /// re-minting while a plan child is live would strand its held bridge
     /// requests, since `request_permission` equality-checks the token with no
     /// expiry.
-    pub fn mint_gate_token(&self, session_id: &str) -> String {
+    pub fn mint_gate_token(&self, session_id: &str, plan_mode: bool) -> String {
         let token = uuid::Uuid::new_v4().to_string();
-        self.gate_tokens
-            .lock()
-            .unwrap()
-            .insert(session_id.to_string(), token.clone());
+        self.gate_tokens.lock().unwrap().insert(
+            session_id.to_string(),
+            GateToken {
+                value: token.clone(),
+                plan_mode,
+            },
+        );
         token
     }
 
@@ -1610,8 +1667,8 @@ impl ChatHost {
     }
 
     /// Bridge entry point (`POST /api/internal/permissions`): decide one
-    /// blocked tool call from a plan-mode turn. Auto-decides by policy where
-    /// the answer is unambiguous; otherwise surfaces a card and **blocks until
+    /// blocked tool call from a bridged Claude turn. Plan auto-decides where
+    /// the answer is unambiguous; otherwise this surfaces a card and **blocks until
     /// the user answers** (or the timeout denies) — the held HTTP response is
     /// what pauses the claude turn mid-flight.
     pub async fn request_permission(
@@ -1624,15 +1681,10 @@ impl ChatHost {
         // The endpoint grants tool permissions, so unlike the rest of the
         // localhost API it authenticates: the bridge must echo the token its
         // child was spawned with.
-        let token_ok = self
-            .gate_tokens
-            .lock()
-            .unwrap()
-            .get(session_id)
-            .is_some_and(|t| t == token);
-        if !token_ok {
-            return Err(anyhow!("unknown or stale gate token"));
-        }
+        let plan_mode = match self.gate_tokens.lock().unwrap().get(session_id) {
+            Some(gate) if gate.value == token => gate.plan_mode,
+            _ => return Err(anyhow!("unknown or stale gate token")),
+        };
         // A bridge child that outlived its turn has nothing left to approve.
         if !self.is_busy(session_id).await {
             return Ok(PermissionDecision::deny(
@@ -1640,9 +1692,36 @@ impl ChatHost {
             ));
         }
 
-        // Tier 1 — policy decides, no card.
-        if let Some(decision) = plan_auto_policy(tool_name, &tool_input) {
-            return Ok(decision);
+        // Tier 1 — Plan has a small automatic read/deny policy. Manual and
+        // Accept edits surface whatever Claude delegated to the bridge.
+        if plan_mode {
+            if let Some(decision) = plan_auto_policy(tool_name, &tool_input) {
+                return Ok(decision);
+            }
+        }
+
+        let review_lock = self
+            .permission_review_locks
+            .lock()
+            .await
+            .entry(session_id.to_string())
+            .or_default()
+            .clone();
+        let _review = review_lock.lock().await;
+
+        // This request may have waited behind another review. Revalidate the
+        // child and turn before exposing it: an interrupt or respawn while it
+        // was queued makes the old request stale.
+        let gate_is_current = self
+            .gate_tokens
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .is_some_and(|gate| gate.value == token);
+        if !gate_is_current || !self.is_busy(session_id).await {
+            return Ok(PermissionDecision::deny(
+                "the turn this approval belonged to has already ended",
+            ));
         }
 
         // Tier 2 — the user decides. ExitPlanMode becomes the plan card (the
@@ -1858,7 +1937,13 @@ impl ChatHost {
             .get(session_id)
             .map(|q| {
                 q.iter()
-                    .map(|m| json!({ "id": m.id, "text": queued_label(m) }))
+                    .map(|m| {
+                        json!({
+                            "id": m.id,
+                            "text": queued_label(m),
+                            "planMode": m.overrides.plan_mode,
+                        })
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -1918,15 +2003,84 @@ impl ChatHost {
         session_id: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            // Scope the guard: a std mutex must never be held across an await.
-            let items: Vec<QueuedMessage> = {
-                let mut map = self.queued.lock().unwrap();
-                match map.remove(session_id) {
-                    Some(q) => q.into(),
-                    None => return,
+            let turn_state = {
+                let mut turns = self.turns.lock().await;
+                match turns.get(session_id) {
+                    Some(TurnState::Draining) => {
+                        turns.insert(session_id.to_string(), TurnState::Reserved);
+                        Some(true)
+                    }
+                    Some(_) => None,
+                    None => Some(false),
                 }
             };
+            let mut guard = match turn_state {
+                Some(true) => TurnGuard::adopt(self, session_id),
+                None => return,
+                Some(false) => {
+                    let Some(guard) = TurnGuard::claim(self, session_id, None).await else {
+                        return;
+                    };
+                    guard
+                }
+            };
+            // Scope the guard: a std mutex must never be held across an await.
+            let batch: Option<(Vec<QueuedMessage>, TurnOverrides)> = {
+                let _plan_changes = self.plan_changes.lock().unwrap();
+                let _permission_changes = self.permission_changes.lock().unwrap();
+                let mut map = self.queued.lock().unwrap();
+                map.remove(session_id).map(|queue| {
+                    let items: Vec<QueuedMessage> = queue.into();
+                    let overrides =
+                        items
+                            .iter()
+                            .fold(TurnOverrides::default(), |mut merged, item| {
+                                merged.apply_explicit(&item.overrides);
+                                merged
+                            });
+                    (items, overrides)
+                })
+            };
+            let Some((items, overrides)) = batch else {
+                guard.release().await;
+                if self
+                    .queued
+                    .lock()
+                    .unwrap()
+                    .get(session_id)
+                    .is_some_and(|queue| !queue.is_empty())
+                {
+                    self.drain_queue(session_id).await;
+                }
+                return;
+            };
+            if let Some(plan_mode) = overrides.plan_mode {
+                if let Ok(store) = Store::open() {
+                    if let Ok(Some(current)) = store.get_chat_session(session_id) {
+                        let reset_pending = !plan_mode
+                            && current.harness == "codex"
+                            && (current.plan_mode || current.plan_reset_pending);
+                        if store
+                            .set_chat_session_plan_state(session_id, plan_mode, reset_pending)
+                            .is_ok()
+                        {
+                            self.emit_session(store.get_chat_session(session_id).ok().flatten())
+                                .await;
+                        }
+                    }
+                }
+            }
             if items.is_empty() {
+                guard.release().await;
+                if self
+                    .queued
+                    .lock()
+                    .unwrap()
+                    .get(session_id)
+                    .is_some_and(|queue| !queue.is_empty())
+                {
+                    self.drain_queue(session_id).await;
+                }
                 return;
             }
             self.emit_queued(session_id);
@@ -1954,11 +2108,7 @@ impl ChatHost {
                 .iter()
                 .flat_map(|m| m.images.iter().cloned())
                 .collect();
-            let overrides = items
-                .last()
-                .map(|m| m.overrides.clone())
-                .unwrap_or_default();
-            if let Err(err) = self
+            let send_result = self
                 .send_message_showing(
                     session_id,
                     messages,
@@ -1968,34 +2118,11 @@ impl ChatHost {
                     },
                     overrides,
                     images,
-                    false,
+                    TurnAdmission::Preclaimed(guard),
                 )
-                .await
-            {
-                while matches!(
-                    self.turns.lock().await.get(session_id),
-                    Some(TurnState::Reserved)
-                ) {
-                    tokio::task::yield_now().await;
-                }
-                // Re-park only for the genuine race: a fresh send claimed the
-                // slot in the gap after `finish_turn` freed it (session busy
-                // again), so restore the messages up front and let that turn
-                // drain them. Any other failure (a real setup error, or a session
-                // being deleted) has no turn to retry against — drop them rather
-                // than strand chips that re-fail on every future drain.
-                if self.is_busy(session_id).await {
-                    {
-                        let mut map = self.queued.lock().unwrap();
-                        let q = map.entry(session_id.to_string()).or_default();
-                        for item in items.into_iter().rev() {
-                            q.push_front(item);
-                        }
-                    }
-                    self.emit_queued(session_id);
-                } else {
-                    eprintln!("orx up: dropped queued messages after send failure: {err}");
-                }
+                .await;
+            if let Err(err) = send_result {
+                eprintln!("orx up: dropped queued messages after send failure: {err}");
             }
         })
     }
@@ -2025,7 +2152,7 @@ impl ChatHost {
             },
             overrides,
             images,
-            true,
+            TurnAdmission::QueueIfBusy,
         )
         .await
     }
@@ -2038,9 +2165,9 @@ impl ChatHost {
         session_id: &str,
         messages: Vec<AnnotatedText>,
         transcript: TranscriptDisplay,
-        overrides: TurnOverrides,
+        mut overrides: TurnOverrides,
         images: Vec<ImageAttachment>,
-        queue_if_busy: bool,
+        admission: TurnAdmission,
     ) -> Result<()> {
         let TranscriptDisplay {
             text: transcript_text,
@@ -2063,62 +2190,106 @@ impl ChatHost {
                 .cloned()
                 .collect()
         });
-        // Atomically claim the session's turn slot: the busy-check and the
-        // reservation happen under one lock so two concurrent sends (or a
-        // send racing a /respond resume) can't both spawn a turn against the
-        // same session. `_guard` releases the reservation on any early error.
-        let mut guard = match TurnGuard::claim(self, session_id).await {
-            Some(guard) => guard,
-            // Busy: park a genuine user send (Claude-desktop steering) so it
-            // runs when the turn ends, instead of rejecting it. System/resume
-            // sends pass `queue_if_busy = false` and keep the old rejection.
-            None if queue_if_busy
-                && !(text.trim().is_empty() && images.is_empty() && !has_annotations) =>
-            {
-                let message = messages
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| anyhow!("message content is required"))?;
-                let AnnotatedText { text, annotations } = message;
-                let idle = {
-                    let turns = self.turns.lock().await;
-                    if matches!(turns.get(session_id), Some(TurnState::Cancelling)) {
-                        return Err(anyhow!("session is stopping — send again once it is idle"));
-                    }
-                    self.queued
-                        .lock()
-                        .unwrap()
-                        .entry(session_id.to_string())
-                        .or_default()
-                        .push_back(QueuedMessage {
-                            id: format!("q_{}", uuid::Uuid::new_v4()),
-                            text,
-                            transcript_text,
-                            overrides,
-                            images,
-                            annotations,
-                        });
-                    !turns.contains_key(session_id)
-                };
-                self.emit_queued(session_id);
-                if idle {
-                    self.drain_queue(session_id).await;
-                }
-                return Ok(());
-            }
-            None => return Err(anyhow!("session is busy — interrupt it first")),
-        };
         let store = Store::open()?;
         let mut session = store
             .get_chat_session(session_id)?
             .ok_or_else(|| anyhow!("chat session not found"))?;
-        let has_messages = store.has_chat_messages(session_id)?;
-        let starts_session = is_initial_chat_message(transcript_text.as_deref(), has_messages)
-            || (has_annotations && !has_messages);
-        let project = store
-            .get_local_project(&session.project_id)?
-            .ok_or_else(|| anyhow!("project not found"))?;
-
+        if let Some(mode) = overrides
+            .permission_mode
+            .as_deref()
+            .filter(|m| !m.is_empty())
+        {
+            if crate::local::harness::permission_mode_for(&session.harness, mode).is_none() {
+                return Err(anyhow!("invalid permission mode for selected harness"));
+            }
+        }
+        if overrides.plan_mode.is_some()
+            && !crate::local::harness::supports_command_plan(&session.harness)
+        {
+            return Err(anyhow!("this harness activates Plan through permissions"));
+        }
+        // Atomically claim the session's turn slot: the busy-check and the
+        // reservation happen under one lock so two concurrent sends (or a
+        // send racing a /respond resume) can't both spawn a turn against the
+        // same session. `_guard` releases the reservation on any early error.
+        let mut guard = match admission {
+            TurnAdmission::Preclaimed(guard) => guard,
+            admission => {
+                let queue_if_busy = matches!(admission, TurnAdmission::QueueIfBusy);
+                match TurnGuard::claim(self, session_id, Some(&mut overrides)).await {
+                    Some(guard) => guard,
+                    // Busy: park a genuine user send (Claude-desktop steering) so it
+                    // runs when the turn ends, instead of rejecting it. System/resume
+                    // sends pass `queue_if_busy = false` and keep the old rejection.
+                    None if queue_if_busy
+                        && !(text.trim().is_empty() && images.is_empty() && !has_annotations) =>
+                    {
+                        let message = messages
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| anyhow!("message content is required"))?;
+                        let AnnotatedText { text, annotations } = message;
+                        let idle = {
+                            let turns = self.turns.lock().await;
+                            if matches!(turns.get(session_id), Some(TurnState::Cancelling)) {
+                                return Err(anyhow!(
+                                    "session is stopping — send again once it is idle"
+                                ));
+                            }
+                            let mut plan_changes = self.plan_changes.lock().unwrap();
+                            let mut permission_changes = self.permission_changes.lock().unwrap();
+                            let mut queued = self.queued.lock().unwrap();
+                            stamp_turn_revisions(
+                                &mut overrides,
+                                session_id,
+                                &mut plan_changes,
+                                &mut permission_changes,
+                            );
+                            if let Some(plan_mode) = overrides.plan_mode {
+                                let current = store
+                                    .get_chat_session(session_id)?
+                                    .ok_or_else(|| anyhow!("chat session not found"))?;
+                                let reset_pending = !plan_mode
+                                    && current.harness == "codex"
+                                    && (current.plan_mode || current.plan_reset_pending);
+                                store.set_chat_session_plan_state(
+                                    session_id,
+                                    plan_mode,
+                                    reset_pending,
+                                )?;
+                                overrides.plan_mode = None;
+                                overrides.plan_revision = None;
+                            }
+                            if let Some(permission_mode) = overrides.permission_mode.take() {
+                                store.set_chat_session_permission_mode(
+                                    session_id,
+                                    &permission_mode,
+                                )?;
+                                overrides.permission_revision = None;
+                            }
+                            queued.entry(session_id.to_string()).or_default().push_back(
+                                QueuedMessage {
+                                    id: format!("q_{}", uuid::Uuid::new_v4()),
+                                    text,
+                                    transcript_text,
+                                    overrides,
+                                    images,
+                                    annotations,
+                                },
+                            );
+                            !turns.contains_key(session_id)
+                        };
+                        self.emit_queued(session_id);
+                        self.emit_session(store.get_chat_session(session_id)?).await;
+                        if idle {
+                            self.drain_queue(session_id).await;
+                        }
+                        return Ok(());
+                    }
+                    None => return Err(anyhow!("session is busy — interrupt it first")),
+                }
+            }
+        };
         // Composer selections are sticky: an override that differs from the
         // stored value is persisted so the next turn (and a reload) keep it.
         if let Some(model) = overrides.model.filter(|m| !m.is_empty()) {
@@ -2127,23 +2298,63 @@ impl ChatHost {
                 session.model = Some(model);
             }
         }
-        // Read the session's mode BEFORE the composer override rewrites it: the
-        // codex harness needs to know whether the *previous* turn ran under Plan
-        // (the thread may be sticky-planned) to decide whether this turn must
-        // attach a `default` collaborationMode mask to un-stick it. Captured
-        // here because the override below is the last moment the pre-turn value
-        // is visible. Persists across restarts (it's the DB row), so a resume
-        // after `orx up` bounced still un-sticks.
-        let prev_permission_mode = session
-            .permission_mode
-            .as_deref()
-            .and_then(crate::local::harness::PermissionMode::from_id);
-        if let Some(mode) = overrides.permission_mode.filter(|m| !m.is_empty()) {
-            if session.permission_mode.as_deref() != Some(mode.as_str()) {
+        if let Some(requested_mode) = overrides.permission_mode.filter(|m| !m.is_empty()) {
+            let mut changes = self.permission_changes.lock().unwrap();
+            let current = store
+                .get_chat_session(session_id)?
+                .ok_or_else(|| anyhow!("chat session not found"))?;
+            let (revision, mode) = resolve_permission_change(
+                &changes,
+                session_id,
+                requested_mode,
+                overrides.permission_revision,
+            );
+            if current.permission_mode.as_deref() != Some(mode.as_str()) {
                 store.set_chat_session_permission_mode(&session.id, &mode)?;
-                session.permission_mode = Some(mode);
             }
+            session.permission_mode = Some(mode.clone());
+            changes.insert(session_id.to_string(), (revision, mode));
         }
+        // Normalize an unknown legacy value to the provider's current default.
+        // Incoming values were rejected above; this branch is only stored data
+        // from an older build or a manually edited database.
+        let effective_permission = crate::local::harness::effective_permission_id(
+            &session.harness,
+            session.permission_mode.as_deref(),
+        );
+        if session.permission_mode != effective_permission {
+            if let Some(mode) = effective_permission.as_deref() {
+                store.set_chat_session_permission_mode(&session.id, mode)?;
+            }
+            session.permission_mode = effective_permission;
+        }
+        if let Some(requested_plan_mode) = overrides.plan_mode {
+            let mut changes = self.plan_changes.lock().unwrap();
+            let current = store
+                .get_chat_session(session_id)?
+                .ok_or_else(|| anyhow!("chat session not found"))?;
+            let (revision, plan_mode) = resolve_plan_change(
+                &changes,
+                session_id,
+                requested_plan_mode,
+                overrides.plan_revision,
+            );
+            let reset_pending = !plan_mode
+                && current.harness == "codex"
+                && (current.plan_mode || current.plan_reset_pending);
+            if current.plan_mode != plan_mode || current.plan_reset_pending != reset_pending {
+                store.set_chat_session_plan_state(&session.id, plan_mode, reset_pending)?;
+            }
+            session.plan_mode = plan_mode;
+            session.plan_reset_pending = reset_pending;
+            changes.insert(session_id.to_string(), (revision, plan_mode));
+        }
+        let has_messages = store.has_chat_messages(session_id)?;
+        let starts_session = is_initial_chat_message(transcript_text.as_deref(), has_messages)
+            || (has_annotations && !has_messages);
+        let project = store
+            .get_local_project(&session.project_id)?
+            .ok_or_else(|| anyhow!("project not found"))?;
         if let Some(level) = overrides.reasoning_level.filter(|l| !l.is_empty()) {
             if session.reasoning_level.as_deref() != Some(level.as_str()) {
                 store.set_chat_session_reasoning_level(&session.id, &level)?;
@@ -2276,11 +2487,11 @@ impl ChatHost {
             harness: session.harness.clone(),
             native_session_id: session.native_session_id.clone(),
             model: session.model.clone(),
-            permission_mode: session
-                .permission_mode
-                .as_deref()
-                .and_then(crate::local::harness::PermissionMode::from_id),
-            prev_permission_mode,
+            permission_mode: session.permission_mode.as_deref().and_then(|mode| {
+                crate::local::harness::permission_mode_for(&session.harness, mode)
+            }),
+            plan_mode: session.plan_mode,
+            plan_reset_pending: session.plan_reset_pending,
             reasoning_level: session.reasoning_level.clone(),
             project,
             text: turn_text,
@@ -2366,7 +2577,7 @@ impl ChatHost {
 
     /// Turn cleanup: drop the handle, bump the session, broadcast idle.
     async fn finish_turn(&self, session_id: &str, message_id: Option<&str>) {
-        let should_finish = {
+        let (should_finish, reserved_queue) = {
             let mut turns = self.turns.lock().await;
             let matches = match (turns.get(session_id), message_id) {
                 (Some(TurnState::Active(active)), Some(message_id)) => {
@@ -2376,10 +2587,21 @@ impl ChatHost {
                 _ => false,
             };
             if matches {
-                turns.remove(session_id);
-                true
+                let reserved_queue = message_id.is_some()
+                    && self
+                        .queued
+                        .lock()
+                        .unwrap()
+                        .get(session_id)
+                        .is_some_and(|queue| !queue.is_empty());
+                if reserved_queue {
+                    turns.insert(session_id.to_string(), TurnState::Draining);
+                } else {
+                    turns.remove(session_id);
+                }
+                (true, reserved_queue)
             } else {
-                false
+                (false, false)
             }
         };
         if !should_finish {
@@ -2399,7 +2621,7 @@ impl ChatHost {
         }
         self.emit(
             "chat.busy",
-            json!({ "sessionId": session_id, "busy": false }),
+            json!({ "sessionId": session_id, "busy": reserved_queue }),
         );
     }
 
@@ -2419,7 +2641,7 @@ impl ChatHost {
             };
             match std::mem::replace(state, TurnState::Cancelling) {
                 TurnState::Active(active) => Some(active),
-                TurnState::Reserved => None,
+                TurnState::Reserved | TurnState::Draining => None,
                 TurnState::Cancelling => return Ok(false),
             }
         };
@@ -2439,20 +2661,33 @@ impl ChatHost {
                                 let _ = host.http.post(url).body("{}").send().await;
                             }
                         } else if session.harness == "codex" {
-                            host.codex.interrupt_session(&session_id).await;
+                            return host.codex.interrupt_session(&session_id).await;
                         } else if session.harness == "claude-code" {
                             host.claude.kill_session(&session_id).await;
                         }
                     }
                 }
+                None
             };
-            let _ = tokio::time::timeout(Duration::from_secs(10), native_shutdown).await;
+            let interrupted_items = tokio::time::timeout(Duration::from_secs(10), native_shutdown)
+                .await
+                .ok()
+                .flatten();
             if let Some(active) = active.as_ref() {
                 active.handle.abort();
             }
             if let Some(active) = active {
                 let _ = active.handle.await;
-                if let Some(message) = reconcile_target_file(&session_id, &active.message_id) {
+                let mut message = reconcile_target_file(&session_id, &active.message_id);
+                if let Some(items) = interrupted_items.as_deref() {
+                    message = crate::local::harness::codex::reconcile_interrupted_items(
+                        &session_id,
+                        &active.message_id,
+                        items,
+                    )
+                    .or(message);
+                }
+                if let Some(message) = message {
                     host.emit("chat.message", message_json(&message, &session_id));
                 }
                 let _ = std::fs::remove_file(target_event_path(&session_id, &active.message_id));
@@ -2547,6 +2782,17 @@ impl ChatHost {
         let Some(prompt) = unresolved_prompt(&req.session_id, &req.prompt_id)? else {
             return Ok(());
         };
+        if prompt.kind == "permission"
+            && first_unresolved_permission_id(&req.session_id)?.as_deref()
+                != Some(req.prompt_id.as_str())
+        {
+            return Err(anyhow!("another approval must be answered before this one"));
+        }
+        if let Some(mode) = req.resume_mode.as_deref() {
+            if crate::local::harness::permission_mode_for(&session.harness, mode).is_none() {
+                return Err(anyhow!("invalid resume mode for selected harness"));
+            }
+        }
         let harness = crate::local::harness::chat_harness(&session.harness)
             .ok_or_else(|| anyhow!("unknown harness: {}", session.harness))?;
 
@@ -2576,7 +2822,11 @@ impl ChatHost {
         // retryable: nothing has been mutated, the card is still actionable.
         // (The resolve itself is best-effort — see `resolve_prompt_card`.)
         match action {
-            ResumeAction::SendMessage { text, mode } => {
+            ResumeAction::SendMessage {
+                text,
+                mode,
+                plan_mode,
+            } => {
                 // A native (mid-turn) card may resume while its turn is still
                 // running — plan approval under the permission bridge replaces
                 // the paused plan turn with the implementation turn, so
@@ -2589,7 +2839,12 @@ impl ChatHost {
                 }
                 let overrides = TurnOverrides {
                     model: None,
-                    permission_mode: mode.map(|m| m.id().to_string()),
+                    permission_mode: mode.and_then(|mode| {
+                        crate::local::harness::permission_id_for_mode(&session.harness, mode)
+                    }),
+                    permission_revision: None,
+                    plan_mode,
+                    plan_revision: None,
                     reasoning_level: None,
                 };
                 // Plan/permission resumes are scaffolding the user never typed
@@ -2621,7 +2876,7 @@ impl ChatHost {
                     },
                     overrides,
                     Vec::new(),
-                    false,
+                    TurnAdmission::RejectIfBusy,
                 )
                 .await?;
                 let mut prompt_echo = req;
@@ -2629,9 +2884,12 @@ impl ChatHost {
                 self.resolve_prompt_card(&prompt_echo);
                 Ok(())
             }
-            ResumeAction::Handled => {
+            ResumeAction::Handled { plan_mode } => {
                 // The inline reply unblocked the still-running turn; it keeps
                 // streaming and will `finish_turn` itself. Leave `busy` alone.
+                if let Some(plan_mode) = plan_mode {
+                    self.set_plan_mode(&req.session_id, plan_mode).await?;
+                }
                 self.resolve_prompt_card(&req);
                 Ok(())
             }
@@ -2714,6 +2972,77 @@ impl ChatHost {
     ) -> Result<Option<StoredChatSession>> {
         let store = Store::open()?;
         store.set_chat_session_archived(session_id, archived)?;
+        Ok(self.emit_session(store.get_chat_session(session_id)?).await)
+    }
+
+    /// Enter or leave the independent Plan axis used by Codex/OpenCode.
+    /// Leaving Codex Plan arms a durable one-turn reset for its sticky native
+    /// collaboration mode; entering Plan clears any obsolete reset.
+    pub async fn set_plan_mode(
+        &self,
+        session_id: &str,
+        plan_mode: bool,
+    ) -> Result<Option<StoredChatSession>> {
+        let store = Store::open()?;
+        let Some(session) = store.get_chat_session(session_id)? else {
+            return Ok(None);
+        };
+        if !crate::local::harness::supports_command_plan(&session.harness) {
+            return Err(anyhow!("this harness activates Plan through permissions"));
+        }
+        {
+            let mut changes = self.plan_changes.lock().unwrap();
+            let session = store
+                .get_chat_session(session_id)?
+                .ok_or_else(|| anyhow!("chat session not found"))?;
+            let revision = changes
+                .get(session_id)
+                .map_or(1, |(revision, _)| revision + 1);
+            let reset_pending = !plan_mode
+                && session.harness == "codex"
+                && (session.plan_mode || session.plan_reset_pending);
+            store.set_chat_session_plan_state(session_id, plan_mode, reset_pending)?;
+            changes.insert(session_id.to_string(), (revision, plan_mode));
+            if let Some(items) = self.queued.lock().unwrap().get_mut(session_id) {
+                for item in items {
+                    if item
+                        .overrides
+                        .plan_revision
+                        .is_some_and(|queued_revision| queued_revision < revision)
+                    {
+                        item.overrides.plan_mode = None;
+                        item.overrides.plan_revision = None;
+                    }
+                }
+            }
+        }
+        self.emit_queued(session_id);
+        Ok(self.emit_session(store.get_chat_session(session_id)?).await)
+    }
+
+    pub async fn set_permission_mode(
+        &self,
+        session_id: &str,
+        permission_mode: &str,
+    ) -> Result<Option<StoredChatSession>> {
+        let store = Store::open()?;
+        let Some(session) = store.get_chat_session(session_id)? else {
+            return Ok(None);
+        };
+        if crate::local::harness::permission_mode_for(&session.harness, permission_mode).is_none() {
+            return Err(anyhow!("invalid permission mode for selected harness"));
+        }
+        {
+            let mut changes = self.permission_changes.lock().unwrap();
+            let revision = changes
+                .get(session_id)
+                .map_or(1, |(revision, _)| revision + 1);
+            store.set_chat_session_permission_mode(session_id, permission_mode)?;
+            changes.insert(
+                session_id.to_string(),
+                (revision, permission_mode.to_string()),
+            );
+        }
         Ok(self.emit_session(store.get_chat_session(session_id)?).await)
     }
 
@@ -2808,9 +3137,9 @@ pub struct PromptAnswer {
     /// Approve (proceed) vs reject (dismiss). For questions, always true.
     #[serde(default = "default_true")]
     pub approve: bool,
-    /// For plan/permission approval: the permission mode to resume under
-    /// (a harness-agnostic wire id, e.g. `"auto"`, `"accept-edits"`). None keeps
-    /// the session's mode. Only meaningful for end-turn resume (Claude); inline
+    /// For plan/permission approval: a provider-owned permission id to resume
+    /// under. It is validated against the session harness. None keeps the
+    /// session's mode. Only meaningful for end-turn resume (Claude); inline
     /// harnesses reply over their live protocol and ignore it.
     #[serde(default)]
     pub resume_mode: Option<String>,
@@ -2911,6 +3240,36 @@ fn unresolved_prompt(session_id: &str, prompt_id: &str) -> Result<Option<WirePro
     Ok(None)
 }
 
+fn first_unresolved_permission_in_parts(parts: &[WirePart]) -> Option<String> {
+    for part in parts {
+        if part
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.kind == "permission" && !prompt.resolved)
+        {
+            return Some(part.id.clone());
+        }
+        if let Some(id) = first_unresolved_permission_in_parts(&part.children) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn first_unresolved_permission_id(session_id: &str) -> Result<Option<String>> {
+    let store = Store::open()?;
+    for msg in store.list_chat_messages(session_id)? {
+        if msg.role != "assistant" {
+            continue;
+        }
+        let parts: Vec<WirePart> = serde_json::from_str(&msg.parts_json).unwrap_or_default();
+        if let Some(id) = first_unresolved_permission_in_parts(&parts) {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
 /// Flip a prompt to resolved and stamp the answer echo (see
 /// [`WirePrompt::answers`]) so the collapsed card can show the outcome.
 /// `None` (stale-card cleanup, cancelled bridge requests) leaves any earlier
@@ -2980,12 +3339,10 @@ fn mark_prompt_resolved(
 
 /// Resolve still-unresolved prompt cards of a session, store-side.
 ///
-/// For inline-approval harnesses whose prompts die with their turn (codex: a
-/// JSON-RPC request the process has since abandoned), a leftover unresolved
-/// card is a zombie — unanswerable, and worse, its reply id can collide with a
-/// fresh child's restarting request ids, so a click on the dead card could be
-/// delivered to a *different, live* request. Called at codex turn entry
-/// (`native_only: false`) to close both.
+/// For inline-approval harnesses whose prompts die with their turn (Codex and
+/// OpenCode), a leftover unresolved card is a zombie — unanswerable, and worse,
+/// its reply id can collide with a fresh request, so a click on the dead card
+/// could be delivered to a *different, live* request.
 ///
 /// End-turn harnesses (Claude) sweep with `native_only: true`: their
 /// UN-held cards deliberately outlive turns and resume via a new message, but
@@ -3008,15 +3365,7 @@ fn resolve_stale_prompts(
             continue;
         }
         let mut parts: Vec<WirePart> = serde_json::from_str(&msg.parts_json).unwrap_or_default();
-        let mut changed = false;
-        for part in parts.iter_mut() {
-            if let Some(prompt) = part.prompt.as_mut() {
-                if !prompt.resolved && (!native_only || prompt.native_id.is_some()) {
-                    stamp_resolved(prompt, None);
-                    changed = true;
-                }
-            }
-        }
+        let changed = resolve_stale_prompts_in_parts(&mut parts, native_only);
         if changed {
             store.upsert_chat_message(&StoredChatMessage {
                 id: msg.id.clone(),
@@ -3034,6 +3383,20 @@ fn resolve_stale_prompts(
         }
     }
     Ok(updated)
+}
+
+fn resolve_stale_prompts_in_parts(parts: &mut [WirePart], native_only: bool) -> bool {
+    let mut changed = false;
+    for part in parts {
+        if let Some(prompt) = part.prompt.as_mut() {
+            if !prompt.resolved && (!native_only || prompt.native_id.is_some()) {
+                stamp_resolved(prompt, None);
+                changed = true;
+            }
+        }
+        changed |= resolve_stale_prompts_in_parts(&mut part.children, native_only);
+    }
+    changed
 }
 
 impl ChatHost {
@@ -3054,7 +3417,87 @@ impl ChatHost {
 pub struct TurnOverrides {
     pub model: Option<String>,
     pub permission_mode: Option<String>,
+    pub(crate) permission_revision: Option<u64>,
+    pub plan_mode: Option<bool>,
+    pub(crate) plan_revision: Option<u64>,
     pub reasoning_level: Option<String>,
+}
+
+impl TurnOverrides {
+    fn apply_explicit(&mut self, next: &Self) {
+        if next.model.is_some() {
+            self.model.clone_from(&next.model);
+        }
+        if next.permission_mode.is_some() {
+            self.permission_mode.clone_from(&next.permission_mode);
+            self.permission_revision = next.permission_revision;
+        }
+        if next.plan_mode.is_some() {
+            self.plan_mode = next.plan_mode;
+            self.plan_revision = next.plan_revision;
+        }
+        if next.reasoning_level.is_some() {
+            self.reasoning_level.clone_from(&next.reasoning_level);
+        }
+    }
+}
+
+fn stamp_turn_revisions(
+    overrides: &mut TurnOverrides,
+    session_id: &str,
+    plan_changes: &mut HashMap<String, (u64, bool)>,
+    permission_changes: &mut HashMap<String, (u64, String)>,
+) {
+    if overrides.plan_revision.is_none() {
+        if let Some(plan_mode) = overrides.plan_mode {
+            let revision = plan_changes
+                .get(session_id)
+                .map_or(1, |(revision, _)| revision + 1);
+            plan_changes.insert(session_id.to_string(), (revision, plan_mode));
+            overrides.plan_revision = Some(revision);
+        }
+    }
+    if overrides.permission_revision.is_none() {
+        if let Some(permission_mode) = overrides.permission_mode.as_ref() {
+            let revision = permission_changes
+                .get(session_id)
+                .map_or(1, |(revision, _)| revision + 1);
+            permission_changes.insert(session_id.to_string(), (revision, permission_mode.clone()));
+            overrides.permission_revision = Some(revision);
+        }
+    }
+}
+
+fn resolve_plan_change(
+    changes: &HashMap<String, (u64, bool)>,
+    session_id: &str,
+    requested: bool,
+    revision: Option<u64>,
+) -> (u64, bool) {
+    match (revision, changes.get(session_id).copied()) {
+        (Some(revision), Some((latest, mode))) if latest > revision => (latest, mode),
+        (Some(revision), _) => (revision, requested),
+        (None, latest) => {
+            let revision = latest.map_or(1, |(revision, _)| revision + 1);
+            (revision, requested)
+        }
+    }
+}
+
+fn resolve_permission_change(
+    changes: &HashMap<String, (u64, String)>,
+    session_id: &str,
+    requested: String,
+    revision: Option<u64>,
+) -> (u64, String) {
+    match (revision, changes.get(session_id)) {
+        (Some(revision), Some((latest, mode))) if *latest > revision => (*latest, mode.clone()),
+        (Some(revision), _) => (revision, requested),
+        (None, latest) => {
+            let revision = latest.map_or(1, |(revision, _)| revision + 1);
+            (revision, requested)
+        }
+    }
 }
 
 pub struct TurnCtx {
@@ -3066,13 +3509,11 @@ pub struct TurnCtx {
     /// Effective permission mode for this turn (session value; harness applies
     /// its own default when `None`).
     pub permission_mode: Option<crate::local::harness::PermissionMode>,
-    /// The permission mode the session carried *before* this turn's composer
-    /// override — read pre-override in `send_message`. The codex harness uses it
-    /// to tell "this thread may be sticky-planned" (previous turn was Plan, so a
-    /// non-plan turn must attach a `default` collaborationMode mask to un-stick
-    /// it) from a thread that never entered Plan (attach nothing — a mask always
-    /// injects a template). `None` on the very first turn of a session.
-    pub prev_permission_mode: Option<crate::local::harness::PermissionMode>,
+    /// Independent Plan state for Codex/OpenCode.
+    pub plan_mode: bool,
+    /// Codex must attach one native `default` collaboration-mode mask after
+    /// Plan is left, even if ORX restarted before the next turn.
+    pub plan_reset_pending: bool,
     /// Effective reasoning-level wire id for this turn (harness-owned vocabulary;
     /// the harness interprets it, e.g. Claude → `--effort`). Default when `None`.
     pub reasoning_level: Option<String>,
@@ -3112,7 +3553,8 @@ impl TurnCtx {
             native_session_id: None,
             model: None,
             permission_mode: None,
-            prev_permission_mode: None,
+            plan_mode: false,
+            plan_reset_pending: false,
             reasoning_level: None,
             project: crate::local::model::LocalProject {
                 id: "test-project".into(),
@@ -4246,6 +4688,88 @@ mod cap_tests {
 mod bridge_tests {
     use super::*;
 
+    fn test_host() -> ChatHost {
+        ChatHost::new(
+            Arc::new(crate::local::opencode::AgentHost::new(None)),
+            Arc::new(crate::local::codex::CodexHost::new()),
+            Arc::new(crate::local::claude::ClaudeHost::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn claude_permission_reviews_are_serialized_per_session() {
+        let host = test_host();
+        let lock = host
+            .permission_review_locks
+            .lock()
+            .await
+            .entry("session".into())
+            .or_default()
+            .clone();
+        let active = lock.lock().await;
+        assert!(lock.try_lock().is_err());
+        drop(active);
+        assert!(lock.try_lock().is_ok());
+    }
+
+    #[test]
+    fn shared_permission_order_only_activates_the_oldest_unresolved_card() {
+        let permission = |id: &str, resolved| {
+            WirePart::prompt(
+                id,
+                WirePrompt {
+                    kind: "permission".into(),
+                    resolved,
+                    ..Default::default()
+                },
+            )
+        };
+        let parts = vec![
+            WirePart::prompt(
+                "plan",
+                WirePrompt {
+                    kind: "plan".into(),
+                    ..Default::default()
+                },
+            ),
+            permission("first", false),
+            permission("second", false),
+        ];
+        assert_eq!(
+            first_unresolved_permission_in_parts(&parts).as_deref(),
+            Some("first")
+        );
+
+        let parts = vec![permission("first", true), permission("second", false)];
+        assert_eq!(
+            first_unresolved_permission_in_parts(&parts).as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn stale_native_prompt_sweep_reaches_nested_cards() {
+        let mut parts = vec![WirePart {
+            id: "tool".into(),
+            kind: "tool".into(),
+            text: None,
+            tool: Some("Task".into()),
+            state: None,
+            prompt: None,
+            children: vec![WirePart::prompt(
+                "permission",
+                WirePrompt {
+                    kind: "permission".into(),
+                    native_id: Some("request-1".into()),
+                    ..Default::default()
+                },
+            )],
+        }];
+
+        assert!(resolve_stale_prompts_in_parts(&mut parts, true));
+        assert!(parts[0].children[0].prompt.as_ref().unwrap().resolved);
+    }
+
     /// The decision wire shapes are Claude Code's permission-prompt-tool
     /// contract verbatim — the bridge stringifies them unchanged, so a drift
     /// here breaks every approval.
@@ -4270,6 +4794,16 @@ mod bridge_tests {
             serde_json::to_value(&deny).unwrap(),
             json!({"behavior": "deny", "message": "no"})
         );
+    }
+
+    #[test]
+    fn gate_token_captures_the_childs_plan_policy() {
+        let host = test_host();
+        let token = host.mint_gate_token("session", true);
+        let gates = host.gate_tokens.lock().unwrap();
+        let gate = gates.get("session").unwrap();
+        assert_eq!(gate.value, token);
+        assert!(gate.plan_mode);
     }
 
     #[test]
@@ -4398,6 +4932,8 @@ mod bridge_tests {
             title_source: None,
             model: Some("claude-haiku-4-5".into()),
             permission_mode: None,
+            plan_mode: false,
+            plan_reset_pending: false,
             reasoning_level: None,
             archived: false,
             context_usage_json: None,
@@ -4434,6 +4970,71 @@ mod bridge_tests {
     }
 
     #[test]
+    fn session_json_exposes_plan_and_normalizes_invalid_permissions() {
+        let mut session = bare_session();
+        session.harness = "codex".into();
+        session.permission_mode = Some("plan".into());
+        session.plan_mode = true;
+        let value = session_json(&session, false);
+        assert_eq!(value["permissionMode"], "approve-for-me");
+        assert_eq!(value["planMode"], true);
+    }
+
+    #[test]
+    fn queued_overrides_keep_the_last_explicit_value_on_each_axis() {
+        let first = TurnOverrides {
+            model: Some("first-model".into()),
+            permission_mode: Some("ask".into()),
+            permission_revision: Some(1),
+            plan_mode: Some(true),
+            plan_revision: Some(1),
+            reasoning_level: Some("high".into()),
+        };
+        let second = TurnOverrides {
+            model: Some("second-model".into()),
+            permission_mode: None,
+            permission_revision: None,
+            plan_mode: None,
+            plan_revision: None,
+            reasoning_level: Some("low".into()),
+        };
+        let mut merged = TurnOverrides::default();
+        merged.apply_explicit(&first);
+        merged.apply_explicit(&second);
+
+        assert_eq!(merged.model.as_deref(), Some("second-model"));
+        assert_eq!(merged.permission_mode.as_deref(), Some("ask"));
+        assert_eq!(merged.plan_mode, Some(true));
+        assert_eq!(merged.reasoning_level.as_deref(), Some("low"));
+
+        let leave_plan = TurnOverrides {
+            plan_mode: Some(false),
+            ..Default::default()
+        };
+        merged.apply_explicit(&leave_plan);
+        assert_eq!(merged.plan_mode, Some(false));
+    }
+
+    #[test]
+    fn detached_queue_plan_change_defers_to_a_newer_revision() {
+        let changes = HashMap::from([("session".to_string(), (2, false))]);
+        assert_eq!(
+            resolve_plan_change(&changes, "session", true, Some(1)),
+            (2, false)
+        );
+        assert_eq!(changes["session"], (2, false));
+    }
+
+    #[test]
+    fn detached_queue_permission_defers_to_a_newer_selection() {
+        let changes = HashMap::from([("session".to_string(), (2, "plan".to_string()))]);
+        assert_eq!(
+            resolve_permission_change(&changes, "session", "auto".into(), Some(1)),
+            (2, "plan".to_string())
+        );
+    }
+
+    #[test]
     fn context_usage_serde_camel_cases_and_skips_none() {
         let usage = ContextUsage {
             used_tokens: 100,
@@ -4463,6 +5064,8 @@ mod notify_target_tests {
                 title_source: None,
                 model: None,
                 permission_mode: None,
+                plan_mode: false,
+                plan_reset_pending: false,
                 reasoning_level: None,
                 archived: false,
                 context_usage_json: None,
