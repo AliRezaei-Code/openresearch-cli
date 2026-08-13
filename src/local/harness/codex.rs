@@ -40,7 +40,10 @@ use super::detect::{
     bin_version, find_on_path, jwt_payload, nonempty_str, parse_version, read_json,
     resolve_symlinks, title_case, HarnessInfo, ModelInfo,
 };
-use super::options::{resolve_reasoning, HarnessOptions, PermissionMode, REASONING_DEFAULT_ID};
+use super::options::{
+    resolve_reasoning, HarnessOptions, OptionChoice, PermissionMode, PlanActivation,
+    REASONING_DEFAULT_ID,
+};
 use super::{should_synthesize_plan, synthesize_resume, Harness, ResumeAction, TURN_WATCHDOG};
 use crate::error::{anyhow, Result};
 use crate::local::chat::{
@@ -49,6 +52,7 @@ use crate::local::chat::{
 };
 use crate::local::codex::{CodexClient, ServerReqKind, TurnEvent};
 use crate::local::opencode::ensure_playbook;
+use crate::store::Store;
 
 // FALLBACK model table, used only when the app-server catalog is unreachable
 // (codex < 0.144's legacy exec path, or a failed/timed-out `model/list`). The
@@ -546,29 +550,29 @@ impl Harness for Codex {
     }
 
     fn options(&self) -> HarnessOptions {
-        // Plan + Auto + Bypass over the app-server (codex ≥ 0.144). Plan is a
-        // native *collaboration mode*: `turn/start.collaborationMode` injects
-        // codex's own plan.md template, enables the `request_user_input` tool,
-        // and streams the finished plan as a dedicated `plan` item — the same
-        // scheme the codex TUI's `/plan` uses (see `run_turn_app_server`). The
-        // legacy exec fallback (< 0.144) has no collaboration mode, so Plan
-        // there degrades to a read-only sandbox with no cards (see
-        // `codex_sandbox`) — harmless, and noted in the detect-time agent note.
-        //   * Plan  — read-mostly planning turn: same sandbox as Auto
-        //     (workspace-write + on-request), restricted only by the prompt-level
-        //     plan template (see `codex_policies` for the parity gap vs Claude's
-        //     hook-gated plan mode).
-        //   * Auto  — workspace-write + `on-request` approvals, using Codex's
-        //     built-in reviewer when the active provider supports it.
-        //   * Bypass— full access, approvals off.
+        // Codex keeps planning on its independent collaboration-mode axis; the
+        // dropdown mirrors the desktop app's three permission choices.
         HarnessOptions::none()
-            .with_permission_modes(
-                &[
-                    PermissionMode::Plan,
-                    PermissionMode::Auto,
-                    PermissionMode::Bypass,
+            .with_permission_choices(
+                vec![
+                    OptionChoice::described(
+                        "ask",
+                        "Ask for approval",
+                        "Ask before commands that need elevated access",
+                    ),
+                    OptionChoice::described(
+                        "approve-for-me",
+                        "Approve for me",
+                        "Codex reviews approval requests automatically",
+                    ),
+                    OptionChoice::described(
+                        "full-access",
+                        "Full access",
+                        "Run without sandbox or approval prompts",
+                    ),
                 ],
-                PermissionMode::Auto,
+                "approve-for-me",
+                PlanActivation::Command,
             )
             // Harness-wide fallback only — the real per-model lists ride on each
             // `ModelInfo` (see `CODEX_MODELS`). The default is
@@ -588,8 +592,8 @@ impl Harness for Codex {
     ///   delivered inline the same way (`user_input_reply`).
     /// * `plan` (end-turn card, no `native_id`): resumes by a NEW user message
     ///   ([`ResumeAction::SendMessage`]) — approve sends the implementation
-    ///   prompt under the chosen (default Auto) mode; whose maskless→`default`
-    ///   collaborationMode is what actually exits plan mode. Revise stays in
+    ///   prompt with Plan cleared while preserving the selected permission;
+    ///   the `default` collaborationMode mask exits native Plan. Revise stays in
     ///   Plan (shared `synthesize_resume`); a note-less reject just closes the
     ///   card ([`ResumeAction::Nothing`]).
     async fn resume_from_prompt(
@@ -612,26 +616,26 @@ impl Harness for Codex {
                     return Ok(ResumeAction::Nothing);
                 }
                 let note = answer.note.as_deref().filter(|s| !s.trim().is_empty());
-                let chosen = answer
-                    .resume_mode
-                    .as_deref()
-                    .and_then(PermissionMode::from_id);
-                let (text, mode) = if answer.approve {
+                let (text, plan_mode) = if answer.approve {
                     // Codex's plan template primes the model for "Implement the
                     // plan." — its own proven approval phrasing (the TUI uses
-                    // it). Approving leaves plan mode; default to Auto, whose
-                    // fresh turn attaches the `default` mask that un-sticks.
+                    // it). Approving leaves Plan without changing permissions;
+                    // the fresh turn attaches the `default` mask that un-sticks.
                     let mut text = "Implement the plan.".to_string();
                     if let Some(note) = note {
                         text.push_str(&format!("\n\nAdditional guidance: {note}"));
                     }
-                    (text, chosen.or(Some(PermissionMode::Auto)))
+                    (text, false)
                 } else {
                     // Revise (a note-carrying reject): stay in Plan. Reuse the
                     // shared plan-deny wording so the phrasing matches Claude.
-                    synthesize_resume("plan", answer)
+                    (synthesize_resume("plan", answer).0, true)
                 };
-                Ok(ResumeAction::SendMessage { text, mode })
+                Ok(ResumeAction::SendMessage {
+                    text,
+                    mode: None,
+                    plan_mode: Some(plan_mode),
+                })
             }
             // Native held cards (permission / question): reply inline over the
             // live child. A reply only lands if the turn is still paused on it —
@@ -671,7 +675,7 @@ impl Harness for Codex {
                         anyhow!("codex app-server is not running — cannot deliver the reply")
                     })?;
                 client.respond(&rpc_id, reply).await?;
-                Ok(ResumeAction::Handled)
+                Ok(ResumeAction::Handled { plan_mode: None })
             }
             other => Err(anyhow!("codex cannot reply to a `{other}` prompt")),
         }
@@ -849,6 +853,20 @@ fn collaboration_mode_json(mode: &str, model: &str, effort: Option<&str>) -> Val
     }
     settings.insert("developer_instructions".to_string(), Value::Null);
     serde_json::json!({ "mode": mode, "settings": Value::Object(settings) })
+}
+
+fn collaboration_mask_mode(
+    plan_mode: bool,
+    reset_pending: bool,
+    last_mode: Option<&str>,
+) -> Option<&'static str> {
+    if plan_mode {
+        Some("plan")
+    } else if reset_pending || last_mode == Some("plan") {
+        Some("default")
+    } else {
+        None
+    }
 }
 
 /// How a turn ended, from `turn/completed`.
@@ -1750,29 +1768,24 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
     //   * Non-plan turn whose thread MAY be sticky-planned → the `default` mask,
     //     once, to un-stick (a `plan` turn leaves the thread planning until a
     //     turn carries `default`; there is no way back to "no template"). "May
-    //     be sticky-planned" fires on either signal: the DB `prev_permission_mode`
+    //     be sticky-planned" fires on either signal: the durable reset marker
     //     (survives restarts) or this child's in-memory `last_collab_mode` (a
     //     `plan` mask we sent and haven't cleared).
     //   * Otherwise → attach nothing (preserves today's template-free context).
     // The mask's required `settings.model` is the session model, falling back to
     // codex's reported thread model; keep the top-level `model`/`effort` above
     // so the None-model escape path still works (mask omitted, plain turn).
-    let plan_turn = ctx.permission_mode == Some(PermissionMode::Plan);
-    let may_be_sticky = ctx.prev_permission_mode == Some(PermissionMode::Plan)
-        || client.last_collab_mode() == Some("plan");
-    let mask_mode = if plan_turn {
-        Some("plan")
-    } else if may_be_sticky {
-        Some("default")
-    } else {
-        None
-    };
+    let plan_turn = ctx.plan_mode;
+    let mask_mode =
+        collaboration_mask_mode(plan_turn, ctx.plan_reset_pending, client.last_collab_mode());
+    let mut applied_mask_mode = None;
     if let Some(mode) = mask_mode {
         let collab_model = ctx.model.clone().or_else(|| client.thread_model());
         match collab_model {
             Some(model) => {
                 turn_params["collaborationMode"] = collaboration_mode_json(mode, &model, effort);
                 client.set_last_collab_mode(mode);
+                applied_mask_mode = Some(mode);
             }
             None if plan_turn => {
                 // Plan mode with no known model can't build the mask (settings
@@ -1793,6 +1806,10 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
     }
 
     let started = client.request("turn/start", turn_params).await?;
+    if applied_mask_mode == Some("default") && ctx.plan_reset_pending {
+        Store::open()?.clear_chat_session_plan_reset(&ctx.session_id)?;
+        ctx.plan_reset_pending = false;
+    }
     // Everything below is filtered to this turn: an earlier turn of the same
     // session that was orx-side aborted (its native interrupt raced or never
     // fired) can still be streaming into the shared channel, and its tail —
@@ -2482,7 +2499,11 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
     //
     // Yields the data dir granted as a writable root (if any), so the child's
     // store can be pinned to it below, after `prepare_env`.
-    let data_dir_pin = match codex_sandbox(ctx.permission_mode) {
+    let data_dir_pin = match if ctx.plan_mode {
+        Some("read-only")
+    } else {
+        codex_sandbox(ctx.permission_mode)
+    } {
         Some(policy) => {
             cmd.args([
                 "-c",
@@ -2537,14 +2558,15 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
     if let Some(model) = &ctx.model {
         cmd.args(["-m", model]);
     }
+    let turn_text = legacy_exec_text(&ctx.text, ctx.plan_mode);
     let prompt = if ctx.native_session_id.is_none() {
         let playbook_md = std::fs::read_to_string(&playbook).unwrap_or_default();
         format!(
             "<system-context>\n{playbook_md}\n</system-context>\n\n{}",
-            ctx.text
+            turn_text
         )
     } else {
-        ctx.text.clone()
+        turn_text
     };
     cmd.arg(prompt);
     prepare_env(&mut cmd);
@@ -2704,7 +2726,24 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
             crate::store::data_dir().join("agent-codex.log").display()
         ));
     }
+    if ctx.plan_mode {
+        if let Some(card) = plan_card(&ctx.assistant.parts, &ctx.assistant.id) {
+            ctx.upsert_part(card);
+        }
+        let _ = ctx.flush();
+    }
     Ok(())
+}
+
+fn legacy_exec_text(text: &str, plan_mode: bool) -> String {
+    if !plan_mode {
+        return text.to_string();
+    }
+    format!(
+        "<plan-mode>\nInvestigate and produce a complete implementation plan only. Do not modify \
+         files or run mutating commands. Ask clarifying questions when needed, then present the \
+         plan for approval.\n</plan-mode>\n\n{text}"
+    )
 }
 
 fn handle_item(ctx: &mut TurnCtx, item: &Value, next_id: &mut impl FnMut(&str) -> String) {
@@ -2858,6 +2897,10 @@ requires_openai_auth = false
         );
         assert_eq!(
             codex_policies(Some(PermissionMode::Auto), false),
+            ("workspace-write", "on-request", "user")
+        );
+        assert_eq!(
+            codex_policies(Some(PermissionMode::Ask), true),
             ("workspace-write", "on-request", "user")
         );
         // Plan runs the SAME sandbox as Auto — native plan mode restricts at the
@@ -3842,6 +3885,17 @@ requires_openai_auth = false
         assert!(default["settings"]["developer_instructions"].is_null());
     }
 
+    #[test]
+    fn collaboration_mode_is_independent_from_permissions_and_resets_once() {
+        assert_eq!(collaboration_mask_mode(true, false, None), Some("plan"));
+        assert_eq!(collaboration_mask_mode(false, true, None), Some("default"));
+        assert_eq!(
+            collaboration_mask_mode(false, false, Some("plan")),
+            Some("default")
+        );
+        assert_eq!(collaboration_mask_mode(false, false, None), None);
+    }
+
     /// A plan turn: streamed deltas accumulate, the completed `plan` item is
     /// authoritative, and `plan_card` surfaces it as a NON-synthesized card.
     #[test]
@@ -4079,41 +4133,51 @@ requires_openai_auth = false
         }
     }
 
-    /// The codex plan card resume arms: approve → "Implement the plan." under
-    /// Auto (override honored); revise → shared plan-deny wording in Plan mode
-    /// (matching Claude); note-less reject → Nothing.
+    /// The codex plan card resume arms: approve → "Implement the plan." with
+    /// permission unchanged; revise → shared plan-deny wording in Plan mode;
+    /// note-less reject → Nothing.
     #[tokio::test]
     async fn plan_resume_arms() {
         let ctx = test_resume_ctx();
         let card = plan_prompt_card();
 
-        // Approve, no note → codex's own phrasing, default Auto.
+        // Approve leaves Plan without changing the selected permission mode.
         let action = Codex
             .resume_from_prompt(&ctx, &card, &answer(true, None, &[], None))
             .await
             .unwrap();
         match action {
-            ResumeAction::SendMessage { text, mode } => {
+            ResumeAction::SendMessage {
+                text,
+                mode,
+                plan_mode,
+            } => {
                 assert_eq!(text, "Implement the plan.");
-                assert_eq!(mode, Some(PermissionMode::Auto));
+                assert_eq!(mode, None);
+                assert_eq!(plan_mode, Some(false));
             }
             _ => panic!("approve should send a message"),
         }
 
-        // Approve with a note + a resume_mode override.
+        // A stale resumeMode cannot overwrite Codex's permission choice.
         let action = Codex
             .resume_from_prompt(
                 &ctx,
                 &card,
-                &answer(true, Some("bypass"), &[], Some("skip tests")),
+                &answer(true, Some("bypassPermissions"), &[], Some("skip tests")),
             )
             .await
             .unwrap();
         match action {
-            ResumeAction::SendMessage { text, mode } => {
+            ResumeAction::SendMessage {
+                text,
+                mode,
+                plan_mode,
+            } => {
                 assert!(text.contains("Implement the plan."));
                 assert!(text.contains("skip tests"));
-                assert_eq!(mode, Some(PermissionMode::Bypass));
+                assert_eq!(mode, None);
+                assert_eq!(plan_mode, Some(false));
             }
             _ => panic!("approve should send a message"),
         }
@@ -4123,13 +4187,17 @@ requires_openai_auth = false
             .resume_from_prompt(&ctx, &card, &answer(false, None, &[], Some("tweak X")))
             .await
             .unwrap();
-        let (shared_text, shared_mode) =
+        let (shared_text, _) =
             synthesize_resume("plan", &answer(false, None, &[], Some("tweak X")));
         match action {
-            ResumeAction::SendMessage { text, mode } => {
+            ResumeAction::SendMessage {
+                text,
+                mode,
+                plan_mode,
+            } => {
                 assert_eq!(text, shared_text, "revise reuses Claude's wording");
-                assert_eq!(mode, shared_mode);
-                assert_eq!(mode, Some(PermissionMode::Plan));
+                assert_eq!(mode, None);
+                assert_eq!(plan_mode, Some(true));
             }
             _ => panic!("revise should send a message"),
         }
@@ -4140,6 +4208,15 @@ requires_openai_auth = false
             .await
             .unwrap();
         assert!(matches!(action, ResumeAction::Nothing));
+    }
+
+    #[test]
+    fn legacy_exec_plan_mode_injects_an_explicit_planning_contract() {
+        let planned = legacy_exec_text("investigate this", true);
+        assert!(planned.contains("<plan-mode>"));
+        assert!(planned.contains("Do not modify files"));
+        assert!(planned.ends_with("investigate this"));
+        assert_eq!(legacy_exec_text("implement this", false), "implement this");
     }
 
     /// server_req_kind classifies the three reply schemas the settle paths key

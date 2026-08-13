@@ -9,7 +9,7 @@
 //! overhead; a config change (permission mode
 //! / effort / bridge), interrupt, or crash respawns it with `--resume`. The
 //! playbook rides `--append-system-prompt-file`; the permission mode is
-//! `--permission-mode` from the session's setting (`auto`/`bypass` — see
+//! `--permission-mode` from the session's setting (`auto`/`bypassPermissions` — see
 //! `options`). AskUserQuestion / ExitPlanMode surface as interactive cards: the
 //! turn ends on them and the user's answer resumes the session — except in plan
 //! mode, where the mcp-gate bridge holds both open mid-turn and the answer
@@ -33,7 +33,9 @@ use super::detect::{
     bin_version, find_on_path, nonempty_str, parse_version, read_json, HarnessAuthState,
     HarnessInfo, ModelInfo,
 };
-use super::options::{HarnessOptions, PermissionMode, REASONING_DEFAULT_ID};
+use super::options::{
+    HarnessOptions, OptionChoice, PermissionMode, PlanActivation, REASONING_DEFAULT_ID,
+};
 use super::{Harness, ResumeAction};
 use crate::error::{anyhow, Result};
 use crate::local::chat::{
@@ -523,26 +525,28 @@ impl Harness for ClaudeCode {
     }
 
     fn options(&self) -> HarnessOptions {
-        // Plan + Auto + Bypass. Headless `claude --print` has no interactive
-        // approval, so `ask`/`accept-edits` can't grant a blocked tool (they just
-        // deny) — those stay out.
-        //   * Plan  — read/propose only: file edits stay blocked until the user
-        //     approves the plan (via the ExitPlanMode card). Plan mode would
-        //     normally also gate `Bash(orx …)`, which would break planning — the
-        //     agent plans by *inspecting* prior runs/logs/evidence via read-only
-        //     `orx`. A `PreToolUse` hook (wired in `run_turn` only for this mode,
-        //     via `write_plan_settings`) lets read-only `orx` verbs through while
-        //     launches (`orx exp run`, `instance`, …) stay gated. See `plan_gate`.
-        //   * Auto  — the balanced default; runs tools without prompting.
-        //   * Bypass— runs everything, no sandbox.
+        // Claude owns planning as one of its five native permission modes. The
+        // permission bridge makes Manual and Accept edits actionable in
+        // headless mode instead of letting their prompts die unseen.
         HarnessOptions::none()
-            .with_permission_modes(
-                &[
-                    PermissionMode::Plan,
-                    PermissionMode::Auto,
-                    PermissionMode::Bypass,
+            .with_permission_choices(
+                vec![
+                    OptionChoice::described("manual", "Manual", "Always ask before making changes"),
+                    OptionChoice::described(
+                        "acceptEdits",
+                        "Accept edits",
+                        "Automatically accept all file edits",
+                    ),
+                    OptionChoice::described("plan", "Plan", "Create a plan before making changes"),
+                    OptionChoice::described("auto", "Auto", "Claude handles permission decisions"),
+                    OptionChoice::described(
+                        "bypassPermissions",
+                        "Bypass permissions",
+                        "Accepts all permissions",
+                    ),
                 ],
-                PermissionMode::Auto,
+                "auto",
+                PlanActivation::Permission,
             )
             // Harness-wide fallback only, and deliberately the conservative
             // five: `options()` is static and can't see the detected CLI
@@ -588,7 +592,7 @@ impl Harness for ClaudeCode {
                             updated_input: prompt.tool_input.clone(),
                         },
                     )?;
-                    Ok(ResumeAction::Handled)
+                    Ok(ResumeAction::Handled { plan_mode: None })
                 }
                 ("permission", false) => {
                     let message = match note {
@@ -602,7 +606,7 @@ impl Harness for ClaudeCode {
                         native_id,
                         crate::local::chat::PermissionDecision::Deny { message },
                     )?;
-                    Ok(ResumeAction::Handled)
+                    Ok(ResumeAction::Handled { plan_mode: None })
                 }
                 // Deny the held ExitPlanMode. With a note it's a revision
                 // request — the model revises the plan in the same turn. With
@@ -617,7 +621,7 @@ impl Harness for ClaudeCode {
                         native_id,
                         crate::local::chat::PermissionDecision::Deny { message },
                     )?;
-                    Ok(ResumeAction::Handled)
+                    Ok(ResumeAction::Handled { plan_mode: None })
                 }
                 // Plan approval: don't settle the held request — the paused
                 // plan turn gets interrupted (respond()'s SendMessage arm) and
@@ -626,7 +630,11 @@ impl Harness for ClaudeCode {
                 // bridge request is denied into the dying child, harmlessly.
                 ("plan", true) => {
                     let (text, mode) = synthesize_resume("plan", answer);
-                    Ok(ResumeAction::SendMessage { text, mode })
+                    Ok(ResumeAction::SendMessage {
+                        text,
+                        mode,
+                        plan_mode: None,
+                    })
                 }
                 // Mid-turn question (a bridge-held AskUserQuestion): the held
                 // tool call is denied with the user's answer as the message —
@@ -649,7 +657,7 @@ impl Harness for ClaudeCode {
                             ),
                         },
                     )?;
-                    Ok(ResumeAction::Handled)
+                    Ok(ResumeAction::Handled { plan_mode: None })
                 }
                 _ => Err(anyhow!("unsupported prompt kind for a bridge card")),
             };
@@ -676,7 +684,11 @@ impl Harness for ClaudeCode {
         if text.trim().is_empty() {
             return Err(anyhow!("no answer provided"));
         }
-        Ok(ResumeAction::SendMessage { text, mode })
+        Ok(ResumeAction::SendMessage {
+            text,
+            mode,
+            plan_mode: None,
+        })
     }
 
     fn config_home(&self) -> Option<PathBuf> {
@@ -701,10 +713,9 @@ impl Harness for ClaudeCode {
     }
 }
 
-/// Session mode → Claude Code `--permission-mode` value. The shared wire ids are
-/// harness-agnostic (`ask`/`accept-edits`/`bypass`), so this is where the enum
-/// is spelled back into Claude's own CLI vocabulary; `Auto` is the default when
-/// the session hasn't picked a mode.
+/// Internal policy → Claude Code `--permission-mode` value. The UI's native
+/// `manual` choice maps to the CLI's `default`; every other choice already uses
+/// the CLI spelling. `Auto` is the default when the session hasn't picked one.
 pub(crate) fn claude_permission_mode(mode: Option<PermissionMode>) -> &'static str {
     match mode.unwrap_or(PermissionMode::Auto) {
         PermissionMode::Ask => "default",
@@ -713,6 +724,13 @@ pub(crate) fn claude_permission_mode(mode: Option<PermissionMode>) -> &'static s
         PermissionMode::Auto => "auto",
         PermissionMode::Bypass => "bypassPermissions",
     }
+}
+
+pub(crate) fn uses_permission_bridge(mode: Option<PermissionMode>) -> bool {
+    matches!(
+        mode,
+        Some(PermissionMode::Ask | PermissionMode::AcceptEdits | PermissionMode::Plan)
+    )
 }
 
 /// Path (relative to the worktree) of the plan-mode settings file we write and
@@ -814,9 +832,9 @@ fn claude_effort(level: Option<&str>) -> Option<&str> {
 
 /// The follow-up message + resume mode for an answered Claude prompt — Claude's
 /// resume strategy: a prompt ends the turn and the answer becomes a *new user
-/// message* that continues via `--resume`. `resume_mode` on the answer is a
-/// harness-agnostic wire id; unknown/absent ids fall through to the per-kind
-/// default (or the session's mode, applied downstream). The question arm is
+/// message* that continues via `--resume`. `ChatHost` validates `resume_mode`
+/// against Claude's advertised choices before this helper parses it; an absent
+/// id falls through to the per-kind default. The question arm is
 /// also reused as a plain text builder by the bridge's mid-turn question
 /// resume (the denial message that carries the answer).
 pub(crate) fn synthesize_resume(
@@ -851,10 +869,10 @@ pub(crate) fn synthesize_resume(
             // *grants* it. Claude's `--permission-mode` is coarse: `acceptEdits`
             // only auto-approves file edits, so it leaves a Bash (or any
             // non-edit) denial in place — the tool is denied again and the card
-            // re-appears in a loop. `bypass` is the only mode that lets the
+            // re-appears in a loop. `bypassPermissions` is the only mode that lets the
             // previously-blocked tool through, so that's the default for an
             // approval (a caller can still override via `resume_mode`). Verified
-            // against the CLI: acceptEdits re-denies Bash, bypass clears it.
+            // against the CLI: acceptEdits re-denies Bash, bypassPermissions clears it.
             let text = "The user approved that action. Continue.".to_string();
             (text, chosen.or(Some(PermissionMode::Bypass)))
         }
@@ -1535,8 +1553,7 @@ fn spawn_config(ctx: &TurnCtx) -> SpawnConfig {
         // spawned child's config (a failed write leaves it false and the next
         // plan turn respawns). Keeping the wanted value here means a plan turn
         // reconciles against a child that already has the bridge and reuses it.
-        bridge_active: ctx.permission_mode == Some(PermissionMode::Plan)
-            && ctx.host.up_port().is_some(),
+        bridge_active: uses_permission_bridge(ctx.permission_mode) && ctx.host.up_port().is_some(),
     }
 }
 
@@ -1941,9 +1958,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_mode_maps_neutral_ids_to_claude_cli_strings() {
-        // The shared wire ids are neutral; claude.rs is where they're spelled
-        // back into Claude's own `--permission-mode` vocabulary.
+    fn permission_mode_maps_to_claude_cli_strings() {
         assert_eq!(claude_permission_mode(Some(PermissionMode::Ask)), "default");
         assert_eq!(
             claude_permission_mode(Some(PermissionMode::AcceptEdits)),
@@ -1960,12 +1975,21 @@ mod tests {
     }
 
     #[test]
+    fn permission_bridge_covers_every_headless_prompting_mode() {
+        assert!(uses_permission_bridge(Some(PermissionMode::Ask)));
+        assert!(uses_permission_bridge(Some(PermissionMode::AcceptEdits)));
+        assert!(uses_permission_bridge(Some(PermissionMode::Plan)));
+        assert!(!uses_permission_bridge(Some(PermissionMode::Auto)));
+        assert!(!uses_permission_bridge(Some(PermissionMode::Bypass)));
+    }
+
+    #[test]
     fn plan_approve_defaults_to_auto_but_honors_chosen_mode() {
         let (text, mode) = synthesize_resume("plan", &answer(true, None, &[], None));
         assert!(text.contains("approved the plan"));
         assert_eq!(mode, Some(PermissionMode::Auto));
 
-        let (_, mode) = synthesize_resume("plan", &answer(true, Some("accept-edits"), &[], None));
+        let (_, mode) = synthesize_resume("plan", &answer(true, Some("acceptEdits"), &[], None));
         assert_eq!(mode, Some(PermissionMode::AcceptEdits));
     }
 
@@ -1990,7 +2014,7 @@ mod tests {
 
     #[test]
     fn permission_approve_defaults_to_bypass() {
-        // Approving a blocked tool must resume under `bypass` — the only mode
+        // Approving a blocked tool must resume under `bypassPermissions` — the only mode
         // that actually grants it. `acceptEdits`/`ask` would re-deny a Bash tool
         // and loop the card. (Verified against the real CLI.)
         let (text, mode) = synthesize_resume("permission", &answer(true, None, &[], None));

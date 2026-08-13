@@ -791,6 +791,10 @@ pub struct WirePrompt {
     pub options: Vec<WireQuestionOption>,
     #[serde(default)]
     pub multi_select: bool,
+    /// OpenCode question emitted by its native `plan_exit` tool. The adapter
+    /// uses the tool call id to distinguish this from ordinary Yes/No prompts.
+    #[serde(default)]
+    pub plan_exit: bool,
     /// The harness-native id used to reply over a live protocol (opencode's
     /// permission/question request id, the Claude bridge's held request id).
     /// The backend resume path routes on it; the UI reads only its *presence*
@@ -1070,7 +1074,11 @@ pub fn session_json(s: &StoredChatSession, busy: bool) -> Value {
         // to tell one from a placeholder or a user rename.
         "titleSource": s.title_source,
         "model": s.model,
-        "permissionMode": s.permission_mode,
+        "permissionMode": crate::local::harness::effective_permission_id(
+            &s.harness,
+            s.permission_mode.as_deref(),
+        ),
+        "planMode": s.plan_mode,
         "reasoningLevel": s.reasoning_level,
         "archived": s.archived,
         "createdAt": s.created_at,
@@ -1640,9 +1648,19 @@ impl ChatHost {
             ));
         }
 
-        // Tier 1 — policy decides, no card.
-        if let Some(decision) = plan_auto_policy(tool_name, &tool_input) {
-            return Ok(decision);
+        // Tier 1 — Plan has a small automatic read/deny policy. Manual and
+        // Accept edits surface whatever Claude delegated to the bridge.
+        let session = Store::open()?.get_chat_session(session_id)?;
+        let plan_mode = session.as_ref().is_some_and(|session| {
+            crate::local::harness::permission_mode_for(
+                &session.harness,
+                session.permission_mode.as_deref().unwrap_or_default(),
+            ) == Some(crate::local::harness::PermissionMode::Plan)
+        });
+        if plan_mode {
+            if let Some(decision) = plan_auto_policy(tool_name, &tool_input) {
+                return Ok(decision);
+            }
         }
 
         // Tier 2 — the user decides. ExitPlanMode becomes the plan card (the
@@ -1955,9 +1973,11 @@ impl ChatHost {
                 .flat_map(|m| m.images.iter().cloned())
                 .collect();
             let overrides = items
-                .last()
-                .map(|m| m.overrides.clone())
-                .unwrap_or_default();
+                .iter()
+                .fold(TurnOverrides::default(), |mut merged, item| {
+                    merged.apply_explicit(&item.overrides);
+                    merged
+                });
             if let Err(err) = self
                 .send_message_showing(
                     session_id,
@@ -2119,6 +2139,24 @@ impl ChatHost {
             .get_local_project(&session.project_id)?
             .ok_or_else(|| anyhow!("project not found"))?;
 
+        // Validate the complete override set before persisting any part of it.
+        // A rejected Plan/permission value must not leave an unrelated model or
+        // reasoning change behind on a turn that never started.
+        if let Some(mode) = overrides
+            .permission_mode
+            .as_deref()
+            .filter(|m| !m.is_empty())
+        {
+            if crate::local::harness::permission_mode_for(&session.harness, mode).is_none() {
+                return Err(anyhow!("invalid permission mode for selected harness"));
+            }
+        }
+        if overrides.plan_mode.is_some()
+            && !crate::local::harness::supports_command_plan(&session.harness)
+        {
+            return Err(anyhow!("this harness activates Plan through permissions"));
+        }
+
         // Composer selections are sticky: an override that differs from the
         // stored value is persisted so the next turn (and a reload) keep it.
         if let Some(model) = overrides.model.filter(|m| !m.is_empty()) {
@@ -2127,21 +2165,33 @@ impl ChatHost {
                 session.model = Some(model);
             }
         }
-        // Read the session's mode BEFORE the composer override rewrites it: the
-        // codex harness needs to know whether the *previous* turn ran under Plan
-        // (the thread may be sticky-planned) to decide whether this turn must
-        // attach a `default` collaborationMode mask to un-stick it. Captured
-        // here because the override below is the last moment the pre-turn value
-        // is visible. Persists across restarts (it's the DB row), so a resume
-        // after `orx up` bounced still un-sticks.
-        let prev_permission_mode = session
-            .permission_mode
-            .as_deref()
-            .and_then(crate::local::harness::PermissionMode::from_id);
         if let Some(mode) = overrides.permission_mode.filter(|m| !m.is_empty()) {
             if session.permission_mode.as_deref() != Some(mode.as_str()) {
                 store.set_chat_session_permission_mode(&session.id, &mode)?;
                 session.permission_mode = Some(mode);
+            }
+        }
+        // Normalize an unknown legacy value to the provider's current default.
+        // Incoming values were rejected above; this branch is only stored data
+        // from an older build or a manually edited database.
+        let effective_permission = crate::local::harness::effective_permission_id(
+            &session.harness,
+            session.permission_mode.as_deref(),
+        );
+        if session.permission_mode != effective_permission {
+            if let Some(mode) = effective_permission.as_deref() {
+                store.set_chat_session_permission_mode(&session.id, mode)?;
+            }
+            session.permission_mode = effective_permission;
+        }
+        if let Some(plan_mode) = overrides.plan_mode {
+            let reset_pending = !plan_mode
+                && session.harness == "codex"
+                && (session.plan_mode || session.plan_reset_pending);
+            if session.plan_mode != plan_mode || session.plan_reset_pending != reset_pending {
+                store.set_chat_session_plan_state(&session.id, plan_mode, reset_pending)?;
+                session.plan_mode = plan_mode;
+                session.plan_reset_pending = reset_pending;
             }
         }
         if let Some(level) = overrides.reasoning_level.filter(|l| !l.is_empty()) {
@@ -2276,11 +2326,11 @@ impl ChatHost {
             harness: session.harness.clone(),
             native_session_id: session.native_session_id.clone(),
             model: session.model.clone(),
-            permission_mode: session
-                .permission_mode
-                .as_deref()
-                .and_then(crate::local::harness::PermissionMode::from_id),
-            prev_permission_mode,
+            permission_mode: session.permission_mode.as_deref().and_then(|mode| {
+                crate::local::harness::permission_mode_for(&session.harness, mode)
+            }),
+            plan_mode: session.plan_mode,
+            plan_reset_pending: session.plan_reset_pending,
             reasoning_level: session.reasoning_level.clone(),
             project,
             text: turn_text,
@@ -2547,6 +2597,11 @@ impl ChatHost {
         let Some(prompt) = unresolved_prompt(&req.session_id, &req.prompt_id)? else {
             return Ok(());
         };
+        if let Some(mode) = req.resume_mode.as_deref() {
+            if crate::local::harness::permission_mode_for(&session.harness, mode).is_none() {
+                return Err(anyhow!("invalid resume mode for selected harness"));
+            }
+        }
         let harness = crate::local::harness::chat_harness(&session.harness)
             .ok_or_else(|| anyhow!("unknown harness: {}", session.harness))?;
 
@@ -2576,7 +2631,11 @@ impl ChatHost {
         // retryable: nothing has been mutated, the card is still actionable.
         // (The resolve itself is best-effort — see `resolve_prompt_card`.)
         match action {
-            ResumeAction::SendMessage { text, mode } => {
+            ResumeAction::SendMessage {
+                text,
+                mode,
+                plan_mode,
+            } => {
                 // A native (mid-turn) card may resume while its turn is still
                 // running — plan approval under the permission bridge replaces
                 // the paused plan turn with the implementation turn, so
@@ -2589,7 +2648,10 @@ impl ChatHost {
                 }
                 let overrides = TurnOverrides {
                     model: None,
-                    permission_mode: mode.map(|m| m.id().to_string()),
+                    permission_mode: mode.and_then(|mode| {
+                        crate::local::harness::permission_id_for_mode(&session.harness, mode)
+                    }),
+                    plan_mode,
                     reasoning_level: None,
                 };
                 // Plan/permission resumes are scaffolding the user never typed
@@ -2629,9 +2691,12 @@ impl ChatHost {
                 self.resolve_prompt_card(&prompt_echo);
                 Ok(())
             }
-            ResumeAction::Handled => {
+            ResumeAction::Handled { plan_mode } => {
                 // The inline reply unblocked the still-running turn; it keeps
                 // streaming and will `finish_turn` itself. Leave `busy` alone.
+                if let Some(plan_mode) = plan_mode {
+                    self.set_plan_mode(&req.session_id, plan_mode).await?;
+                }
                 self.resolve_prompt_card(&req);
                 Ok(())
             }
@@ -2714,6 +2779,44 @@ impl ChatHost {
     ) -> Result<Option<StoredChatSession>> {
         let store = Store::open()?;
         store.set_chat_session_archived(session_id, archived)?;
+        Ok(self.emit_session(store.get_chat_session(session_id)?).await)
+    }
+
+    /// Enter or leave the independent Plan axis used by Codex/OpenCode.
+    /// Leaving Codex Plan arms a durable one-turn reset for its sticky native
+    /// collaboration mode; entering Plan clears any obsolete reset.
+    pub async fn set_plan_mode(
+        &self,
+        session_id: &str,
+        plan_mode: bool,
+    ) -> Result<Option<StoredChatSession>> {
+        let store = Store::open()?;
+        let Some(session) = store.get_chat_session(session_id)? else {
+            return Ok(None);
+        };
+        if !crate::local::harness::supports_command_plan(&session.harness) {
+            return Err(anyhow!("this harness activates Plan through permissions"));
+        }
+        let reset_pending = !plan_mode
+            && session.harness == "codex"
+            && (session.plan_mode || session.plan_reset_pending);
+        store.set_chat_session_plan_state(session_id, plan_mode, reset_pending)?;
+        Ok(self.emit_session(store.get_chat_session(session_id)?).await)
+    }
+
+    pub async fn set_permission_mode(
+        &self,
+        session_id: &str,
+        permission_mode: &str,
+    ) -> Result<Option<StoredChatSession>> {
+        let store = Store::open()?;
+        let Some(session) = store.get_chat_session(session_id)? else {
+            return Ok(None);
+        };
+        if crate::local::harness::permission_mode_for(&session.harness, permission_mode).is_none() {
+            return Err(anyhow!("invalid permission mode for selected harness"));
+        }
+        store.set_chat_session_permission_mode(session_id, permission_mode)?;
         Ok(self.emit_session(store.get_chat_session(session_id)?).await)
     }
 
@@ -2808,9 +2911,9 @@ pub struct PromptAnswer {
     /// Approve (proceed) vs reject (dismiss). For questions, always true.
     #[serde(default = "default_true")]
     pub approve: bool,
-    /// For plan/permission approval: the permission mode to resume under
-    /// (a harness-agnostic wire id, e.g. `"auto"`, `"accept-edits"`). None keeps
-    /// the session's mode. Only meaningful for end-turn resume (Claude); inline
+    /// For plan/permission approval: a provider-owned permission id to resume
+    /// under. It is validated against the session harness. None keeps the
+    /// session's mode. Only meaningful for end-turn resume (Claude); inline
     /// harnesses reply over their live protocol and ignore it.
     #[serde(default)]
     pub resume_mode: Option<String>,
@@ -3054,7 +3157,25 @@ impl ChatHost {
 pub struct TurnOverrides {
     pub model: Option<String>,
     pub permission_mode: Option<String>,
+    pub plan_mode: Option<bool>,
     pub reasoning_level: Option<String>,
+}
+
+impl TurnOverrides {
+    fn apply_explicit(&mut self, next: &Self) {
+        if next.model.is_some() {
+            self.model.clone_from(&next.model);
+        }
+        if next.permission_mode.is_some() {
+            self.permission_mode.clone_from(&next.permission_mode);
+        }
+        if next.plan_mode.is_some() {
+            self.plan_mode = next.plan_mode;
+        }
+        if next.reasoning_level.is_some() {
+            self.reasoning_level.clone_from(&next.reasoning_level);
+        }
+    }
 }
 
 pub struct TurnCtx {
@@ -3066,13 +3187,11 @@ pub struct TurnCtx {
     /// Effective permission mode for this turn (session value; harness applies
     /// its own default when `None`).
     pub permission_mode: Option<crate::local::harness::PermissionMode>,
-    /// The permission mode the session carried *before* this turn's composer
-    /// override — read pre-override in `send_message`. The codex harness uses it
-    /// to tell "this thread may be sticky-planned" (previous turn was Plan, so a
-    /// non-plan turn must attach a `default` collaborationMode mask to un-stick
-    /// it) from a thread that never entered Plan (attach nothing — a mask always
-    /// injects a template). `None` on the very first turn of a session.
-    pub prev_permission_mode: Option<crate::local::harness::PermissionMode>,
+    /// Independent Plan state for Codex/OpenCode.
+    pub plan_mode: bool,
+    /// Codex must attach one native `default` collaboration-mode mask after
+    /// Plan is left, even if ORX restarted before the next turn.
+    pub plan_reset_pending: bool,
     /// Effective reasoning-level wire id for this turn (harness-owned vocabulary;
     /// the harness interprets it, e.g. Claude → `--effort`). Default when `None`.
     pub reasoning_level: Option<String>,
@@ -3112,7 +3231,8 @@ impl TurnCtx {
             native_session_id: None,
             model: None,
             permission_mode: None,
-            prev_permission_mode: None,
+            plan_mode: false,
+            plan_reset_pending: false,
             reasoning_level: None,
             project: crate::local::model::LocalProject {
                 id: "test-project".into(),
@@ -4398,6 +4518,8 @@ mod bridge_tests {
             title_source: None,
             model: Some("claude-haiku-4-5".into()),
             permission_mode: None,
+            plan_mode: false,
+            plan_reset_pending: false,
             reasoning_level: None,
             archived: false,
             context_usage_json: None,
@@ -4434,6 +4556,48 @@ mod bridge_tests {
     }
 
     #[test]
+    fn session_json_exposes_plan_and_normalizes_invalid_permissions() {
+        let mut session = bare_session();
+        session.harness = "codex".into();
+        session.permission_mode = Some("plan".into());
+        session.plan_mode = true;
+        let value = session_json(&session, false);
+        assert_eq!(value["permissionMode"], "approve-for-me");
+        assert_eq!(value["planMode"], true);
+    }
+
+    #[test]
+    fn queued_overrides_keep_the_last_explicit_value_on_each_axis() {
+        let first = TurnOverrides {
+            model: Some("first-model".into()),
+            permission_mode: Some("ask".into()),
+            plan_mode: Some(true),
+            reasoning_level: Some("high".into()),
+        };
+        let second = TurnOverrides {
+            model: Some("second-model".into()),
+            permission_mode: None,
+            plan_mode: None,
+            reasoning_level: Some("low".into()),
+        };
+        let mut merged = TurnOverrides::default();
+        merged.apply_explicit(&first);
+        merged.apply_explicit(&second);
+
+        assert_eq!(merged.model.as_deref(), Some("second-model"));
+        assert_eq!(merged.permission_mode.as_deref(), Some("ask"));
+        assert_eq!(merged.plan_mode, Some(true));
+        assert_eq!(merged.reasoning_level.as_deref(), Some("low"));
+
+        let leave_plan = TurnOverrides {
+            plan_mode: Some(false),
+            ..Default::default()
+        };
+        merged.apply_explicit(&leave_plan);
+        assert_eq!(merged.plan_mode, Some(false));
+    }
+
+    #[test]
     fn context_usage_serde_camel_cases_and_skips_none() {
         let usage = ContextUsage {
             used_tokens: 100,
@@ -4463,6 +4627,8 @@ mod notify_target_tests {
                 title_source: None,
                 model: None,
                 permission_mode: None,
+                plan_mode: false,
+                plan_reset_pending: false,
                 reasoning_level: None,
                 archived: false,
                 context_usage_json: None,

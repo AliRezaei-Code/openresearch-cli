@@ -512,6 +512,13 @@ struct CompleteOnboardingReq {
 
 const RESEARCH_AREAS: [&str; 4] = ["AI/ML", "Biology", "Physics", "Other"];
 
+fn preferred_permission_mode(harness: &str, mode: Option<String>) -> Option<String> {
+    match mode.as_deref() {
+        Some("plan") => local::harness::effective_permission_id(harness, None),
+        _ => mode,
+    }
+}
+
 fn normalize_research_profile(
     research_areas: Vec<String>,
     other_area: Option<String>,
@@ -561,10 +568,17 @@ async fn complete_onboarding(
         return Err(bad_request(format!("unknown harness: {}", req.harness)));
     }
     let nonempty = |value: Option<String>| value.filter(|item| !item.trim().is_empty());
+    let permission_mode = nonempty(req.permission_mode);
+    if permission_mode
+        .as_deref()
+        .is_some_and(|mode| local::harness::permission_mode_for(&req.harness, mode).is_none())
+    {
+        return Err(bad_request("invalid permission mode for selected harness"));
+    }
     let selection = local::demo::DemoSelection {
         harness: req.harness,
         model: nonempty(req.model),
-        permission_mode: nonempty(req.permission_mode),
+        permission_mode,
         reasoning_level: nonempty(req.reasoning_level),
     };
     let profile = normalize_research_profile(
@@ -581,7 +595,10 @@ async fn complete_onboarding(
         store.set_preferred_agent(&StoredAgentSelection {
             harness: completion.selection.harness.clone(),
             model: completion.selection.model.clone(),
-            permission_mode: completion.selection.permission_mode.clone(),
+            permission_mode: preferred_permission_mode(
+                &completion.selection.harness,
+                completion.selection.permission_mode.clone(),
+            ),
             reasoning_level: completion.selection.reasoning_level.clone(),
         })?;
         store.set_onboarding_completed(true)?;
@@ -3201,10 +3218,16 @@ async fn set_ui_state(Json(req): Json<SetUiStateReq>) -> ApiResult {
                     return Err(anyhow!("unknown harness: {}", selection.harness));
                 }
                 let nonempty = |value: Option<String>| value.filter(|item| !item.trim().is_empty());
+                let permission_mode = nonempty(selection.permission_mode);
+                if permission_mode.as_deref().is_some_and(|mode| {
+                    local::harness::permission_mode_for(&selection.harness, mode).is_none()
+                }) {
+                    return Err(anyhow!("invalid permission mode for selected harness"));
+                }
                 Ok(StoredAgentSelection {
-                    harness: selection.harness,
+                    harness: selection.harness.clone(),
                     model: nonempty(selection.model),
-                    permission_mode: nonempty(selection.permission_mode),
+                    permission_mode: preferred_permission_mode(&selection.harness, permission_mode),
                     reasoning_level: nonempty(selection.reasoning_level),
                 })
             })
@@ -4051,6 +4074,8 @@ struct CreateChatSessionReq {
     harness: String,
     model: Option<String>,
     permission_mode: Option<String>,
+    #[serde(default)]
+    plan_mode: bool,
     reasoning_level: Option<String>,
 }
 
@@ -4071,6 +4096,18 @@ async fn create_chat_session(
         .get_local_project(&req.project_id)?
         .ok_or_else(|| not_found("project"))?;
     let nonempty = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
+    let permission_mode = nonempty(req.permission_mode);
+    if permission_mode
+        .as_deref()
+        .is_some_and(|mode| local::harness::permission_mode_for(&req.harness, mode).is_none())
+    {
+        return Err(bad_request("invalid permission mode for selected harness"));
+    }
+    if req.plan_mode && !local::harness::supports_command_plan(&req.harness) {
+        return Err(bad_request(
+            "this harness activates Plan through permissions",
+        ));
+    }
     let session = StoredChatSession {
         id: format!("chat_{}", uuid::Uuid::new_v4()),
         project_id: req.project_id,
@@ -4079,7 +4116,9 @@ async fn create_chat_session(
         title: None,
         title_source: None,
         model: nonempty(req.model),
-        permission_mode: nonempty(req.permission_mode),
+        permission_mode,
+        plan_mode: req.plan_mode,
+        plan_reset_pending: false,
         reasoning_level: nonempty(req.reasoning_level),
         archived: false,
         context_usage_json: None,
@@ -4104,6 +4143,8 @@ async fn delete_chat_session(State(state): State<AppState>, Path(id): Path<Strin
 struct UpdateChatSessionReq {
     archived: Option<bool>,
     title: Option<String>,
+    plan_mode: Option<bool>,
+    permission_mode: Option<String>,
 }
 
 async fn update_chat_session(
@@ -4126,6 +4167,18 @@ async fn update_chat_session(
         state
             .chat
             .set_archived(&id, archived)
+            .await?
+            .ok_or_else(|| not_found("chat session"))?
+    } else if let Some(plan_mode) = req.plan_mode {
+        state
+            .chat
+            .set_plan_mode(&id, plan_mode)
+            .await?
+            .ok_or_else(|| not_found("chat session"))?
+    } else if let Some(permission_mode) = req.permission_mode {
+        state
+            .chat
+            .set_permission_mode(&id, &permission_mode)
             .await?
             .ok_or_else(|| not_found("chat session"))?
     } else {
@@ -4154,6 +4207,7 @@ struct SendChatReq {
     text: String,
     model: Option<String>,
     permission_mode: Option<String>,
+    plan_mode: Option<bool>,
     reasoning_level: Option<String>,
     #[serde(default)]
     images: Vec<local::chat::ImageAttachment>,
@@ -4179,6 +4233,7 @@ async fn send_chat_message(
     let overrides = local::chat::TurnOverrides {
         model: req.model,
         permission_mode: req.permission_mode,
+        plan_mode: req.plan_mode,
         reasoning_level: req.reasoning_level,
     };
     // The turn runs in the background; progress streams over /api/events.
@@ -4593,6 +4648,22 @@ async fn spa(uri: Uri) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_never_becomes_the_preferred_mode_for_new_sessions() {
+        assert_eq!(
+            preferred_permission_mode("claude-code", Some("plan".into())).as_deref(),
+            Some("auto")
+        );
+        assert_eq!(
+            preferred_permission_mode("codex", Some("plan".into())).as_deref(),
+            Some("approve-for-me")
+        );
+        assert_eq!(
+            preferred_permission_mode("opencode", Some("plan".into())).as_deref(),
+            Some("default")
+        );
+    }
 
     fn expect_profile(
         result: std::result::Result<crate::telemetry::ResearchProfile, ApiError>,

@@ -354,7 +354,7 @@ export function OptionPicker({
         <ChevronDown size={12} />
       </button>
       {open && (
-        <div className={`option-menu absolute bottom-[calc(100%_+_8px)] left-0 max-h-95 flex flex-col bg-background border border-border rounded-lg shadow-[0_12px_32px_rgba(0,_0,_0,_0.18)] z-50 overflow-hidden min-w-47.5 p-1.5 [&.align-right]:left-auto [&.align-right]:right-0 [&.drop-down]:bottom-auto [&.drop-down]:top-[calc(100%_+_4px)] [&.session-menu]:left-auto [&.session-menu]:right-1.5 [&.session-menu]:top-[calc(100%_-_2px)] [&.session-menu]:min-w-35 ${align === "right" ? "align-right" : ""}`}>
+        <div className={`option-menu absolute bottom-[calc(100%_+_8px)] left-0 max-h-95 flex flex-col bg-background border border-border rounded-lg shadow-[0_12px_32px_rgba(0,_0,_0,_0.18)] z-50 overflow-hidden min-w-47.5 p-1.5 [&.align-right]:left-auto [&.align-right]:right-0 [&.drop-down]:bottom-auto [&.drop-down]:top-[calc(100%_+_4px)] [&.session-menu]:left-auto [&.session-menu]:right-1.5 [&.session-menu]:top-[calc(100%_-_2px)] [&.session-menu]:min-w-35 ${choices.some((choice) => choice.description) ? "min-w-80" : ""} ${align === "right" ? "align-right" : ""}`}>
           {header && <div className={MODEL_GROUP_CLASS_NAME}>{header}</div>}
           {pinned && (
             <>
@@ -376,13 +376,20 @@ export function OptionPicker({
           )}
           {rest.map((c, i) => (
             <button key={c.id} className={MODEL_ITEM_CLASS_NAME} onClick={() => choose(c.id)}>
-              <span>
-                {c.label}
-                {/* A concrete default renders inline, in ramp order, with just
-                    the marker — it's one of the tiers, not a separate kind of
-                    choice like the pinned sentinel above. */}
-                {!pinned && c.id === defaultId && (
-                  <span className="option-default text-muted font-normal"> · Default</span>
+              <span className="flex min-w-0 flex-col items-start gap-0.5">
+                <span>
+                  {c.label}
+                  {/* A concrete default renders inline, in ramp order, with just
+                      the marker — it's one of the tiers, not a separate kind of
+                      choice like the pinned sentinel above. */}
+                  {!pinned && c.id === defaultId && (
+                    <span className="option-default text-muted font-normal"> · Default</span>
+                  )}
+                </span>
+                {c.description && (
+                  <span className="max-w-68 text-sm font-normal leading-snug text-muted">
+                    {c.description}
+                  </span>
                 )}
               </span>
               {effectiveId === c.id ? (

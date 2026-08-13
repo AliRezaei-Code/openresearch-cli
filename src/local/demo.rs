@@ -280,6 +280,8 @@ fn seed_at(
         title_source: Some("generated".into()),
         model: selection.model.clone(),
         permission_mode: selection.permission_mode.clone(),
+        plan_mode: false,
+        plan_reset_pending: false,
         reasoning_level: selection.reasoning_level.clone(),
         archived: false,
         context_usage_json: None,
@@ -310,6 +312,8 @@ fn seed_at(
         title_source: Some("generated".into()),
         model: selection.model.clone(),
         permission_mode: selection.permission_mode.clone(),
+        plan_mode: false,
+        plan_reset_pending: false,
         reasoning_level: selection.reasoning_level.clone(),
         archived: false,
         context_usage_json: None,
@@ -343,6 +347,8 @@ fn seed_at(
         title_source: Some("generated".into()),
         model: selection.model,
         permission_mode: selection.permission_mode,
+        plan_mode: false,
+        plan_reset_pending: false,
         reasoning_level: selection.reasoning_level,
         archived: false,
         context_usage_json: None,
@@ -1446,7 +1452,7 @@ mod tests {
         let selection = DemoSelection {
             harness: "codex".into(),
             model: None,
-            permission_mode: Some("auto".into()),
+            permission_mode: None,
             reasoning_level: None,
         };
         let first = seed_at(&store, &data, &repo, selection.clone()).unwrap();

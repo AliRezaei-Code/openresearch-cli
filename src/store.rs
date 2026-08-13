@@ -243,6 +243,8 @@ impl Store {
                 title_source      TEXT,
                 model             TEXT,
                 permission_mode   TEXT,
+                plan_mode         INTEGER NOT NULL DEFAULT 0,
+                plan_reset_pending INTEGER NOT NULL DEFAULT 0,
                 reasoning_level   TEXT,
                 archived          INTEGER NOT NULL DEFAULT 0,
                 context_usage_json TEXT,
@@ -285,6 +287,8 @@ impl Store {
             "ALTER TABLE runs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE runs ADD COLUMN chat_session_id TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN permission_mode TEXT",
+            "ALTER TABLE chat_sessions ADD COLUMN plan_mode INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE chat_sessions ADD COLUMN plan_reset_pending INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE chat_sessions ADD COLUMN reasoning_level TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE chat_sessions ADD COLUMN context_usage_json TEXT",
@@ -303,52 +307,113 @@ impl Store {
             "DROP INDEX IF EXISTS uidx_local_experiments_project_baseline",
             [],
         );
-        // Data migration: the chat_sessions.permission_mode wire ids were
-        // neutralized off Claude Code's `--permission-mode` spelling (`default`,
-        // `acceptEdits`, `bypassPermissions`) onto harness-agnostic ids (`ask`,
-        // `accept-edits`, `bypass`) once Codex's sandbox policies stopped mapping
-        // onto Claude's strings. Rewrite any rows written under the old scheme.
-        // `plan`/`auto` were already harness-agnostic and need no rewrite.
-        // Idempotent: after the first pass no old spellings remain to match.
-        for (old, new) in [
-            ("default", "ask"),
-            ("acceptEdits", "accept-edits"),
-            ("bypassPermissions", "bypass"),
+        // Provider-owned permission ids + the independent Codex/OpenCode Plan
+        // axis. These updates are idempotent and intentionally do not touch
+        // Claude's native `plan`, Manual, or Accept edits modes.
+        let _ = conn.execute(
+            "UPDATE chat_sessions
+             SET plan_mode = 1, permission_mode = 'ask'
+             WHERE harness = 'codex' AND permission_mode = 'plan'",
+            [],
+        );
+        let _ = conn.execute(
+            "UPDATE chat_sessions
+             SET plan_mode = 1, permission_mode = 'default'
+             WHERE harness = 'opencode' AND permission_mode = 'plan'",
+            [],
+        );
+        for (harness, old, new) in [
+            ("claude-code", "ask", "manual"),
+            ("claude-code", "default", "manual"),
+            ("claude-code", "accept-edits", "acceptEdits"),
+            ("claude-code", "bypass", "bypassPermissions"),
+            ("codex", "auto", "approve-for-me"),
+            ("codex", "bypass", "full-access"),
+            ("codex", "accept-edits", "ask"),
+            ("codex", "acceptEdits", "ask"),
+            ("opencode", "auto", "default"),
+            ("opencode", "bypass", "auto-approve"),
+            ("opencode", "ask", "default"),
+            ("opencode", "accept-edits", "default"),
+            ("opencode", "acceptEdits", "default"),
         ] {
             let _ = conn.execute(
-                "UPDATE chat_sessions SET permission_mode = ?2 WHERE permission_mode = ?1",
-                params![old, new],
+                "UPDATE chat_sessions SET permission_mode = ?3
+                 WHERE harness = ?1 AND permission_mode = ?2",
+                params![harness, old, new],
             );
         }
-        // Retired permission modes → `auto`, per harness:
-        //  * Claude Code KEEPS `plan` — it's a real mode again (the plan-gate
-        //    hook + mcp-gate permission bridge make read-only planning and
-        //    plan approval work headless). `ask`/`accept-edits` stay retired
-        //    from the *picker* (never grantable headless mid-turn), and a
-        //    session parked on them by an old build normalizes to `auto`.
-        //    NOTE: this list runs on every open — a mode offered by
-        //    `options()` must never appear in it, or picking that mode
-        //    silently degrades to `auto` on the next request (exactly what
-        //    happened to `plan` between #75 and this fix).
-        //  * Codex KEEPS `plan` — it's a real mode now too (native
-        //    collaboration mode over the app-server: the plan.md template,
-        //    `request_user_input` question cards, and the streamed plan item
-        //    make read-mostly planning and plan approval work). Only
-        //    `ask`/`accept-edits` stay retired (never grantable). Same rule as
-        //    Claude's `plan` above: a mode offered by `options()` must NEVER
-        //    appear in this list, or picking it silently degrades to `auto` on
-        //    the next request.
-        //  * OpenCode dropped its hollow `ask` (its default is permissive, so a
-        //    dedicated ask mode almost never fired) — but KEEPS `plan` (its real
-        //    plan agent), so that one is left untouched.
         let _ = conn.execute(
             "UPDATE chat_sessions SET permission_mode = 'auto'
-             WHERE (harness = 'claude-code'
-                    AND permission_mode IN ('ask', 'accept-edits'))
-                OR (harness = 'codex'
-                    AND permission_mode IN ('ask', 'accept-edits'))
-                OR (harness = 'opencode'
-                    AND permission_mode IN ('ask', 'accept-edits'))",
+             WHERE harness = 'claude-code'
+               AND (permission_mode IS NULL OR permission_mode NOT IN
+                    ('manual', 'acceptEdits', 'plan', 'auto', 'bypassPermissions'))",
+            [],
+        );
+        let _ = conn.execute(
+            "UPDATE chat_sessions SET permission_mode = 'approve-for-me'
+             WHERE harness = 'codex'
+               AND (permission_mode IS NULL OR permission_mode NOT IN
+                    ('ask', 'approve-for-me', 'full-access'))",
+            [],
+        );
+        let _ = conn.execute(
+            "UPDATE chat_sessions SET permission_mode = 'default'
+             WHERE harness = 'opencode'
+               AND (permission_mode IS NULL OR permission_mode NOT IN
+                    ('default', 'auto-approve'))",
+            [],
+        );
+        // Preferred-agent state never carries Plan for command-activated
+        // harnesses: new sessions start in Build/Default until `/plan` is used.
+        let _ = conn.execute(
+            "UPDATE ui_state SET preferred_permission_mode = 'ask'
+             WHERE preferred_harness = 'codex' AND preferred_permission_mode = 'plan'",
+            [],
+        );
+        let _ = conn.execute(
+            "UPDATE ui_state SET preferred_permission_mode = 'default'
+             WHERE preferred_harness = 'opencode' AND preferred_permission_mode = 'plan'",
+            [],
+        );
+        let _ = conn.execute(
+            "UPDATE ui_state SET preferred_permission_mode = 'auto'
+             WHERE preferred_harness = 'claude-code' AND preferred_permission_mode = 'plan'",
+            [],
+        );
+        for (harness, old, new) in [
+            ("claude-code", "ask", "manual"),
+            ("claude-code", "default", "manual"),
+            ("claude-code", "accept-edits", "acceptEdits"),
+            ("claude-code", "bypass", "bypassPermissions"),
+            ("codex", "auto", "approve-for-me"),
+            ("codex", "bypass", "full-access"),
+            ("opencode", "auto", "default"),
+            ("opencode", "bypass", "auto-approve"),
+        ] {
+            let _ = conn.execute(
+                "UPDATE ui_state SET preferred_permission_mode = ?3
+                 WHERE preferred_harness = ?1 AND preferred_permission_mode = ?2",
+                params![harness, old, new],
+            );
+        }
+        let _ = conn.execute(
+            "UPDATE ui_state SET preferred_permission_mode = 'auto'
+             WHERE preferred_harness = 'claude-code'
+               AND preferred_permission_mode NOT IN
+                   ('manual', 'acceptEdits', 'plan', 'auto', 'bypassPermissions')",
+            [],
+        );
+        let _ = conn.execute(
+            "UPDATE ui_state SET preferred_permission_mode = 'approve-for-me'
+             WHERE preferred_harness = 'codex'
+               AND preferred_permission_mode NOT IN ('ask', 'approve-for-me', 'full-access')",
+            [],
+        );
+        let _ = conn.execute(
+            "UPDATE ui_state SET preferred_permission_mode = 'default'
+             WHERE preferred_harness = 'opencode'
+               AND preferred_permission_mode NOT IN ('default', 'auto-approve')",
             [],
         );
 
@@ -687,10 +752,11 @@ impl Store {
         for session in sessions {
             tx.execute(
                 "INSERT INTO chat_sessions (id, project_id, harness, native_session_id, title,
-                                            title_source, model, permission_mode, reasoning_level,
+                                            title_source, model, permission_mode, plan_mode,
+                                            plan_reset_pending, reasoning_level,
                                             archived, context_usage_json, bootstrap_context,
                                             created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     session.id,
                     session.project_id,
@@ -700,6 +766,8 @@ impl Store {
                     session.title_source,
                     session.model,
                     session.permission_mode,
+                    session.plan_mode,
+                    session.plan_reset_pending,
                     session.reasoning_level,
                     session.archived,
                     session.context_usage_json,
@@ -886,9 +954,9 @@ impl Store {
     pub fn create_chat_session(&self, s: &StoredChatSession) -> Result<()> {
         self.conn.execute(
             "INSERT INTO chat_sessions (id, project_id, harness, native_session_id, title, title_source, model,
-                                        permission_mode, reasoning_level, archived, bootstrap_context,
+                                        permission_mode, plan_mode, plan_reset_pending, reasoning_level, archived, bootstrap_context,
                                         created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 s.id,
                 s.project_id,
@@ -898,6 +966,8 @@ impl Store {
                 s.title_source,
                 s.model,
                 s.permission_mode,
+                s.plan_mode,
+                s.plan_reset_pending,
                 s.reasoning_level,
                 s.archived,
                 s.bootstrap_context,
@@ -970,6 +1040,29 @@ impl Store {
         self.conn.execute(
             "UPDATE chat_sessions SET permission_mode = ?2, updated_at = ?3 WHERE id = ?1",
             params![id, mode, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_chat_session_plan_state(
+        &self,
+        id: &str,
+        plan_mode: bool,
+        reset_pending: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chat_sessions
+             SET plan_mode = ?2, plan_reset_pending = ?3, updated_at = ?4
+             WHERE id = ?1",
+            params![id, plan_mode, reset_pending, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_chat_session_plan_reset(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chat_sessions SET plan_reset_pending = 0 WHERE id = ?1",
+            params![id],
         )?;
         Ok(())
     }
@@ -1147,6 +1240,12 @@ pub struct StoredChatSession {
     pub model: Option<String>,
     /// Permission-mode wire id (`"auto"` / `"plan"` / …); None = harness default.
     pub permission_mode: Option<String>,
+    /// Independent Plan state for Codex/OpenCode. Claude keeps Plan in
+    /// `permission_mode`, matching its native permission-mode model.
+    pub plan_mode: bool,
+    /// Codex must send one `collaborationMode: default` after leaving Plan;
+    /// persisted so a restart cannot strand the native thread in Plan.
+    pub plan_reset_pending: bool,
     /// Reasoning-level wire id (`"low"` / `"medium"` / `"high"`); None = default.
     pub reasoning_level: Option<String>,
     /// Hidden from the default Recents list, but fully intact and resumable.
@@ -1190,8 +1289,8 @@ pub struct StoredChatMessage {
 }
 
 const CHAT_SESSION_COLS: &str = "id, project_id, harness, native_session_id, title, model, \
-     permission_mode, reasoning_level, archived, context_usage_json, created_at, updated_at, \
-     title_source, bootstrap_context";
+     permission_mode, plan_mode, plan_reset_pending, reasoning_level, archived, context_usage_json, \
+     created_at, updated_at, title_source, bootstrap_context";
 
 fn row_to_chat_session(
     row: &rusqlite::Row<'_>,
@@ -1204,13 +1303,15 @@ fn row_to_chat_session(
         title: row.get(4)?,
         model: row.get(5)?,
         permission_mode: row.get(6)?,
-        reasoning_level: row.get(7)?,
-        archived: row.get(8)?,
-        context_usage_json: row.get(9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
-        title_source: row.get(12)?,
-        bootstrap_context: row.get(13)?,
+        plan_mode: row.get(7)?,
+        plan_reset_pending: row.get(8)?,
+        reasoning_level: row.get(9)?,
+        archived: row.get(10)?,
+        context_usage_json: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+        title_source: row.get(14)?,
+        bootstrap_context: row.get(15)?,
     })
 }
 
@@ -1368,6 +1469,78 @@ mod tests {
     }
 
     #[test]
+    fn permission_and_plan_migration_preserves_each_harness_native_contract() {
+        let dir =
+            std::env::temp_dir().join(format!("orx-store-plan-migrate-{}", uuid::Uuid::new_v4()));
+        {
+            let store = Store::open_at(dir.clone()).unwrap();
+            for (id, harness, mode) in [
+                ("claude_manual", "claude-code", "ask"),
+                ("claude_edits", "claude-code", "accept-edits"),
+                ("claude_plan", "claude-code", "plan"),
+                ("codex_plan", "codex", "plan"),
+                ("codex_auto", "codex", "auto"),
+                ("codex_bypass", "codex", "bypass"),
+                ("codex_invalid", "codex", "retired-mode"),
+                ("open_plan", "opencode", "plan"),
+                ("open_auto", "opencode", "auto"),
+                ("open_bypass", "opencode", "bypass"),
+            ] {
+                let mut session = chat_session_fixture(id);
+                session.harness = harness.into();
+                session.permission_mode = Some(mode.into());
+                store.create_chat_session(&session).unwrap();
+            }
+        }
+        let store = Store::open_at(dir.clone()).unwrap();
+        let state = |id: &str| {
+            let session = store.get_chat_session(id).unwrap().unwrap();
+            (session.permission_mode.unwrap(), session.plan_mode)
+        };
+        assert_eq!(state("claude_manual"), ("manual".into(), false));
+        assert_eq!(state("claude_edits"), ("acceptEdits".into(), false));
+        assert_eq!(state("claude_plan"), ("plan".into(), false));
+        assert_eq!(state("codex_plan"), ("ask".into(), true));
+        assert_eq!(state("codex_auto"), ("approve-for-me".into(), false));
+        assert_eq!(state("codex_bypass"), ("full-access".into(), false));
+        assert_eq!(state("codex_invalid"), ("approve-for-me".into(), false));
+        assert_eq!(state("open_plan"), ("default".into(), true));
+        assert_eq!(state("open_auto"), ("default".into(), false));
+        assert_eq!(state("open_bypass"), ("auto-approve".into(), false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn codex_plan_reset_marker_roundtrips_and_clears() {
+        let dir =
+            std::env::temp_dir().join(format!("orx-store-plan-reset-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let mut session = chat_session_fixture("codex");
+        session.harness = "codex".into();
+        session.permission_mode = Some("approve-for-me".into());
+        store.create_chat_session(&session).unwrap();
+        store
+            .set_chat_session_plan_state("codex", false, true)
+            .unwrap();
+        assert!(
+            store
+                .get_chat_session("codex")
+                .unwrap()
+                .unwrap()
+                .plan_reset_pending
+        );
+        store.clear_chat_session_plan_reset("codex").unwrap();
+        assert!(
+            !store
+                .get_chat_session("codex")
+                .unwrap()
+                .unwrap()
+                .plan_reset_pending
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn chat_message_existence_tracks_persisted_messages() {
         let dir = std::env::temp_dir().join(format!("orx-store-messages-{}", uuid::Uuid::new_v4()));
         let store = Store::open_at(dir.clone()).unwrap();
@@ -1400,6 +1573,8 @@ mod tests {
             title_source: None,
             model: None,
             permission_mode: None,
+            plan_mode: false,
+            plan_reset_pending: false,
             reasoning_level: None,
             archived: false,
             context_usage_json: None,

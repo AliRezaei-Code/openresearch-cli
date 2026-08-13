@@ -14,6 +14,7 @@ import {
   GitBranch,
   Globe,
   HelpCircle,
+  Lightbulb,
   MessageSquareQuote,
   MoreHorizontal,
   PanelLeft,
@@ -59,6 +60,8 @@ import {
   respondChat,
   sendChatMessage,
   setChatSessionArchived,
+  setChatSessionPermissionMode,
+  setChatSessionPlanMode,
   type ChatImageAttachment,
   type ChatMessage,
   type ChatPart,
@@ -87,6 +90,7 @@ import {
 } from "./ModelPicker";
 import { ContextMeter } from "./ContextMeter";
 import { renderNote } from "./agentNote";
+import { commandsForHarness, parsePlanCommand } from "../planCommand";
 import { loadReadDemoSessions, markDemoSessionRead } from "../demoSessionState";
 import { ICON_BUTTON_BASE_CLASS_NAME, ICON_BUTTON_CLASS_NAME, MODEL_ITEM_CLASS_NAME, PAPER_TITLE_CLASS_NAME, SPINNER_CLASS_NAME } from "../styleClasses";
 import {
@@ -2482,7 +2486,7 @@ function PromptCard({
             <button className="btn-primary" onClick={() => respond({ approve: true, resumeMode: "auto" })}>
               Accept and auto mode
             </button>
-            <button className="btn-ghost" onClick={() => respond({ approve: true, resumeMode: "bypass" })}>
+            <button className="btn-ghost" onClick={() => respond({ approve: true, resumeMode: "bypassPermissions" })}>
               Accept and bypass all
             </button>
             <button className="btn-ghost" onClick={() => respond({ approve: false })}>
@@ -2537,7 +2541,7 @@ function PromptCard({
           )}
           {!done && (
             // No resumeMode: the harness picks the right one for an approval.
-            // Claude resumes under `bypass` (the only mode that actually grants a
+            // Claude resumes under `bypassPermissions` (the only mode that grants a
             // blocked tool — acceptEdits would re-deny Bash); inline harnesses
             // (opencode) reply once/reject keyed off `approve`. Deny denies either way.
             <div className="prompt-actions flex items-center justify-end gap-2 pt-0.5">
@@ -3536,6 +3540,9 @@ export function ChatPanel({
     { dataUrl: string; mediaType: string; name?: string; size: number }[]
   >([]);
   const [attachError, setAttachError] = useState<string | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const settingsMutationTail = useRef<Promise<void>>(Promise.resolve());
+  const settingsMutationSeq = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [state, dispatch] = useReducer(reducer, {
     messagesBySession: {},
@@ -3626,16 +3633,6 @@ export function ChatPanel({
   useEffect(() => {
     getSkills(projectId).then(setSkills).catch(() => {});
   }, [projectId, mainView]);
-  const slashToken =
-    !pickedSkill && draft.startsWith("/") && !/\s/.test(draft) ? draft.slice(1) : null;
-  const skillMatches =
-    slashToken !== null && !skillMenuDismissed
-      ? skills.filter((s) => s.name.startsWith(slashToken.toLowerCase()))
-      : [];
-  const skillMenuOpen = skillMatches.length > 0;
-  const activeSkillIdx = Math.min(skillIdx, Math.max(0, skillMatches.length - 1));
-  useEffect(() => setSkillIdx(0), [slashToken]);
-
   function pickSkill(skill: SkillInfo) {
     setPickedSkill(skill);
     setDraft("");
@@ -3705,6 +3702,7 @@ export function ChatPanel({
   //  * with a session open — that session's stored settings, with any unsent
   //    picker tweaks layered on. The harness is the session's, not the global.
   //  * with no session — the sticky global preference (seeds a new session).
+  const savedSelection = selection ?? defaultSelection(harnesses);
   const rawSelection: ModelSelection | null = openSession
     ? {
         harness: openSession.harness,
@@ -3712,11 +3710,23 @@ export function ChatPanel({
         permissionMode: sessionOverride.permissionMode ?? openSession.permissionMode,
         reasoningLevel: sessionOverride.reasoningLevel ?? openSession.reasoningLevel,
       }
-    : (selection ?? defaultSelection(harnesses));
+    : savedSelection
+      ? { ...savedSelection, ...sessionOverride }
+      : null;
   const activeHarness = rawSelection
     ? harnesses.find((h) => h.id === rawSelection.harness)
     : undefined;
   const opts = activeHarness?.options;
+  const commands = commandsForHarness(skills, opts?.planActivation);
+  const slashToken =
+    !pickedSkill && draft.startsWith("/") && !/\s/.test(draft) ? draft.slice(1) : null;
+  const skillMatches =
+    slashToken !== null && !skillMenuDismissed
+      ? commands.filter((command) => command.name.startsWith(slashToken.toLowerCase()))
+      : [];
+  const skillMenuOpen = skillMatches.length > 0;
+  const activeSkillIdx = Math.min(skillIdx, Math.max(0, skillMatches.length - 1));
+  useEffect(() => setSkillIdx(0), [slashToken]);
   // Reconcile the reasoning level against the *currently selected model* here
   // rather than only in the picker's `pick`. Two paths reach the composer with
   // a level nobody chose for this model: a session row stored by an older build
@@ -3754,10 +3764,90 @@ export function ChatPanel({
     const merged = { ...composerSelection, ...next };
     setSelection(merged);
     void onPreferredAgentChange(merged).catch(() => {});
-    if (openSession) setSessionOverride((cur) => ({ ...cur, ...next }));
+    if (openSession) {
+      setSessionOverride((cur) => ({ ...cur, ...next }));
+    } else if (next.harness && next.harness !== composerSelection.harness) {
+      setSessionOverride({});
+    }
   };
-  const setPermissionMode = (id: string) => selectModel({ permissionMode: id });
+  const queueSessionSetting = (mutation: () => Promise<ChatSession>): Promise<ChatSession> => {
+    const result = settingsMutationTail.current.catch(() => {}).then(mutation);
+    settingsMutationTail.current = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
+  };
+  const setPermissionMode = (id: string) => {
+    // Plan is session-scoped. Claude exposes it in the permission dropdown,
+    // but it must not become the saved default for future sessions.
+    if (id === "plan" && activeHarness?.id === "claude-code") {
+      setSessionOverride((current) => ({ ...current, permissionMode: id }));
+    } else {
+      setSessionOverride((current) => {
+        const next = { ...current };
+        delete next.permissionMode;
+        return next;
+      });
+      selectModel({ permissionMode: id });
+    }
+    if (!openSession) return;
+    const sessionId = openSession.id;
+    const mutation = ++settingsMutationSeq.current;
+    setSettingsError(null);
+    void queueSessionSetting(() => setChatSessionPermissionMode(sessionId, id))
+      .then((session) => {
+        setSessions((current) =>
+          current.map((candidate) => (candidate.id === session.id ? session : candidate)),
+        );
+        if (settingsMutationSeq.current === mutation) {
+          setSessionOverride((current) => {
+            const next = { ...current };
+            delete next.permissionMode;
+            return next;
+          });
+        }
+      })
+      .catch(() => {
+        if (settingsMutationSeq.current !== mutation) return;
+        setSessionOverride((current) => {
+          const next = { ...current };
+          delete next.permissionMode;
+          return next;
+        });
+        setSettingsError("Could not update permissions. Try again.");
+      });
+  };
   const setReasoningLevel = (id: string) => selectModel({ reasoningLevel: id });
+  const planActive = !!openSession &&
+    (openSession.harness === "claude-code"
+      ? composerSelection?.permissionMode === "plan"
+      : openSession.planMode);
+
+  async function setIndependentPlanMode(planMode: boolean) {
+    if (!openSession) return;
+    const sessionId = openSession.id;
+    const mutation = ++settingsMutationSeq.current;
+    setSettingsError(null);
+    const session = await queueSessionSetting(() => setChatSessionPlanMode(sessionId, planMode));
+    setSessions((current) =>
+      current.map((candidate) => (candidate.id === session.id ? session : candidate)),
+    );
+    if (settingsMutationSeq.current === mutation) setSettingsError(null);
+  }
+
+  async function exitPlanMode() {
+    if (!openSession) return;
+    if (openSession.harness === "claude-code") {
+      setPermissionMode("auto");
+      return;
+    }
+    try {
+      await setIndependentPlanMode(false);
+    } catch {
+      setSettingsError("Could not exit Plan mode. Try again.");
+    }
+  }
 
   sessionsRef.current = sessions;
 
@@ -4092,7 +4182,11 @@ export function ChatPanel({
 
   // Drop any unsent composer tweak when switching sessions, so it never bleeds
   // from one session's pickers onto another's.
-  useEffect(() => setSessionOverride({}), [activeId]);
+  useEffect(() => {
+    settingsMutationSeq.current += 1;
+    setSessionOverride({});
+    setSettingsError(null);
+  }, [activeId]);
 
   // Surface the open session to the shell (Agent-scoped panes key off it).
   useEffect(() => {
@@ -4132,7 +4226,12 @@ export function ChatPanel({
     const args = draft.trim();
     // Reassemble the picked skill chip into the plain `/name args` wire form —
     // the backend's slash expansion and the transcript both see only text.
-    const text = pickedSkill ? `/${pickedSkill.name}${args ? ` ${args}` : ""}` : args;
+    const originalText = pickedSkill ? `/${pickedSkill.name}${args ? ` ${args}` : ""}` : args;
+    const planCommand = !pendingQuestion
+      ? parsePlanCommand(originalText, opts?.planActivation)
+      : null;
+    const planRequested = !!planCommand;
+    const text = planCommand ? planCommand.prompt : originalText;
     const pending = attachments;
     const pendingAnnotations = annotations;
     const wireAnnotations = pendingAnnotations.map((annotation) => ({
@@ -4146,10 +4245,36 @@ export function ChatPanel({
     };
     const restoreComposer = () => {
       if (!inSourceScope()) return;
-      setDraft((current) => current || text);
+      setDraft((current) => current || originalText);
       setAttachments((current) => (current.length ? current : pending));
       setAnnotations((current) => (current.length ? current : pendingAnnotations));
     };
+    if (planRequested && !text && pending.length === 0 && pendingAnnotations.length === 0) {
+      setDraft("");
+      setPickedSkill(null);
+      setSkillMenuDismissed(false);
+      try {
+        if (openSession) {
+          await setIndependentPlanMode(true);
+        } else if (activeHarness?.agentReady && composerSelection) {
+          const session = await createChatSession(projectId, composerSelection.harness, {
+            model: composerSelection.model,
+            permissionMode: composerSelection.permissionMode,
+            planMode: true,
+            reasoningLevel: composerSelection.reasoningLevel,
+          });
+          loadedSessions.current.add(session.id);
+          dispatch({ type: "seed", sessionId: session.id, messages: [], queued: [] });
+          setSessions((current) => [session, ...current]);
+          setActiveId(session.id);
+          composerScopeRef.current = { projectId, activeId: session.id };
+        }
+      } catch {
+        setSettingsError("Could not enter Plan mode. Try again.");
+        restoreComposer();
+      }
+      return;
+    }
     if (!text && pending.length === 0 && pendingAnnotations.length === 0) return;
     // A pending question card owns plain typed text as a custom answer
     // (Claude-desktop behavior). This also works while the turn is HELD on
@@ -4187,6 +4312,7 @@ export function ChatPanel({
         ? {
             model: composerSelection.model,
             permissionMode: composerSelection.permissionMode,
+            planMode: planRequested ? true : undefined,
             reasoningLevel: composerSelection.reasoningLevel,
           }
         : {};
@@ -4226,6 +4352,7 @@ export function ChatPanel({
         const session = await createChatSession(projectId, effective.harness, {
           model: effective.model,
           permissionMode: effective.permissionMode,
+          planMode: planRequested ? true : undefined,
           reasoningLevel: effective.reasoningLevel,
         });
         loadedSessions.current.add(session.id);
@@ -4255,6 +4382,7 @@ export function ChatPanel({
         ? {
             model: effective.model,
             permissionMode: effective.permissionMode,
+            planMode: planRequested ? true : undefined,
             reasoningLevel: effective.reasoningLevel,
           }
         : {};
@@ -4759,7 +4887,7 @@ export function ChatPanel({
               onRespond={respond}
               onOpenPlan={openPlan}
               onOpenSubagent={openSubagent}
-              skills={skills}
+              skills={commands}
             />
             {busy &&
               (awaitingInput ? (
@@ -4807,9 +4935,14 @@ export function ChatPanel({
             agentLabel={
               activeSession ? HARNESS_LABELS[activeSession.harness] : "The agent"
             }
+            showResumeModes={activeSession?.harness === "claude-code"}
             onView={() => openPlan?.(pendingPlan.plan, pendingPlan.promptId)}
             onApprove={(resumeMode) =>
-              respond({ promptId: pendingPlan.promptId, approve: true, resumeMode })
+              respond({
+                promptId: pendingPlan.promptId,
+                approve: true,
+                ...(resumeMode ? { resumeMode } : {}),
+              })
             }
             // Plain rejection — no note; the model stops and waits.
             onReject={() => respond({ promptId: pendingPlan.promptId, approve: false })}
@@ -4907,6 +5040,11 @@ export function ChatPanel({
               {attachError}
             </div>
           )}
+          {settingsError && (
+            <div className="composer-settings-error pt-1.5 px-3 pb-0 text-sm text-accent-red" role="alert">
+              {settingsError}
+            </div>
+          )}
           <div className="composer-input relative flex overflow-hidden [&_textarea]:flex-1">
             {pickedSkill && (
               // Inert like inline text: clicks fall through to the textarea
@@ -4937,9 +5075,9 @@ export function ChatPanel({
                       : pickedSkill.argHint
                     : composerSelection
                       ? activeHarness?.agentReady
-                        ? `Message ${HARNESS_LABELS[composerSelection.harness]}… ( / for skills)`
+                        ? `Message ${HARNESS_LABELS[composerSelection.harness]}… ( / for commands)`
                         : `${HARNESS_LABELS[composerSelection.harness]} is unavailable — open the model picker`
-                      : "Ask the research agent… ( / for skills)"
+                      : "Ask the research agent… ( / for commands)"
               }
               rows={2}
               onPaste={onComposerPaste}
@@ -4960,7 +5098,7 @@ export function ChatPanel({
                 // skill-expanded) and not mid-IME-composition.
                 if (!pickedSkill && !pendingQuestion && !composingRef.current) {
                   const m = v.match(/^\/(\S+)\s([\s\S]*)$/);
-                  const hit = m && skills.find((s) => s.name === m[1].toLowerCase());
+                  const hit = m && commands.find((command) => command.name === m[1].toLowerCase());
                   if (hit) {
                     setPickedSkill(hit);
                     setDraft(m[2]);
@@ -5090,6 +5228,18 @@ export function ChatPanel({
               <Paperclip size={16} />
             </button>
             <div style={{ flex: 1 }} />
+            {planActive && (
+              <button
+                type="button"
+                className="plan-indicator ml-1 mr-0.5 inline-flex items-center gap-1.5 border-0 border-l border-solid border-l-border-variant bg-transparent py-1 pl-3 pr-1 text-md text-muted transition-colors hover:text-text focus-visible:text-text"
+                title="Exit Plan mode"
+                aria-label="Exit Plan mode"
+                onClick={() => void exitPlanMode()}
+              >
+                <Lightbulb size={16} strokeWidth={1.6} aria-hidden="true" />
+                <span>Plan</span>
+              </button>
+            )}
             {/* The model picker reflects the open session (harness locked once it
                 exists); the global default only applies before the first
                 message. */}
