@@ -260,7 +260,7 @@ function ComposerAnnotations({
       </div>
       {popover.open && (
         <div
-          className="annotation-menu absolute bottom-[calc(100%_+_8px)] left-3 z-50 w-[min(440px,_calc(100vw_-_48px))] max-h-80 overflow-y-auto bg-background border border-border rounded-lg shadow-[0_12px_32px_rgba(0,_0,_0,_0.18)] p-2"
+          className="annotation-menu absolute bottom-[calc(100%_+_8px)] left-3 z-50 w-[min(440px,_calc(100vw_-_48px))] max-h-80 overflow-y-auto overscroll-contain bg-background border border-border rounded-lg shadow-[0_12px_32px_rgba(0,_0,_0,_0.18)] p-2"
           role="dialog"
           aria-label="Selected chat text"
         >
@@ -272,7 +272,7 @@ function ComposerAnnotations({
               <span className="text-sm text-muted text-right">{index + 1}.</span>
               <div className="min-w-0">
                 <div className="text-sm text-muted mb-1">Selected text:</div>
-                <div className="text-md leading-normal text-text whitespace-pre-wrap wrap-anywhere max-h-24 overflow-hidden">
+                <div className="text-md leading-normal text-text whitespace-pre-wrap wrap-anywhere">
                   {annotation.text}
                 </div>
               </div>
