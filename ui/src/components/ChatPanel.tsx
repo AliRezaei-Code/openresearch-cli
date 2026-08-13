@@ -14,6 +14,7 @@ import {
   GitBranch,
   Globe,
   HelpCircle,
+  MessageSquareQuote,
   MoreHorizontal,
   PanelLeft,
   Paperclip,
@@ -31,6 +32,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useReducer,
@@ -62,6 +64,7 @@ import {
   type ChatPart,
   type ChatPrompt,
   type ChatSession,
+  type ChatTextAnnotation,
   type Harness,
   type PromptAnswer,
   type QueuedMessage,
@@ -86,6 +89,17 @@ import { ContextMeter } from "./ContextMeter";
 import { renderNote } from "./agentNote";
 import { loadReadDemoSessions, markDemoSessionRead } from "../demoSessionState";
 import { ICON_BUTTON_BASE_CLASS_NAME, ICON_BUTTON_CLASS_NAME, MODEL_ITEM_CLASS_NAME, PAPER_TITLE_CLASS_NAME, SPINNER_CLASS_NAME } from "../styleClasses";
+import {
+  escapeMarkdownText,
+  fencedCodeMarkdown,
+  formatMath,
+  headingMarkdown,
+  isLegacyFingerprintMatch,
+  inlineCodeMarkdown,
+  listItemMarkdown,
+  shouldRecoverLegacyMath,
+  tableMarkdown,
+} from "./annotationMarkdown";
 
 const TOOL_LINE_CLASS_NAME = [
   "tool-line flex-1 min-w-0 overflow-hidden text-ellipsis whitespace-nowrap",
@@ -118,6 +132,531 @@ function permissionToolPresentation(tool?: string): { kind: "edit" | "command" |
   if (PERMISSION_EDIT_TOOLS.has(baseTool)) return { kind: "edit", label: "File change" };
   if (PERMISSION_COMMAND_TOOLS.has(baseTool)) return { kind: "command", label: "Command" };
   return { kind: "other", label: rawTool || "Action" };
+}
+const SELECTION_ACTION_GAP_PX = 8;
+const CHAT_ANNOTATION_HIGHLIGHT_NAME = "chat-annotations";
+
+interface ComposerAnnotation extends ChatTextAnnotation {
+  id: string;
+  range?: Range;
+}
+
+interface SelectionAction {
+  text: string;
+  range: Range;
+  x: number;
+  top: number;
+}
+
+function elementForNode(node: Node): Element | null {
+  return node instanceof Element ? node : node.parentElement;
+}
+
+interface DomPoint {
+  container: Node;
+  offset: number;
+}
+
+function pointRange(point: DomPoint): Range {
+  const range = document.createRange();
+  range.setStart(point.container, point.offset);
+  range.collapse(true);
+  return range;
+}
+
+function pointBefore(left: DomPoint, right: DomPoint): boolean {
+  return pointRange(left).compareBoundaryPoints(Range.START_TO_START, pointRange(right)) < 0;
+}
+
+function cloneBetween(start: DomPoint, end: DomPoint): DocumentFragment {
+  const range = document.createRange();
+  range.setStart(start.container, start.offset);
+  range.setEnd(end.container, end.offset);
+  return range.cloneContents();
+}
+
+const INLINE_MARKDOWN_TAGS = new Set(["A", "B", "CODE", "EM", "I", "STRONG"]);
+
+function preservePartialInlineContext(range: Range, container: HTMLElement): void {
+  const end = elementForNode(range.endContainer);
+  if (Array.from(container.childNodes).every((node) => node.nodeType === Node.TEXT_NODE)) {
+    let ancestor = elementForNode(range.startContainer);
+    while (ancestor && ancestor.matches(".md *") && ancestor.contains(end)) {
+      if (INLINE_MARKDOWN_TAGS.has(ancestor.tagName)) {
+        const wrapper = ancestor.cloneNode(false);
+        if (wrapper instanceof HTMLElement) {
+          wrapper.replaceChildren(...Array.from(container.childNodes));
+          container.replaceChildren(wrapper);
+        }
+      }
+      ancestor = ancestor.parentElement;
+    }
+  }
+  const sourcePre = elementForNode(range.startContainer)?.closest("pre");
+  if (sourcePre?.contains(end)) {
+    const code = sourcePre.querySelector("code")?.cloneNode(false);
+    const pre = sourcePre.cloneNode(false);
+    if (pre instanceof HTMLElement && code instanceof HTMLElement) {
+      code.replaceChildren(...Array.from(container.childNodes));
+      pre.replaceChildren(code);
+      container.replaceChildren(pre);
+    }
+  }
+}
+
+function pruneAnnotationSelection(container: HTMLElement): void {
+  container.querySelectorAll("button").forEach((button) => {
+    button.replaceWith(document.createTextNode(button.textContent ?? ""));
+  });
+  container
+    .querySelectorAll("script, style, iframe, object, embed, input, textarea, select")
+    .forEach((element) => element.remove());
+  container.querySelectorAll("*").forEach((element) => {
+    for (const attribute of Array.from(element.attributes)) {
+      if (
+        attribute.name.toLowerCase().startsWith("on") ||
+        attribute.name === "contenteditable" ||
+        attribute.name === "tabindex"
+      ) {
+        element.removeAttribute(attribute.name);
+      }
+    }
+  });
+}
+
+function selectionContent(range: Range, root: HTMLElement): HTMLDivElement {
+  const container = document.createElement("div");
+  const selectionEnd = { container: range.endContainer, offset: range.endOffset };
+  let cursor = { container: range.startContainer, offset: range.startOffset };
+  const katexNodes = Array.from(root.querySelectorAll<HTMLElement>(".katex")).filter((katex) =>
+    range.intersectsNode(katex),
+  );
+  for (const katex of katexNodes) {
+    const math = katex.closest<HTMLElement>(".katex-display") ?? katex;
+    const mathRange = document.createRange();
+    mathRange.selectNode(math);
+    const mathStart = { container: mathRange.startContainer, offset: mathRange.startOffset };
+    const mathEnd = { container: mathRange.endContainer, offset: mathRange.endOffset };
+    if (pointBefore(cursor, mathStart)) container.append(cloneBetween(cursor, mathStart));
+    container.append(math.cloneNode(true));
+    cursor = mathEnd;
+    if (!pointBefore(cursor, selectionEnd)) break;
+  }
+  if (katexNodes.length === 0) {
+    container.append(range.cloneContents());
+  } else if (pointBefore(cursor, selectionEnd)) {
+    container.append(cloneBetween(cursor, selectionEnd));
+  }
+  preservePartialInlineContext(range, container);
+  pruneAnnotationSelection(container);
+  return container;
+}
+
+function markdownTable(table: HTMLElement): string {
+  const rows = Array.from(table.querySelectorAll("tr")).map((row) =>
+    Array.from(row.querySelectorAll(":scope > th, :scope > td"))
+      .map((cell) => markdownFromSelectionNode(cell).trim().replaceAll("|", "\\|")),
+  ).filter((row) => row.length > 0);
+  return rows.length > 0
+    ? `\n\n${tableMarkdown(rows, Boolean(table.querySelector("tr:first-child th")))}\n\n`
+    : "";
+}
+
+function markdownList(list: HTMLElement): string {
+  const ordered = list.tagName === "OL";
+  const startAttribute = list.getAttribute("start");
+  const parsedStart = startAttribute === null ? 1 : Number(startAttribute);
+  let next = Number.isFinite(parsedStart) ? parsedStart : 1;
+  const lines: string[] = [];
+  for (const item of Array.from(list.children).filter(
+    (child): child is HTMLElement => child instanceof HTMLElement && child.tagName === "LI",
+  )) {
+    const explicitValue = item.getAttribute("value");
+    const parsedValue = explicitValue === null ? next : Number(explicitValue);
+    const value = Number.isFinite(parsedValue) ? parsedValue : next;
+    next = value + 1;
+    const content = Array.from(item.childNodes)
+      .map((child) => child instanceof HTMLElement && child.matches("UL, OL")
+        ? `\n${markdownList(child).trim()}\n`
+        : markdownFromSelectionNode(child))
+      .join("")
+      .trim();
+    lines.push(listItemMarkdown(ordered ? `${value}.` : "-", content));
+  }
+  return `\n\n${lines.join("\n")}\n\n`;
+}
+
+function markdownFromSelectionNode(node: Node): string {
+  if (node.nodeType === Node.TEXT_NODE) return escapeMarkdownText(node.textContent ?? "");
+  if (!(node instanceof HTMLElement)) {
+    return Array.from(node.childNodes).map(markdownFromSelectionNode).join("");
+  }
+  if (node.matches(".katex-display")) {
+    const tex = node.querySelector("annotation[encoding='application/x-tex']")?.textContent?.trim();
+    return tex ? formatMath(tex, true) : "";
+  }
+  if (node.matches(".katex")) {
+    const tex = node.querySelector("annotation[encoding='application/x-tex']")?.textContent?.trim();
+    return tex ? formatMath(tex, false) : "";
+  }
+  if (node.tagName === "BR") return "\n";
+  if (node.tagName === "TABLE") return markdownTable(node);
+  if (node.matches("UL, OL")) return markdownList(node);
+  if (node.tagName === "CODE" && node.parentElement?.tagName !== "PRE") {
+    return inlineCodeMarkdown(node.textContent ?? "");
+  }
+  if (node.tagName === "PRE") return fencedCodeMarkdown(node.textContent ?? "");
+  const inner = Array.from(node.childNodes).map(markdownFromSelectionNode).join("");
+  if (!inner) return "";
+  if (node.matches("strong, b")) return `**${inner}**`;
+  if (node.matches("em, i")) return `*${inner}*`;
+  if (node.tagName === "A") {
+    const href = node.getAttribute("href");
+    return href ? `[${inner}](${href})` : inner;
+  }
+  if (node.tagName === "LI") return `${inner.trim()}\n`;
+  if (node.matches("TH, TD")) return `${inner.trim()} | `;
+  if (node.tagName === "TR") return `${inner.replace(/ \| $/, "")}\n`;
+  if (node.tagName === "BLOCKQUOTE") {
+    return `\n\n${inner.trim().split("\n").map((line) => `> ${line}`).join("\n")}\n\n`;
+  }
+  const heading = headingMarkdown(node.tagName, inner);
+  if (heading) return `\n\n${heading}\n\n`;
+  if (node.matches("P, DIV, UL, OL, TABLE")) {
+    return `\n\n${inner.trim()}\n\n`;
+  }
+  return inner;
+}
+
+function semanticSelectionText(content: HTMLElement, fallback: string): string {
+  const text = markdownFromSelectionNode(content)
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return text || fallback;
+}
+
+function annotationFingerprint(text: string): string {
+  return text.normalize("NFKC").replace(/[\s\u200B-\u200D\u2060\uFEFF]/g, "").toLowerCase();
+}
+
+function legacyAnnotationMarkdown(text: string, root: HTMLElement): string | undefined {
+  if (!shouldRecoverLegacyMath(text)) return undefined;
+  const target = annotationFingerprint(text);
+  if (target.length < 8) return undefined;
+  let best: { markdown: string; delta: number } | undefined;
+  for (const katex of root.querySelectorAll<HTMLElement>(".msg-assistant > .md .katex")) {
+    const fingerprints = [
+      katex.querySelector(".katex-mathml")?.textContent,
+      katex.querySelector(".katex-html")?.textContent,
+      katex.textContent,
+    ]
+      .filter((value): value is string => Boolean(value))
+      .map(annotationFingerprint);
+    const match = fingerprints.find((candidate) => isLegacyFingerprintMatch(candidate, target));
+    if (!match) continue;
+    const tex = katex.querySelector("annotation[encoding='application/x-tex']")?.textContent?.trim();
+    if (!tex) continue;
+    const display = Boolean(katex.closest(".katex-display"));
+    const candidate = {
+      markdown: formatMath(tex, display).trim(),
+      delta: Math.abs(match.length - target.length),
+    };
+    if (!best || candidate.delta < best.delta) best = candidate;
+  }
+  return best?.markdown;
+}
+
+function currentTranscriptSelection(root: HTMLElement): SelectionAction | null {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) return null;
+  const range = selection.getRangeAt(0);
+  const focusNode = selection.focusNode;
+  if (!focusNode) return null;
+  const commonElement = elementForNode(range.commonAncestorContainer);
+  const focusElement = elementForNode(focusNode);
+  if (!commonElement || !root.contains(commonElement)) return null;
+  if (!focusElement || !root.contains(focusElement)) return null;
+  const startElement = elementForNode(range.startContainer);
+  const endElement = elementForNode(range.endContainer);
+  const startMarkdown = startElement?.closest<HTMLElement>(".md");
+  const endMarkdown = endElement?.closest<HTMLElement>(".md");
+  const assistant = startMarkdown?.parentElement;
+  if (
+    !startMarkdown || !endMarkdown || !assistant?.classList.contains("msg-assistant") ||
+    endMarkdown.parentElement !== assistant || startMarkdown.dataset.streaming === "true" ||
+    endMarkdown.dataset.streaming === "true"
+  ) return null;
+  const fallbackText = selection
+    .toString()
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (!fallbackText) return null;
+  const content = selectionContent(range, root);
+
+  const selectionRects = Array.from(range.getClientRects()).filter(
+    (rect) => rect.width > 0 && rect.height > 0,
+  );
+  const firstRect = selectionRects[0] ?? range.getBoundingClientRect();
+  const firstLineRects = selectionRects.filter(
+    (rect) => rect.top < firstRect.bottom && rect.bottom > firstRect.top,
+  );
+  const lineRects = firstLineRects.length > 0 ? firstLineRects : [firstRect];
+  const left = Math.min(...lineRects.map((rect) => rect.left));
+  const right = Math.max(...lineRects.map((rect) => rect.right));
+  const selectionTop = Math.min(...lineRects.map((rect) => rect.top));
+  const selectionBottom = Math.max(...lineRects.map((rect) => rect.bottom));
+  const actionHeight = 34;
+  const actionHalfWidth = 74;
+  const top = selectionTop >= actionHeight + SELECTION_ACTION_GAP_PX
+    ? selectionTop - actionHeight - SELECTION_ACTION_GAP_PX
+    : selectionBottom + SELECTION_ACTION_GAP_PX;
+  return {
+    text: semanticSelectionText(content, fallbackText),
+    range: range.cloneRange(),
+    x: Math.min(window.innerWidth - actionHalfWidth, Math.max(actionHalfWidth, left + (right - left) / 2)),
+    top,
+  };
+}
+
+function useTranscriptSelection(
+  rootRef: React.RefObject<HTMLDivElement | null>,
+  onAdd: (selection: Pick<SelectionAction, "text" | "range">) => void,
+) {
+  const [action, setAction] = useState<SelectionAction | null>(null);
+  const selectingWithPointer = useRef(false);
+  const update = useCallback(() => {
+    const root = rootRef.current;
+    setAction(root ? currentTranscriptSelection(root) : null);
+  }, [rootRef]);
+
+  useEffect(() => {
+    let updateFrame: number | null = null;
+    const selectionChanged = () => {
+      if (!selectingWithPointer.current) update();
+    };
+    const pointerDown = (event: PointerEvent) => {
+      const root = rootRef.current;
+      const target = event.target;
+      if (
+        !event.isPrimary ||
+        event.button !== 0 ||
+        !root ||
+        !(target instanceof Node) ||
+        !root.contains(target)
+      ) {
+        return;
+      }
+      selectingWithPointer.current = true;
+      setAction(null);
+    };
+    const pointerFinished = (event: PointerEvent) => {
+      if (!event.isPrimary || !selectingWithPointer.current) return;
+      selectingWithPointer.current = false;
+      updateFrame = window.requestAnimationFrame(update);
+    };
+
+    document.addEventListener("selectionchange", selectionChanged);
+    document.addEventListener("pointerdown", pointerDown, true);
+    window.addEventListener("pointerup", pointerFinished, true);
+    window.addEventListener("pointercancel", pointerFinished, true);
+    return () => {
+      document.removeEventListener("selectionchange", selectionChanged);
+      document.removeEventListener("pointerdown", pointerDown, true);
+      window.removeEventListener("pointerup", pointerFinished, true);
+      window.removeEventListener("pointercancel", pointerFinished, true);
+      if (updateFrame !== null) window.cancelAnimationFrame(updateFrame);
+      selectingWithPointer.current = false;
+    };
+  }, [update]);
+
+  useEffect(() => {
+    if (!action) return;
+    const dismiss = (event: MouseEvent) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest(".chat-selection-action")) return;
+      setAction(null);
+    };
+    document.addEventListener("mousedown", dismiss, true);
+    window.addEventListener("resize", update);
+    return () => {
+      document.removeEventListener("mousedown", dismiss, true);
+      window.removeEventListener("resize", update);
+    };
+  }, [action, update]);
+
+  const add = useCallback(() => {
+    if (!action) return;
+    onAdd({ text: action.text, range: action.range });
+    setAction(null);
+    window.getSelection()?.removeAllRanges();
+  }, [action, onAdd]);
+  const dismiss = useCallback(() => setAction(null), []);
+
+  return { action, add, dismiss };
+}
+
+function useAnnotationHighlights(annotations: ComposerAnnotation[]) {
+  useLayoutEffect(() => {
+    if (!("highlights" in CSS) || typeof Highlight === "undefined") return;
+    const ranges = annotations.flatMap((annotation) =>
+      annotation.range ? [annotation.range] : [],
+    );
+    if (ranges.length === 0) {
+      CSS.highlights.delete(CHAT_ANNOTATION_HIGHLIGHT_NAME);
+      return;
+    }
+
+    const highlight = new Highlight(...ranges);
+    CSS.highlights.set(CHAT_ANNOTATION_HIGHLIGHT_NAME, highlight);
+    return () => {
+      if (CSS.highlights.get(CHAT_ANNOTATION_HIGHLIGHT_NAME) === highlight) {
+        CSS.highlights.delete(CHAT_ANNOTATION_HIGHLIGHT_NAME);
+      }
+    };
+  }, [annotations]);
+}
+
+function AnnotationPreview({ annotation }: { annotation: ComposerAnnotation }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [legacyMarkdown, setLegacyMarkdown] = useState<string>();
+  useLayoutEffect(() => {
+    const root = ref.current?.closest<HTMLElement>(".chat-thread-inner");
+    setLegacyMarkdown(root ? legacyAnnotationMarkdown(annotation.text, root) : undefined);
+  }, [annotation.id, annotation.text]);
+  return <div ref={ref}><Md text={legacyMarkdown ?? annotation.text} /></div>;
+}
+
+function AnnotationEntries({
+  annotations,
+  onRemove,
+}: {
+  annotations: ComposerAnnotation[];
+  onRemove?: (id: string) => void;
+}) {
+  return annotations.map((annotation, index) => (
+    <div
+      key={annotation.id}
+      className={`annotation-item grid gap-2 py-2 px-1 [&+&]:border-t [&+&]:border-border-variant ${onRemove ? "grid-cols-[24px_minmax(0,_1fr)_24px]" : "grid-cols-[24px_minmax(0,_1fr)]"}`}
+    >
+      <span className="text-sm text-muted text-right">{index + 1}.</span>
+      <div className="min-w-0">
+        <div className="text-sm text-muted mb-1">Selected text:</div>
+        <AnnotationPreview annotation={annotation} />
+      </div>
+      {onRemove && (
+        <button
+          type="button"
+          className="inline-flex items-center justify-center w-6 h-6 rounded-sm text-muted [&:hover]:bg-surface [&:hover]:text-text"
+          title="Remove annotation"
+          aria-label={`Remove annotation ${index + 1}`}
+          onClick={() => onRemove(annotation.id)}
+        >
+          <X size={13} />
+        </button>
+      )}
+    </div>
+  ));
+}
+
+function AnnotationsPopover({
+  annotations,
+  variant,
+  onClear,
+  onRemove,
+}: {
+  annotations: ComposerAnnotation[];
+  variant: "composer" | "sent";
+  onClear?: () => void;
+  onRemove?: (id: string) => void;
+}) {
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const dialogId = useId();
+  const popover = usePopover(triggerRef);
+  const sent = variant === "sent";
+  const closeTimer = useRef<number | null>(null);
+  const openSent = () => {
+    if (closeTimer.current !== null) window.clearTimeout(closeTimer.current);
+    closeTimer.current = null;
+    popover.setOpen(true);
+  };
+  const closeSent = () => {
+    closeTimer.current = window.setTimeout(() => {
+      if (!dialogRef.current?.contains(document.activeElement)) popover.setOpen(false);
+    }, 160);
+  };
+  const toggleFromTrigger = () => {
+    const opening = sent || !popover.open;
+    popover.setOpen(opening);
+    if (opening) window.requestAnimationFrame(() => dialogRef.current?.focus());
+  };
+  const removeAnnotation = (id: string) => {
+    onRemove?.(id);
+    window.requestAnimationFrame(() => {
+      const next = dialogRef.current?.querySelector<HTMLButtonElement>("button[aria-label^='Remove annotation']");
+      (next ?? dialogRef.current ?? triggerRef.current)?.focus();
+    });
+  };
+  useEffect(
+    () => () => {
+      if (closeTimer.current !== null) window.clearTimeout(closeTimer.current);
+    },
+    [],
+  );
+  return (
+    <div
+      className={sent ? "sent-annotations relative flex w-fit" : "composer-annotations relative flex w-fit pt-2 px-3 pb-0"}
+      ref={popover.ref}
+      onMouseEnter={sent ? openSent : undefined}
+      onMouseLeave={sent ? closeSent : undefined}
+    >
+      <div className={`inline-flex items-center border border-border bg-background overflow-hidden ${sent ? "rounded-full" : "rounded-sm"}`}>
+        <button
+          ref={triggerRef}
+          type="button"
+          className={`inline-flex items-center gap-1.5 py-1 text-sm font-medium text-text [&:hover]:bg-surface ${sent ? "px-2.5" : "pl-2 pr-1.5"}`}
+          aria-expanded={popover.open}
+          aria-haspopup="dialog"
+          aria-controls={dialogId}
+          onClick={toggleFromTrigger}
+        >
+          <MessageSquareQuote size={sent ? 13 : 14} className="text-muted" />
+          {annotations.length} {annotations.length === 1 ? "annotation" : "annotations"}
+        </button>
+        {onClear && (
+          <button
+            type="button"
+            className="inline-flex items-center justify-center self-stretch w-6.5 text-muted border-l border-border [&:hover]:bg-surface [&:hover]:text-text"
+            title="Clear annotations"
+            aria-label="Clear annotations"
+            onClick={onClear}
+          >
+            <X size={13} />
+          </button>
+        )}
+      </div>
+      {popover.open && (
+        <div
+          id={dialogId}
+          ref={dialogRef}
+          tabIndex={-1}
+          className={`annotation-menu absolute bottom-[calc(100%_+_8px)] z-50 w-[min(440px,_calc(100vw_-_48px))] max-h-80 overflow-y-auto overscroll-contain bg-background border border-border rounded-lg shadow-[0_4px_16px_rgba(0,_0,_0,_0.10)] p-2 text-left ${sent ? "right-0 after:absolute after:top-full after:left-0 after:right-0 after:h-2 after:content-['']" : "left-3"}`}
+          role="dialog"
+          aria-label="Selected chat text"
+        >
+          <AnnotationEntries annotations={annotations} onRemove={onRemove ? removeAnnotation : undefined} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ComposerAnnotations(props: Omit<React.ComponentProps<typeof AnnotationsPopover>, "variant">) {
+  return <AnnotationsPopover {...props} variant="composer" />;
 }
 
 const PROMPT_COLLAPSED_CLASS_NAME = [
@@ -193,6 +732,7 @@ type Action =
       sessionId: string;
       text: string;
       attachments: { url: string; mediaType: string; name?: string }[];
+      annotations: ComposerAnnotation[];
     }
   | { type: "busy"; sessionId: string; busy: boolean }
   // `known` scopes the reseed: flags for sessions outside it (other projects —
@@ -211,9 +751,8 @@ function upsertMessage(list: ChatMessage[], message: ChatMessage): ChatMessage[]
     return next;
   }
   // The server's copy of the user message replaces the optimistic local one.
-  const cleaned =
-    message.role === "user" ? list.filter((m) => !m.id.startsWith(LOCAL_PREFIX)) : list;
-  return [...cleaned, message];
+  if (message.role !== "user") return [...list, message];
+  return [...list.filter((m) => !m.id.startsWith(LOCAL_PREFIX)), message];
 }
 
 function reducer(state: ChatState, action: Action): ChatState {
@@ -252,6 +791,13 @@ function reducer(state: ChatState, action: Action): ChatState {
       // Data URLs stand in until the server's copy arrives with file names.
       action.attachments.forEach((a, i) =>
         parts.push({ id: `img${i}`, type: "image", text: a.url, name: a.name }),
+      );
+      action.annotations.forEach((annotation, i) =>
+        parts.push({
+          id: `annotation${i}`,
+          type: "annotation",
+          text: annotation.text,
+        }),
       );
       const msg: ChatMessage = {
         id: `${LOCAL_PREFIX}${Date.now()}`,
@@ -1877,28 +2423,35 @@ function PromptCard({
     // custom answer). No echo at all (stale-resolved): neutral "Resolved",
     // matching the plan row.
     const chosen = (p.answers ?? []).join(", ") || p.note || "";
+    const annotations: ComposerAnnotation[] = (p.annotations ?? []).map((annotation, index) => ({
+      id: `${part.id}-annotation-${index}`,
+      text: annotation.text,
+    }));
     return (
-      <details className={PROMPT_COLLAPSED_CLASS_NAME}>
-        <summary>
-          <span className="prompt-collapsed-title font-[375] wrap-anywhere">{p.header || p.question || "Question"}</span>
-          <span className={`prompt-outcome font-[375] text-subtext wrap-anywhere [&.approved]:text-accent-green [&.chosen]:text-accent-green [&.approved::before]:content-['✓_'] [&.chosen::before]:content-['✓_'] [&.revised]:text-accent-amber [&.rejected]:text-accent-amber ${chosen ? "chosen" : ""}`}>{chosen || "Resolved"}</span>
-        </summary>
-        <div className={PROMPT_COLLAPSED_BODY_CLASS_NAME}>
-          {/* The summary title already shows the question when there's no header. */}
-          {p.header && p.question && <div className="prompt-q text-base font-semibold leading-normal text-text">{p.question}</div>}
-          {(p.options ?? []).length > 0 && (
-            <ul className="prompt-collapsed-options mt-1.5 mx-0 mb-0 pl-4.5 [&_.sel]:text-text [&_.sel]:font-semibold">
-              {(p.options ?? []).map((o) => (
-                <li key={o.label} className={p.answers?.includes(o.label) ? "sel" : ""}>
-                  {o.label}
-                </li>
-              ))}
-            </ul>
-          )}
-          {/* A note-only answer is already the summary outcome — don't echo it twice. */}
-          {p.note && p.note !== chosen && <div className="prompt-collapsed-note mt-1.5 italic">{p.note}</div>}
-        </div>
-      </details>
+      <div className="flex flex-col items-end gap-1.5">
+        {annotations.length > 0 && <AnnotationsPopover annotations={annotations} variant="sent" />}
+        <details className={PROMPT_COLLAPSED_CLASS_NAME}>
+          <summary>
+            <span className="prompt-collapsed-title font-[375] wrap-anywhere">{p.header || p.question || "Question"}</span>
+            <span className={`prompt-outcome font-[375] text-subtext wrap-anywhere [&.approved]:text-accent-green [&.chosen]:text-accent-green [&.approved::before]:content-['✓_'] [&.chosen::before]:content-['✓_'] [&.revised]:text-accent-amber [&.rejected]:text-accent-amber ${chosen ? "chosen" : ""}`}>{chosen || "Resolved"}</span>
+          </summary>
+          <div className={PROMPT_COLLAPSED_BODY_CLASS_NAME}>
+            {/* The summary title already shows the question when there's no header. */}
+            {p.header && p.question && <div className="prompt-q text-base font-semibold leading-normal text-text">{p.question}</div>}
+            {(p.options ?? []).length > 0 && (
+              <ul className="prompt-collapsed-options mt-1.5 mx-0 mb-0 pl-4.5 [&_.sel]:text-text [&_.sel]:font-semibold">
+                {(p.options ?? []).map((o) => (
+                  <li key={o.label} className={p.answers?.includes(o.label) ? "sel" : ""}>
+                    {o.label}
+                  </li>
+                ))}
+              </ul>
+            )}
+            {/* A note-only answer is already the summary outcome — don't echo it twice. */}
+            {p.note && p.note !== chosen && <div className="prompt-collapsed-note mt-1.5 italic">{p.note}</div>}
+          </div>
+        </details>
+      </div>
     );
   }
 
@@ -2142,35 +2695,46 @@ const Message = memo(function Message({
       .map(attachmentPartView);
     const images = attachments.filter((a) => !a.isPdf);
     const files = attachments.filter((a) => a.isPdf);
+    const annotations: ComposerAnnotation[] = message.parts
+      .filter((part) => part.type === "annotation" && part.text)
+      .map((part) => ({
+        id: part.id,
+        text: part.text ?? "",
+      }));
     return (
-      <div className="msg-user self-end max-w-[88%] bg-surface rounded-[16px] py-2.5 px-[15px] text-base whitespace-pre-wrap wrap-anywhere [&_.skill-chip]:mr-0.5 [&_.skill-chip]:align-baseline">
-        {command ? (
-          <>
-            <span className="skill-chip inline-flex items-center py-px px-[7px] font-mono text-md font-medium text-primary bg-primary-subtle border border-border-variant rounded-sm">/{command.name}</span>
-            {slash![2]}
-          </>
-        ) : (
-          text
+      <div className="msg-user-group self-end flex max-w-[88%] flex-col items-end gap-1.5">
+        {annotations.length > 0 && (
+          <AnnotationsPopover annotations={annotations} variant="sent" />
         )}
-        {images.length > 0 && (
-          <div className="msg-images flex flex-wrap gap-1.5 mt-2 [&_img]:max-w-55 [&_img]:max-h-40 [&_img]:border [&_img]:border-border-variant [&_img]:rounded-xs [&_img]:block">
-            {images.map((a, i) => (
-              <a key={i} href={a.src} target="_blank" rel="noreferrer">
-                <img src={a.src} alt="attachment" />
-              </a>
-            ))}
-          </div>
-        )}
-        {files.length > 0 && (
-          <div className="msg-files flex flex-wrap gap-1.5 mt-2">
-            {files.map((a, i) => (
-              <a key={i} className="msg-file inline-flex items-center gap-1.5 max-w-60 py-1.5 px-2.5 border border-border-variant rounded-sm text-text no-underline [&:hover]:border-text [&_span]:overflow-hidden [&_span]:text-ellipsis [&_span]:whitespace-nowrap" href={a.src} target="_blank" rel="noreferrer">
-                <FileText size={15} />
-                <span>{a.name}</span>
-              </a>
-            ))}
-          </div>
-        )}
+        <div className="msg-user max-w-full bg-surface rounded-[16px] py-2.5 px-[15px] text-base whitespace-pre-wrap wrap-anywhere [&_.skill-chip]:mr-0.5 [&_.skill-chip]:align-baseline">
+          {command ? (
+            <>
+              <span className="skill-chip inline-flex items-center py-px px-[7px] font-mono text-md font-medium text-primary bg-primary-subtle border border-border-variant rounded-sm">/{command.name}</span>
+              {slash![2]}
+            </>
+          ) : (
+            text
+          )}
+          {images.length > 0 && (
+            <div className="msg-images flex flex-wrap gap-1.5 mt-2 [&_img]:max-w-55 [&_img]:max-h-40 [&_img]:border [&_img]:border-border-variant [&_img]:rounded-xs [&_img]:block">
+              {images.map((a, i) => (
+                <a key={i} href={a.src} target="_blank" rel="noreferrer">
+                  <img src={a.src} alt="attachment" />
+                </a>
+              ))}
+            </div>
+          )}
+          {files.length > 0 && (
+            <div className="msg-files flex flex-wrap gap-1.5 mt-2">
+              {files.map((a, i) => (
+                <a key={i} className="msg-file inline-flex items-center gap-1.5 max-w-60 py-1.5 px-2.5 border border-border-variant rounded-sm text-text no-underline [&:hover]:border-text [&_span]:overflow-hidden [&_span]:text-ellipsis [&_span]:whitespace-nowrap" href={a.src} target="_blank" rel="noreferrer">
+                  <FileText size={15} />
+                  <span>{a.name}</span>
+                </a>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
     );
   }
@@ -2963,6 +3527,10 @@ export function ChatPanel({
   const [unreadSessionIds, setUnreadSessionIds] = useState<ReadonlySet<string>>(new Set());
   const [sessionFilter, setSessionFilter] = useState<SessionFilter>("active");
   const [draft, setDraft] = useState("");
+  const [annotations, setAnnotations] = useState<ComposerAnnotation[]>([]);
+  const annotationId = useRef(0);
+  const composerScopeRef = useRef({ projectId, activeId });
+  composerScopeRef.current = { projectId, activeId };
   // Pasted/dropped/uploaded attachments waiting in the composer, as data URLs.
   const [attachments, setAttachments] = useState<
     { dataUrl: string; mediaType: string; name?: string; size: number }[]
@@ -3009,6 +3577,21 @@ export function ChatPanel({
   // Consolidated chat-settings popover (permissions/reasoning/sources), opened
   // by the switch icon in the composer footer.
   const chatSettings = usePopover();
+  const addTranscriptSelection = useCallback((selection: Pick<SelectionAction, "text" | "range">) => {
+    annotationId.current += 1;
+    setAnnotations((current) => [
+      ...current,
+      { id: `annotation-${annotationId.current}`, ...selection },
+    ]);
+    composerRef.current?.focus();
+  }, []);
+  const transcriptSelection = useTranscriptSelection(threadInnerRef, addTranscriptSelection);
+  useAnnotationHighlights(annotations);
+
+  useEffect(() => {
+    setAnnotations([]);
+    transcriptSelection.dismiss();
+  }, [activeId, projectId, transcriptSelection.dismiss]);
 
   // Slash-skills: menu state is derived from the draft — open while the first
   // token is an unfinished `/command` (no whitespace yet) with matches.
@@ -3551,18 +4134,40 @@ export function ChatPanel({
     // the backend's slash expansion and the transcript both see only text.
     const text = pickedSkill ? `/${pickedSkill.name}${args ? ` ${args}` : ""}` : args;
     const pending = attachments;
-    if (!text && pending.length === 0) return;
+    const pendingAnnotations = annotations;
+    const wireAnnotations = pendingAnnotations.map((annotation) => ({
+      text: annotation.text,
+    }));
+    const sourceProjectId = projectId;
+    let sourceSessionId = activeId;
+    const inSourceScope = () => {
+      const current = composerScopeRef.current;
+      return current.projectId === sourceProjectId && current.activeId === sourceSessionId;
+    };
+    const restoreComposer = () => {
+      if (!inSourceScope()) return;
+      setDraft((current) => current || text);
+      setAttachments((current) => (current.length ? current : pending));
+      setAnnotations((current) => (current.length ? current : pendingAnnotations));
+    };
+    if (!text && pending.length === 0 && pendingAnnotations.length === 0) return;
     // A pending question card owns plain typed text as a custom answer
     // (Claude-desktop behavior). This also works while the turn is HELD on
     // the card — where a new message would be rejected as busy and silently
     // dropped. A failed answer restores the draft so the text isn't lost.
     // (Auto-convert is off while a card is pending; a chip picked from the
     // menu or left over just serializes into the note text, same as typing it.)
-    if (text && pendingQuestion && pending.length === 0) {
+    if ((text || pendingAnnotations.length > 0) && pendingQuestion && pending.length === 0) {
       setDraft("");
       setPickedSkill(null);
-      void respond({ promptId: pendingQuestion, answers: [], note: text }).then((ok) => {
-        if (!ok) setDraft((cur) => cur || text);
+      setAnnotations([]);
+      void respond({
+        promptId: pendingQuestion,
+        answers: [],
+        note: text || undefined,
+        annotations: wireAnnotations,
+      }).then((ok) => {
+        if (!ok) restoreComposer();
       });
       return;
     }
@@ -3576,6 +4181,7 @@ export function ChatPanel({
       setDraft("");
       setPickedSkill(null);
       setAttachments([]);
+      setAnnotations([]);
       setAttachError(null);
       const turnOpts = composerSelection
         ? {
@@ -3591,11 +4197,16 @@ export function ChatPanel({
         name: a.name,
       }));
       try {
-        await sendChatMessage(sid, text, turnOpts, images.length ? images : undefined);
+        await sendChatMessage(
+          sid,
+          text,
+          turnOpts,
+          images.length ? images : undefined,
+          wireAnnotations,
+        );
       } catch {
         // Never reached the queue — restore the composer so a retry is one keypress.
-        setDraft((cur) => cur || text);
-        setAttachments((cur) => (cur.length ? cur : pending));
+        restoreComposer();
       }
       return;
     }
@@ -3603,29 +4214,33 @@ export function ChatPanel({
     // `composerSelection` already resolves to the open session's settings (+ any
     // unsent tweak) or, for a new session, the global preference.
     const effective = composerSelection;
-    if (!effective && !activeId) return; // no harness available at all
+    if (!effective) return;
     setDraft("");
     setPickedSkill(null);
     setAttachments([]);
+    setAnnotations([]);
     setAttachError(null);
     let sid = activeId;
     try {
       if (!sid) {
-        const session = await createChatSession(projectId, effective!.harness, {
-          model: effective!.model,
-          permissionMode: effective!.permissionMode,
-          reasoningLevel: effective!.reasoningLevel,
+        const session = await createChatSession(projectId, effective.harness, {
+          model: effective.model,
+          permissionMode: effective.permissionMode,
+          reasoningLevel: effective.reasoningLevel,
         });
         loadedSessions.current.add(session.id);
         setSessions((cur) => [session, ...cur]);
         setActiveId(session.id);
         sid = session.id;
+        sourceSessionId = session.id;
+        composerScopeRef.current = { projectId, activeId: session.id };
       }
       dispatch({
         type: "optimisticUser",
         sessionId: sid,
-        text,
+        text: text || "Asked about selected text",
         attachments: pending.map((a) => ({ url: a.dataUrl, mediaType: a.mediaType, name: a.name })),
+        annotations: pendingAnnotations,
       });
       dispatch({ type: "busy", sessionId: sid, busy: true });
       stickToBottom.current = true;
@@ -3649,12 +4264,17 @@ export function ChatPanel({
         dataBase64: a.dataUrl.slice(a.dataUrl.indexOf(",") + 1),
         name: a.name,
       }));
-      await sendChatMessage(sid, text, turnOpts, images.length ? images : undefined);
+      await sendChatMessage(
+        sid,
+        text,
+        turnOpts,
+        images.length ? images : undefined,
+        wireAnnotations,
+      );
     } catch (err) {
       // The message never reached a turn — put it back in the composer so a
       // retry is one keypress, whichever branch below applies.
-      setDraft((cur) => cur || text);
-      setAttachments((cur) => (cur.length ? cur : pending));
+      restoreComposer();
       if (!sid) return; // session creation failed; no transcript to annotate
       const msg = err instanceof Error ? err.message : String(err);
       // A *network* failure does not prove no turn started — the backend
@@ -3669,8 +4289,11 @@ export function ChatPanel({
           .catch(() => false);
         if (busyNow) {
           // The turn is real and streaming — undo the restore, nothing failed.
-          setDraft((cur) => (cur === text ? "" : cur));
-          setAttachments((cur) => (cur === pending ? [] : cur));
+          if (inSourceScope()) {
+            setDraft((cur) => (cur === text ? "" : cur));
+            setAttachments((cur) => (cur === pending ? [] : cur));
+            setAnnotations((cur) => (cur === pendingAnnotations ? [] : cur));
+          }
           return;
         }
       }
@@ -4121,6 +4744,7 @@ export function ChatPanel({
           onScroll={(e) => {
             const el = e.currentTarget;
             stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+            transcriptSelection.dismiss();
           }}
         >
           <div className="chat-thread-inner max-w-readable my-0 mx-auto pt-4 px-4 pb-8 flex flex-col gap-4" ref={threadInnerRef}>
@@ -4147,6 +4771,23 @@ export function ChatPanel({
               ))}
           </div>
         </div>
+      )}
+
+      {transcriptSelection.action && (
+        <button
+          type="button"
+          className="chat-selection-action fixed z-50 inline-flex items-center gap-1.5 py-1.5 px-3 border border-border rounded-md bg-background text-text text-sm font-medium shadow-[0_2px_8px_rgba(0,_0,_0,_0.10)] whitespace-nowrap [&:hover]:bg-surface"
+          style={{
+            left: transcriptSelection.action.x,
+            top: transcriptSelection.action.top,
+            transform: "translateX(-50%)",
+          }}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={transcriptSelection.add}
+        >
+          <MessageSquareQuote size={14} />
+          Ask about this
+        </button>
       )}
 
       {/* Docked while a plan awaits a decision, so the approval controls never
@@ -4219,6 +4860,22 @@ export function ChatPanel({
               activeIndex={activeSkillIdx}
               onPick={pickSkill}
               onHover={setSkillIdx}
+            />
+          )}
+          {annotations.length > 0 && (
+            <ComposerAnnotations
+              annotations={annotations}
+              onClear={() => {
+                setAnnotations([]);
+                window.requestAnimationFrame(() => composerRef.current?.focus());
+              }}
+              onRemove={(id) => {
+                const remaining = annotations.filter((annotation) => annotation.id !== id);
+                setAnnotations(remaining);
+                if (remaining.length === 0) {
+                  window.requestAnimationFrame(() => composerRef.current?.focus());
+                }
+              }}
             />
           )}
           {attachments.length > 0 && (
@@ -4460,7 +5117,10 @@ export function ChatPanel({
                 onClick={() => void send()}
                 disabled={
                   !activeHarness?.agentReady ||
-                  (!pickedSkill && !draft.trim() && attachments.length === 0)
+                  (!pickedSkill &&
+                    !draft.trim() &&
+                    attachments.length === 0 &&
+                    annotations.length === 0)
                 }
               >
                 <CornerDownLeft size={16} />

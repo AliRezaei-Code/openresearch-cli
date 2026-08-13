@@ -95,6 +95,7 @@
   --surface: #faf7f2;
   --surface-bright: #fdfbfb;
   --highlight: #fdf3f1;
+  --chat-annotation-highlight: #b8d4ff;
   --text: #1d1b1a;
   --subtext: #737373;
   --muted: #a1a1a1;
@@ -177,6 +178,7 @@
   --surface: #1d1b1a;
   --surface-bright: #130f0f;
   --highlight: #393433;
+  --chat-annotation-highlight: #244e7a;
   --text: #e6e1e0;
   --subtext: #a68e8b;
   --muted: #737373;
@@ -234,6 +236,14 @@ body {
 
 ::selection {
   background: var(--highlight);
+}
+
+.chat-thread-inner ::selection {
+  background: var(--chat-annotation-highlight);
+}
+
+::highlight(chat-annotations) {
+  background: var(--chat-annotation-highlight);
 }
 
 button {
@@ -336,6 +346,11 @@ textarea::placeholder {
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   animation: tool-running-shimmer 1.75s linear infinite;
+}
+
+.tool-running-shimmer::selection {
+  color: var(--text);
+  -webkit-text-fill-color: var(--text);
 }
 
 .tool-running-shimmer-icon {
@@ -475,6 +490,11 @@ textarea::placeholder {
     background: none;
     -webkit-text-fill-color: currentColor;
     animation: none;
+  }
+
+  .tool-running-shimmer::selection {
+    color: HighlightText;
+    -webkit-text-fill-color: HighlightText;
   }
 
   .tool-running-shimmer-icon {

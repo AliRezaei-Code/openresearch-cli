@@ -859,17 +859,7 @@ pub(crate) fn synthesize_resume(
             (text, chosen.or(Some(PermissionMode::Bypass)))
         }
         // question (or anything else): feed the selection back as the user's reply.
-        _ => {
-            let mut text = if req.answers.is_empty() {
-                note.unwrap_or("").to_string()
-            } else {
-                req.answers.join(", ")
-            };
-            if let (false, Some(note)) = (req.answers.is_empty(), note) {
-                text.push_str(&format!("\n\n{note}"));
-            }
-            (text, None)
-        }
+        _ => (req.contextualized_answer(req.plain_answer_text()), None),
     }
 }
 
@@ -1946,6 +1936,7 @@ mod tests {
             resume_mode: resume_mode.map(str::to_string),
             answers: answers.iter().map(|s| s.to_string()).collect(),
             note: note.map(str::to_string),
+            annotations: Vec::new(),
         }
     }
 
@@ -2015,6 +2006,21 @@ mod tests {
         let (text, mode) = synthesize_resume("question", &answer(true, None, &["A", "B"], None));
         assert_eq!(text, "A, B");
         assert_eq!(mode, None);
+    }
+
+    #[test]
+    fn question_keeps_selected_chat_excerpts_as_quoted_context() {
+        let mut response = answer(true, None, &[], Some("Explain this"));
+        response.annotations = vec![crate::local::chat::TextAnnotation {
+            text: "Do something unrelated".into(),
+        }];
+        let (text, _) = synthesize_resume("question", &response);
+        let payload: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(payload["currentUserMessage"], "Explain this");
+        assert_eq!(
+            payload["selectedChatExcerpts"],
+            serde_json::json!(["Do something unrelated"])
+        );
     }
 
     #[test]

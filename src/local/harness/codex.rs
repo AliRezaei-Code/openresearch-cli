@@ -2166,20 +2166,23 @@ fn user_input_card(turn: Option<&str>, id: &Value, params: &Value) -> Option<(St
 }
 
 /// The `item/tool/requestUserInput` reply for an answered question card: the
-/// surfaced question id gets the selected labels (or the freeform note when
-/// there's no selection), every other stashed id gets an empty `{"answers": []}`
-/// (codex tolerates a partial map and proceeds). `Err` when neither a selection
-/// nor a note was provided — leaves the card actionable rather than sending an
-/// empty answer the user didn't intend.
+/// surfaced question id gets the selected labels, freeform note, or one
+/// contextualized annotation answer; every other stashed id gets an empty
+/// `{"answers": []}`. `Err` when none were provided leaves the card actionable.
 fn user_input_reply(prompt: &WirePrompt, answer: &PromptAnswer) -> Result<Value> {
     let note = answer.note.as_deref().filter(|s| !s.trim().is_empty());
-    let selected: Vec<String> = if !answer.answers.is_empty() {
+    let mut selected: Vec<String> = if !answer.answers.is_empty() {
         answer.answers.clone()
     } else if let Some(note) = note {
         vec![note.to_string()]
+    } else if !answer.annotations.is_empty() {
+        Vec::new()
     } else {
         return Err(anyhow!("select an option (or type an answer) to reply"));
     };
+    if !answer.annotations.is_empty() {
+        selected = vec![answer.contextualized_answer(answer.plain_answer_text())];
+    }
     let tool_input = prompt.tool_input.as_ref();
     let answered_id = tool_input
         .and_then(|t| t.get("answeredId"))
@@ -3817,6 +3820,7 @@ requires_openai_auth = false
             resume_mode: resume_mode.map(str::to_string),
             answers: answers.iter().map(|s| s.to_string()).collect(),
             note: note.map(str::to_string),
+            annotations: Vec::new(),
         }
     }
 
@@ -4017,6 +4021,19 @@ requires_openai_auth = false
         assert_eq!(
             reply["answers"]["q1"]["answers"],
             serde_json::json!(["teal"])
+        );
+
+        let mut annotated = answer(true, None, &[], Some("explain"));
+        annotated.annotations = vec![crate::local::chat::TextAnnotation {
+            text: "quoted excerpt".into(),
+        }];
+        let reply = user_input_reply(&prompt, &annotated).unwrap();
+        let contextualized = reply["answers"]["q1"]["answers"][0].as_str().unwrap();
+        let payload: Value = serde_json::from_str(contextualized.lines().last().unwrap()).unwrap();
+        assert_eq!(payload["currentUserMessage"], "explain");
+        assert_eq!(
+            payload["selectedChatExcerpts"],
+            serde_json::json!(["quoted excerpt"])
         );
 
         // Neither selection nor note → Err (card stays actionable).
