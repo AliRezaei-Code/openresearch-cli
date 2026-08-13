@@ -1092,7 +1092,7 @@ fn message_json(m: &WireMessage, session_id: &str) -> Value {
     json!({ "sessionId": session_id, "message": m })
 }
 
-fn stored_to_wire(m: &StoredChatMessage) -> WireMessage {
+pub(crate) fn stored_to_wire(m: &StoredChatMessage) -> WireMessage {
     let mut message = WireMessage {
         id: m.id.clone(),
         role: m.role.clone(),
@@ -1379,6 +1379,10 @@ pub struct ChatHost {
     /// Outstanding permission-bridge requests, keyed by the prompt part id the
     /// card was surfaced under. Sync mutex, never held across an await.
     pending_permissions: std::sync::Mutex<HashMap<String, PendingPermission>>,
+    /// Claude can ask to run parallel tools in one model response. Review stays
+    /// sequential: each session holds this gate from card creation through the
+    /// user's answer, so later bridge requests cannot surface alongside it.
+    permission_review_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Per-session bridge token and immutable spawn-time Plan policy, minted
     /// once per bridged child spawn (the
     /// resident bridge carries it for the child's whole life — re-minting
@@ -1613,6 +1617,7 @@ impl ChatHost {
             respond_locks: Mutex::new(HashMap::new()),
             msg_write: std::sync::Mutex::new(()),
             pending_permissions: std::sync::Mutex::new(HashMap::new()),
+            permission_review_locks: Mutex::new(HashMap::new()),
             gate_tokens: std::sync::Mutex::new(HashMap::new()),
             plan_changes: std::sync::Mutex::new(HashMap::new()),
             permission_changes: std::sync::Mutex::new(HashMap::new()),
@@ -1693,6 +1698,30 @@ impl ChatHost {
             if let Some(decision) = plan_auto_policy(tool_name, &tool_input) {
                 return Ok(decision);
             }
+        }
+
+        let review_lock = self
+            .permission_review_locks
+            .lock()
+            .await
+            .entry(session_id.to_string())
+            .or_default()
+            .clone();
+        let _review = review_lock.lock().await;
+
+        // This request may have waited behind another review. Revalidate the
+        // child and turn before exposing it: an interrupt or respawn while it
+        // was queued makes the old request stale.
+        let gate_is_current = self
+            .gate_tokens
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .is_some_and(|gate| gate.value == token);
+        if !gate_is_current || !self.is_busy(session_id).await {
+            return Ok(PermissionDecision::deny(
+                "the turn this approval belonged to has already ended",
+            ));
         }
 
         // Tier 2 — the user decides. ExitPlanMode becomes the plan card (the
@@ -2632,20 +2661,33 @@ impl ChatHost {
                                 let _ = host.http.post(url).body("{}").send().await;
                             }
                         } else if session.harness == "codex" {
-                            host.codex.interrupt_session(&session_id).await;
+                            return host.codex.interrupt_session(&session_id).await;
                         } else if session.harness == "claude-code" {
                             host.claude.kill_session(&session_id).await;
                         }
                     }
                 }
+                None
             };
-            let _ = tokio::time::timeout(Duration::from_secs(10), native_shutdown).await;
+            let interrupted_items = tokio::time::timeout(Duration::from_secs(10), native_shutdown)
+                .await
+                .ok()
+                .flatten();
             if let Some(active) = active.as_ref() {
                 active.handle.abort();
             }
             if let Some(active) = active {
                 let _ = active.handle.await;
-                if let Some(message) = reconcile_target_file(&session_id, &active.message_id) {
+                let mut message = reconcile_target_file(&session_id, &active.message_id);
+                if let Some(items) = interrupted_items.as_deref() {
+                    message = crate::local::harness::codex::reconcile_interrupted_items(
+                        &session_id,
+                        &active.message_id,
+                        items,
+                    )
+                    .or(message);
+                }
+                if let Some(message) = message {
                     host.emit("chat.message", message_json(&message, &session_id));
                 }
                 let _ = std::fs::remove_file(target_event_path(&session_id, &active.message_id));
@@ -2740,6 +2782,12 @@ impl ChatHost {
         let Some(prompt) = unresolved_prompt(&req.session_id, &req.prompt_id)? else {
             return Ok(());
         };
+        if prompt.kind == "permission"
+            && first_unresolved_permission_id(&req.session_id)?.as_deref()
+                != Some(req.prompt_id.as_str())
+        {
+            return Err(anyhow!("another approval must be answered before this one"));
+        }
         if let Some(mode) = req.resume_mode.as_deref() {
             if crate::local::harness::permission_mode_for(&session.harness, mode).is_none() {
                 return Err(anyhow!("invalid resume mode for selected harness"));
@@ -3192,6 +3240,36 @@ fn unresolved_prompt(session_id: &str, prompt_id: &str) -> Result<Option<WirePro
     Ok(None)
 }
 
+fn first_unresolved_permission_in_parts(parts: &[WirePart]) -> Option<String> {
+    for part in parts {
+        if part
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.kind == "permission" && !prompt.resolved)
+        {
+            return Some(part.id.clone());
+        }
+        if let Some(id) = first_unresolved_permission_in_parts(&part.children) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn first_unresolved_permission_id(session_id: &str) -> Result<Option<String>> {
+    let store = Store::open()?;
+    for msg in store.list_chat_messages(session_id)? {
+        if msg.role != "assistant" {
+            continue;
+        }
+        let parts: Vec<WirePart> = serde_json::from_str(&msg.parts_json).unwrap_or_default();
+        if let Some(id) = first_unresolved_permission_in_parts(&parts) {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
 /// Flip a prompt to resolved and stamp the answer echo (see
 /// [`WirePrompt::answers`]) so the collapsed card can show the outcome.
 /// `None` (stale-card cleanup, cancelled bridge requests) leaves any earlier
@@ -3261,12 +3339,10 @@ fn mark_prompt_resolved(
 
 /// Resolve still-unresolved prompt cards of a session, store-side.
 ///
-/// For inline-approval harnesses whose prompts die with their turn (codex: a
-/// JSON-RPC request the process has since abandoned), a leftover unresolved
-/// card is a zombie — unanswerable, and worse, its reply id can collide with a
-/// fresh child's restarting request ids, so a click on the dead card could be
-/// delivered to a *different, live* request. Called at codex turn entry
-/// (`native_only: false`) to close both.
+/// For inline-approval harnesses whose prompts die with their turn (Codex and
+/// OpenCode), a leftover unresolved card is a zombie — unanswerable, and worse,
+/// its reply id can collide with a fresh request, so a click on the dead card
+/// could be delivered to a *different, live* request.
 ///
 /// End-turn harnesses (Claude) sweep with `native_only: true`: their
 /// UN-held cards deliberately outlive turns and resume via a new message, but
@@ -3289,15 +3365,7 @@ fn resolve_stale_prompts(
             continue;
         }
         let mut parts: Vec<WirePart> = serde_json::from_str(&msg.parts_json).unwrap_or_default();
-        let mut changed = false;
-        for part in parts.iter_mut() {
-            if let Some(prompt) = part.prompt.as_mut() {
-                if !prompt.resolved && (!native_only || prompt.native_id.is_some()) {
-                    stamp_resolved(prompt, None);
-                    changed = true;
-                }
-            }
-        }
+        let changed = resolve_stale_prompts_in_parts(&mut parts, native_only);
         if changed {
             store.upsert_chat_message(&StoredChatMessage {
                 id: msg.id.clone(),
@@ -3315,6 +3383,20 @@ fn resolve_stale_prompts(
         }
     }
     Ok(updated)
+}
+
+fn resolve_stale_prompts_in_parts(parts: &mut [WirePart], native_only: bool) -> bool {
+    let mut changed = false;
+    for part in parts {
+        if let Some(prompt) = part.prompt.as_mut() {
+            if !prompt.resolved && (!native_only || prompt.native_id.is_some()) {
+                stamp_resolved(prompt, None);
+                changed = true;
+            }
+        }
+        changed |= resolve_stale_prompts_in_parts(&mut part.children, native_only);
+    }
+    changed
 }
 
 impl ChatHost {
@@ -4612,6 +4694,80 @@ mod bridge_tests {
             Arc::new(crate::local::codex::CodexHost::new()),
             Arc::new(crate::local::claude::ClaudeHost::new()),
         )
+    }
+
+    #[tokio::test]
+    async fn claude_permission_reviews_are_serialized_per_session() {
+        let host = test_host();
+        let lock = host
+            .permission_review_locks
+            .lock()
+            .await
+            .entry("session".into())
+            .or_default()
+            .clone();
+        let active = lock.lock().await;
+        assert!(lock.try_lock().is_err());
+        drop(active);
+        assert!(lock.try_lock().is_ok());
+    }
+
+    #[test]
+    fn shared_permission_order_only_activates_the_oldest_unresolved_card() {
+        let permission = |id: &str, resolved| {
+            WirePart::prompt(
+                id,
+                WirePrompt {
+                    kind: "permission".into(),
+                    resolved,
+                    ..Default::default()
+                },
+            )
+        };
+        let parts = vec![
+            WirePart::prompt(
+                "plan",
+                WirePrompt {
+                    kind: "plan".into(),
+                    ..Default::default()
+                },
+            ),
+            permission("first", false),
+            permission("second", false),
+        ];
+        assert_eq!(
+            first_unresolved_permission_in_parts(&parts).as_deref(),
+            Some("first")
+        );
+
+        let parts = vec![permission("first", true), permission("second", false)];
+        assert_eq!(
+            first_unresolved_permission_in_parts(&parts).as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn stale_native_prompt_sweep_reaches_nested_cards() {
+        let mut parts = vec![WirePart {
+            id: "tool".into(),
+            kind: "tool".into(),
+            text: None,
+            tool: Some("Task".into()),
+            state: None,
+            prompt: None,
+            children: vec![WirePart::prompt(
+                "permission",
+                WirePrompt {
+                    kind: "permission".into(),
+                    native_id: Some("request-1".into()),
+                    ..Default::default()
+                },
+            )],
+        }];
+
+        assert!(resolve_stale_prompts_in_parts(&mut parts, true));
+        assert!(parts[0].children[0].prompt.as_ref().unwrap().resolved);
     }
 
     /// The decision wire shapes are Claude Code's permission-prompt-tool

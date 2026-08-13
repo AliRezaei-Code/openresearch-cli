@@ -136,12 +136,12 @@ impl Harness for OpenCode {
                 OptionChoice::described(
                     "default",
                     "Default",
-                    "Honor configured allow, ask, and deny rules",
+                    "Ask before actions that need your approval",
                 ),
                 OptionChoice::described(
                     "auto-approve",
                     "Auto-approve",
-                    "Approve ask requests while preserving explicit denies",
+                    "Approve requests automatically, except actions you have denied",
                 ),
             ],
             "default",
@@ -643,6 +643,12 @@ fn plan_exit_transition(prompt: &WirePrompt, answer: &PromptAnswer) -> Option<bo
 }
 
 async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
+    // Native permission and question requests die with their turn. Clear any
+    // crash/restart leftovers before a new live request can be surfaced.
+    ctx.host
+        .resolve_stale_prompts(&ctx.session_id, true)
+        .await?;
+
     // Lazy bring-up: spawns serve in this session's worktree or reuses the
     // session's live child.
     let status = ctx

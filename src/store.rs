@@ -39,7 +39,11 @@ pub fn data_dir() -> PathBuf {
 
 pub(crate) fn open_lifecycle_lock() -> Result<fd_lock::RwLock<std::fs::File>> {
     // The config dir stays put while the user can move the live data directory.
-    open_lifecycle_lock_at(&crate::config::config_dir().join("orx.lifecycle.lock"))
+    open_lifecycle_lock_at(&lifecycle_lock_path())
+}
+
+pub(crate) fn lifecycle_lock_path() -> PathBuf {
+    crate::config::config_dir().join("orx.lifecycle.lock")
 }
 
 pub(crate) fn open_lifecycle_lock_at(

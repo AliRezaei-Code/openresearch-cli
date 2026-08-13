@@ -26,6 +26,7 @@ import {
   SlidersHorizontal,
   SquareTerminal,
   ToggleRight,
+  TriangleAlert,
   Users,
   X,
 } from "lucide-react";
@@ -84,7 +85,6 @@ import {
   defaultSelection,
   HARNESS_LABELS,
   ModelPicker,
-  OptionPicker,
   usePopover,
   type ModelSelection,
 } from "./ModelPicker";
@@ -116,31 +116,6 @@ const TOOL_LINE_CLASS_NAME = [
 const TOOL_TARGET_LIMIT = 256;
 const TOOL_TARGET_INSPECTION_LIMIT = 1_024;
 const TOOL_OUTPUT_SCAN_LIMIT = 20_000;
-const PERMISSION_EDIT_TOOLS = new Set([
-  "edit",
-  "edit_file",
-  "filechange",
-  "multiedit",
-  "notebookedit",
-  "write",
-  "write_file",
-]);
-const PERMISSION_COMMAND_TOOLS = new Set([
-  "bash",
-  "command",
-  "exec",
-  "exec_command",
-  "run_command",
-  "shell",
-]);
-
-function permissionToolPresentation(tool?: string): { kind: "edit" | "command" | "other"; label: string } {
-  const rawTool = tool?.trim() || "";
-  const baseTool = rawTool.toLowerCase().split(/(?::|\.|__)+/).at(-1) || "";
-  if (PERMISSION_EDIT_TOOLS.has(baseTool)) return { kind: "edit", label: "File change" };
-  if (PERMISSION_COMMAND_TOOLS.has(baseTool)) return { kind: "command", label: "Command" };
-  return { kind: "other", label: rawTool || "Action" };
-}
 const SELECTION_ACTION_GAP_PX = 8;
 const CHAT_ANNOTATION_HIGHLIGHT_NAME = "chat-annotations";
 
@@ -2073,6 +2048,34 @@ function activityInProgress(activity: ToolActivity): ToolActivity {
   return { ...activity, label };
 }
 
+function permissionActivityLabel(tool: string | undefined, input: Record<string, unknown> | undefined): string {
+  const activity = toolActivity({
+    id: "permission-preview",
+    type: "tool",
+    tool,
+    state: { status: "running", input },
+  });
+  const replacements: Array<[RegExp, string]> = [
+    [/^Reviewed /, "Review "],
+    [/^Searched /, "Search "],
+    [/^Listed /, "List "],
+    [/^Edited /, "Edit "],
+    [/^Updated /, "Update "],
+    [/^Created /, "Create "],
+    [/^Deleted /, "Delete "],
+    [/^Ran /, "Run "],
+    [/^Started /, "Start "],
+    [/^Waited /, "Wait "],
+    [/^Checked /, "Check "],
+    [/^Built /, "Build "],
+    [/^Cancelled /, "Cancel "],
+  ];
+  for (const [pattern, replacement] of replacements) {
+    if (pattern.test(activity.label)) return activity.label.replace(pattern, replacement);
+  }
+  return activity.label;
+}
+
 function resolvedActivityLabel(
   activity: ToolActivity,
   runExperimentName?: (runId: string) => string,
@@ -2503,17 +2506,16 @@ function PromptCard({
   }
 
   if (p.kind === "permission") {
+    const toolInput = p.toolInput ?? {};
     const summary =
-      (typeof p.toolInput?.command === "string" && p.toolInput.command) ||
-      (typeof p.toolInput?.filePath === "string" && p.toolInput.filePath) ||
+      inputString(toolInput, "command", "cmd", "filePath", "file_path", "path") ||
       "";
     // Codex approval cards ship a human-readable reason (and fileChange cards
     // carry nothing else) — show it so the user knows what they're granting.
     const reason =
       (typeof p.toolInput?.reason === "string" && p.toolInput.reason) || "";
-    const toolPresentation = permissionToolPresentation(p.tool);
-    const PermissionIcon = toolPresentation.kind === "edit" ? Pencil : toolPresentation.kind === "command" ? SquareTerminal : Blocks;
-    const toolLabel = toolPresentation.label;
+    const description = inputString(toolInput, "description") || "";
+    const explanation = reason || description || permissionActivityLabel(p.tool, toolInput);
     const headingId = `permission-heading-${part.id}`;
     return (
       <div
@@ -2521,27 +2523,18 @@ function PromptCard({
         role="group"
         aria-labelledby={headingId}
       >
-        <div className="flex items-center gap-2.5 border-b border-border-variant px-3.5 py-2.5">
+        <div className="flex items-center gap-2.5 px-3.5 pt-3 pb-0">
           <span className="flex size-7 shrink-0 items-center justify-center rounded-md bg-accent-amber-subtle text-accent-amber">
-            <PermissionIcon size={15} strokeWidth={1.8} aria-hidden="true" />
+            <TriangleAlert size={15} strokeWidth={1.8} aria-hidden="true" />
           </span>
-          <span id={headingId} className="text-md font-semibold text-text">Approval required</span>
-          <span
-            className="ml-auto max-w-[45%] truncate rounded-sm bg-surface px-2 py-0.5 text-xs font-medium text-subtext"
-            title={toolLabel}
-          >
-            {toolLabel}
-          </span>
+          <span id={headingId} className="text-base font-semibold text-text">Approval required</span>
         </div>
         <div className="flex flex-col gap-3 px-3.5 py-3">
-          {reason && <div className="prompt-sub text-md leading-normal text-text wrap-anywhere">{reason}</div>}
+          <div className="prompt-sub text-base font-normal leading-normal text-text wrap-anywhere">{explanation}</div>
           {summary && (
-            <code className="prompt-command block max-h-36 overflow-auto whitespace-pre-wrap wrap-anywhere rounded-md border border-border-variant bg-surface px-3 py-2 font-mono text-sm leading-relaxed text-subtext">
+            <code className="prompt-command block max-h-36 overflow-auto whitespace-pre-wrap wrap-anywhere rounded-md border border-border-variant bg-surface px-3 py-2 font-mono text-sm leading-relaxed text-text">
               {summary}
             </code>
-          )}
-          {!reason && !summary && (
-            <div className="text-md text-subtext">This action needs permission to continue.</div>
           )}
           {!done && (
             // No resumeMode: the harness picks the right one for an approval.
@@ -2617,9 +2610,15 @@ function PromptCard({
  * stored these before the harness-side skip existed) and resolved permission
  * cards (which leave no trace). Shared by `messageHasVisibleContent` and
  * `renderParts` so the two can't drift. */
-function partIsVisible(part: ChatPart): boolean {
-  if (part.type === "prompt")
-    return !!part.prompt && !(part.prompt.resolved && part.prompt.kind === "permission");
+function partIsVisible(part: ChatPart, activePermissionId?: string | null): boolean {
+  if (part.type === "prompt") {
+    if (!part.prompt) return false;
+    if (part.prompt.kind === "permission") {
+      if (part.prompt.resolved) return false;
+      if (activePermissionId !== undefined) return part.id === activePermissionId;
+    }
+    return true;
+  }
   if (part.type === "text" || part.type === "reasoning") return !!part.text;
   return true; // tool, image, …
 }
@@ -2627,9 +2626,9 @@ function partIsVisible(part: ChatPart): boolean {
 /** Whether a message renders anything once resolved-permission cards vanish —
  * a bridge permission card rides its own message, so resolving it leaves the
  * message empty and it must drop out of the transcript entirely. */
-function messageHasVisibleContent(m: ChatMessage): boolean {
+function messageHasVisibleContent(m: ChatMessage, activePermissionId?: string | null): boolean {
   if (m.role === "user") return true;
-  return m.parts.some(partIsVisible);
+  return m.parts.some((part) => partIsVisible(part, activePermissionId));
 }
 
 /** Memoized: streaming re-broadcasts the whole updated message up to ~13x/sec, and
@@ -2660,6 +2659,7 @@ function attachmentPartView(p: ChatPart): { src: string; isPdf: boolean; name: s
 
 const Message = memo(function Message({
   message,
+  activePermissionId,
   pendingTailToolId,
   onOpenFile,
   onOpenRun,
@@ -2673,6 +2673,7 @@ const Message = memo(function Message({
   predictTextTail = false,
 }: {
   message: ChatMessage;
+  activePermissionId: string | null;
   pendingTailToolId?: string | null;
   onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
@@ -2749,6 +2750,7 @@ const Message = memo(function Message({
   return (
     <div className="msg-assistant text-lg leading-[1.62] text-text min-w-0">
       {renderParts(message.parts, {
+        activePermissionId,
         pendingTailToolId,
         onOpenFile,
         onOpenRun,
@@ -2772,6 +2774,7 @@ const Message = memo(function Message({
 function renderParts(
   parts: ChatPart[],
   opts: {
+    activePermissionId?: string | null;
     pendingTailToolId?: string | null;
     onOpenFile?: OpenTranscriptFile;
     onOpenRun?: (runId: string) => void;
@@ -2785,6 +2788,7 @@ function renderParts(
   },
 ): React.ReactNode[] {
   const {
+    activePermissionId,
     pendingTailToolId,
     onOpenFile,
     onOpenRun,
@@ -2796,7 +2800,7 @@ function renderParts(
     onOpenSubagent,
     predictTextTail = false,
   } = opts;
-  const visibleTail = parts.filter(partIsVisible).at(-1);
+  const visibleTail = parts.filter((part) => partIsVisible(part, activePermissionId)).at(-1);
   const rendered: React.ReactNode[] = [];
   let toolRun: ChatPart[] = [];
   const flushTools = () => {
@@ -2821,7 +2825,7 @@ function renderParts(
     // transcripts predating the ingest-side skip still carry them), or a
     // resolved permission card. Without this, each invisible part splits
     // consecutive tools into single-row groups.
-    if (!partIsVisible(part)) continue;
+    if (!partIsVisible(part, activePermissionId)) continue;
     // A sub-agent spawn part streams its own transcript in `children` — render
     // it as a standalone nested block, not folded into a tool run. The signal is
     // harness-agnostic: Codex tags the row `subagent`, while Claude's `Task` /
@@ -3025,30 +3029,29 @@ function latestToolStates(messages: ChatMessage[]): { messageId: string; states:
   return { messageId: message.id, states };
 }
 
-function latestPendingPermission(messages: ChatMessage[]): { path: string; label: string } | null {
-  let message: ChatMessage | undefined;
-  for (let index = messages.length - 1; index >= 0; index--) {
-    if (messages[index].role !== "assistant") continue;
-    message = messages[index];
-    break;
-  }
-  if (!message) return null;
-  const visit = (parts: ChatPart[], parent: string): { path: string; label: string } | null => {
-    for (let index = parts.length - 1; index >= 0; index--) {
-      const part = parts[index];
+function firstPendingPermission(messages: ChatMessage[]): { id: string; path: string; label: string } | null {
+  const visit = (parts: ChatPart[], parent: string): { id: string; path: string; label: string } | null => {
+    for (const part of parts) {
+      const prompt = part.prompt;
+      if (part.type === "prompt" && prompt?.kind === "permission" && !prompt.resolved) {
+        const toolInput = prompt.toolInput ?? {};
+        const reason = inputString(toolInput, "reason", "description");
+        const label = reason || permissionActivityLabel(prompt.tool, toolInput);
+        return { id: part.id, path: `${parent}/${part.id}`, label };
+      }
       if (part.children?.length) {
         const nested = visit(part.children, `${parent}/${part.id}`);
         if (nested) return nested;
       }
-      const prompt = part.prompt;
-      if (part.type !== "prompt" || prompt?.kind !== "permission" || prompt.resolved) continue;
-      const reason = typeof prompt.toolInput?.reason === "string" ? prompt.toolInput.reason : "";
-      const label = reason || `${permissionToolPresentation(prompt.tool).label} needs approval`;
-      return { path: `${parent}/${part.id}`, label };
     }
     return null;
   };
-  return visit(message.parts, message.id);
+  for (const message of messages) {
+    if (message.role !== "assistant") continue;
+    const pending = visit(message.parts, message.id);
+    if (pending) return pending;
+  }
+  return null;
 }
 
 interface TranscriptAnnouncement {
@@ -3067,7 +3070,7 @@ function useTranscriptAnnouncement(messages: ChatMessage[]): TranscriptAnnouncem
   useEffect(() => {
     const transcript = messages[0]?.id ?? "";
     const { messageId, states } = latestToolStates(messages);
-    const pendingPermission = latestPendingPermission(messages);
+    const pendingPermission = firstPendingPermission(messages);
     if (!previous.current || previous.current.transcript !== transcript) {
       previous.current = { transcript, messageId, states, permissionPath: pendingPermission?.path ?? null };
       setAnnouncement((current) => ({
@@ -3149,7 +3152,10 @@ const Transcript = memo(function Transcript({
   onOpenSubagent?: (spawnPartId: string) => void;
   skills?: SkillInfo[];
 }) {
-  const visibleMessages = messages.filter(messageHasVisibleContent);
+  const activePermissionId = firstPendingPermission(messages)?.id ?? null;
+  const visibleMessages = messages.filter((message) =>
+    messageHasVisibleContent(message, activePermissionId),
+  );
   const activeMessage = visibleMessages.at(-1);
   const transcriptAnnouncement = useTranscriptAnnouncement(messages);
   const pendingTailTool = busy ? streamTailTool(messages) : null;
@@ -3162,6 +3168,7 @@ const Transcript = memo(function Transcript({
         <Message
           key={m.id}
           message={m}
+          activePermissionId={activePermissionId}
           pendingTailToolId={pendingTailTool?.messageId === m.id ? pendingTailTool.toolId : null}
           onOpenFile={onOpenFile}
           onOpenRun={onOpenRun}
@@ -3589,9 +3596,7 @@ export function ChatPanel({
   const threadInnerRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const composerRef = useRef<HTMLTextAreaElement>(null);
-  // Consolidated chat-settings popover (permissions/reasoning/sources), opened
-  // by the switch icon in the composer footer.
-  const chatSettings = usePopover();
+  const dataSources = usePopover();
   const addTranscriptSelection = useCallback((selection: Pick<SelectionAction, "text" | "range">) => {
     annotationId.current += 1;
     setAnnotations((current) => [
@@ -3827,10 +3832,9 @@ export function ChatPanel({
       });
   };
   const setReasoningLevel = (id: string) => selectModel({ reasoningLevel: id });
-  const planActive = !!openSession &&
-    (openSession.harness === "claude-code"
-      ? composerSelection?.permissionMode === "plan"
-      : planModeOverride ?? openSession.planMode);
+  const planActive = composerSelection?.harness === "claude-code"
+    ? composerSelection.permissionMode === "plan"
+    : !!openSession && (planModeOverride ?? openSession.planMode);
   useEffect(() => {
     if (planModeOverride === null || openSession?.planMode !== planModeOverride) return;
     planModeOverrideRef.current = null;
@@ -3864,11 +3868,11 @@ export function ChatPanel({
   }
 
   async function exitPlanMode() {
-    if (!openSession) return;
-    if (openSession.harness === "claude-code") {
+    if (composerSelection?.harness === "claude-code") {
       setPermissionMode("auto");
       return;
     }
+    if (!openSession) return;
     try {
       await setIndependentPlanMode(false);
     } catch {
@@ -4709,7 +4713,7 @@ export function ChatPanel({
   }, [startNewTask]);
 
   const rail = (
-    <aside className="session-rail w-68 shrink-0 flex flex-col mt-2.5 mr-3.5 mb-2.5 ml-0 bg-background min-h-0 [&_.rail-body]:flex-1 [&_.rail-body]:min-h-0 [&_.rail-body]:overflow-y-auto [&_.rail-body]:py-1 [&_.rail-body]:px-2 floating-panel border border-border rounded-lg shadow-[0_6px_24px_color-mix(in_oklab,_var(--text)_5%,_transparent),_0_1px_4px_color-mix(in_oklab,_var(--text)_4%,_transparent)] overflow-hidden">
+    <aside className="session-rail w-68 shrink-0 flex flex-col mt-2.5 mr-3.5 mb-2.5 ml-0 bg-background min-h-0 [&_.rail-body]:flex-1 [&_.rail-body]:min-h-0 [&_.rail-body]:overflow-y-auto [&_.rail-body]:py-1 [&_.rail-body]:px-2 floating-panel border border-border rounded-lg shadow-[0_6px_24px_color-mix(in_oklab,_var(--text)_5%,_transparent),_0_1px_4px_color-mix(in_oklab,_var(--text)_4%,_transparent)] overflow-visible">
       {railHeader}
       {/* Workspace tools open beside chat; settings sections replace the middle pane. */}
       <nav className="rail-nav flex flex-col gap-0.5 p-2 shrink-0">
@@ -5243,53 +5247,22 @@ export function ChatPanel({
             />
           </div>
           <div className="composer-actions flex justify-end items-center gap-2 pt-1.5 px-2 pb-2">
-            {/* Chat settings (permissions, reasoning, sources) live behind the
-                switch icon. */}
-            <div className="option-picker relative inline-flex" ref={chatSettings.ref}>
+            <div className="option-picker relative inline-flex" ref={dataSources.ref}>
               <button
                 type="button"
-                className="composer-bare inline-flex items-center gap-[3px] text-md text-text py-[5px] px-1 rounded-sm transition-[background] duration-150 ease-standard [&:hover]:bg-surface"
-                title="Chat settings"
-                aria-label="Chat settings"
+                className="composer-bare inline-flex items-center justify-center rounded-sm p-1.5 text-text transition-[background] duration-150 ease-standard hover:bg-surface"
+                title="Data sources"
+                aria-label="Data sources"
                 aria-haspopup="dialog"
-                aria-expanded={chatSettings.open}
-                onClick={() => chatSettings.setOpen((v) => !v)}
+                aria-expanded={dataSources.open}
+                onClick={() => dataSources.setOpen((open) => !open)}
               >
                 <ToggleRight size={16} />
               </button>
-              {chatSettings.open && (
-                <div className="composer-settings-menu absolute bottom-[calc(100%_+_8px)] left-0 flex flex-col gap-0.5 min-w-55 bg-background border border-border rounded-lg shadow-[0_12px_32px_rgba(0,_0,_0,_0.18)] z-50 p-1.5 [&_.composer-pill]:px-1.5 [&_.composer-bare]:px-1.5 [&_.option-menu]:bottom-0 [&_.option-menu]:top-auto [&_.option-menu]:left-[calc(100%_+_8px)] [&_.option-menu]:right-auto">
-                  <div className="flex items-center justify-between gap-3 pl-2">
-                    <span className="text-md text-muted">Permissions</span>
-                    <OptionPicker
-                      choices={activeHarness?.agentReady ? (opts?.permissionModes ?? []) : []}
-                      value={composerSelection?.permissionMode ?? null}
-                      defaultId={opts?.defaultPermissionMode ?? null}
-                      header="Permissions"
-                      align="left"
-                      variant="pill"
-                      numbered
-                      title="Permission mode for this chat"
-                      onSelect={setPermissionMode}
-                    />
-                  </div>
-                  <div className="flex items-center justify-between gap-3 pl-2">
-                    <span className="text-md text-muted">Reasoning</span>
-                    <OptionPicker
-                      choices={activeHarness?.agentReady ? reasoning.choices : []}
-                      value={composerSelection?.reasoningLevel ?? null}
-                      defaultId={reasoning.defaultId}
-                      header="Reasoning"
-                      align="left"
-                      variant="bare"
-                      title="Reasoning level for this chat — Default sends no override, so the harness CLI's own configured effort applies"
-                      onSelect={setReasoningLevel}
-                    />
-                  </div>
-                  <div className="flex flex-col gap-0.5 mt-1 pt-2 border-t border-border">
-                    <span className="text-md text-muted pl-2">Sources</span>
-                    <LitSourcesList />
-                  </div>
+              {dataSources.open && (
+                <div className="composer-sources-menu absolute bottom-[calc(100%_+_8px)] left-0 z-50 flex min-w-55 flex-col gap-1 rounded-md border border-border bg-background p-2 shadow-[0_10px_26px_rgba(0,_0,_0,_0.16)]">
+                  <span className="px-1 text-sm font-medium text-muted">Data sources</span>
+                  <LitSourcesList />
                 </div>
               )}
             </div>
@@ -5332,6 +5305,12 @@ export function ChatPanel({
             <ModelPicker
               value={composerSelection}
               onSelect={selectModel}
+              permissionChoices={activeHarness?.agentReady ? (opts?.permissionModes ?? []) : []}
+              defaultPermissionId={opts?.defaultPermissionMode ?? null}
+              onSelectPermission={setPermissionMode}
+              reasoningChoices={activeHarness?.agentReady ? reasoning.choices : []}
+              defaultReasoningId={reasoning.defaultId}
+              onSelectReasoning={setReasoningLevel}
               onHarnesses={setHarnesses}
               lockHarness={!!openSession}
             />

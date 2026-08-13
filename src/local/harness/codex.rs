@@ -48,11 +48,12 @@ use super::{should_synthesize_plan, synthesize_resume, Harness, ResumeAction, TU
 use crate::error::{anyhow, Result};
 use crate::local::chat::{
     find_part_mut, prepare_env, set_chat_session_env, upsert_preserving_children, ContextUsage,
-    PromptAnswer, ResumeCtx, TurnCtx, WirePart, WirePrompt, WireQuestionOption, WireToolState,
+    PromptAnswer, ResumeCtx, TurnCtx, WireMessage, WirePart, WirePrompt, WireQuestionOption,
+    WireToolState,
 };
 use crate::local::codex::{CodexClient, ServerReqKind, TurnEvent};
 use crate::local::opencode::ensure_playbook;
-use crate::store::Store;
+use crate::store::{Store, StoredChatMessage};
 
 // FALLBACK model table, used only when the app-server catalog is unreachable
 // (codex < 0.144's legacy exec path, or a failed/timed-out `model/list`). The
@@ -803,18 +804,19 @@ async fn codex_auto_review_supported(client: &CodexClient, workspace: &Path) -> 
 }
 
 /// The per-turn `sandboxPolicy` object. workspace-write carries the same
-/// grants the exec path passed via `-c`: the orx data dir + the hub clone's
-/// `.git` as writable roots (see `ensure_orx_data_dir` / `shared_git_dir`),
-/// and network on (the agent's job is driving the orx API and git). Like the
-/// exec `-c` override, this is a full policy replacement for the turn — a
-/// user's own config.toml `sandbox_workspace_write.writable_roots` don't
-/// survive it (no append form exists on either transport).
+/// grants the exec path passed via `-c`: the orx data dir, its lifecycle lock,
+/// and the hub clone's `.git` as writable roots (see the helpers below), plus
+/// network (the agent's job is driving the orx API and git). Like the exec `-c`
+/// override, this is a full policy replacement for the turn — a user's own
+/// config.toml `sandbox_workspace_write.writable_roots` don't survive it (no
+/// append form exists on either transport).
 async fn sandbox_policy_json(mode: Option<PermissionMode>, workspace: &Path) -> Value {
     match mode.unwrap_or(PermissionMode::Auto) {
         PermissionMode::Bypass => serde_json::json!({ "type": "dangerFullAccess" }),
         _ => {
             let mut roots: Vec<String> = Vec::new();
             roots.extend(ensure_orx_data_dir().map(|p| p.to_string_lossy().into_owned()));
+            roots.extend(ensure_orx_lifecycle_lock().map(|p| p.to_string_lossy().into_owned()));
             roots.extend(
                 shared_git_dir(workspace)
                     .await
@@ -1069,6 +1071,73 @@ fn apply_item(ctx: &mut TurnCtx, item: &Value, completed: bool) {
         return;
     }
     upsert_preserving_children(&mut ctx.assistant.parts, part);
+}
+
+async fn reconcile_turn_items(
+    ctx: &mut TurnCtx,
+    client: &CodexClient,
+    thread_id: &str,
+    turn_id: Option<&str>,
+) {
+    let Some(turn_id) = turn_id else { return };
+    let Some(items) = client.read_turn_items(thread_id, turn_id).await else {
+        return;
+    };
+    reconcile_items(&mut ctx.assistant.parts, &items);
+}
+
+pub(crate) fn reconcile_interrupted_items(
+    session_id: &str,
+    message_id: &str,
+    items: &[Value],
+) -> Option<WireMessage> {
+    let store = Store::open().ok()?;
+    let stored = store
+        .list_chat_messages(session_id)
+        .ok()?
+        .into_iter()
+        .find(|message| message.id == message_id)?;
+    let mut message = crate::local::chat::stored_to_wire(&stored);
+    reconcile_items(&mut message.parts, items);
+    settle_interrupted_parts(&mut message.parts);
+    store
+        .upsert_chat_message(&StoredChatMessage {
+            id: message.id.clone(),
+            session_id: session_id.to_string(),
+            role: message.role.clone(),
+            parts_json: serde_json::to_string(&message.parts).ok()?,
+            created_at: message.created_at,
+        })
+        .ok()?;
+    Some(message)
+}
+
+fn reconcile_items(parts: &mut Vec<WirePart>, items: &[Value]) {
+    for item in items {
+        let completed = item.get("status").and_then(Value::as_str) != Some("inProgress");
+        let Some(part) = item_to_part(item, completed, parts) else {
+            continue;
+        };
+        if completed
+            && streamed_text_kind(item)
+            && part_text_is_empty(&part)
+            && parts.iter().any(|prior| prior.id == part.id)
+        {
+            continue;
+        }
+        upsert_preserving_children(parts, part);
+    }
+}
+
+fn settle_interrupted_parts(parts: &mut [WirePart]) {
+    for part in parts {
+        settle_interrupted_parts(&mut part.children);
+        if let Some(state) = part.state.as_mut() {
+            if state.status == "running" {
+                state.status = "interrupted".into();
+            }
+        }
+    }
 }
 
 /// The three item types whose text streams token-by-token via `item/*/delta`
@@ -1898,6 +1967,7 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                 match apply_notification(ctx, &method, &params) {
                     Some(TurnEnd::Done { interrupted }) => {
                         sweep_open_requests(ctx, &client, &mut open_requests).await;
+                        reconcile_turn_items(ctx, &client, &thread_id, turn_id.as_deref()).await;
                         // A sub-agent whose `turn/completed` never arrived before
                         // the parent turn ended would otherwise spin forever.
                         settle_running_subagents(&mut ctx.assistant.parts);
@@ -2380,6 +2450,14 @@ pub(crate) fn ensure_orx_data_dir() -> Option<PathBuf> {
     dir.canonicalize().ok()
 }
 
+/// The exact lifecycle lock file required by every stateful `orx` command.
+/// Granting only this file avoids exposing the neighboring credentials file.
+fn ensure_orx_lifecycle_lock() -> Option<PathBuf> {
+    let lock = crate::store::open_lifecycle_lock().ok()?;
+    drop(lock);
+    crate::store::lifecycle_lock_path().canonicalize().ok()
+}
+
 /// Session reasoning id → Codex `model_reasoning_effort` value. See
 /// [`resolve_reasoning`] for what a `None` result means.
 ///
@@ -2512,7 +2590,7 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
                 "approval_policy=\"never\"",
             ]);
             // workspace-write out of the box is too tight for the orx
-            // workflow in three ways (all verified via `codex sandbox` against
+            // workflow in four ways (all verified via `codex sandbox` against
             // codex-cli 0.144; in the TUI these denials escalate to approval
             // prompts, which `codex exec` doesn't have):
             //   * Network is blocked by default — DNS doesn't even resolve, so
@@ -2524,6 +2602,10 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
             //     every `orx` command that touches it fails with "unable to
             //     open database file"; grant the data dir (see
             //     `ensure_orx_data_dir`).
+            //   * Every stateful `orx` command takes a lifecycle lock in the
+            //     config dir before opening the store. Grant only that lock
+            //     file, not the neighboring credentials (see
+            //     `ensure_orx_lifecycle_lock`).
             //   * Git metadata isn't writable — codex protects `.git` inside
             //     the workspace, and a worktree's real metadata (the hub
             //     clone's `.git`) sits outside it — so `git fetch`/`commit`
@@ -2534,10 +2616,14 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
             if policy == "workspace-write" {
                 cmd.args(["-c", "sandbox_workspace_write.network_access=true"]);
                 let data_dir = ensure_orx_data_dir();
-                let roots: Vec<PathBuf> = [data_dir.clone(), shared_git_dir(&repo).await]
-                    .into_iter()
-                    .flatten()
-                    .collect();
+                let roots: Vec<PathBuf> = [
+                    data_dir.clone(),
+                    ensure_orx_lifecycle_lock(),
+                    shared_git_dir(&repo).await,
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
                 if let Some(override_arg) = writable_roots_override(&roots) {
                     cmd.args(["-c", &override_arg]);
                 }
@@ -2994,6 +3080,64 @@ requires_openai_auth = false
             parts[2].text.as_deref(),
             Some("Command was not run because the required escalation was rejected.")
         );
+    }
+
+    #[test]
+    fn native_history_restores_a_missed_failed_command() {
+        let mut parts = vec![tool_part(
+            "ok".into(),
+            "bash",
+            "completed",
+            Some(serde_json::json!({ "command": "printf ok" })),
+            Some("ok".into()),
+        )];
+        let items = serde_json::json!([
+            {
+                "type": "commandExecution",
+                "id": "failed",
+                "command": "orx projects",
+                "cwd": "/worktree",
+                "status": "failed",
+                "aggregatedOutput": "Operation not permitted (os error 1)\n",
+                "exitCode": 1
+            },
+            {
+                "type": "commandExecution",
+                "id": "ok",
+                "command": "printf ok",
+                "cwd": "/worktree",
+                "status": "completed",
+                "aggregatedOutput": "ok",
+                "exitCode": 0
+            }
+        ]);
+
+        reconcile_items(&mut parts, items.as_array().unwrap());
+
+        assert_eq!(parts.len(), 2);
+        let failed = parts.iter().find(|part| part.id == "failed").unwrap();
+        assert_eq!(failed.state.as_ref().unwrap().status, "error");
+        assert_eq!(
+            failed.state.as_ref().unwrap().output.as_deref(),
+            Some("Operation not permitted (os error 1)\n")
+        );
+    }
+
+    #[test]
+    fn interrupted_history_settles_in_progress_tools_as_interrupted() {
+        let mut parts = Vec::new();
+        let items = serde_json::json!([{
+            "type": "commandExecution",
+            "id": "command",
+            "command": "sleep 30",
+            "cwd": "/worktree",
+            "status": "inProgress"
+        }]);
+
+        reconcile_items(&mut parts, items.as_array().unwrap());
+        settle_interrupted_parts(&mut parts);
+
+        assert_eq!(parts[0].state.as_ref().unwrap().status, "interrupted");
     }
 
     /// Every tool-flavored ThreadItem — web search, MCP, dynamic tool call —

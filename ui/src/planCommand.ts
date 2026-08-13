@@ -11,7 +11,12 @@ export function commandsForHarness(
   skills: SkillInfo[],
   planActivation: "permission" | "command" | null | undefined,
 ): SkillInfo[] {
-  return planActivation === "command" ? [PLAN_COMMAND, ...skills] : skills;
+  const availableSkills = skills.filter(
+    (skill) => skill.name.toLowerCase() !== PLAN_COMMAND.name,
+  );
+  return planActivation === "command"
+    ? [PLAN_COMMAND, ...availableSkills]
+    : availableSkills;
 }
 
 export function parsePlanCommand(

@@ -12,7 +12,21 @@ test("Plan is the first command only for command-activated harnesses", () => {
     "plan",
     "review",
   ]);
-  assert.equal(commandsForHarness(skills, "permission"), skills);
+  assert.deepEqual(commandsForHarness(skills, "permission"), skills);
+});
+
+test("built-in Plan replaces legacy user-skill collisions", () => {
+  const skills = [
+    { name: "PLAN", description: "Legacy collision", argHint: "", source: "user" },
+    { name: "review", description: "Review", argHint: "", source: "user" },
+  ];
+  const commands = commandsForHarness(skills, "command");
+  assert.deepEqual(commands.map((item) => item.name), ["plan", "review"]);
+  assert.equal(commands[0].source, "command");
+  assert.deepEqual(
+    commandsForHarness(skills, "permission").map((item) => item.name),
+    ["review"],
+  );
 });
 
 test("standalone and inline Plan commands are parsed without toggling", () => {

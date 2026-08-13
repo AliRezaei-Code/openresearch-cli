@@ -507,12 +507,12 @@ mod tests {
                 (
                     "default",
                     "Default",
-                    "Honor configured allow, ask, and deny rules"
+                    "Ask before actions that need your approval"
                 ),
                 (
                     "auto-approve",
                     "Auto-approve",
-                    "Approve ask requests while preserving explicit denies"
+                    "Approve requests automatically, except actions you have denied"
                 ),
             ]
         );
