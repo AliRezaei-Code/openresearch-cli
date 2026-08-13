@@ -4157,6 +4157,8 @@ struct SendChatReq {
     reasoning_level: Option<String>,
     #[serde(default)]
     images: Vec<local::chat::ImageAttachment>,
+    #[serde(default)]
+    annotations: Vec<local::chat::TextAnnotation>,
 }
 
 async fn send_chat_message(
@@ -4166,7 +4168,12 @@ async fn send_chat_message(
 ) -> ApiResult {
     reject_if_moving(&state)?;
     let text = req.text.trim().to_string();
-    if text.is_empty() && req.images.is_empty() {
+    let annotations = req
+        .annotations
+        .into_iter()
+        .filter(|annotation| !annotation.text.trim().is_empty())
+        .collect::<Vec<_>>();
+    if text.is_empty() && req.images.is_empty() && annotations.is_empty() {
         return Err(bad_request("text is required"));
     }
     let overrides = local::chat::TurnOverrides {
@@ -4177,7 +4184,7 @@ async fn send_chat_message(
     // The turn runs in the background; progress streams over /api/events.
     state
         .chat
-        .send_message(&id, text, overrides, req.images)
+        .send_message(&id, text, overrides, req.images, annotations)
         .await
         .map_err(bad_request)?;
     Ok(Json(json!({ "ok": true })))
@@ -4247,6 +4254,8 @@ struct RespondReq {
     answers: Vec<String>,
     #[serde(default)]
     note: Option<String>,
+    #[serde(default)]
+    annotations: Vec<local::chat::TextAnnotation>,
 }
 
 fn default_true() -> bool {
@@ -4268,6 +4277,11 @@ async fn respond_chat(
             resume_mode: req.resume_mode,
             answers: req.answers,
             note: req.note,
+            annotations: req
+                .annotations
+                .into_iter()
+                .filter(|annotation| !annotation.text.trim().is_empty())
+                .collect(),
         })
         .await
         .map_err(bad_request)?;
