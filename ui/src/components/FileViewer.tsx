@@ -5,7 +5,7 @@
 // the code browser.
 
 import { Code, FileText, GitBranch, RotateCw } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   artifactUrl,
   getArtifactFileMetadata,
@@ -27,6 +27,11 @@ type LoadedFile =
   | { source: "checkout"; file: ProjectFile }
   | { source: "artifact"; file: ArtifactPreviewFile; checkoutRoot?: CheckoutRoot };
 
+export interface FileScrollPosition {
+  top: number;
+  left: number;
+}
+
 export function FileViewer({
   projectId,
   path,
@@ -36,6 +41,10 @@ export function FileViewer({
   line,
   branchLabel,
   onOpenFile,
+  scrollPosition,
+  onScrollPositionChange,
+  lineScrollRequest,
+  onLineScrollRequestHandled,
 }: {
   projectId: string;
   path: string;
@@ -55,6 +64,10 @@ export function FileViewer({
   branchLabel?: string;
   /** Open a linked file as another tab (rendered-markdown links). */
   onOpenFile?: (path: string, sessionId?: string, ref?: string) => void;
+  scrollPosition?: FileScrollPosition;
+  onScrollPositionChange?: (position: FileScrollPosition) => void;
+  lineScrollRequest?: number;
+  onLineScrollRequestHandled?: () => void;
 }) {
   const [loaded, setLoaded] = useState<LoadedFile | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -65,6 +78,8 @@ export function FileViewer({
   const isMarkdown = isMarkdownFile(path);
   const artifactsFolder = path.split("/").slice(0, -1).join("/");
   const [showSource, setShowSource] = useState(false);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const scrollPositionRef = useRef(scrollPosition);
   const data = loaded?.file ?? null;
   const mediaKind = mediaPreviewKind(data?.presentation);
   const viaArtifacts = loaded?.source === "artifact" && !isArtifacts;
@@ -131,6 +146,14 @@ export function FileViewer({
     };
   }, [projectId, path, source, sessionId, gitRef, nonce]);
 
+  useLayoutEffect(() => {
+    const body = bodyRef.current;
+    const position = scrollPositionRef.current;
+    if (!body || !data || !position) return;
+    body.scrollTop = position.top;
+    body.scrollLeft = position.left;
+  }, [data]);
+
   const notFoundCopy = (d: LoadedFile) => {
     if (isArtifacts) return "Artifact not found in the project.";
     if (gitRef) return `File not found on branch ${gitRef}.`;
@@ -174,7 +197,18 @@ export function FileViewer({
           {loading ? <span className={SPINNER_CLASS_NAME} /> : <RotateCw size={13} />}
         </button>
       </div>
-      <div className="file-view-body flex-1 min-h-0 overflow-auto bg-background">
+      <div
+        ref={bodyRef}
+        className="file-view-body flex-1 min-h-0 overflow-auto bg-background"
+        onScroll={(event) => {
+          const position = {
+            top: event.currentTarget.scrollTop,
+            left: event.currentTarget.scrollLeft,
+          };
+          scrollPositionRef.current = position;
+          onScrollPositionChange?.(position);
+        }}
+      >
         {!error && loaded?.source === "checkout" && !loaded.file.notFound && !gitRef && sessionId && loaded.file.root === "clone" && (
           <div className="file-view-note py-2.5 px-4 text-sm text-muted">
             This session&apos;s worktree isn&apos;t available — showing the project clone&apos;s copy.
@@ -222,7 +256,13 @@ export function FileViewer({
                 )}
               </div>
             ) : (
-              <CodeView text={data.content} path={path} highlightLine={line} />
+              <CodeView
+                text={data.content}
+                path={path}
+                highlightLine={line}
+                scrollRequest={lineScrollRequest}
+                onScrollRequestHandled={onLineScrollRequestHandled}
+              />
             )}
             {data.truncated && (
               <div className="file-view-note py-2.5 px-4 text-sm text-muted">File truncated — showing the first 512 KB.</div>
