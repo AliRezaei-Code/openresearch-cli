@@ -91,9 +91,13 @@ import {
 import { ContextMeter } from "./ContextMeter";
 import { renderNote } from "./agentNote";
 import {
+  commandsForSlashContext,
   commandsForHarness,
   effectiveCommandPlanMode,
   parsePlanCommand,
+  removeSlashCommand,
+  slashCommandContext,
+  type SlashCommandContext,
 } from "../planCommand";
 import { loadReadDemoSessions, markDemoSessionRead } from "../demoSessionState";
 import { ICON_BUTTON_BASE_CLASS_NAME, ICON_BUTTON_CLASS_NAME, MODEL_ITEM_CLASS_NAME, PAPER_TITLE_CLASS_NAME, SPINNER_CLASS_NAME } from "../styleClasses";
@@ -2475,7 +2479,7 @@ function PromptCard({
     const docked = !!onOpenPlan;
     return (
       <div className={`prompt-card my-2 mx-0 py-3 px-3.5 border border-border border-l-[3px] border-l-border rounded-sm bg-surface flex flex-col gap-[9px] [&.plan]:border-l-accent-blue [&.permission]:border-l-accent-amber [&.question]:border-l-accent-purple [&.readonly]:opacity-60 plan ${done ? "readonly" : ""}`}>
-        <div className={PROMPT_HEAD_CLASS_NAME}>
+        <div className="prompt-head text-lg font-semibold text-text">
           {p.synthesized ? "Plan mode — ready to proceed?" : "Proposed plan"}
         </div>
         <div className={`prompt-plan text-base leading-[1.6] text-text max-h-85 overflow-y-auto [&.clamped]:max-h-[9.5em] [&.clamped]:overflow-hidden [&.clamped]:relative [&.clamped::after]:content-[''] [&.clamped::after]:absolute [&.clamped::after]:inset-x-0 [&.clamped::after]:bottom-0 [&.clamped::after]:top-auto [&.clamped::after]:h-8.5 [&.clamped::after]:bg-[linear-gradient(to_bottom,_transparent,_var(--surface))] [&.clamped::after]:pointer-events-none ${docked ? "clamped" : ""}`}>
@@ -3618,6 +3622,7 @@ export function ChatPanel({
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [skillIdx, setSkillIdx] = useState(0);
   const [skillMenuDismissed, setSkillMenuDismissed] = useState(false);
+  const [composerCursor, setComposerCursor] = useState(0);
   // A picked skill renders as a chip on the textarea's first line
   // (Claude-desktop style); the textarea then holds only the args. send()
   // reassembles `/name args`, so the wire and transcript keep the plain-text
@@ -3647,6 +3652,25 @@ export function ChatPanel({
     getSkills(projectId).then(setSkills).catch(() => {});
   }, [projectId, mainView]);
   function pickSkill(skill: SkillInfo) {
+    if (skill.source === "command" && skill.name === "plan" && slashContext) {
+      activatePlanCommand(draft, slashContext);
+      return;
+    }
+    if (slashContext?.inline) {
+      const before = draft.slice(0, slashContext.start);
+      const after = draft.slice(slashContext.end);
+      const insertion = `/${skill.name}`;
+      const separator = after ? "" : " ";
+      const cursor = before.length + insertion.length + separator.length;
+      setDraft(`${before}${insertion}${separator}${after}`);
+      setSkillMenuDismissed(true);
+      window.requestAnimationFrame(() => {
+        composerRef.current?.focus();
+        composerRef.current?.setSelectionRange(cursor, cursor);
+        setComposerCursor(cursor);
+      });
+      return;
+    }
     setPickedSkill(skill);
     setDraft("");
     composerRef.current?.focus();
@@ -3731,11 +3755,13 @@ export function ChatPanel({
     : undefined;
   const opts = activeHarness?.options;
   const commands = commandsForHarness(skills, opts?.planActivation);
-  const slashToken =
-    !pickedSkill && draft.startsWith("/") && !/\s/.test(draft) ? draft.slice(1) : null;
+  const slashContext = !pickedSkill ? slashCommandContext(draft, composerCursor) : null;
+  const slashToken = slashContext?.query ?? null;
   const skillMatches =
     slashToken !== null && !skillMenuDismissed
-      ? commands.filter((command) => command.name.startsWith(slashToken.toLowerCase()))
+      ? commandsForSlashContext(commands, slashContext?.inline ?? false).filter((command) =>
+          command.name.startsWith(slashToken),
+        )
       : [];
   const skillMenuOpen = skillMatches.length > 0;
   const activeSkillIdx = Math.min(skillIdx, Math.max(0, skillMatches.length - 1));
@@ -3834,7 +3860,9 @@ export function ChatPanel({
   const setReasoningLevel = (id: string) => selectModel({ reasoningLevel: id });
   const planActive = composerSelection?.harness === "claude-code"
     ? composerSelection.permissionMode === "plan"
-    : !!openSession && (planModeOverride ?? openSession.planMode);
+    : opts?.planActivation === "command"
+      ? planModeOverride ?? openSession?.planMode ?? false
+      : false;
   useEffect(() => {
     if (planModeOverride === null || openSession?.planMode !== planModeOverride) return;
     planModeOverrideRef.current = null;
@@ -3842,11 +3870,11 @@ export function ChatPanel({
   }, [openSession?.planMode, planModeOverride]);
 
   async function setIndependentPlanMode(planMode: boolean) {
+    planModeOverrideRef.current = planMode;
+    setPlanModeOverride(planMode);
     if (!openSession) return;
     const sessionId = openSession.id;
     const mutation = ++planMutationSeq.current;
-    planModeOverrideRef.current = planMode;
-    setPlanModeOverride(planMode);
     setSettingsError(null);
     try {
       const session = await queueSessionMutation(() => setChatSessionPlanMode(sessionId, planMode));
@@ -3878,6 +3906,34 @@ export function ChatPanel({
     } catch {
       setSettingsError("Could not exit Plan mode. Try again.");
     }
+  }
+
+  async function togglePlanMode() {
+    const nextPlanMode = !planActive;
+    try {
+      if (composerSelection?.harness === "claude-code") {
+        setPermissionMode(nextPlanMode ? "plan" : "auto");
+      } else if (opts?.planActivation === "command") {
+        await setIndependentPlanMode(nextPlanMode);
+      } else {
+        throw new Error("The selected harness is unavailable");
+      }
+    } catch {
+      setSettingsError("Could not toggle Plan mode. Try again.");
+    }
+  }
+
+  function activatePlanCommand(text: string, context: SlashCommandContext) {
+    const next = removeSlashCommand(text, context);
+    setDraft(next.text);
+    setPickedSkill(null);
+    setSkillMenuDismissed(true);
+    void togglePlanMode();
+    window.requestAnimationFrame(() => {
+      composerRef.current?.focus();
+      composerRef.current?.setSelectionRange(next.cursor, next.cursor);
+      setComposerCursor(next.cursor);
+    });
   }
 
   sessionsRef.current = sessions;
@@ -4284,11 +4340,15 @@ export function ChatPanel({
       ? parsePlanCommand(originalText, opts?.planActivation)
       : null;
     const planRequested = !!planCommand;
+    const toggledPlanMode = !planActive;
     const independentPlanMode = effectiveCommandPlanMode(
       opts?.planActivation,
-      planRequested,
+      planRequested ? toggledPlanMode : undefined,
       planModeOverrideRef.current,
     );
+    const planPermissionMode = planRequested && activeHarness?.id === "claude-code"
+      ? toggledPlanMode ? "plan" : "auto"
+      : undefined;
     const text = planCommand ? planCommand.prompt : originalText;
     const pending = attachments;
     const pendingAnnotations = annotations;
@@ -4312,39 +4372,37 @@ export function ChatPanel({
       setPickedSkill(null);
       setSkillMenuDismissed(false);
       try {
-        if (openSession) {
-          await setIndependentPlanMode(true);
-        } else if (activeHarness?.agentReady && composerSelection) {
-          const session = await createChatSession(projectId, composerSelection.harness, {
-            model: composerSelection.model,
-            permissionMode: composerSelection.permissionMode,
-            planMode: true,
-            reasoningLevel: composerSelection.reasoningLevel,
-          });
-          loadedSessions.current.add(session.id);
-          dispatch({ type: "seed", sessionId: session.id, messages: [], queued: [] });
-          setSessions((current) => [session, ...current]);
-          setActiveId(session.id);
-          composerScopeRef.current = { projectId, activeId: session.id };
+        if (activeHarness?.id === "claude-code") {
+          setPermissionMode(toggledPlanMode ? "plan" : "auto");
+        } else if (opts?.planActivation === "command") {
+          await setIndependentPlanMode(toggledPlanMode);
         } else {
           throw new Error("The selected harness is unavailable");
         }
       } catch {
-        setSettingsError("Could not enter Plan mode. Try again.");
+        setSettingsError("Could not toggle Plan mode. Try again.");
         restoreComposer();
       }
       return;
     }
+    const effective = composerSelection
+      ? {
+          ...composerSelection,
+          ...(planPermissionMode ? { permissionMode: planPermissionMode } : {}),
+        }
+      : null;
+    if (planPermissionMode) setPermissionMode(planPermissionMode);
     let planCommandMutation: number | null = null;
-    if (planRequested && openSession && opts?.planActivation === "command") {
+    const previousPlanModeOverride = planModeOverrideRef.current;
+    if (planRequested && opts?.planActivation === "command") {
       planCommandMutation = ++planMutationSeq.current;
-      planModeOverrideRef.current = true;
-      setPlanModeOverride(true);
+      planModeOverrideRef.current = toggledPlanMode;
+      setPlanModeOverride(toggledPlanMode);
     }
     const clearFailedPlanCommand = () => {
       if (planCommandMutation === null || planMutationSeq.current !== planCommandMutation) return;
-      planModeOverrideRef.current = null;
-      setPlanModeOverride(null);
+      planModeOverrideRef.current = previousPlanModeOverride;
+      setPlanModeOverride(previousPlanModeOverride);
     };
     if (!text && pending.length === 0 && pendingAnnotations.length === 0) return;
     // A pending question card owns plain typed text as a custom answer
@@ -4382,12 +4440,12 @@ export function ChatPanel({
       setAttachments([]);
       setAnnotations([]);
       setAttachError(null);
-      const turnOpts = composerSelection
+      const turnOpts = effective
         ? {
-            model: composerSelection.model,
-            permissionMode: composerSelection.permissionMode,
+            model: effective.model,
+            permissionMode: effective.permissionMode,
             planMode: independentPlanMode,
-            reasoningLevel: composerSelection.reasoningLevel,
+            reasoningLevel: effective.reasoningLevel,
           }
         : {};
       setSessionOverride({});
@@ -4419,7 +4477,6 @@ export function ChatPanel({
     }
     // `composerSelection` already resolves to the open session's settings (+ any
     // unsent tweak) or, for a new session, the global preference.
-    const effective = composerSelection;
     if (!effective) {
       clearFailedPlanCommand();
       return;
@@ -5181,6 +5238,15 @@ export function ChatPanel({
               }}
               onChange={(e) => {
                 const v = e.target.value;
+                const cursor = e.target.selectionStart;
+                setComposerCursor(cursor);
+                const completedCommand = cursor > 0 && /\s/.test(v[cursor - 1])
+                  ? slashCommandContext(v, cursor - 1)
+                  : null;
+                if (completedCommand?.query === "plan") {
+                  activatePlanCommand(v, completedCommand);
+                  return;
+                }
                 // Auto-convert a typed/pasted full `/name ` into the chip the
                 // moment the space lands. Known names only — unknown `/foo`
                 // stays plain text (server-side pass-through contract). Not
@@ -5199,6 +5265,7 @@ export function ChatPanel({
                 setDraft(v);
                 setSkillMenuDismissed(false);
               }}
+              onSelect={(e) => setComposerCursor(e.currentTarget.selectionStart)}
               onCompositionStart={() => {
                 composingRef.current = true;
               }}
@@ -5286,19 +5353,22 @@ export function ChatPanel({
             >
               <Paperclip size={16} />
             </button>
-            <div style={{ flex: 1 }} />
             {planActive && (
               <button
                 type="button"
-                className="plan-indicator ml-1 mr-0.5 inline-flex items-center gap-1.5 border-0 border-l border-solid border-l-border-variant bg-transparent py-1 pl-3 pr-1 text-md text-muted transition-colors hover:text-text focus-visible:text-text"
+                className="plan-indicator group inline-flex h-7.5 items-center gap-1.5 rounded-sm bg-surface px-2 text-sm text-muted transition-colors hover:text-text focus-visible:text-text"
                 title="Exit Plan mode"
                 aria-label="Exit Plan mode"
                 onClick={() => void exitPlanMode()}
               >
-                <Lightbulb size={16} strokeWidth={1.6} aria-hidden="true" />
+                <span className="relative size-4" aria-hidden="true">
+                  <Lightbulb className="absolute inset-0 transition-opacity group-hover:opacity-0 group-focus-visible:opacity-0" size={16} strokeWidth={1.6} />
+                  <X className="absolute inset-0 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100" size={16} strokeWidth={1.8} />
+                </span>
                 <span>Plan</span>
               </button>
             )}
+            <div style={{ flex: 1 }} />
             {/* The model picker reflects the open session (harness locked once it
                 exists); the global default only applies before the first
                 message. */}
