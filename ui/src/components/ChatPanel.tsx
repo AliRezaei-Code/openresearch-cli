@@ -153,14 +153,50 @@ function useTranscriptSelection(
   onAdd: (text: string) => void,
 ) {
   const [action, setAction] = useState<SelectionAction | null>(null);
+  const selectingWithPointer = useRef(false);
   const update = useCallback(() => {
     const root = rootRef.current;
     setAction(root ? currentTranscriptSelection(root) : null);
   }, [rootRef]);
 
   useEffect(() => {
-    document.addEventListener("selectionchange", update);
-    return () => document.removeEventListener("selectionchange", update);
+    let updateFrame: number | null = null;
+    const selectionChanged = () => {
+      if (!selectingWithPointer.current) update();
+    };
+    const pointerDown = (event: PointerEvent) => {
+      const root = rootRef.current;
+      const target = event.target;
+      if (
+        !event.isPrimary ||
+        event.button !== 0 ||
+        !root ||
+        !(target instanceof Node) ||
+        !root.contains(target)
+      ) {
+        return;
+      }
+      selectingWithPointer.current = true;
+      setAction(null);
+    };
+    const pointerFinished = (event: PointerEvent) => {
+      if (!event.isPrimary || !selectingWithPointer.current) return;
+      selectingWithPointer.current = false;
+      updateFrame = window.requestAnimationFrame(update);
+    };
+
+    document.addEventListener("selectionchange", selectionChanged);
+    document.addEventListener("pointerdown", pointerDown, true);
+    window.addEventListener("pointerup", pointerFinished, true);
+    window.addEventListener("pointercancel", pointerFinished, true);
+    return () => {
+      document.removeEventListener("selectionchange", selectionChanged);
+      document.removeEventListener("pointerdown", pointerDown, true);
+      window.removeEventListener("pointerup", pointerFinished, true);
+      window.removeEventListener("pointercancel", pointerFinished, true);
+      if (updateFrame !== null) window.cancelAnimationFrame(updateFrame);
+      selectingWithPointer.current = false;
+    };
   }, [update]);
 
   useEffect(() => {
