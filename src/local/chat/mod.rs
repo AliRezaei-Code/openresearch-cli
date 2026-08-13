@@ -810,6 +810,8 @@ pub struct WirePrompt {
     pub approved: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<TextAnnotation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -861,6 +863,13 @@ impl WirePart {
         Self {
             kind: "image".into(),
             ..Self::text(id, name)
+        }
+    }
+
+    pub fn annotation(id: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            kind: "annotation".into(),
+            ..Self::text(id, text)
         }
     }
 
@@ -917,7 +926,8 @@ pub struct ImageAttachment {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TextAnnotation {
     pub text: String,
 }
@@ -1188,7 +1198,7 @@ mod initial_message_tests {
     #[test]
     fn empty_selected_chat_context_leaves_the_message_unchanged() {
         assert_eq!(
-            with_selected_chat_context("question".into(), &[TextAnnotation { text: "  ".into() }]),
+            with_selected_chat_context("question".into(), &[TextAnnotation { text: "  ".into() }],),
             "question"
         );
     }
@@ -1407,6 +1417,11 @@ struct QueuedMessage {
 struct AnnotatedText {
     text: String,
     annotations: Vec<TextAnnotation>,
+}
+
+struct TranscriptDisplay {
+    text: Option<String>,
+    annotations: Option<Vec<TextAnnotation>>,
 }
 
 fn contextualize_messages(
@@ -1947,7 +1962,10 @@ impl ChatHost {
                 .send_message_showing(
                     session_id,
                     messages,
-                    transcript_text,
+                    TranscriptDisplay {
+                        text: transcript_text,
+                        annotations: None,
+                    },
                     overrides,
                     images,
                     false,
@@ -2001,7 +2019,10 @@ impl ChatHost {
         self.send_message_showing(
             session_id,
             vec![AnnotatedText { text, annotations }],
-            transcript_text,
+            TranscriptDisplay {
+                text: transcript_text,
+                annotations: None,
+            },
             overrides,
             images,
             true,
@@ -2016,11 +2037,15 @@ impl ChatHost {
         self: &Arc<Self>,
         session_id: &str,
         messages: Vec<AnnotatedText>,
-        transcript_text: Option<String>,
+        transcript: TranscriptDisplay,
         overrides: TurnOverrides,
         images: Vec<ImageAttachment>,
         queue_if_busy: bool,
     ) -> Result<()> {
+        let TranscriptDisplay {
+            text: transcript_text,
+            annotations: transcript_annotations,
+        } = transcript;
         let text = messages
             .iter()
             .map(|message| message.text.trim())
@@ -2030,6 +2055,14 @@ impl ChatHost {
         let has_annotations = messages
             .iter()
             .any(|message| !message.annotations.is_empty());
+        let transcript_annotations = transcript_annotations.unwrap_or_else(|| {
+            messages
+                .iter()
+                .flat_map(|message| message.annotations.iter())
+                .filter(|annotation| !annotation.text.trim().is_empty())
+                .cloned()
+                .collect()
+        });
         // Atomically claim the session's turn slot: the busy-check and the
         // reservation happen under one lock so two concurrent sends (or a
         // send racing a /respond resume) can't both spawn a turn against the
@@ -2167,6 +2200,12 @@ impl ChatHost {
         }
         for (i, att) in saved_images.iter().enumerate() {
             parts.push(WirePart::image(format!("img{i}"), att.file_name.clone()));
+        }
+        for (i, annotation) in transcript_annotations.iter().enumerate() {
+            parts.push(WirePart::annotation(
+                format!("annotation{i}"),
+                annotation.text.trim(),
+            ));
         }
         // A resume whose transcript text is empty (e.g. a note-less plan
         // approval) records no user message: the resolved card already tells
@@ -2576,13 +2615,18 @@ impl ChatHost {
                         text,
                         annotations: Vec::new(),
                     }],
-                    transcript,
+                    TranscriptDisplay {
+                        text: transcript,
+                        annotations: Some(req.annotations.clone()),
+                    },
                     overrides,
                     Vec::new(),
                     false,
                 )
                 .await?;
-                self.resolve_prompt_card(&req);
+                let mut prompt_echo = req;
+                prompt_echo.annotations.clear();
+                self.resolve_prompt_card(&prompt_echo);
                 Ok(())
             }
             ResumeAction::Handled => {
@@ -2877,6 +2921,7 @@ fn stamp_resolved(prompt: &mut WirePrompt, answer: Option<&PromptAnswer>) {
         prompt.answers = answer.answers.clone();
         prompt.approved = Some(answer.approve);
         prompt.note = answer.note.clone().filter(|n| !n.trim().is_empty());
+        prompt.annotations = answer.annotations.clone();
     }
 }
 
@@ -3353,7 +3398,7 @@ impl TurnCtx {
     /// Merge the persisted resolution state of prompt parts into the in-memory
     /// assistant message, so a concurrent `respond` that resolved a card isn't
     /// clobbered by this turn's next flush. Only ever flips `false`→`true` and
-    /// fills an empty echo (`answers`/`approved`/`note`) — never the reverse —
+    /// fills an empty echo (`answers`/`approved`/`note`/`annotations`) — never the reverse —
     /// so it's safe regardless of ordering: the in-memory copy normally never
     /// carries an echo of its own, and dropping the stored one here would
     /// erase the stamped outcome on the next flush.
@@ -3378,10 +3423,15 @@ impl TurnCtx {
             // echo-less (codex's turn loop resolves its in-memory card
             // without one) — else this flush would persist the bare copy
             // over the stamped outcome.
-            if prompt.answers.is_empty() && prompt.approved.is_none() && prompt.note.is_none() {
+            if prompt.answers.is_empty()
+                && prompt.approved.is_none()
+                && prompt.note.is_none()
+                && prompt.annotations.is_empty()
+            {
                 prompt.answers = stored_prompt.answers.clone();
                 prompt.approved = stored_prompt.approved;
                 prompt.note = stored_prompt.note.clone();
+                prompt.annotations = stored_prompt.annotations.clone();
             }
         }
     }
@@ -4301,14 +4351,16 @@ mod bridge_tests {
             kind: "question".into(),
             ..Default::default()
         };
-        stamp_resolved(
-            &mut prompt,
-            Some(&answer(&["Core patching science"], true, Some("go deep"))),
-        );
+        let mut response = answer(&["Core patching science"], true, Some("go deep"));
+        response.annotations = vec![TextAnnotation {
+            text: "selected excerpt".into(),
+        }];
+        stamp_resolved(&mut prompt, Some(&response));
         assert!(prompt.resolved);
         assert_eq!(prompt.answers, vec!["Core patching science"]);
         assert_eq!(prompt.approved, Some(true));
         assert_eq!(prompt.note.as_deref(), Some("go deep"));
+        assert_eq!(prompt.annotations[0].text, "selected excerpt");
 
         // A whitespace-only note is dropped, a denial echoes approved=false.
         let mut prompt = WirePrompt {
