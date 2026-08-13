@@ -364,6 +364,24 @@ impl Store {
                     ('default', 'auto-approve'))",
             [],
         );
+        // Seed before normalizing preferences: on the first open of an older
+        // database the latest session may itself carry a retired mode or Plan.
+        conn.execute(
+            "INSERT OR IGNORE INTO ui_state (
+                 id, onboarding_completed, tour_completed,
+                 preferred_harness, preferred_model,
+                 preferred_permission_mode, preferred_reasoning_level
+             )
+             SELECT 1,
+                    EXISTS(SELECT 1 FROM local_projects),
+                    EXISTS(SELECT 1 FROM local_projects),
+                    harness, model, permission_mode, reasoning_level
+             FROM (SELECT 1) seed
+             LEFT JOIN chat_sessions ON chat_sessions.id = (
+                 SELECT id FROM chat_sessions ORDER BY updated_at DESC LIMIT 1
+             )",
+            [],
+        )?;
         // Preferred-agent state never carries Plan for command-activated
         // harnesses: new sessions start in Build/Default until `/plan` is used.
         let _ = conn.execute(
@@ -416,27 +434,6 @@ impl Store {
                AND preferred_permission_mode NOT IN ('default', 'auto-approve')",
             [],
         );
-
-        // Seed the singleton for existing databases without replaying first-run
-        // UI. The newest chat session is the best durable approximation of the
-        // browser-only agent preference older builds used.
-        conn.execute(
-            "INSERT OR IGNORE INTO ui_state (
-                 id, onboarding_completed, tour_completed,
-                 preferred_harness, preferred_model,
-                 preferred_permission_mode, preferred_reasoning_level
-             )
-             SELECT 1,
-                    EXISTS(SELECT 1 FROM local_projects),
-                    EXISTS(SELECT 1 FROM local_projects),
-                    harness, model, permission_mode, reasoning_level
-             FROM (SELECT 1) seed
-             LEFT JOIN chat_sessions ON chat_sessions.id = (
-                 SELECT id FROM chat_sessions ORDER BY updated_at DESC LIMIT 1
-             )",
-            [],
-        )?;
-
         // NOTE: `reasoning_level` deliberately has NO migration for issue #123,
         // unlike the permission modes above. Rows written by older builds carry
         // an implicit effort (`high`), but every value the old builds wrote is
@@ -1423,8 +1420,9 @@ mod tests {
         older.harness = "codex".into();
         store.create_chat_session(&older).unwrap();
         let mut session = chat_session_fixture("latest");
-        session.harness = "opencode".into();
+        session.harness = "claude-code".into();
         session.model = Some("model".into());
+        session.permission_mode = Some("plan".into());
         session.updated_at = 2;
         store.create_chat_session(&session).unwrap();
         store.conn.execute("DELETE FROM ui_state", []).unwrap();
@@ -1433,7 +1431,9 @@ mod tests {
         let migrated = Store::open_at(dir.clone()).unwrap().ui_state().unwrap();
         assert!(migrated.onboarding_completed);
         assert!(migrated.tour_completed);
-        assert_eq!(migrated.preferred_agent.unwrap().harness, "opencode");
+        let preferred = migrated.preferred_agent.unwrap();
+        assert_eq!(preferred.harness, "claude-code");
+        assert_eq!(preferred.permission_mode.as_deref(), Some("auto"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -160,11 +160,11 @@ impl Harness for OpenCode {
         answer: &PromptAnswer,
     ) -> Result<ResumeAction> {
         let plan_mode = plan_exit_transition(prompt, answer);
-        if plan_mode == Some(false) {
-            // Persist the exit before OpenCode consumes the native Yes answer.
-            // If delivery fails, restore Plan so the still-actionable card and
-            // ORX state continue to agree.
-            ctx.host.set_plan_mode(&ctx.session_id, false).await?;
+        if let Some(plan_mode) = plan_mode {
+            // Persist the native answer's Plan transition before OpenCode
+            // consumes it. If delivery fails, restore the active Plan state so
+            // the still-actionable card and ORX continue to agree.
+            ctx.host.set_plan_mode(&ctx.session_id, plan_mode).await?;
             if let Err(err) = reply_inline(ctx, prompt, answer).await {
                 let _ = ctx.host.set_plan_mode(&ctx.session_id, true).await;
                 return Err(err);
@@ -172,7 +172,7 @@ impl Harness for OpenCode {
             return Ok(ResumeAction::Handled { plan_mode: None });
         }
         reply_inline(ctx, prompt, answer).await?;
-        Ok(ResumeAction::Handled { plan_mode })
+        Ok(ResumeAction::Handled { plan_mode: None })
     }
 
     fn config_home(&self) -> Option<PathBuf> {

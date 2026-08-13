@@ -385,7 +385,10 @@ async fn spawn_client(spec: &SpawnSpec, auth_generation: u64) -> Result<Arc<Clau
         // equality-checks the token with no expiry (chat/mod.rs), so a fresh
         // token invalidates the resident bridge child's held requests.
         if let Some(port) = spec.chat.up_port() {
-            let token = spec.chat.mint_gate_token(&spec.session_id);
+            let token = spec.chat.mint_gate_token(
+                &spec.session_id,
+                spec.config.permission_mode == Some(PermissionMode::Plan),
+            );
             match write_mcp_config(&spec.repo, port, &spec.session_id, &token) {
                 Ok(path) => {
                     cmd.arg("--mcp-config").arg(path);

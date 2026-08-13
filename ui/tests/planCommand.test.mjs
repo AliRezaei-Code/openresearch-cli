@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { commandsForHarness, parsePlanCommand } from "../src/planCommand.ts";
+import {
+  commandsForHarness,
+  effectiveCommandPlanMode,
+  parsePlanCommand,
+} from "../src/planCommand.ts";
 
 test("Plan is the first command only for command-activated harnesses", () => {
   const skills = [{ name: "review", description: "Review", argHint: "", source: "user" }];
@@ -18,4 +22,12 @@ test("standalone and inline Plan commands are parsed without toggling", () => {
   });
   assert.equal(parsePlanCommand("/plan", "permission"), null);
   assert.equal(parsePlanCommand("/planner", "command"), null);
+});
+
+test("pending Plan transitions override stored state for an immediate send", () => {
+  assert.equal(effectiveCommandPlanMode("command", false, false), false);
+  assert.equal(effectiveCommandPlanMode("command", false, true), true);
+  assert.equal(effectiveCommandPlanMode("command", true, false), true);
+  assert.equal(effectiveCommandPlanMode("permission", true, true), undefined);
+  assert.equal(effectiveCommandPlanMode("command", false, null), undefined);
 });

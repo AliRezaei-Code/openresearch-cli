@@ -226,7 +226,7 @@ pub fn permission_mode_for(harness_id: &str, id: &str) -> Option<PermissionMode>
 
 /// The valid wire id to expose for a session. Unknown/stale values fall back to
 /// the harness default instead of leaving the composer on an impossible mode.
-pub fn effective_permission_id<'a>(harness_id: &str, stored: Option<&'a str>) -> Option<String> {
+pub fn effective_permission_id(harness_id: &str, stored: Option<&str>) -> Option<String> {
     let harness = chat_harness(harness_id)?;
     let options = harness.options();
     if let Some(id) = stored.filter(|id| options.permission_modes.iter().any(|c| c.id == *id)) {

@@ -22,3 +22,13 @@ export function parsePlanCommand(
   const match = text.match(/^\/plan(?:\s+([\s\S]*))?$/i);
   return match ? { prompt: (match[1] ?? "").trim() } : null;
 }
+
+export function effectiveCommandPlanMode(
+  planActivation: "permission" | "command" | null | undefined,
+  commandRequested: boolean,
+  pendingMode: boolean | null,
+): boolean | undefined {
+  if (planActivation !== "command") return undefined;
+  if (commandRequested) return true;
+  return pendingMode ?? undefined;
+}

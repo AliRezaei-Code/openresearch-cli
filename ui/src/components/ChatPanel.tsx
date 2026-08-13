@@ -90,7 +90,11 @@ import {
 } from "./ModelPicker";
 import { ContextMeter } from "./ContextMeter";
 import { renderNote } from "./agentNote";
-import { commandsForHarness, parsePlanCommand } from "../planCommand";
+import {
+  commandsForHarness,
+  effectiveCommandPlanMode,
+  parsePlanCommand,
+} from "../planCommand";
 import { loadReadDemoSessions, markDemoSessionRead } from "../demoSessionState";
 import { ICON_BUTTON_BASE_CLASS_NAME, ICON_BUTTON_CLASS_NAME, MODEL_ITEM_CLASS_NAME, PAPER_TITLE_CLASS_NAME, SPINNER_CLASS_NAME } from "../styleClasses";
 import {
@@ -3543,6 +3547,10 @@ export function ChatPanel({
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const settingsMutationTail = useRef<Promise<void>>(Promise.resolve());
   const settingsMutationSeq = useRef(0);
+  const planMutationSeq = useRef(0);
+  const [planModeOverride, setPlanModeOverride] = useState<boolean | null>(null);
+  const planModeOverrideRef = useRef<boolean | null>(null);
+  const queuedPlanOverrideSeen = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [state, dispatch] = useReducer(reducer, {
     messagesBySession: {},
@@ -3770,14 +3778,14 @@ export function ChatPanel({
       setSessionOverride({});
     }
   };
-  const queueSessionSetting = (mutation: () => Promise<ChatSession>): Promise<ChatSession> => {
+  const queueSessionMutation = useCallback(<T,>(mutation: () => Promise<T>): Promise<T> => {
     const result = settingsMutationTail.current.catch(() => {}).then(mutation);
     settingsMutationTail.current = result.then(
       () => {},
       () => {},
     );
     return result;
-  };
+  }, []);
   const setPermissionMode = (id: string) => {
     // Plan is session-scoped. Claude exposes it in the permission dropdown,
     // but it must not become the saved default for future sessions.
@@ -3795,7 +3803,7 @@ export function ChatPanel({
     const sessionId = openSession.id;
     const mutation = ++settingsMutationSeq.current;
     setSettingsError(null);
-    void queueSessionSetting(() => setChatSessionPermissionMode(sessionId, id))
+    void queueSessionMutation(() => setChatSessionPermissionMode(sessionId, id))
       .then((session) => {
         setSessions((current) =>
           current.map((candidate) => (candidate.id === session.id ? session : candidate)),
@@ -3822,18 +3830,37 @@ export function ChatPanel({
   const planActive = !!openSession &&
     (openSession.harness === "claude-code"
       ? composerSelection?.permissionMode === "plan"
-      : openSession.planMode);
+      : planModeOverride ?? openSession.planMode);
+  useEffect(() => {
+    if (planModeOverride === null || openSession?.planMode !== planModeOverride) return;
+    planModeOverrideRef.current = null;
+    setPlanModeOverride(null);
+  }, [openSession?.planMode, planModeOverride]);
 
   async function setIndependentPlanMode(planMode: boolean) {
     if (!openSession) return;
     const sessionId = openSession.id;
-    const mutation = ++settingsMutationSeq.current;
+    const mutation = ++planMutationSeq.current;
+    planModeOverrideRef.current = planMode;
+    setPlanModeOverride(planMode);
     setSettingsError(null);
-    const session = await queueSessionSetting(() => setChatSessionPlanMode(sessionId, planMode));
-    setSessions((current) =>
-      current.map((candidate) => (candidate.id === session.id ? session : candidate)),
-    );
-    if (settingsMutationSeq.current === mutation) setSettingsError(null);
+    try {
+      const session = await queueSessionMutation(() => setChatSessionPlanMode(sessionId, planMode));
+      setSessions((current) =>
+        current.map((candidate) => (candidate.id === session.id ? session : candidate)),
+      );
+      if (planMutationSeq.current === mutation) {
+        planModeOverrideRef.current = null;
+        setPlanModeOverride(null);
+        setSettingsError(null);
+      }
+    } catch (error) {
+      if (planMutationSeq.current === mutation) {
+        planModeOverrideRef.current = null;
+        setPlanModeOverride(null);
+      }
+      throw error;
+    }
   }
 
   async function exitPlanMode() {
@@ -4058,6 +4085,21 @@ export function ChatPanel({
   // Messages the user parked behind the running turn (oldest first). Populated
   // by chat.queued events and the seed snapshot; each runs when its turn ends.
   const queued = activeId ? (state.queuedBySession[activeId] ?? []) : [];
+  useEffect(() => {
+    const queuedMode = queued.reduce<boolean | undefined>(
+      (mode, item) => item.planMode ?? mode,
+      undefined,
+    );
+    if (queuedMode !== undefined) {
+      queuedPlanOverrideSeen.current = true;
+      planModeOverrideRef.current = queuedMode;
+      setPlanModeOverride(queuedMode);
+    } else if (queuedPlanOverrideSeen.current) {
+      queuedPlanOverrideSeen.current = false;
+      planModeOverrideRef.current = null;
+      setPlanModeOverride(null);
+    }
+  }, [queued]);
   // A session whose transcript hasn't been seeded yet: its key is absent from
   // messagesBySession (vs. present-but-empty for a genuinely empty session).
   // Switching to an existing session leaves this true for the getChatMessages
@@ -4184,6 +4226,13 @@ export function ChatPanel({
   // from one session's pickers onto another's.
   useEffect(() => {
     settingsMutationSeq.current += 1;
+    planMutationSeq.current += 1;
+    const queuedMode = (activeId ? state.queuedBySession[activeId] ?? [] : []).reduce<
+      boolean | undefined
+    >((mode, item) => item.planMode ?? mode, undefined);
+    queuedPlanOverrideSeen.current = queuedMode !== undefined;
+    planModeOverrideRef.current = queuedMode ?? null;
+    setPlanModeOverride(queuedMode ?? null);
     setSessionOverride({});
     setSettingsError(null);
   }, [activeId]);
@@ -4231,6 +4280,11 @@ export function ChatPanel({
       ? parsePlanCommand(originalText, opts?.planActivation)
       : null;
     const planRequested = !!planCommand;
+    const independentPlanMode = effectiveCommandPlanMode(
+      opts?.planActivation,
+      planRequested,
+      planModeOverrideRef.current,
+    );
     const text = planCommand ? planCommand.prompt : originalText;
     const pending = attachments;
     const pendingAnnotations = annotations;
@@ -4268,6 +4322,8 @@ export function ChatPanel({
           setSessions((current) => [session, ...current]);
           setActiveId(session.id);
           composerScopeRef.current = { projectId, activeId: session.id };
+        } else {
+          throw new Error("The selected harness is unavailable");
         }
       } catch {
         setSettingsError("Could not enter Plan mode. Try again.");
@@ -4275,6 +4331,17 @@ export function ChatPanel({
       }
       return;
     }
+    let planCommandMutation: number | null = null;
+    if (planRequested && openSession && opts?.planActivation === "command") {
+      planCommandMutation = ++planMutationSeq.current;
+      planModeOverrideRef.current = true;
+      setPlanModeOverride(true);
+    }
+    const clearFailedPlanCommand = () => {
+      if (planCommandMutation === null || planMutationSeq.current !== planCommandMutation) return;
+      planModeOverrideRef.current = null;
+      setPlanModeOverride(null);
+    };
     if (!text && pending.length === 0 && pendingAnnotations.length === 0) return;
     // A pending question card owns plain typed text as a custom answer
     // (Claude-desktop behavior). This also works while the turn is HELD on
@@ -4301,7 +4368,10 @@ export function ChatPanel({
       // so it runs when the turn ends, instead of dropping it. The server
       // enqueues it and echoes chat.queued to render the chip — no optimistic
       // transcript bubble, since it hasn't run yet.
-      if (!activeId || !activeHarness?.agentReady) return;
+      if (!activeId || !activeHarness?.agentReady) {
+        clearFailedPlanCommand();
+        return;
+      }
       const sid = activeId;
       setDraft("");
       setPickedSkill(null);
@@ -4312,7 +4382,7 @@ export function ChatPanel({
         ? {
             model: composerSelection.model,
             permissionMode: composerSelection.permissionMode,
-            planMode: planRequested ? true : undefined,
+            planMode: independentPlanMode,
             reasoningLevel: composerSelection.reasoningLevel,
           }
         : {};
@@ -4323,24 +4393,33 @@ export function ChatPanel({
         name: a.name,
       }));
       try {
-        await sendChatMessage(
-          sid,
-          text,
-          turnOpts,
-          images.length ? images : undefined,
-          wireAnnotations,
-        );
+        const sendQueued = () =>
+          sendChatMessage(
+            sid,
+            text,
+            turnOpts,
+            images.length ? images : undefined,
+            wireAnnotations,
+          );
+        await queueSessionMutation(sendQueued);
       } catch {
         // Never reached the queue — restore the composer so a retry is one keypress.
+        clearFailedPlanCommand();
         restoreComposer();
       }
       return;
     }
-    if (!activeHarness?.agentReady) return;
+    if (!activeHarness?.agentReady) {
+      clearFailedPlanCommand();
+      return;
+    }
     // `composerSelection` already resolves to the open session's settings (+ any
     // unsent tweak) or, for a new session, the global preference.
     const effective = composerSelection;
-    if (!effective) return;
+    if (!effective) {
+      clearFailedPlanCommand();
+      return;
+    }
     setDraft("");
     setPickedSkill(null);
     setAttachments([]);
@@ -4352,7 +4431,7 @@ export function ChatPanel({
         const session = await createChatSession(projectId, effective.harness, {
           model: effective.model,
           permissionMode: effective.permissionMode,
-          planMode: planRequested ? true : undefined,
+          planMode: independentPlanMode,
           reasoningLevel: effective.reasoningLevel,
         });
         loadedSessions.current.add(session.id);
@@ -4382,7 +4461,7 @@ export function ChatPanel({
         ? {
             model: effective.model,
             permissionMode: effective.permissionMode,
-            planMode: planRequested ? true : undefined,
+            planMode: independentPlanMode,
             reasoningLevel: effective.reasoningLevel,
           }
         : {};
@@ -4392,17 +4471,22 @@ export function ChatPanel({
         dataBase64: a.dataUrl.slice(a.dataUrl.indexOf(",") + 1),
         name: a.name,
       }));
-      await sendChatMessage(
-        sid,
-        text,
-        turnOpts,
-        images.length ? images : undefined,
-        wireAnnotations,
-      );
+      const targetSessionId = sid;
+      if (!targetSessionId) throw new Error("chat session was not created");
+      const sendTurn = () =>
+        sendChatMessage(
+          targetSessionId,
+          text,
+          turnOpts,
+          images.length ? images : undefined,
+          wireAnnotations,
+        );
+      await queueSessionMutation(sendTurn);
     } catch (err) {
       // The message never reached a turn — put it back in the composer so a
       // retry is one keypress, whichever branch below applies.
       restoreComposer();
+      clearFailedPlanCommand();
       if (!sid) return; // session creation failed; no transcript to annotate
       const msg = err instanceof Error ? err.message : String(err);
       // A *network* failure does not prove no turn started — the backend
@@ -4565,7 +4649,7 @@ export function ChatPanel({
       const sid = activeId;
       // The resumed turn streams over SSE; optimistically mark busy.
       dispatch({ type: "busy", sessionId: sid, busy: true });
-      return respondChat(sid, answer)
+      return queueSessionMutation(() => respondChat(sid, answer))
         .then(() => true)
         .catch(() => false)
         .finally(() => {
@@ -4594,7 +4678,7 @@ export function ChatPanel({
             .catch(() => {});
         });
     },
-    [activeId, projectId],
+    [activeId, projectId, queueSessionMutation],
   );
 
   const visibleSessions = sessions.filter((s) => matchesFilter(sessionFilter, s.archived));

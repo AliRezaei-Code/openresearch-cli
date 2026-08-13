@@ -1245,6 +1245,7 @@ export const setChatSessionPermissionMode = (sessionId: string, permissionMode: 
 export interface QueuedMessage {
   id: string;
   text: string;
+  planMode?: boolean;
 }
 
 export const getChatMessages = (sessionId: string) =>

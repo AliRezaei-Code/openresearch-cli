@@ -713,12 +713,12 @@ impl Harness for ClaudeCode {
     }
 }
 
-/// Internal policy → Claude Code `--permission-mode` value. The UI's native
-/// `manual` choice maps to the CLI's `default`; every other choice already uses
-/// the CLI spelling. `Auto` is the default when the session hasn't picked one.
+/// Internal policy → Claude Code `--permission-mode` value. Each provider-owned
+/// choice already uses the CLI spelling. `Auto` is the default when the session
+/// hasn't picked one.
 pub(crate) fn claude_permission_mode(mode: Option<PermissionMode>) -> &'static str {
     match mode.unwrap_or(PermissionMode::Auto) {
-        PermissionMode::Ask => "default",
+        PermissionMode::Ask => "manual",
         PermissionMode::AcceptEdits => "acceptEdits",
         PermissionMode::Plan => "plan",
         PermissionMode::Auto => "auto",
@@ -1959,7 +1959,7 @@ mod tests {
 
     #[test]
     fn permission_mode_maps_to_claude_cli_strings() {
-        assert_eq!(claude_permission_mode(Some(PermissionMode::Ask)), "default");
+        assert_eq!(claude_permission_mode(Some(PermissionMode::Ask)), "manual");
         assert_eq!(
             claude_permission_mode(Some(PermissionMode::AcceptEdits)),
             "acceptEdits"

@@ -4233,7 +4233,9 @@ async fn send_chat_message(
     let overrides = local::chat::TurnOverrides {
         model: req.model,
         permission_mode: req.permission_mode,
+        permission_revision: None,
         plan_mode: req.plan_mode,
+        plan_revision: None,
         reasoning_level: req.reasoning_level,
     };
     // The turn runs in the background; progress streams over /api/events.
