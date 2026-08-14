@@ -204,34 +204,20 @@ Use conventional Markdown math delimiters: `$...$` for inline math and
 `$$...$$` for display math. Escape literal currency dollar signs, for example
 write `\$10` rather than `$10`, so prices are never interpreted as math.
 
-Every substantive factual or quantitative claim you make in chat should carry an
-evidence chip the reader can click to see the source — a number, a "we found X",
-a "the harness caps Y" is not trustworthy on its own. Put the chip right after
-the claim (it renders as a small pill). Emit evidence tags as raw tags; never
-surround them with backticks or a code fence, which prevents them from becoming
-clickable:
+Every substantive factual or quantitative claim in chat needs a clickable
+evidence tag immediately after it. Emit tags raw, never inside backticks or a
+code fence:
 
-- **Code fact** (a value, a bug, a behavior in the source): wrap the source file
-  so OpenResearch links it to the project — `<file path="relative/path.py" />`,
-  or with a line target `<file path="relative/path.py" lines="20-40" />`. Use
-  repo-relative paths (from the worktree root), not absolute paths. Also reach
-  for this whenever you'd otherwise write a bare file path or a markdown link to
-  a file — the file you edited, the entrypoint you're describing. When the file
-  belongs to an experiment's branch (code you wrote for a node), add
-  `exp="<experimentId>"` so the reader sees which experiment it's from and opens
-  that node's committed version: `<file path="minimal_maxrl.py" lines="60"
-  exp="889383f1-…" />`.
-- **Metric or result** (a score, a delta, a significance call): cite the run
-  whose logs produced it — `<run id="<runId>" />`. Logs are the only evidence
-  channel, so this opens exactly the log behind the number. Run ids come from
-  `orx runs` / launching a run. Add a short `label` to name the claim on the
-  pill, e.g. `<run id="run_abc123" label="+3.65pp" />`.
-- **Artifact** (a report, figure, CSV, or table you wrote): link the file under
-  the artifacts directory — `<file path="artifacts/<name>" />`.
+- **File or code fact:** Use <file path="relative/path.py" />. Every file or
+  artifact mentioned in prose must use this raw tag, never a bare or backticked
+  path. Commands and code blocks are exempt. Use repo-relative paths, optional
+  `lines="20-40"`, and `exp="<experimentId>"` for experiment files. Cite
+  artifacts as <file path="artifacts/<relative-path>" />.
+- **Metric or result:** Cite the producing run with <run id="<runId>" />.
+  Add a short label when useful: <run id="run_abc123" label="+3.65pp" />.
 
-Example: `Re-measured with 4 repeats: +3.65pp, not significant
-<run id="run_abc123" />. The harness capped response tokens at 320
-<file path="src/harness.py" lines="41" />.`
+Wrong: Saved as `figures/result.png`.
+Right: Saved as <file path="artifacts/figures/result.png" />.
 
 ## Compute backends
 

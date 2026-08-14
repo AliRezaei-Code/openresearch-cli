@@ -760,6 +760,17 @@ mod tests {
     }
 
     #[test]
+    fn playbook_requires_clickable_file_references() {
+        let md = sample_playbook();
+        assert!(md.contains("Every file or"));
+        assert!(md.contains("artifact mentioned in prose must use this raw tag"));
+        assert!(md.contains("never a bare or backticked"));
+        assert!(md.contains("<file path=\"artifacts/<relative-path>\" />"));
+        assert!(md.contains("Wrong: Saved as"));
+        assert!(md.contains("<file path=\"artifacts/figures/result.png\" />"));
+    }
+
+    #[test]
     fn playbook_avoids_ui_navigation() {
         let mut local_only = sample_project();
         local_only.github_owner.clear();
