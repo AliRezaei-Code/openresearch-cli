@@ -56,6 +56,7 @@ import {
   interruptChat,
   listChatSessions,
   reasoningFor,
+  recoverChatTurn,
   reconcileReasoning,
   renameChatSession,
   respondChat,
@@ -75,6 +76,7 @@ import {
   type SkillInfo,
 } from "../api";
 import { onChatEvent } from "../events";
+import { recoveryTurnOptions } from "../chatRecovery";
 import { LitSourceLogo, parseOrxLit, paperUrl } from "./LitSourceLogo";
 import { LitSourcesList } from "./LitSourcesPicker";
 import { Md } from "./Md";
@@ -90,6 +92,7 @@ import {
 } from "./ModelPicker";
 import { ContextMeter } from "./ContextMeter";
 import { renderNote } from "./agentNote";
+import { recoveryAction as parseRecoveryAction, retryStatusLabel } from "../chatRecovery";
 import {
   commandsForSlashContext,
   commandsForHarness,
@@ -2166,6 +2169,55 @@ function squashToolParts(parts: ChatPart[]): SquashedToolPart[] {
 
 /** Routine successful calls are static activity rows. Only failures disclose
  * raw command/output, because that detail is useful for diagnosis. */
+function TurnStatusRow({
+  part,
+  busy,
+  recovering,
+  onRecover,
+}: {
+  part: ChatPart;
+  busy: boolean;
+  recovering: boolean;
+  onRecover?: (turnId: string, action: "retry" | "continue") => void;
+}) {
+  const input = part.state?.input;
+  const nextRetryAt = input?.nextRetryAt ?? null;
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (typeof nextRetryAt !== "number") return;
+    const timer = window.setInterval(() => setNow(Date.now()), 250);
+    return () => window.clearInterval(timer);
+  }, [nextRetryAt]);
+  if (part.id === "turn-retry") {
+    const label = retryStatusLabel(input ?? {}, now);
+    return (
+      <div className="turn-retry-row flex items-center gap-2 py-1 px-1 text-sm text-subtext" role="status">
+        <span className={SPINNER_CLASS_NAME} />
+        <span>{label}</span>
+      </div>
+    );
+  }
+  const action = parseRecoveryAction(input?.recoveryAction);
+  const turnId = input?.turnId;
+  if ((action !== "retry" && action !== "continue") || !turnId) return null;
+  const label = action === "retry" ? "Retry" : "Continue";
+  return (
+    <div className="turn-recovery-row flex items-center justify-between gap-3 py-2 px-3 border border-border rounded-md bg-surface">
+      <span className="min-w-0 text-sm text-accent-red">
+        {cleanToolError(part.state?.error || "This turn did not finish.")}
+      </span>
+      <button
+        type="button"
+        className="shrink-0 py-1.5 px-3 rounded-sm border border-border bg-background text-sm font-medium text-text disabled:opacity-50"
+        disabled={busy || recovering}
+        onClick={() => onRecover?.(turnId, action)}
+      >
+        {recovering ? "Starting…" : label}
+      </button>
+    </div>
+  );
+}
+
 function ToolRow({
   part,
   repeatCount = 1,
@@ -2673,6 +2725,9 @@ const Message = memo(function Message({
   onRespond,
   onOpenPlan,
   onOpenSubagent,
+  busy = false,
+  recoveringTurnId,
+  onRecover,
   skills,
   predictTextTail = false,
 }: {
@@ -2689,6 +2744,9 @@ const Message = memo(function Message({
   onOpenPlan?: (plan: string, promptId: string) => void;
   /** Open a sub-agent's transcript in the right pane (spawn-row "view"). */
   onOpenSubagent?: (spawnPartId: string) => void;
+  busy?: boolean;
+  recoveringTurnId?: string | null;
+  onRecover?: (turnId: string, action: "retry" | "continue") => void;
   /** Known slash-skills, for rendering a leading `/name` as a command chip. */
   skills?: SkillInfo[];
   predictTextTail?: boolean;
@@ -2751,9 +2809,15 @@ const Message = memo(function Message({
       </div>
     );
   }
+  const turnStatus = message.parts.find(
+    (part) => part.id === "turn-retry" || part.id === "turn-recovery",
+  );
+  const regularParts = turnStatus
+    ? message.parts.filter((part) => part !== turnStatus)
+    : message.parts;
   return (
     <div className="msg-assistant text-lg leading-[1.62] text-text min-w-0">
-      {renderParts(message.parts, {
+      {renderParts(regularParts, {
         activePermissionId,
         pendingTailToolId,
         onOpenFile,
@@ -2766,6 +2830,14 @@ const Message = memo(function Message({
         onOpenSubagent,
         predictTextTail,
       })}
+      {turnStatus && (
+        <TurnStatusRow
+          part={turnStatus}
+          busy={busy}
+          recovering={recoveringTurnId === turnStatus.state?.input?.turnId}
+          onRecover={onRecover}
+        />
+      )}
     </div>
   );
 });
@@ -3142,6 +3214,8 @@ const Transcript = memo(function Transcript({
   onRespond,
   onOpenPlan,
   onOpenSubagent,
+  recoveringTurnId,
+  onRecover,
   skills,
 }: {
   messages: ChatMessage[];
@@ -3154,6 +3228,8 @@ const Transcript = memo(function Transcript({
   onRespond?: (answer: PromptAnswer) => void;
   onOpenPlan?: (plan: string, promptId: string) => void;
   onOpenSubagent?: (spawnPartId: string) => void;
+  recoveringTurnId?: string | null;
+  onRecover?: (turnId: string, action: "retry" | "continue") => void;
   skills?: SkillInfo[];
 }) {
   const activePermissionId = firstPendingPermission(messages)?.id ?? null;
@@ -3182,6 +3258,9 @@ const Transcript = memo(function Transcript({
           onRespond={onRespond}
           onOpenPlan={onOpenPlan}
           onOpenSubagent={onOpenSubagent}
+          busy={busy}
+          recoveringTurnId={recoveringTurnId}
+          onRecover={onRecover}
           skills={skills}
           predictTextTail={busy && m === activeMessage && m.role === "assistant"}
         />
@@ -3577,6 +3656,11 @@ export function ChatPanel({
   // active session changes. Distinct from `selection`, which is the sticky
   // global preference that seeds *new* sessions.
   const [sessionOverride, setSessionOverride] = useState<Partial<ModelSelection>>({});
+  const [recoveryOverrides, setRecoveryOverrides] = useState<
+    Partial<ModelSelection> & { planMode?: boolean }
+  >({});
+  const [recoveringTurnId, setRecoveringTurnId] = useState<string | null>(null);
+  const pendingClientTurn = useRef<{ signature: string; id: string } | null>(null);
   // Sessions whose title was just replaced by a harness-generated one, mapped
   // to a nonce that bumps per reveal so a second retitle remounts the spans and
   // replays the animation instead of sitting on a finished one.
@@ -3801,6 +3885,19 @@ export function ChatPanel({
   const selectModel = (next: Partial<ModelSelection>) => {
     if (!composerSelection) return;
     const merged = { ...composerSelection, ...next };
+    const changed: Partial<ModelSelection> = {};
+    if (next.model !== undefined && next.model !== composerSelection.model) changed.model = next.model;
+    if (
+      next.permissionMode !== undefined &&
+      next.permissionMode !== composerSelection.permissionMode
+    )
+      changed.permissionMode = next.permissionMode;
+    if (
+      next.reasoningLevel !== undefined &&
+      next.reasoningLevel !== composerSelection.reasoningLevel
+    )
+      changed.reasoningLevel = next.reasoningLevel;
+    setRecoveryOverrides((current) => ({ ...current, ...changed }));
     setSelection(merged);
     void onPreferredAgentChange(merged).catch(() => {});
     if (openSession) {
@@ -3821,6 +3918,7 @@ export function ChatPanel({
     // Plan is session-scoped. Claude exposes it in the permission dropdown,
     // but it must not become the saved default for future sessions.
     if (id === "plan" && activeHarness?.id === "claude-code") {
+      setRecoveryOverrides((current) => ({ ...current, permissionMode: id }));
       setSessionOverride((current) => ({ ...current, permissionMode: id }));
     } else {
       setSessionOverride((current) => {
@@ -3870,6 +3968,7 @@ export function ChatPanel({
   }, [openSession?.planMode, planModeOverride]);
 
   async function setIndependentPlanMode(planMode: boolean) {
+    setRecoveryOverrides((current) => ({ ...current, planMode }));
     planModeOverrideRef.current = planMode;
     setPlanModeOverride(planMode);
     if (!openSession) return;
@@ -3984,6 +4083,21 @@ export function ChatPanel({
     }
   }, [projectId]);
 
+  const reseedSession = useCallback(
+    async (sessionId: string) => {
+      const [{ messages, queued }, list] = await Promise.all([
+        getChatMessages(sessionId),
+        syncSessionList(),
+      ]);
+      dispatch({ type: "seed", sessionId, messages, queued });
+      const authoritative = list?.find((session) => session.id === sessionId);
+      if (authoritative) {
+        dispatch({ type: "busy", sessionId, busy: authoritative.busy });
+      }
+    },
+    [syncSessionList],
+  );
+
   // Reset everything when the project changes.
   useEffect(() => {
     setSessions([]);
@@ -4025,6 +4139,8 @@ export function ChatPanel({
   }, [projectId, syncSessionList]);
 
   // Load message history when a session becomes active.
+  useEffect(() => setRecoveryOverrides({}), [activeId]);
+
   useEffect(() => {
     if (!activeId || loadedSessions.current.has(activeId)) return;
     loadedSessions.current.add(activeId);
@@ -4425,6 +4541,27 @@ export function ChatPanel({
       });
       return;
     }
+    const turnSignature = JSON.stringify({
+      text,
+      images: pending.map((attachment) => ({
+        mediaType: attachment.mediaType,
+        name: attachment.name,
+        dataUrl: attachment.dataUrl,
+      })),
+      annotations: wireAnnotations,
+      settings: effective
+        ? {
+            model: effective.model,
+            permissionMode: effective.permissionMode,
+            planMode: independentPlanMode,
+            reasoningLevel: effective.reasoningLevel,
+          }
+        : null,
+    });
+    const clientTurnId = pendingClientTurn.current?.signature === turnSignature
+      ? pendingClientTurn.current.id
+      : `ct_${crypto.randomUUID()}`;
+    pendingClientTurn.current = { signature: turnSignature, id: clientTurnId };
     if (busy) {
       // A turn is already running: park this message (Claude-desktop steering)
       // so it runs when the turn ends, instead of dropping it. The server
@@ -4462,8 +4599,12 @@ export function ChatPanel({
             turnOpts,
             images.length ? images : undefined,
             wireAnnotations,
+            clientTurnId,
           );
-        await queueSessionMutation(sendQueued);
+        const response = await queueSessionMutation(sendQueued);
+        if (response.turn.existing) await reseedSession(sid);
+        setRecoveryOverrides({});
+        if (pendingClientTurn.current?.id === clientTurnId) pendingClientTurn.current = null;
       } catch {
         // Never reached the queue — restore the composer so a retry is one keypress.
         clearFailedPlanCommand();
@@ -4541,8 +4682,12 @@ export function ChatPanel({
           turnOpts,
           images.length ? images : undefined,
           wireAnnotations,
+          clientTurnId,
         );
-      await queueSessionMutation(sendTurn);
+      const response = await queueSessionMutation(sendTurn);
+      if (response.turn.existing) await reseedSession(targetSessionId);
+      setRecoveryOverrides({});
+      if (pendingClientTurn.current?.id === clientTurnId) pendingClientTurn.current = null;
     } catch (err) {
       // The message never reached a turn — put it back in the composer so a
       // retry is one keypress, whichever branch below applies.
@@ -4600,20 +4745,48 @@ export function ChatPanel({
   }
 
   function stop() {
-    if (activeId) void interruptChat(activeId);
+    if (!activeId) return;
+    void interruptChat(activeId).catch(() => {
+      setSettingsError("The turn stopped, but queued messages could not be cancelled. Try Stop again.");
+    });
   }
 
-  // Optimistic: drop locally now; the server's chat.queued echo reconciles. A
-  // message that already started running server-side simply isn't found.
+  async function recoverFailedTurn(turnId: string, action: "retry" | "continue") {
+    if (!activeId || recoveringTurnId) return;
+    setRecoveringTurnId(turnId);
+    try {
+      const turnOpts = recoveryTurnOptions({
+        model: recoveryOverrides.model ?? undefined,
+        permissionMode: recoveryOverrides.permissionMode ?? undefined,
+        planMode: recoveryOverrides.planMode,
+        reasoningLevel: recoveryOverrides.reasoningLevel ?? undefined,
+      });
+      const sessionId = activeId;
+      const response = await recoverChatTurn(sessionId, turnId, action, turnOpts);
+      if (response.turn.existing) await reseedSession(sessionId);
+      setRecoveryOverrides({});
+    } catch (error) {
+      setSettingsError(error instanceof Error ? error.message : "Could not recover this turn.");
+    } finally {
+      setRecoveringTurnId(null);
+    }
+  }
+
+  // Durable cancellation wins before the chip disappears. If persistence
+  // fails, leave it visible so a restart cannot surprise the user by sending it.
   function cancelQueued(itemId: string) {
     if (!activeId) return;
     const sid = activeId;
-    dispatch({
-      type: "setQueued",
-      sessionId: sid,
-      items: queued.filter((q) => q.id !== itemId),
-    });
-    void cancelQueuedMessage(sid, itemId).catch(() => {});
+    void cancelQueuedMessage(sid, itemId)
+      .then(({ removed }) => {
+        if (!removed) return;
+        dispatch({
+          type: "setQueued",
+          sessionId: sid,
+          items: queued.filter((q) => q.id !== itemId),
+        });
+      })
+      .catch(() => setSettingsError("Could not cancel the queued message. Try again."));
   }
 
   // Escape stops the streaming turn and drops focus back into the composer,
@@ -5034,6 +5207,8 @@ export function ChatPanel({
               onRespond={respond}
               onOpenPlan={openPlan}
               onOpenSubagent={openSubagent}
+              recoveringTurnId={recoveringTurnId}
+              onRecover={recoverFailedTurn}
               skills={commands}
             />
             {busy &&
@@ -5108,13 +5283,19 @@ export function ChatPanel({
               <div
                 key={q.id}
                 className="queued-chip flex items-center gap-2 py-1.5 px-2.5 text-sm text-subtext bg-surface border border-border rounded-sm"
-                title={q.text}
+                title={q.error || q.text}
               >
                 <Clock size={13} className="shrink-0 text-muted" />
                 <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
                   {q.text}
                 </span>
-                <span className="shrink-0 text-xs text-muted uppercase tracking-wide">Queued</span>
+                <span className="shrink-0 text-xs text-muted uppercase tracking-wide">
+                  {q.dispatchState === "blocked"
+                    ? "Blocked"
+                    : q.dispatchState === "retrying"
+                      ? "Retrying"
+                      : "Queued"}
+                </span>
                 <button
                   title="Cancel queued message"
                   aria-label="Cancel queued message"

@@ -17,13 +17,17 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, Mutex};
+use sha2::{Digest as _, Sha256};
+use tokio::sync::{broadcast, watch, Mutex};
 
 use crate::error::{anyhow, Result};
 use crate::local::harness::ResumeAction;
 use crate::local::model::LocalProject;
 use crate::local::opencode::AgentHost;
-use crate::store::{now_ms, Store, StoredChatMessage, StoredChatSession};
+use crate::store::{
+    now_ms, ChatTurnAdmission, Store, StoredChatMessage, StoredChatSession, StoredChatTurn,
+    StoredQueuedChatMessage,
+};
 
 /// Min interval between mid-turn persist+broadcast flushes (streaming parts
 /// can update many times a second; the final flush is always unconditional).
@@ -920,7 +924,7 @@ impl WirePart {
 // --- image attachments ---------------------------------------------------------
 
 /// A pasted image or uploaded file riding the send-message request.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageAttachment {
     pub media_type: String,
@@ -1404,14 +1408,60 @@ pub struct ChatHost {
     up_port: std::sync::OnceLock<u16>,
     /// Messages the user sent while the session's turn was in flight, oldest
     /// first. `drain_queue` runs the front one when a turn finishes naturally;
-    /// a user Stop clears the whole queue. In-memory and uncommitted — a queued
-    /// message only becomes a transcript bubble once it actually runs.
+    /// a user Stop clears the whole queue. Persisted before acknowledgement; a
+    /// queued message only becomes a transcript bubble once it actually runs.
     queued: std::sync::Mutex<HashMap<String, VecDeque<QueuedMessage>>>,
+    queue_persistence: std::sync::Mutex<()>,
+    /// Browser idempotency claims held while a non-queued request is being
+    /// prepared but has not reached atomic durable admission yet.
+    pending_client_turns: std::sync::Mutex<HashMap<(String, String), PendingClientTurn>>,
+    queue_dispatch_suppressed: std::sync::Mutex<HashSet<String>>,
+    queue_dispatch_cancelled: std::sync::Mutex<HashSet<String>>,
+}
+
+struct PendingClientTurnGuard {
+    host: Arc<ChatHost>,
+    key: (String, String),
+    outcome: watch::Sender<Option<bool>>,
+    finished: bool,
+}
+
+#[derive(Clone)]
+struct PendingClientTurn {
+    request_hash: String,
+    turn_id: String,
+    outcome: watch::Receiver<Option<bool>>,
+}
+
+impl PendingClientTurnGuard {
+    fn finish(mut self) {
+        self.finished = true;
+        let _ = self.outcome.send(Some(true));
+        self.host
+            .pending_client_turns
+            .lock()
+            .unwrap()
+            .remove(&self.key);
+    }
+}
+
+impl Drop for PendingClientTurnGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.outcome.send(Some(false));
+        }
+        self.host
+            .pending_client_turns
+            .lock()
+            .unwrap()
+            .remove(&self.key);
+    }
 }
 
 struct ActiveTurn {
     handle: tokio::task::JoinHandle<()>,
     message_id: String,
+    turn_id: String,
 }
 
 struct GateToken {
@@ -1420,7 +1470,7 @@ struct GateToken {
 }
 
 enum TurnState {
-    Reserved,
+    Reserved { turn_id: Option<String> },
     Draining,
     Active(ActiveTurn),
     Cancelling,
@@ -1428,14 +1478,23 @@ enum TurnState {
 
 /// A user message parked while the session was busy, replayed verbatim through
 /// the normal send path once the running turn ends.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct QueuedMessage {
     id: String,
+    client_turn_id: String,
+    request_hash: String,
     text: String,
     transcript_text: Option<String>,
     overrides: TurnOverrides,
     images: Vec<ImageAttachment>,
     annotations: Vec<TextAnnotation>,
+    #[serde(default)]
+    dispatch_attempts: u32,
+    #[serde(default)]
+    dispatch_error: Option<String>,
+    #[serde(default)]
+    next_retry_at: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -1449,17 +1508,64 @@ struct TranscriptDisplay {
     annotations: Option<Vec<TextAnnotation>>,
 }
 
+struct SendTurnRequest {
+    messages: Vec<AnnotatedText>,
+    prepared_input: Option<String>,
+    replace_settings: bool,
+    transcript: TranscriptDisplay,
+    overrides: TurnOverrides,
+    images: Vec<ImageAttachment>,
+    admission: TurnAdmission,
+    client_turn_id: Option<String>,
+    request_hash: Option<String>,
+}
+
 enum TurnAdmission {
     QueueIfBusy,
     RejectIfBusy,
     Preclaimed(TurnGuard),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TurnSubmission {
-    Started,
-    Queued,
+    Started(String),
+    Queued(String),
+    Existing(String),
     NotStarted,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendMessageResult {
+    pub turn_id: String,
+    pub queued: bool,
+    pub existing: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryState {
+    NotSent,
+    Rejected,
+    Accepted,
+    Unknown,
+}
+
+impl DeliveryState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotSent => "not_sent",
+            Self::Rejected => "rejected",
+            Self::Accepted => "accepted",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn recovery_action(self) -> &'static str {
+        match self {
+            Self::NotSent | Self::Rejected => "retry",
+            Self::Accepted | Self::Unknown => "continue",
+        }
+    }
 }
 
 fn contextualize_messages(
@@ -1512,6 +1618,30 @@ fn queued_label(m: &QueuedMessage) -> String {
     format!("{n} attachment{}", if n == 1 { "" } else { "s" })
 }
 
+fn persisted_queue_delay(next_retry_at: Option<i64>, now: i64) -> Duration {
+    Duration::from_millis(
+        next_retry_at
+            .map(|next| next.saturating_sub(now))
+            .unwrap_or(0)
+            .max(0) as u64,
+    )
+}
+
+#[cfg(test)]
+mod persisted_queue_delay_tests {
+    use super::persisted_queue_delay;
+    use std::time::Duration;
+
+    #[test]
+    fn overdue_retry_is_ready_immediately() {
+        assert_eq!(persisted_queue_delay(Some(500), 1_000), Duration::ZERO);
+        assert_eq!(
+            persisted_queue_delay(Some(1_500), 1_000),
+            Duration::from_millis(500)
+        );
+    }
+}
+
 /// Reserves a session's turn slot for the duration of `send_message`'s setup.
 /// `claim` inserts a `None` reservation under the `turns` lock iff the session
 /// isn't already busy — closing the check-then-insert race. On drop (early
@@ -1561,7 +1691,10 @@ impl TurnGuard {
         if !host.claim_durable_turn(session_id) {
             return None;
         }
-        turns.insert(session_id.to_string(), TurnState::Reserved);
+        turns.insert(
+            session_id.to_string(),
+            TurnState::Reserved { turn_id: None },
+        );
         if let Some(overrides) = overrides {
             let mut plan_changes = host.plan_changes.lock().unwrap();
             let mut permission_changes = host.permission_changes.lock().unwrap();
@@ -1597,7 +1730,10 @@ impl TurnGuard {
         if !host.claim_durable_turn(session_id) {
             return None;
         }
-        turns.insert(session_id.to_string(), TurnState::Reserved);
+        turns.insert(
+            session_id.to_string(),
+            TurnState::Reserved { turn_id: None },
+        );
         Some(Self {
             host: host.clone(),
             session_id: session_id.to_string(),
@@ -1617,14 +1753,29 @@ impl TurnGuard {
         self.armed = false;
         let (removed, drain_queued) = {
             let mut turns = self.host.turns.lock().await;
-            if matches!(turns.get(&self.session_id), Some(TurnState::Reserved)) {
-                let drain_queued = self
+            if matches!(
+                turns.get(&self.session_id),
+                Some(TurnState::Reserved { .. })
+            ) {
+                let drain_queued = !self
                     .host
-                    .queued
+                    .queue_dispatch_suppressed
                     .lock()
                     .unwrap()
-                    .get(&self.session_id)
-                    .is_some_and(|queue| !queue.is_empty());
+                    .contains(&self.session_id)
+                    && !self
+                        .host
+                        .queue_dispatch_cancelled
+                        .lock()
+                        .unwrap()
+                        .contains(&self.session_id)
+                    && self
+                        .host
+                        .queued
+                        .lock()
+                        .unwrap()
+                        .get(&self.session_id)
+                        .is_some_and(|queue| !queue.is_empty());
                 if drain_queued {
                     turns.insert(self.session_id.clone(), TurnState::Draining);
                 } else {
@@ -1658,13 +1809,23 @@ impl Drop for TurnGuard {
         tokio::spawn(async move {
             let (removed, drain_queued) = {
                 let mut turns = host.turns.lock().await;
-                if matches!(turns.get(&session_id), Some(TurnState::Reserved)) {
-                    let drain_queued = host
-                        .queued
+                if matches!(turns.get(&session_id), Some(TurnState::Reserved { .. })) {
+                    let drain_queued = !host
+                        .queue_dispatch_suppressed
                         .lock()
                         .unwrap()
-                        .get(&session_id)
-                        .is_some_and(|queue| !queue.is_empty());
+                        .contains(&session_id)
+                        && !host
+                            .queue_dispatch_cancelled
+                            .lock()
+                            .unwrap()
+                            .contains(&session_id)
+                        && host
+                            .queued
+                            .lock()
+                            .unwrap()
+                            .get(&session_id)
+                            .is_some_and(|queue| !queue.is_empty());
                     if drain_queued {
                         turns.insert(session_id.clone(), TurnState::Draining);
                     } else {
@@ -1696,6 +1857,17 @@ impl ChatHost {
         claude: Arc<crate::local::claude::ClaudeHost>,
     ) -> Self {
         let (events, _) = broadcast::channel(256);
+        let mut restored_queue: HashMap<String, VecDeque<QueuedMessage>> = HashMap::new();
+        if let Ok(rows) = Store::open().and_then(|store| store.list_queued_chat_messages()) {
+            for row in rows {
+                if let Ok(message) = serde_json::from_str::<QueuedMessage>(&row.payload_json) {
+                    restored_queue
+                        .entry(row.session_id)
+                        .or_default()
+                        .push_back(message);
+                }
+            }
+        }
         Self {
             opencode,
             codex,
@@ -1714,7 +1886,11 @@ impl ChatHost {
             permission_changes: std::sync::Mutex::new(HashMap::new()),
             bridge_prompted: std::sync::Mutex::new(HashSet::new()),
             up_port: std::sync::OnceLock::new(),
-            queued: std::sync::Mutex::new(HashMap::new()),
+            queued: std::sync::Mutex::new(restored_queue),
+            queue_persistence: std::sync::Mutex::new(()),
+            pending_client_turns: std::sync::Mutex::new(HashMap::new()),
+            queue_dispatch_suppressed: std::sync::Mutex::new(HashSet::new()),
+            queue_dispatch_cancelled: std::sync::Mutex::new(HashSet::new()),
         }
     }
 
@@ -2070,6 +2246,11 @@ impl ChatHost {
                             "id": m.id,
                             "text": queued_label(m),
                             "planMode": m.overrides.plan_mode,
+                            "dispatchState": if m.dispatch_error.is_some() {
+                                if m.next_retry_at.is_some() { "retrying" } else { "blocked" }
+                            } else { "queued" },
+                            "nextRetryAt": m.next_retry_at,
+                            "error": m.dispatch_error,
                         })
                     })
                     .collect()
@@ -2085,9 +2266,102 @@ impl ChatHost {
         self.emit("chat.queued", self.queued_json(session_id));
     }
 
+    fn refresh_persisted_queue(&self, session_id: &str) -> Result<()> {
+        let _mutation = self.queue_persistence.lock().unwrap();
+        if self
+            .queue_dispatch_cancelled
+            .lock()
+            .unwrap()
+            .contains(session_id)
+        {
+            return Err(anyhow!("queued messages are being cancelled"));
+        }
+        let rows = Store::open()?.list_queued_chat_messages()?;
+        let restored = rows
+            .into_iter()
+            .filter(|row| row.session_id == session_id)
+            .filter_map(|row| serde_json::from_str::<QueuedMessage>(&row.payload_json).ok())
+            .collect::<VecDeque<_>>();
+        let mut queued = self.queued.lock().unwrap();
+        if restored.is_empty() {
+            queued.remove(session_id);
+        } else {
+            queued.insert(session_id.to_string(), restored);
+        }
+        drop(queued);
+        self.emit_queued(session_id);
+        Ok(())
+    }
+
+    pub fn resume_persisted_queues(self: &Arc<Self>) {
+        let pending: Vec<(String, Duration)> = self
+            .queued
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(session_id, queue)| {
+                if self
+                    .queue_dispatch_cancelled
+                    .lock()
+                    .unwrap()
+                    .contains(session_id)
+                {
+                    return None;
+                }
+                let item = queue.front()?;
+                if item.dispatch_attempts > crate::local::harness::ORX_MAX_RETRIES {
+                    return None;
+                }
+                Some((
+                    session_id.clone(),
+                    persisted_queue_delay(item.next_retry_at, now_ms()),
+                ))
+            })
+            .collect();
+        for (session_id, delay) in pending {
+            let host = self.clone();
+            tokio::spawn(async move {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                let should_drain = {
+                    let mut turns = host.turns.lock().await;
+                    if turns.contains_key(&session_id) || !host.claim_durable_turn(&session_id) {
+                        false
+                    } else {
+                        turns.insert(session_id.clone(), TurnState::Draining);
+                        true
+                    }
+                };
+                if should_drain {
+                    host.drain_queue(&session_id).await;
+                }
+            });
+        }
+    }
+
+    pub fn reconcile_expired_turn_leases(self: &Arc<Self>) -> Result<()> {
+        let store = Store::open()?;
+        for (session_id, message) in materialize_unfinished_turns(&store, false)? {
+            self.emit("chat.message", message_json(&message, &session_id));
+        }
+        self.resume_persisted_queues();
+        Ok(())
+    }
+
     /// Drop every parked message for a session (user Stop / delete). Emits an
     /// empty `chat.queued` only if there was something to clear.
-    pub fn clear_queue(&self, session_id: &str) {
+    pub fn clear_queue(&self, session_id: &str) -> Result<()> {
+        let _mutation = self.queue_persistence.lock().unwrap();
+        self.queue_dispatch_cancelled
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string());
+        self.queue_dispatch_suppressed
+            .lock()
+            .unwrap()
+            .remove(session_id);
+        Store::open()?.delete_queued_chat_messages_for_session(session_id)?;
         let had = self
             .queued
             .lock()
@@ -2097,15 +2371,26 @@ impl ChatHost {
         if had {
             self.emit_queued(session_id);
         }
+        self.queue_dispatch_cancelled
+            .lock()
+            .unwrap()
+            .remove(session_id);
+        Ok(())
     }
 
     /// Remove one parked message by id (the ✕ on a queued chip).
-    pub fn cancel_queued(&self, session_id: &str, item_id: &str) -> bool {
+    pub fn cancel_queued(self: &Arc<Self>, session_id: &str, item_id: &str) -> Result<bool> {
+        let _mutation = self.queue_persistence.lock().unwrap();
+        let store = Store::open()?;
         let removed = {
             let mut map = self.queued.lock().unwrap();
             let Some(q) = map.get_mut(session_id) else {
-                return false;
+                return Ok(false);
             };
+            if !q.iter().any(|message| message.id == item_id) {
+                return Ok(false);
+            }
+            store.delete_queued_chat_message(item_id)?;
             let before = q.len();
             q.retain(|m| m.id != item_id);
             let removed = q.len() != before;
@@ -2115,14 +2400,29 @@ impl ChatHost {
             removed
         };
         if removed {
+            self.queue_dispatch_suppressed
+                .lock()
+                .unwrap()
+                .remove(session_id);
             self.emit_queued(session_id);
+            if !store
+                .list_queued_chat_messages()?
+                .iter()
+                .any(|message| message.session_id == session_id)
+            {
+                self.queue_dispatch_cancelled
+                    .lock()
+                    .unwrap()
+                    .remove(session_id);
+            }
+            self.resume_persisted_queues();
         }
-        removed
+        Ok(removed)
     }
 
-    /// Drain the whole parked queue into a single turn once the current turn
-    /// finishes naturally — successive steering messages run together in one
-    /// turn, not a full turn each. Boxed return: `drain_queue` →
+    /// Drain the oldest parked message once the current turn finishes. Each
+    /// queued request keeps its browser idempotency key and becomes one durable
+    /// turn in original order. Boxed return: `drain_queue` →
     /// `send_message_showing` → (spawned) `drain_queue` is an async recursion
     /// cycle the auto-`Send` solver can't close on its own, so we assert the
     /// boxed future is `Send` to break it.
@@ -2135,7 +2435,10 @@ impl ChatHost {
                 let mut turns = self.turns.lock().await;
                 match turns.get(session_id) {
                     Some(TurnState::Draining) => {
-                        turns.insert(session_id.to_string(), TurnState::Reserved);
+                        turns.insert(
+                            session_id.to_string(),
+                            TurnState::Reserved { turn_id: None },
+                        );
                         Some(true)
                     }
                     Some(_) => None,
@@ -2152,24 +2455,22 @@ impl ChatHost {
                     guard
                 }
             };
+            if self.refresh_persisted_queue(session_id).is_err() {
+                guard.release().await;
+                return;
+            }
             // Scope the guard: a std mutex must never be held across an await.
-            let batch: Option<(Vec<QueuedMessage>, TurnOverrides)> = {
+            let item = {
                 let _plan_changes = self.plan_changes.lock().unwrap();
                 let _permission_changes = self.permission_changes.lock().unwrap();
                 let mut map = self.queued.lock().unwrap();
-                map.remove(session_id).map(|queue| {
-                    let items: Vec<QueuedMessage> = queue.into();
-                    let overrides =
-                        items
-                            .iter()
-                            .fold(TurnOverrides::default(), |mut merged, item| {
-                                merged.apply_explicit(&item.overrides);
-                                merged
-                            });
-                    (items, overrides)
-                })
+                let item = map.get_mut(session_id).and_then(VecDeque::pop_front);
+                if map.get(session_id).is_some_and(VecDeque::is_empty) {
+                    map.remove(session_id);
+                }
+                item
             };
-            let Some((items, overrides)) = batch else {
+            let Some(item) = item else {
                 guard.release().await;
                 if self
                     .queued
@@ -2182,6 +2483,7 @@ impl ChatHost {
                 }
                 return;
             };
+            let overrides = item.overrides.clone();
             if let Some(plan_mode) = overrides.plan_mode {
                 if let Ok(store) = Store::open() {
                     if let Ok(Some(current)) = store.get_chat_session(session_id) {
@@ -2198,59 +2500,142 @@ impl ChatHost {
                     }
                 }
             }
-            if items.is_empty() {
-                guard.release().await;
-                if self
-                    .queued
-                    .lock()
-                    .unwrap()
-                    .get(session_id)
-                    .is_some_and(|queue| !queue.is_empty())
-                {
-                    self.drain_queue(session_id).await;
-                }
-                return;
-            }
             self.emit_queued(session_id);
-            // Coalesce every parked message into one turn while keeping each
-            // message paired with the excerpts selected for it.
-            let messages = items
-                .iter()
-                .map(|item| AnnotatedText {
-                    text: item.text.clone(),
-                    annotations: item.annotations.clone(),
-                })
-                .collect();
-            let transcript_text = items
-                .iter()
-                .any(|item| item.transcript_text.is_some())
-                .then(|| {
-                    items
-                        .iter()
-                        .map(|item| item.transcript_text.as_deref().unwrap_or(&item.text).trim())
-                        .filter(|text| !text.is_empty())
-                        .collect::<Vec<_>>()
-                        .join("\n\n")
-                });
-            let images: Vec<ImageAttachment> = items
-                .iter()
-                .flat_map(|m| m.images.iter().cloned())
-                .collect();
+            let messages = vec![AnnotatedText {
+                text: item.text.clone(),
+                annotations: item.annotations.clone(),
+            }];
+            self.queue_dispatch_suppressed
+                .lock()
+                .unwrap()
+                .insert(session_id.to_string());
             let send_result = self
                 .send_message_showing(
                     session_id,
-                    messages,
-                    TranscriptDisplay {
-                        text: transcript_text,
-                        annotations: None,
+                    SendTurnRequest {
+                        messages,
+                        prepared_input: None,
+                        replace_settings: false,
+                        transcript: TranscriptDisplay {
+                            text: item.transcript_text.clone(),
+                            annotations: None,
+                        },
+                        overrides,
+                        images: item.images.clone(),
+                        admission: TurnAdmission::Preclaimed(guard),
+                        client_turn_id: Some(item.client_turn_id.clone()),
+                        request_hash: Some(item.request_hash.clone()),
                     },
-                    overrides,
-                    images,
-                    TurnAdmission::Preclaimed(guard),
                 )
                 .await;
-            if let Err(err) = send_result {
-                eprintln!("orx up: dropped queued messages after send failure: {err}");
+            match send_result {
+                Ok(_) => {
+                    let _mutation = self.queue_persistence.lock().unwrap();
+                    self.queue_dispatch_suppressed
+                        .lock()
+                        .unwrap()
+                        .remove(session_id);
+                    if let Ok(store) = Store::open() {
+                        let _ = store.delete_queued_chat_message(&item.id);
+                    }
+                }
+                Err(err) => {
+                    let _mutation = self.queue_persistence.lock().unwrap();
+                    let suppression = self.queue_dispatch_suppressed.lock().unwrap();
+                    if !suppression.contains(session_id)
+                        || self.deleting_sessions.lock().unwrap().contains(session_id)
+                    {
+                        return;
+                    }
+                    let mut item = item;
+                    item.dispatch_attempts += 1;
+                    item.dispatch_error = Some(err.to_string());
+                    let harness = Store::open()
+                        .ok()
+                        .and_then(|store| store.get_chat_session(session_id).ok().flatten())
+                        .map(|session| session.harness)
+                        .unwrap_or_else(|| "unknown".into());
+                    if item.dispatch_attempts == 1 {
+                        crate::telemetry::capture(
+                            "chat_retry_started",
+                            json!({
+                                "harness": &harness,
+                                "owner": "orx",
+                                "reason": "queue_dispatch",
+                                "attempt": item.dispatch_attempts,
+                            }),
+                        );
+                    }
+                    let retry_delay = crate::local::harness::orx_retry_delay(
+                        &item.client_turn_id,
+                        item.dispatch_attempts,
+                        None,
+                    );
+                    item.next_retry_at =
+                        retry_delay.map(|delay| now_ms() + delay.as_millis() as i64);
+                    if retry_delay.is_none() {
+                        crate::telemetry::capture(
+                            "chat_retry_exhausted",
+                            json!({
+                                "harness": &harness,
+                                "owner": "orx",
+                                "reason": "queue_dispatch",
+                                "attempt": item.dispatch_attempts,
+                            }),
+                        );
+                    }
+                    if let Ok(store) = Store::open() {
+                        if let Ok(payload) = serde_json::to_string(&item) {
+                            let _ = store.update_queued_chat_message(&item.id, &payload);
+                        }
+                    }
+                    let retry_identity = (item.id.clone(), item.next_retry_at);
+                    let mut queued = self.queued.lock().unwrap();
+                    let queue = queued.entry(session_id.to_string()).or_default();
+                    queue.push_front(item);
+                    drop(queued);
+                    drop(suppression);
+                    self.emit_queued(session_id);
+                    eprintln!("orx up: queued-message dispatch blocked: {err}");
+                    if let Some(delay) = retry_delay {
+                        let host = self.clone();
+                        let session_id = session_id.to_string();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            let still_pending = host
+                                .queued
+                                .lock()
+                                .unwrap()
+                                .get(&session_id)
+                                .and_then(|queue| queue.front())
+                                .is_some_and(|item| {
+                                    (item.id.as_str(), item.next_retry_at)
+                                        == (retry_identity.0.as_str(), retry_identity.1)
+                                });
+                            if !still_pending {
+                                return;
+                            }
+                            host.queue_dispatch_suppressed
+                                .lock()
+                                .unwrap()
+                                .remove(&session_id);
+                            let should_drain = {
+                                let mut turns = host.turns.lock().await;
+                                if turns.contains_key(&session_id)
+                                    || !host.claim_durable_turn(&session_id)
+                                {
+                                    false
+                                } else {
+                                    turns.insert(session_id.clone(), TurnState::Draining);
+                                    true
+                                }
+                            };
+                            if should_drain {
+                                host.drain_queue(&session_id).await;
+                            }
+                        });
+                    }
+                }
             }
         })
     }
@@ -2263,7 +2648,8 @@ impl ChatHost {
         overrides: TurnOverrides,
         images: Vec<ImageAttachment>,
         annotations: Vec<TextAnnotation>,
-    ) -> Result<()> {
+        client_turn_id: Option<String>,
+    ) -> Result<SendMessageResult> {
         let transcript_text = (!annotations.is_empty()).then(|| {
             if text.trim().is_empty() {
                 "Asked about selected text".to_string()
@@ -2273,17 +2659,286 @@ impl ChatHost {
         });
         self.send_message_showing(
             session_id,
-            vec![AnnotatedText { text, annotations }],
-            TranscriptDisplay {
-                text: transcript_text,
-                annotations: None,
+            SendTurnRequest {
+                messages: vec![AnnotatedText { text, annotations }],
+                prepared_input: None,
+                replace_settings: false,
+                transcript: TranscriptDisplay {
+                    text: transcript_text,
+                    annotations: None,
+                },
+                overrides,
+                images,
+                admission: TurnAdmission::QueueIfBusy,
+                client_turn_id,
+                request_hash: None,
             },
-            overrides,
-            images,
-            TurnAdmission::QueueIfBusy,
         )
         .await
-        .map(|_| ())
+        .and_then(|submission| match submission {
+            TurnSubmission::Started(turn_id) => Ok(SendMessageResult {
+                turn_id,
+                queued: false,
+                existing: false,
+            }),
+            TurnSubmission::Queued(turn_id) => Ok(SendMessageResult {
+                turn_id,
+                queued: true,
+                existing: false,
+            }),
+            TurnSubmission::Existing(turn_id) => Ok(SendMessageResult {
+                turn_id,
+                queued: false,
+                existing: true,
+            }),
+            TurnSubmission::NotStarted => Err(anyhow!("turn was interrupted before it started")),
+        })
+    }
+
+    pub async fn recover_turn(
+        self: &Arc<Self>,
+        session_id: &str,
+        turn_id: &str,
+        action: &str,
+        explicit_overrides: TurnOverrides,
+    ) -> Result<SendMessageResult> {
+        let store = Store::open()?;
+        let mut session = store
+            .get_chat_session(session_id)?
+            .ok_or_else(|| anyhow!("chat session not found"))?;
+        let turn = store
+            .get_chat_turn(session_id, turn_id)?
+            .ok_or_else(|| anyhow!("chat turn not found"))?;
+        if let Some(recovered_by) = turn.recovered_by_turn_id.clone() {
+            return Ok(SendMessageResult {
+                turn_id: recovered_by,
+                queued: false,
+                existing: true,
+            });
+        }
+        if action == "retry"
+            && matches!(
+                turn.state.as_str(),
+                "preparing" | "retrying" | "running" | "completed"
+            )
+        {
+            return Ok(SendMessageResult {
+                turn_id: turn.id,
+                queued: false,
+                existing: true,
+            });
+        }
+        if turn.state != "failed" || turn.recovery_action.as_deref() != Some(action) {
+            return Err(anyhow!("this recovery action is no longer available"));
+        }
+
+        if !matches!(action, "retry" | "continue") {
+            return Err(anyhow!("recovery action must be retry or continue"));
+        }
+        if action == "retry" && !matches!(turn.delivery_state.as_str(), "not_sent" | "rejected") {
+            return Err(anyhow!("an accepted or uncertain turn cannot be replayed"));
+        }
+        if action == "continue" && !matches!(turn.delivery_state.as_str(), "accepted" | "unknown") {
+            return Err(anyhow!(
+                "a turn that was not accepted should be retried instead"
+            ));
+        }
+
+        let supports_command_plan = crate::local::harness::supports_command_plan(&session.harness);
+        let mut settings: TurnOverrides =
+            serde_json::from_str(&turn.settings_json).unwrap_or_default();
+        if !supports_command_plan {
+            settings.plan_mode = None;
+            if explicit_overrides.plan_mode.is_some() {
+                return Err(anyhow!("this harness activates Plan through permissions"));
+            }
+        }
+        settings.apply_explicit(&explicit_overrides);
+        if let Some(mode) = settings.permission_mode.as_deref() {
+            if crate::local::harness::permission_mode_for(&session.harness, mode).is_none() {
+                return Err(anyhow!("invalid permission mode for selected harness"));
+            }
+        }
+        match action {
+            "retry" => {
+                let project = store
+                    .get_local_project(&session.project_id)?
+                    .ok_or_else(|| anyhow!("project not found"))?;
+                let settings_json = serde_json::to_string(&settings)?;
+                let mut assistant = store
+                    .get_chat_message(&turn.assistant_message_id)?
+                    .as_ref()
+                    .map(stored_to_wire)
+                    .unwrap_or(WireMessage {
+                        id: turn.assistant_message_id.clone(),
+                        role: "assistant".into(),
+                        parts: Vec::new(),
+                        created_at: turn.created_at,
+                    });
+                assistant.parts.retain(|part| {
+                    !(matches!(part.id.as_str(), "turn-retry" | "turn-recovery")
+                        || part.tool.as_deref() == Some("error")
+                            && part
+                                .state
+                                .as_ref()
+                                .is_some_and(|state| state.status == "error"))
+                });
+                let assistant_parts = serde_json::to_string(&assistant.parts)?;
+                let Some(guard) = TurnGuard::claim(self, session_id, None).await else {
+                    return Err(anyhow!("session is busy — interrupt it first"));
+                };
+                if !store.reset_chat_turn_for_retry(turn_id)? {
+                    return Err(anyhow!("this recovery action is no longer available"));
+                }
+                let plan_state = settings.plan_mode.map(|plan_mode| {
+                    let reset_pending = !plan_mode
+                        && session.harness == "codex"
+                        && (session.plan_mode || session.plan_reset_pending);
+                    (plan_mode, reset_pending)
+                });
+                let persist_retry = store
+                    .set_chat_session_recovery_settings(
+                        session_id,
+                        settings.model.as_deref(),
+                        settings.permission_mode.as_deref(),
+                        plan_state,
+                        settings.reasoning_level.as_deref(),
+                    )
+                    .and_then(|()| store.set_chat_turn_settings(turn_id, &settings_json))
+                    .and_then(|()| {
+                        store.upsert_chat_message(&StoredChatMessage {
+                            id: assistant.id.clone(),
+                            session_id: session_id.to_string(),
+                            role: assistant.role.clone(),
+                            parts_json: assistant_parts,
+                            created_at: assistant.created_at,
+                        })
+                    });
+                if let Err(error) = persist_retry {
+                    let _ = store.fail_chat_turn(
+                        turn_id,
+                        "not_sent",
+                        "recovery_setup",
+                        &error.to_string(),
+                        Some("retry"),
+                    );
+                    return Err(error);
+                }
+                session.model = settings.model.clone();
+                session.permission_mode = settings.permission_mode.clone();
+                if let Some((plan_mode, reset_pending)) = plan_state {
+                    session.plan_mode = plan_mode;
+                    session.plan_reset_pending = reset_pending;
+                }
+                session.reasoning_level = settings.reasoning_level.clone();
+                self.emit("chat.message", message_json(&assistant, session_id));
+                self.emit(
+                    "chat.busy",
+                    json!({ "sessionId": session_id, "busy": true }),
+                );
+                crate::telemetry::capture(
+                    "chat_recovery_action",
+                    json!({ "harness": session.harness, "action": "retry" }),
+                );
+                let ctx = turn_ctx_from_stored(self.clone(), &session, project, &turn, assistant);
+                let launched = self.launch_turn_ctx(ctx, guard, None).await;
+                let submission = match launched {
+                    Ok(submission) => submission,
+                    Err(error) => {
+                        let _ = store.fail_chat_turn(
+                            turn_id,
+                            "not_sent",
+                            "recovery_launch",
+                            &error.to_string(),
+                            Some("retry"),
+                        );
+                        return Err(error);
+                    }
+                };
+                match submission {
+                    TurnSubmission::Started(turn_id) | TurnSubmission::Existing(turn_id) => {
+                        Ok(SendMessageResult {
+                            turn_id,
+                            queued: false,
+                            existing: false,
+                        })
+                    }
+                    _ => Err(anyhow!("turn was interrupted before it restarted")),
+                }
+            }
+            "continue" => {
+                let prompt = format!(
+                    "<orx-recovery>\nA previous turn ended after the request may have been accepted. \
+                     Inspect the current repository and transcript state before acting. Do not \
+                     repeat completed tool actions. Continue the unfinished request safely.\n\n\
+                     Original request:\n{}\n</orx-recovery>",
+                    rebase_prepared_attachment_paths(&turn.prepared_input)
+                );
+                let submission = self
+                    .send_message_showing(
+                        session_id,
+                        SendTurnRequest {
+                            messages: vec![AnnotatedText {
+                                text: prompt.clone(),
+                                annotations: Vec::new(),
+                            }],
+                            prepared_input: Some(prompt),
+                            replace_settings: true,
+                            transcript: TranscriptDisplay {
+                                text: Some(String::new()),
+                                annotations: None,
+                            },
+                            overrides: settings,
+                            images: Vec::new(),
+                            admission: TurnAdmission::RejectIfBusy,
+                            client_turn_id: Some(format!("recover_{turn_id}")),
+                            request_hash: None,
+                        },
+                    )
+                    .await?;
+                let (recovered_by, existing) = match submission {
+                    TurnSubmission::Started(id) => (id, false),
+                    TurnSubmission::Existing(id) => (id, true),
+                    _ => return Err(anyhow!("recovery turn did not start")),
+                };
+                if let Some(stored) = store.get_chat_message(&turn.assistant_message_id)? {
+                    let mut failed_assistant = stored_to_wire(&stored);
+                    failed_assistant
+                        .parts
+                        .retain(|part| part.id != "turn-recovery" && part.id != "turn-retry");
+                    let updated = StoredChatMessage {
+                        id: failed_assistant.id.clone(),
+                        session_id: session_id.to_string(),
+                        role: failed_assistant.role.clone(),
+                        parts_json: serde_json::to_string(&failed_assistant.parts)?,
+                        created_at: failed_assistant.created_at,
+                    };
+                    if store.mark_chat_turn_recovered_with_message(
+                        turn_id,
+                        &recovered_by,
+                        &updated,
+                    )? {
+                        self.emit("chat.message", message_json(&failed_assistant, session_id));
+                    }
+                } else if !store.mark_chat_turn_recovered(turn_id, &recovered_by)? {
+                    return Ok(SendMessageResult {
+                        turn_id: recovered_by,
+                        queued: false,
+                        existing: true,
+                    });
+                }
+                crate::telemetry::capture(
+                    "chat_recovery_action",
+                    json!({ "harness": session.harness, "action": "continue" }),
+                );
+                Ok(SendMessageResult {
+                    turn_id: recovered_by,
+                    queued: false,
+                    existing,
+                })
+            }
+            _ => unreachable!(),
+        }
     }
 
     async fn send_hidden_message(
@@ -2294,17 +2949,23 @@ impl ChatHost {
     ) -> Result<TurnSubmission> {
         self.send_message_showing(
             session_id,
-            vec![AnnotatedText {
-                text,
-                annotations: Vec::new(),
-            }],
-            TranscriptDisplay {
-                text: Some(String::new()),
-                annotations: None,
+            SendTurnRequest {
+                messages: vec![AnnotatedText {
+                    text,
+                    annotations: Vec::new(),
+                }],
+                prepared_input: None,
+                replace_settings: false,
+                transcript: TranscriptDisplay {
+                    text: Some(String::new()),
+                    annotations: None,
+                },
+                overrides: TurnOverrides::default(),
+                images: Vec::new(),
+                admission: TurnAdmission::Preclaimed(guard),
+                client_turn_id: None,
+                request_hash: None,
             },
-            TurnOverrides::default(),
-            Vec::new(),
-            TurnAdmission::Preclaimed(guard),
         )
         .await
     }
@@ -2315,12 +2976,27 @@ impl ChatHost {
     async fn send_message_showing(
         self: &Arc<Self>,
         session_id: &str,
-        messages: Vec<AnnotatedText>,
-        transcript: TranscriptDisplay,
-        mut overrides: TurnOverrides,
-        images: Vec<ImageAttachment>,
-        admission: TurnAdmission,
+        request: SendTurnRequest,
     ) -> Result<TurnSubmission> {
+        let SendTurnRequest {
+            messages,
+            prepared_input,
+            replace_settings,
+            transcript,
+            mut overrides,
+            images,
+            admission,
+            client_turn_id: requested_client_turn_id,
+            request_hash: request_hash_override,
+        } = request;
+        let request_hash = match request_hash_override {
+            Some(hash) => hash,
+            None => turn_request_hash(&messages, &transcript, &overrides, &images)?,
+        };
+        let client_turn_id = requested_client_turn_id
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| format!("ct_{}", uuid::Uuid::new_v4()));
+        let candidate_turn_id = format!("turn_{}", uuid::Uuid::new_v4());
         let TranscriptDisplay {
             text: transcript_text,
             annotations: transcript_annotations,
@@ -2346,6 +3022,15 @@ impl ChatHost {
         let mut session = store
             .get_chat_session(session_id)?
             .ok_or_else(|| anyhow!("chat session not found"))?;
+        if let Some(existing) = store.get_chat_turn_by_client_id(session_id, &client_turn_id)? {
+            return if existing.request_hash == request_hash {
+                Ok(TurnSubmission::Existing(existing.id))
+            } else {
+                Err(anyhow!(
+                    "clientTurnId was already used with different content"
+                ))
+            };
+        }
         if let Some(mode) = overrides
             .permission_mode
             .as_deref()
@@ -2364,11 +3049,11 @@ impl ChatHost {
         // reservation happen under one lock so two concurrent sends (or a
         // send racing a /respond resume) can't both spawn a turn against the
         // same session. `_guard` releases the reservation on any early error.
-        let mut guard = match admission {
-            TurnAdmission::Preclaimed(guard) => guard,
+        let (guard, mut pending_client_turn) = match admission {
+            TurnAdmission::Preclaimed(guard) => (guard, None),
             TurnAdmission::RejectIfBusy => {
                 match TurnGuard::claim(self, session_id, Some(&mut overrides)).await {
-                    Some(guard) => guard,
+                    Some(guard) => (guard, None),
                     None => return Err(anyhow!("session is busy — interrupt it first")),
                 }
             }
@@ -2377,7 +3062,57 @@ impl ChatHost {
                 if self.deleting_sessions.lock().unwrap().contains(session_id) {
                     return Err(anyhow!("chat session not found"));
                 }
-                if turns.contains_key(session_id) {
+                let pending_key = (session_id.to_string(), client_turn_id.clone());
+                let pending = {
+                    self.pending_client_turns
+                        .lock()
+                        .unwrap()
+                        .get(&pending_key)
+                        .cloned()
+                };
+                if let Some(mut pending) = pending {
+                    if pending.request_hash != request_hash {
+                        return Err(anyhow!(
+                            "clientTurnId was already used with different content"
+                        ));
+                    }
+                    drop(turns);
+                    if pending.outcome.borrow().is_none() {
+                        let _ = pending.outcome.changed().await;
+                    }
+                    return if *pending.outcome.borrow() == Some(true) {
+                        Ok(TurnSubmission::Existing(pending.turn_id))
+                    } else {
+                        Err(anyhow!("the original submission failed before admission"))
+                    };
+                }
+                if let Some(existing) =
+                    self.queued
+                        .lock()
+                        .unwrap()
+                        .get(session_id)
+                        .and_then(|items| {
+                            items
+                                .iter()
+                                .find(|item| item.client_turn_id == client_turn_id)
+                                .cloned()
+                        })
+                {
+                    return if existing.request_hash == request_hash {
+                        Ok(TurnSubmission::Existing(existing.client_turn_id))
+                    } else {
+                        Err(anyhow!(
+                            "clientTurnId was already used with different content"
+                        ))
+                    };
+                }
+                let has_queued = self
+                    .queued
+                    .lock()
+                    .unwrap()
+                    .get(session_id)
+                    .is_some_and(|queue| !queue.is_empty());
+                if turns.contains_key(session_id) || has_queued {
                     if matches!(turns.get(session_id), Some(TurnState::Cancelling)) {
                         return Err(anyhow!("session is stopping — send again once it is idle"));
                     }
@@ -2389,6 +3124,7 @@ impl ChatHost {
                         .next()
                         .ok_or_else(|| anyhow!("message content is required"))?;
                     let AnnotatedText { text, annotations } = message;
+                    let _queue_mutation = self.queue_persistence.lock().unwrap();
                     let mut plan_changes = self.plan_changes.lock().unwrap();
                     let mut permission_changes = self.permission_changes.lock().unwrap();
                     let mut queued = self.queued.lock().unwrap();
@@ -2413,17 +3149,31 @@ impl ChatHost {
                         store.set_chat_session_permission_mode(session_id, &permission_mode)?;
                         overrides.permission_revision = None;
                     }
+                    let queued_message = QueuedMessage {
+                        id: format!("q_{}", uuid::Uuid::new_v4()),
+                        client_turn_id: client_turn_id.clone(),
+                        request_hash: request_hash.clone(),
+                        text,
+                        transcript_text,
+                        overrides,
+                        images,
+                        annotations,
+                        dispatch_attempts: 0,
+                        dispatch_error: None,
+                        next_retry_at: None,
+                    };
+                    store.insert_queued_chat_message(&StoredQueuedChatMessage {
+                        id: queued_message.id.clone(),
+                        session_id: session_id.to_string(),
+                        client_turn_id: client_turn_id.clone(),
+                        request_hash: request_hash.clone(),
+                        payload_json: serde_json::to_string(&queued_message)?,
+                        created_at: now_ms(),
+                    })?;
                     queued
                         .entry(session_id.to_string())
                         .or_default()
-                        .push_back(QueuedMessage {
-                            id: format!("q_{}", uuid::Uuid::new_v4()),
-                            text,
-                            transcript_text,
-                            overrides,
-                            images,
-                            annotations,
-                        });
+                        .push_back(queued_message);
                     drop(queued);
                     drop(permission_changes);
                     drop(plan_changes);
@@ -2435,12 +3185,15 @@ impl ChatHost {
                             json!({ "session": session_json(&session, true) }),
                         );
                     }
-                    return Ok(TurnSubmission::Queued);
+                    return Ok(TurnSubmission::Queued(client_turn_id));
                 }
                 if !self.claim_durable_turn(session_id) {
                     return Err(anyhow!("session is busy in another `orx up` process"));
                 }
-                turns.insert(session_id.to_string(), TurnState::Reserved);
+                turns.insert(
+                    session_id.to_string(),
+                    TurnState::Reserved { turn_id: None },
+                );
                 let mut plan_changes = self.plan_changes.lock().unwrap();
                 let mut permission_changes = self.permission_changes.lock().unwrap();
                 stamp_turn_revisions(
@@ -2449,9 +3202,48 @@ impl ChatHost {
                     &mut plan_changes,
                     &mut permission_changes,
                 );
-                TurnGuard::adopt(self, session_id)
+                let (outcome, receiver) = watch::channel(None);
+                self.pending_client_turns.lock().unwrap().insert(
+                    pending_key.clone(),
+                    PendingClientTurn {
+                        request_hash: request_hash.clone(),
+                        turn_id: candidate_turn_id.clone(),
+                        outcome: receiver,
+                    },
+                );
+                (
+                    TurnGuard::adopt(self, session_id),
+                    Some(PendingClientTurnGuard {
+                        host: self.clone(),
+                        key: pending_key,
+                        outcome,
+                        finished: false,
+                    }),
+                )
             }
         };
+        if replace_settings {
+            let plan_state = overrides.plan_mode.map(|plan_mode| {
+                let reset_pending = !plan_mode
+                    && session.harness == "codex"
+                    && (session.plan_mode || session.plan_reset_pending);
+                (plan_mode, reset_pending)
+            });
+            store.set_chat_session_recovery_settings(
+                session_id,
+                overrides.model.as_deref(),
+                overrides.permission_mode.as_deref(),
+                plan_state,
+                overrides.reasoning_level.as_deref(),
+            )?;
+            session.model = overrides.model.clone();
+            session.permission_mode = overrides.permission_mode.clone();
+            if let Some((plan_mode, reset_pending)) = plan_state {
+                session.plan_mode = plan_mode;
+                session.plan_reset_pending = reset_pending;
+            }
+            session.reasoning_level = overrides.reasoning_level.clone();
+        }
         // Composer selections are sticky: an override that differs from the
         // stored value is persisted so the next turn (and a reload) keep it.
         if let Some(model) = overrides.model.filter(|m| !m.is_empty()) {
@@ -2571,49 +3363,31 @@ impl ChatHost {
         // A resume whose transcript text is empty (e.g. a note-less plan
         // approval) records no user message: the resolved card already tells
         // that part of the story, and an empty bubble would just be noise.
-        if !parts.is_empty() {
-            let user_msg = WireMessage {
+        let user_msg = if parts.is_empty() {
+            None
+        } else {
+            Some(WireMessage {
                 id: format!("msg_{}", uuid::Uuid::new_v4()),
                 role: "user".into(),
                 parts,
                 created_at: now_ms(),
-            };
-            store.upsert_chat_message(&StoredChatMessage {
-                id: user_msg.id.clone(),
-                session_id: session.id.clone(),
-                role: "user".into(),
-                parts_json: serde_json::to_string(&user_msg.parts)?,
-                created_at: user_msg.created_at,
-            })?;
-            if starts_session {
-                crate::telemetry::capture_chat_session_started(&session.harness);
-            }
-            self.emit("chat.message", message_json(&user_msg, &session.id));
-        }
-        store.touch_chat_session(&session.id)?;
-        let session = store.get_chat_session(&session.id)?.unwrap_or(session);
-
-        self.emit(
-            "chat.session",
-            json!({ "session": session_json(&session, true) }),
-        );
-        self.emit(
-            "chat.busy",
-            json!({ "sessionId": session.id, "busy": true }),
-        );
+            })
+        };
 
         // Slash-skills: the transcript keeps the `/name` the user typed; the
         // harness gets the expanded prompt.
-        let turn_text = contextualize_messages(messages, |text| {
-            crate::local::skills::expand(text, project.github_enabled())
-                .or_else(|| crate::local::user_skills::expand(text, &project.id))
-                .unwrap_or_else(|| text.to_string())
+        let mut turn_text = prepared_input.unwrap_or_else(|| {
+            let expanded = contextualize_messages(messages, |text| {
+                crate::local::skills::expand(text, project.github_enabled())
+                    .or_else(|| crate::local::user_skills::expand(text, &project.id))
+                    .unwrap_or_else(|| text.to_string())
+            });
+            with_bootstrap_context(
+                session.native_session_id.as_deref(),
+                session.bootstrap_context.as_deref(),
+                expanded,
+            )
         });
-        let mut turn_text = with_bootstrap_context(
-            session.native_session_id.as_deref(),
-            session.bootstrap_context.as_deref(),
-            turn_text,
-        );
         // Harnesses take plain text; attachments ride as on-disk paths every
         // CLI can open with its own file-reading tool (Read handles PDFs and
         // images alike).
@@ -2629,100 +3403,234 @@ impl ChatHost {
             ));
         }
 
-        let sid = session.id.clone();
+        let turn_id = candidate_turn_id;
         let assistant_message_id = format!("msg_{}", uuid::Uuid::new_v4());
-        let mut ctx = TurnCtx {
-            host: self.clone(),
+        let created_at = now_ms();
+        let stored_user = user_msg
+            .as_ref()
+            .map(|message| -> Result<StoredChatMessage> {
+                Ok(StoredChatMessage {
+                    id: message.id.clone(),
+                    session_id: session.id.clone(),
+                    role: message.role.clone(),
+                    parts_json: serde_json::to_string(&message.parts)?,
+                    created_at: message.created_at,
+                })
+            })
+            .transpose()?;
+        let turn = StoredChatTurn {
+            id: turn_id.clone(),
             session_id: session.id.clone(),
-            harness: session.harness.clone(),
-            native_session_id: session.native_session_id.clone(),
-            model: session.model.clone(),
-            permission_mode: session.permission_mode.as_deref().and_then(|mode| {
-                crate::local::harness::permission_mode_for(&session.harness, mode)
-            }),
-            plan_mode: session.plan_mode,
-            plan_reset_pending: session.plan_reset_pending,
-            reasoning_level: session.reasoning_level.clone(),
+            user_message_id: user_msg.as_ref().map(|message| message.id.clone()),
+            assistant_message_id: assistant_message_id.clone(),
+            client_turn_id,
+            request_hash,
+            prepared_input: turn_text.clone(),
+            settings_json: serde_json::to_string(&TurnOverrides {
+                model: session.model.clone(),
+                permission_mode: session.permission_mode.clone(),
+                permission_revision: None,
+                plan_mode: crate::local::harness::supports_command_plan(&session.harness)
+                    .then_some(session.plan_mode),
+                plan_revision: None,
+                reasoning_level: session.reasoning_level.clone(),
+            })?,
+            state: "preparing".into(),
+            delivery_state: DeliveryState::NotSent.as_str().into(),
+            attempt_count: 0,
+            next_retry_at: None,
+            error_kind: None,
+            error_message: None,
+            recovery_action: None,
+            recovered_by_turn_id: None,
+            created_at,
+            updated_at: created_at,
+        };
+        match store.admit_chat_turn(stored_user.as_ref(), &turn)? {
+            ChatTurnAdmission::Inserted => {}
+            ChatTurnAdmission::Existing(existing) => {
+                if let Some(pending) = pending_client_turn.take() {
+                    pending.finish();
+                }
+                return Ok(TurnSubmission::Existing(existing.id));
+            }
+            ChatTurnAdmission::Conflict => {
+                return Err(anyhow!(
+                    "clientTurnId was already used with different content"
+                ));
+            }
+        }
+        if let Some(pending) = pending_client_turn.take() {
+            pending.finish();
+        }
+        if let Some(TurnState::Reserved { turn_id: reserved }) =
+            self.turns.lock().await.get_mut(session_id)
+        {
+            *reserved = Some(turn_id.clone());
+        }
+        if starts_session {
+            crate::telemetry::capture_chat_session_started(&session.harness);
+        }
+        if let Some(user_msg) = user_msg.as_ref() {
+            self.emit("chat.message", message_json(user_msg, &session.id));
+        }
+        let _ = store.touch_chat_session(&session.id);
+        let session = store
+            .get_chat_session(&session.id)
+            .ok()
+            .flatten()
+            .unwrap_or(session);
+        self.emit(
+            "chat.session",
+            json!({ "session": session_json(&session, true) }),
+        );
+        self.emit(
+            "chat.busy",
+            json!({ "sessionId": session.id, "busy": true }),
+        );
+        let ctx = turn_ctx_from_stored(
+            self.clone(),
+            &session,
             project,
-            text: turn_text,
-            assistant: WireMessage {
+            &turn,
+            WireMessage {
                 id: assistant_message_id,
                 role: "assistant".into(),
                 parts: Vec::new(),
                 created_at: now_ms(),
             },
-            // Seed from the persisted value so mid-turn reports (which carry a
-            // token count but often no window) inherit last turn's window and
-            // the meter keeps its percent while the turn streams.
-            context_usage: session
-                .context_usage_json
-                .as_deref()
-                .and_then(|json| serde_json::from_str(json).ok()),
-            last_flush: Instant::now() - FLUSH_INTERVAL,
-            last_flushed_tool_states: Vec::new(),
-            last_attempted_tool_states: Vec::new(),
-            target_event_path: None,
-            target_event_offset: 0,
-            pending_target_events: Vec::new(),
-            target_event_bindings: HashMap::new(),
-        };
-        // Upgrade the reservation to a live handle, atomically re-checking that
-        // it's still ours: an `interrupt` racing the prologue above may have
-        // removed the reservation, while deletion also closes admission before
-        // it interrupts. In either case no harness task may start.
+        );
+        self.launch_turn_ctx(ctx, guard, title_seed).await
+    }
+
+    async fn launch_turn_ctx(
+        self: &Arc<Self>,
+        mut ctx: TurnCtx,
+        mut guard: TurnGuard,
+        title_seed: Option<String>,
+    ) -> Result<TurnSubmission> {
+        let sid = ctx.session_id.clone();
+        let turn_id = ctx.turn_id.clone();
+        let harness = ctx.harness.clone();
+        let mut turns = self.turns.lock().await;
+        if self.deleting_sessions.lock().unwrap().contains(&sid)
+            || !matches!(turns.get(&sid), Some(TurnState::Reserved { .. }))
         {
-            let mut turns = self.turns.lock().await;
-            if self.deleting_sessions.lock().unwrap().contains(&sid)
-                || !matches!(turns.get(&sid), Some(TurnState::Reserved))
-            {
-                drop(turns);
-                guard.release().await;
-                return Ok(TurnSubmission::NotStarted);
-            }
-            let (target_path, target_event_offset) =
-                target_event_start(&session.id, &ctx.assistant.id);
-            ctx.target_event_path = Some(target_path);
-            ctx.target_event_offset = target_event_offset;
-            let message_id = ctx.assistant.id.clone();
-            let task = tokio::spawn(async move {
-                let result = match crate::local::harness::chat_harness(&ctx.harness) {
-                    Some(harness) => harness.run_turn(&mut ctx).await,
-                    None => Err(anyhow!("unknown harness: {}", ctx.harness)),
-                };
-                if let Err(err) = result {
-                    ctx.push_error(format!("{err}"));
-                }
-                let _ = ctx.flush();
-                if let Some(path) = ctx.target_event_path.as_ref() {
-                    let _ = std::fs::remove_file(path);
-                }
-                remove_target_pointer_if_matches(&ctx.session_id, &ctx.assistant.id);
-                if let Some(usage) = &ctx.context_usage {
-                    if let (Ok(store), Ok(json)) = (Store::open(), serde_json::to_string(usage)) {
-                        let _ = store.set_chat_session_context_usage(&ctx.session_id, &json);
-                    }
-                }
-                ctx.host
-                    .finish_turn(&ctx.session_id, Some(&ctx.assistant.id))
-                    .await;
-                // Natural completion only: a user Stop aborts this task before
-                // it reaches here (and clears the queue itself), so an
-                // interrupted turn never drains.
-                ctx.host.drain_queue(&ctx.session_id).await;
-            });
-            turns.insert(
-                sid,
-                TurnState::Active(ActiveTurn {
-                    handle: task,
-                    message_id,
-                }),
-            );
-            if let Some(seed) = title_seed {
-                self.spawn_title_generation(session.id.clone(), session.harness.clone(), seed);
-            }
-            guard.defuse();
+            drop(turns);
+            let _ = Store::open().and_then(|store| store.interrupt_chat_turn(&turn_id));
+            guard.release().await;
+            return Ok(TurnSubmission::NotStarted);
         }
-        Ok(TurnSubmission::Started)
+        let (target_path, target_event_offset) = target_event_start(&sid, &ctx.assistant.id);
+        ctx.target_event_path = Some(target_path);
+        ctx.target_event_offset = target_event_offset;
+        let message_id = ctx.assistant.id.clone();
+        let active_turn_id = turn_id.clone();
+        let task = tokio::spawn(async move {
+            ctx.attempt_count = 1;
+            let _ = Store::open().and_then(|store| {
+                store.update_chat_turn_progress(
+                    &ctx.turn_id,
+                    "running",
+                    ctx.delivery_state.as_str(),
+                    ctx.attempt_count,
+                    None,
+                )
+            });
+            let result = match crate::local::harness::chat_harness(&ctx.harness) {
+                Some(harness) => harness.run_turn(&mut ctx).await,
+                None => Err(crate::local::harness::TurnFailure {
+                    kind: "unknown_harness",
+                    message: format!("unknown harness: {}", ctx.harness),
+                    delivery: DeliveryState::Rejected,
+                }),
+            };
+            let failure = match result {
+                Err(error) => {
+                    ctx.delivery_state = error.delivery;
+                    Some(
+                        ctx.terminal_error
+                            .take()
+                            .unwrap_or_else(|| (error.kind.to_string(), error.message)),
+                    )
+                }
+                Ok(crate::local::harness::TurnOutcome::Completed) => ctx.terminal_error.take(),
+            };
+            let terminal_won = if let Some((kind, message)) = failure {
+                let action = ctx.delivery_state.recovery_action();
+                let retry_owner = ctx
+                    .retry_owner
+                    .as_deref()
+                    .unwrap_or_else(|| {
+                        if kind.ends_with("_terminal") {
+                            "native"
+                        } else {
+                            "orx"
+                        }
+                    })
+                    .to_string();
+                let changed = Store::open()
+                    .and_then(|store| {
+                        store.fail_chat_turn(
+                            &ctx.turn_id,
+                            ctx.delivery_state.as_str(),
+                            &kind,
+                            &message,
+                            Some(action),
+                        )
+                    })
+                    .unwrap_or(false);
+                if changed {
+                    ctx.push_turn_failure(&kind, message.clone(), action);
+                }
+                if changed && ctx.retry_exhausted {
+                    crate::telemetry::capture(
+                        "chat_retry_exhausted",
+                        json!({
+                            "harness": ctx.harness,
+                            "owner": retry_owner,
+                            "reason": kind,
+                            "attempt": ctx.attempt_count,
+                        }),
+                    );
+                }
+                changed
+            } else if let Ok(store) = Store::open() {
+                ctx.clear_retry_status();
+                store.complete_chat_turn(&ctx.turn_id).unwrap_or(false)
+            } else {
+                false
+            };
+            if terminal_won {
+                let _ = ctx.flush();
+            }
+            if let Some(path) = ctx.target_event_path.as_ref() {
+                let _ = std::fs::remove_file(path);
+            }
+            remove_target_pointer_if_matches(&ctx.session_id, &ctx.assistant.id);
+            if let Some(usage) = &ctx.context_usage {
+                if let (Ok(store), Ok(json)) = (Store::open(), serde_json::to_string(usage)) {
+                    let _ = store.set_chat_session_context_usage(&ctx.session_id, &json);
+                }
+            }
+            ctx.host
+                .finish_turn(&ctx.session_id, Some(&ctx.assistant.id))
+                .await;
+            ctx.host.drain_queue(&ctx.session_id).await;
+        });
+        turns.insert(
+            sid.clone(),
+            TurnState::Active(ActiveTurn {
+                handle: task,
+                message_id,
+                turn_id: active_turn_id,
+            }),
+        );
+        if let Some(seed) = title_seed {
+            self.spawn_title_generation(sid, harness, seed);
+        }
+        guard.defuse();
+        Ok(TurnSubmission::Started(turn_id))
     }
 
     /// Turn cleanup: drop the handle, bump the session, broadcast idle.
@@ -2750,6 +3658,7 @@ impl ChatHost {
             None
         };
         let reserved_queue = {
+            let _ = self.refresh_persisted_queue(session_id);
             let mut turns = self.turns.lock().await;
             let matches = match (turns.get(session_id), message_id) {
                 (Some(TurnState::Active(active)), Some(message_id)) => {
@@ -2804,10 +3713,36 @@ impl ChatHost {
             };
             match std::mem::replace(state, TurnState::Cancelling) {
                 TurnState::Active(active) => Some(active),
-                TurnState::Reserved | TurnState::Draining => None,
+                TurnState::Reserved { turn_id } => {
+                    if let Some(turn_id) = turn_id {
+                        if let Ok(store) = Store::open() {
+                            let _ = store.interrupt_chat_turn(&turn_id);
+                        }
+                    }
+                    None
+                }
+                TurnState::Draining => None,
                 TurnState::Cancelling => return Ok(false),
             }
         };
+        if let Some(active) = active.as_ref() {
+            if let Ok(store) = Store::open() {
+                let _ = store.interrupt_chat_turn(&active.turn_id);
+                if let Ok(Some(stored)) = store.get_chat_message(&active.message_id) {
+                    let mut assistant = stored_to_wire(&stored);
+                    assistant.parts.retain(|part| part.id != "turn-retry");
+                    let _ = store.upsert_chat_message(&StoredChatMessage {
+                        id: assistant.id.clone(),
+                        session_id: session_id.to_string(),
+                        role: assistant.role.clone(),
+                        parts_json: serde_json::to_string(&assistant.parts).unwrap_or_default(),
+                        created_at: assistant.created_at,
+                    });
+                    self.emit("chat.message", message_json(&assistant, session_id));
+                }
+            }
+            active.handle.abort();
+        }
         let host = self.clone();
         let session_id = session_id.to_string();
         let settlement = tokio::spawn(async move {
@@ -2836,9 +3771,6 @@ impl ChatHost {
                 .await
                 .ok()
                 .flatten();
-            if let Some(active) = active.as_ref() {
-                active.handle.abort();
-            }
             if let Some(active) = active {
                 let _ = active.handle.await;
                 let mut message = reconcile_target_file(&session_id, &active.message_id);
@@ -2879,11 +3811,13 @@ impl ChatHost {
         let created_at = now_ms();
         // Stop means stop everything: drop any messages parked behind this turn
         // so they don't fire the moment it aborts.
-        self.clear_queue(session_id);
-        if !self.interrupt(session_id).await? {
-            return Ok(());
+        let _ = self.clear_queue(session_id);
+        let interrupted = self.interrupt(session_id).await;
+        let durable_clear = self.clear_queue(session_id);
+        if !interrupted? {
+            return durable_clear;
         }
-        self.clear_queue(session_id);
+        let durable_error = durable_clear.err();
         let msg = WireMessage {
             id: format!("msg_{}", uuid::Uuid::new_v4()),
             role: "assistant".into(),
@@ -2895,8 +3829,6 @@ impl ChatHost {
             )],
             created_at,
         };
-        // Marker persistence is best-effort: the abort already happened, and an
-        // Err here would surface as a failed Stop on a turn that IS stopped.
         if let (Ok(store), Ok(json)) = (Store::open(), serde_json::to_string(&msg.parts)) {
             let _ = store.upsert_chat_message(&StoredChatMessage {
                 id: msg.id.clone(),
@@ -2907,6 +3839,9 @@ impl ChatHost {
             });
         }
         self.emit("chat.message", message_json(&msg, session_id));
+        if let Some(error) = durable_error {
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -3029,17 +3964,23 @@ impl ChatHost {
                 };
                 self.send_message_showing(
                     &req.session_id,
-                    vec![AnnotatedText {
-                        text,
-                        annotations: Vec::new(),
-                    }],
-                    TranscriptDisplay {
-                        text: transcript,
-                        annotations: Some(req.annotations.clone()),
+                    SendTurnRequest {
+                        messages: vec![AnnotatedText {
+                            text,
+                            annotations: Vec::new(),
+                        }],
+                        prepared_input: None,
+                        replace_settings: false,
+                        transcript: TranscriptDisplay {
+                            text: transcript,
+                            annotations: Some(req.annotations.clone()),
+                        },
+                        overrides,
+                        images: Vec::new(),
+                        admission: TurnAdmission::RejectIfBusy,
+                        client_turn_id: None,
+                        request_hash: None,
                     },
-                    overrides,
-                    Vec::new(),
-                    TurnAdmission::RejectIfBusy,
                 )
                 .await?;
                 let mut prompt_echo = req;
@@ -3258,7 +4199,7 @@ impl ChatHost {
         let _deleting = self
             .begin_session_delete(session_id)
             .ok_or_else(|| anyhow!("session deletion is already in progress"))?;
-        self.clear_queue(session_id);
+        self.clear_queue(session_id)?;
         let _ = self.interrupt(session_id).await;
         // A live opencode serve child would keep running in (and lock) the
         // session's worktree; the resident claude child's cwd is that worktree
@@ -3576,14 +4517,38 @@ impl ChatHost {
 
 /// Composer selections a single message can override, mirroring the sticky
 /// per-session settings. Empty/None fields leave the stored value in place.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TurnOverrides {
     pub model: Option<String>,
     pub permission_mode: Option<String>,
+    #[serde(skip)]
     pub(crate) permission_revision: Option<u64>,
     pub plan_mode: Option<bool>,
+    #[serde(skip)]
     pub(crate) plan_revision: Option<u64>,
     pub reasoning_level: Option<String>,
+}
+
+fn turn_request_hash(
+    messages: &[AnnotatedText],
+    transcript: &TranscriptDisplay,
+    overrides: &TurnOverrides,
+    images: &[ImageAttachment],
+) -> Result<String> {
+    let value = json!({
+        "messages": messages.iter().map(|message| json!({
+            "text": message.text,
+            "annotations": message.annotations,
+        })).collect::<Vec<_>>(),
+        "transcriptText": transcript.text,
+        "transcriptAnnotations": transcript.annotations,
+        "settings": overrides,
+        "images": images,
+    });
+    let mut digest = Sha256::new();
+    digest.update(serde_json::to_vec(&value)?);
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 impl TurnOverrides {
@@ -3665,6 +4630,16 @@ fn resolve_permission_change(
 
 pub struct TurnCtx {
     pub host: Arc<ChatHost>,
+    pub turn_id: String,
+    durable: bool,
+    delivery_state: DeliveryState,
+    attempt_count: i64,
+    retry_owner: Option<String>,
+    retry_started_emitted: bool,
+    retry_exhausted: bool,
+    orx_retry_started: Option<Instant>,
+    orx_retry_count: u32,
+    terminal_error: Option<(String, String)>,
     pub session_id: String,
     pub harness: String,
     pub native_session_id: Option<String>,
@@ -3695,9 +4670,249 @@ pub struct TurnCtx {
     target_event_bindings: HashMap<String, Vec<String>>,
 }
 
+fn turn_ctx_from_stored(
+    host: Arc<ChatHost>,
+    session: &StoredChatSession,
+    project: LocalProject,
+    turn: &StoredChatTurn,
+    assistant: WireMessage,
+) -> TurnCtx {
+    TurnCtx {
+        host,
+        turn_id: turn.id.clone(),
+        durable: true,
+        delivery_state: DeliveryState::NotSent,
+        attempt_count: turn.attempt_count,
+        retry_owner: None,
+        retry_started_emitted: false,
+        retry_exhausted: false,
+        orx_retry_started: None,
+        orx_retry_count: 0,
+        terminal_error: None,
+        session_id: session.id.clone(),
+        harness: session.harness.clone(),
+        native_session_id: session.native_session_id.clone(),
+        model: session.model.clone(),
+        permission_mode: session
+            .permission_mode
+            .as_deref()
+            .and_then(|mode| crate::local::harness::permission_mode_for(&session.harness, mode)),
+        plan_mode: session.plan_mode,
+        plan_reset_pending: session.plan_reset_pending,
+        reasoning_level: session.reasoning_level.clone(),
+        project,
+        text: rebase_prepared_attachment_paths(&turn.prepared_input),
+        assistant,
+        context_usage: session
+            .context_usage_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok()),
+        last_flush: Instant::now() - FLUSH_INTERVAL,
+        last_flushed_tool_states: Vec::new(),
+        last_attempted_tool_states: Vec::new(),
+        target_event_path: None,
+        target_event_offset: 0,
+        pending_target_events: Vec::new(),
+        target_event_bindings: HashMap::new(),
+    }
+}
+
+fn rebase_prepared_attachment_paths(input: &str) -> String {
+    let Ok(current_dir) = attachments_dir() else {
+        return input.to_string();
+    };
+    input
+        .lines()
+        .map(|line| {
+            let Some((label, path)) = line.rsplit_once(" — ") else {
+                return line.to_string();
+            };
+            let normalized = path.replace('\\', "/");
+            let Some((_, file_name)) = normalized.rsplit_once("/chat-attachments/") else {
+                return line.to_string();
+            };
+            if file_name.is_empty() || file_name.contains('/') {
+                return line.to_string();
+            }
+            format!("{label} — {}", current_dir.join(file_name).display())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 impl TurnCtx {
     pub fn http(&self) -> &reqwest::Client {
         &self.host.http
+    }
+
+    pub fn delivery_state(&self) -> DeliveryState {
+        self.delivery_state
+    }
+
+    pub fn mark_delivery(&mut self, delivery: DeliveryState) {
+        let _ = self.persist_delivery(delivery);
+    }
+
+    pub fn persist_delivery(&mut self, delivery: DeliveryState) -> Result<()> {
+        self.delivery_state = delivery;
+        if !self.durable {
+            return Ok(());
+        }
+        Store::open().and_then(|store| {
+            store.update_chat_turn_progress(
+                &self.turn_id,
+                "running",
+                delivery.as_str(),
+                self.attempt_count.max(1),
+                None,
+            )
+        })
+    }
+
+    pub fn mark_terminal_failure(&mut self, kind: impl Into<String>, message: impl Into<String>) {
+        self.terminal_error = Some((kind.into(), message.into()));
+    }
+
+    pub fn schedule_orx_retry(&mut self, explicit: Option<Duration>) -> Option<(u32, Duration)> {
+        let started = *self.orx_retry_started.get_or_insert_with(Instant::now);
+        let retry_number = self.orx_retry_count + 1;
+        let Some(delay) =
+            crate::local::harness::orx_retry_delay(&self.turn_id, retry_number, explicit)
+        else {
+            self.retry_exhausted = self.orx_retry_count > 0;
+            return None;
+        };
+        if started.elapsed() + delay > crate::local::harness::ORX_RETRY_BUDGET {
+            self.retry_exhausted = self.orx_retry_count > 0;
+            return None;
+        }
+        self.orx_retry_count = retry_number;
+        Some((retry_number, delay))
+    }
+
+    pub fn orx_retry_remaining(&self) -> Option<Duration> {
+        self.orx_retry_started.map(|started| {
+            crate::local::harness::ORX_RETRY_BUDGET.saturating_sub(started.elapsed())
+        })
+    }
+
+    pub fn show_retry_status(
+        &mut self,
+        owner: &str,
+        reason: &str,
+        attempt: i64,
+        max_attempts: Option<i64>,
+        next_retry_at: Option<i64>,
+    ) {
+        if self.durable && !self.retry_started_emitted {
+            self.retry_started_emitted = true;
+            crate::telemetry::capture(
+                "chat_retry_started",
+                json!({
+                    "harness": self.harness,
+                    "owner": owner,
+                    "reason": if owner == "native" {
+                        "provider_transient"
+                    } else {
+                        "local_control_plane"
+                    },
+                    "attempt": attempt,
+                }),
+            );
+        }
+        self.attempt_count = self.attempt_count.max(attempt);
+        self.retry_owner = Some(owner.to_string());
+        let mut part = WirePart::tool("turn-retry", "retry", "running", None);
+        if let Some(state) = part.state.as_mut() {
+            state.title = Some(reason.to_string());
+            state.input = Some(json!({
+                "retryOwner": owner,
+                "attempt": attempt,
+                "maximum": max_attempts,
+                "nextRetryAt": next_retry_at,
+                "turnId": self.turn_id,
+            }));
+        }
+        self.upsert_part_raw(part);
+        if !self.durable {
+            return;
+        }
+        let _ = Store::open().and_then(|store| {
+            store.update_chat_turn_progress(
+                &self.turn_id,
+                "retrying",
+                self.delivery_state.as_str(),
+                self.attempt_count,
+                next_retry_at,
+            )
+        });
+        let _ = self.flush();
+    }
+
+    pub fn clear_retry_status(&mut self) {
+        let before = self.assistant.parts.len();
+        self.assistant.parts.retain(|part| part.id != "turn-retry");
+        if self.assistant.parts.len() == before {
+            return;
+        }
+        if !self.durable {
+            return;
+        }
+        if let Ok(store) = Store::open() {
+            let _ = store.update_chat_turn_progress(
+                &self.turn_id,
+                "running",
+                self.delivery_state.as_str(),
+                self.attempt_count.max(1),
+                None,
+            );
+            if self.assistant.parts.is_empty() {
+                if let Ok(parts_json) = serde_json::to_string(&self.assistant.parts) {
+                    let _ = store.upsert_chat_message(&StoredChatMessage {
+                        id: self.assistant.id.clone(),
+                        session_id: self.session_id.clone(),
+                        role: self.assistant.role.clone(),
+                        parts_json,
+                        created_at: self.assistant.created_at,
+                    });
+                    self.host.emit(
+                        "chat.message",
+                        message_json(&self.assistant, &self.session_id),
+                    );
+                }
+            } else {
+                let _ = self.flush();
+            }
+        }
+    }
+
+    pub fn mark_native_retry_exhausted(&mut self) {
+        if self.retry_owner.as_deref() == Some("native")
+            && self
+                .assistant
+                .parts
+                .iter()
+                .any(|part| part.id == "turn-retry")
+        {
+            self.retry_exhausted = true;
+        }
+    }
+
+    fn push_turn_failure(&mut self, kind: &str, message: String, recovery_action: &str) {
+        self.clear_retry_status();
+        let mut part = WirePart::tool("turn-recovery", "error", "error", Some(message));
+        if let Some(state) = part.state.as_mut() {
+            state.input = Some(json!({
+                "turnId": self.turn_id,
+                "errorKind": kind,
+                "recoveryAction": recovery_action,
+            }));
+        }
+        self.upsert_part_raw(part);
+    }
+
+    fn upsert_part_raw(&mut self, part: WirePart) {
+        upsert_preserving_children(&mut self.assistant.parts, part);
     }
 
     /// Bare in-memory ctx for harness unit tests: parts accumulate on
@@ -3711,6 +4926,16 @@ impl TurnCtx {
                 Arc::new(crate::local::codex::CodexHost::new()),
                 Arc::new(crate::local::claude::ClaudeHost::new()),
             )),
+            turn_id: "test-turn".into(),
+            durable: false,
+            delivery_state: DeliveryState::NotSent,
+            attempt_count: 0,
+            retry_owner: None,
+            retry_started_emitted: false,
+            retry_exhausted: false,
+            orx_retry_started: None,
+            orx_retry_count: 0,
+            terminal_error: None,
             session_id: "test-session".into(),
             harness: "test".into(),
             native_session_id: None,
@@ -3887,7 +5112,8 @@ impl TurnCtx {
 
     /// Insert or replace a part by id, preserving arrival order.
     pub fn upsert_part(&mut self, part: WirePart) {
-        upsert_preserving_children(&mut self.assistant.parts, part);
+        self.clear_retry_status();
+        self.upsert_part_raw(part);
     }
 
     /// Like `upsert_part`, but carries forward an existing part's `children` when
@@ -3895,10 +5121,12 @@ impl TurnCtx {
     /// authoritative final-message merge) doesn't drop the sub-agent transcript
     /// that streamed into it.
     pub fn upsert_part_preserving_children(&mut self, part: WirePart) {
-        upsert_preserving_children(&mut self.assistant.parts, part);
+        self.clear_retry_status();
+        self.upsert_part_raw(part);
     }
 
     pub fn append_part_text(&mut self, part_id: &str, delta: &str) {
+        self.clear_retry_status();
         if let Some(part) = self.assistant.parts.iter_mut().find(|p| p.id == part_id) {
             let text = part.text.get_or_insert_with(String::new);
             text.push_str(delta);
@@ -3911,6 +5139,7 @@ impl TurnCtx {
     /// Shared by every harness that streams sub-agent activity (Codex threadId,
     /// Claude parent_tool_use_id, OpenCode child sessionID).
     pub fn upsert_child(&mut self, parent_id: &str, part: WirePart) {
+        self.clear_retry_status();
         if let Some(parent) = find_part_mut(&mut self.assistant.parts, parent_id) {
             upsert_preserving_children(&mut parent.children, part);
         }
@@ -3925,6 +5154,7 @@ impl TurnCtx {
         delta: &str,
         make: impl FnOnce() -> WirePart,
     ) {
+        self.clear_retry_status();
         let Some(parent) = find_part_mut(&mut self.assistant.parts, parent_id) else {
             return;
         };
@@ -4054,6 +5284,69 @@ pub fn list_messages(session_id: &str) -> Result<Vec<WireMessage>> {
         .collect())
 }
 
+/// Materialize restart recovery on the assistant message linked to every turn
+/// the store just converted from in-flight to failed. Nothing is replayed.
+pub fn reconcile_unfinished_turns(store: &Store) -> Result<()> {
+    materialize_unfinished_turns(store, true).map(|_| ())
+}
+
+fn materialize_unfinished_turns(
+    store: &Store,
+    include_existing_failures: bool,
+) -> Result<Vec<(String, WireMessage)>> {
+    let mut messages = Vec::new();
+    let turns = if include_existing_failures {
+        store.reconcile_unfinished_chat_turns()?
+    } else {
+        store.reconcile_expired_unfinished_chat_turns()?
+    };
+    for turn in turns {
+        let action = turn.recovery_action.as_deref().unwrap_or({
+            if matches!(turn.delivery_state.as_str(), "not_sent" | "rejected") {
+                "retry"
+            } else {
+                "continue"
+            }
+        });
+        let mut message = store
+            .get_chat_message(&turn.assistant_message_id)?
+            .as_ref()
+            .map(stored_to_wire)
+            .unwrap_or(WireMessage {
+                id: turn.assistant_message_id.clone(),
+                role: "assistant".into(),
+                parts: Vec::new(),
+                created_at: turn.created_at,
+            });
+        message.parts.retain(|part| part.id != "turn-retry");
+        let mut part = WirePart::tool(
+            "turn-recovery",
+            "error",
+            "error",
+            turn.error_message.clone(),
+        );
+        if let Some(state) = part.state.as_mut() {
+            state.input = Some(json!({
+                "turnId": turn.id,
+                "errorKind": turn.error_kind,
+                "recoveryAction": action,
+            }));
+        }
+        upsert_preserving_children(&mut message.parts, part);
+        let stored = StoredChatMessage {
+            id: message.id.clone(),
+            session_id: turn.session_id.clone(),
+            role: message.role.clone(),
+            parts_json: serde_json::to_string(&message.parts)?,
+            created_at: message.created_at,
+        };
+        if store.upsert_chat_recovery_message_if_actionable(&turn.id, &stored)? {
+            messages.push((turn.session_id, message));
+        }
+    }
+    Ok(messages)
+}
+
 // --- run watcher ----------------------------------------------------------------
 
 fn run_wakeup_text(run: &crate::store::StoredRun) -> Option<String> {
@@ -4114,7 +5407,7 @@ async fn process_run_wakeups(
             .send_hidden_message(&wakeup.chat_session_id, text, guard)
             .await
         {
-            Ok(TurnSubmission::Started) => {
+            Ok(TurnSubmission::Started(_)) => {
                 if !store.mark_run_wakeup_delivered(
                     &wakeup.run.id,
                     &wakeup.chat_session_id,
@@ -4125,7 +5418,11 @@ async fn process_run_wakeups(
                     ));
                 }
             }
-            Ok(TurnSubmission::Queued | TurnSubmission::NotStarted) => {
+            Ok(
+                TurnSubmission::Queued(_)
+                | TurnSubmission::Existing(_)
+                | TurnSubmission::NotStarted,
+            ) => {
                 store.release_run_wakeup(&wakeup.run.id, &wakeup.chat_session_id, &token)?;
             }
             Err(err) => {
@@ -4457,7 +5754,7 @@ mod cap_tests {
         host.turns
             .lock()
             .await
-            .insert("session".into(), TurnState::Reserved);
+            .insert("session".into(), TurnState::Reserved { turn_id: None });
         let guard = TurnGuard {
             host: host.clone(),
             session_id: "session".into(),
@@ -5343,6 +6640,38 @@ with other project runs using `orx runs p1` and inspect this run's logs using `o
         assert_eq!(selected[0].run.id, "run_first");
     }
 
+    #[test]
+    fn delivery_certainty_never_replays_accepted_or_unknown_turns() {
+        assert_eq!(DeliveryState::NotSent.recovery_action(), "retry");
+        assert_eq!(DeliveryState::Rejected.recovery_action(), "retry");
+        assert_eq!(DeliveryState::Accepted.recovery_action(), "continue");
+        assert_eq!(DeliveryState::Unknown.recovery_action(), "continue");
+    }
+
+    #[test]
+    fn orx_retry_budget_is_shared_across_adapter_phases() {
+        let mut ctx = TurnCtx::test_stub();
+        assert_eq!(ctx.schedule_orx_retry(None).unwrap().0, 1);
+        assert_eq!(ctx.schedule_orx_retry(None).unwrap().0, 2);
+        assert_eq!(ctx.schedule_orx_retry(None).unwrap().0, 3);
+        assert!(ctx.schedule_orx_retry(None).is_none());
+    }
+
+    #[test]
+    fn prepared_attachment_paths_rebase_after_data_directory_moves() {
+        let input =
+            "<attached-files>\n- paper — /old/data/chat-attachments/file.pdf\n</attached-files>";
+        let rebased = rebase_prepared_attachment_paths(input);
+        assert!(rebased.contains(
+            &attachments_dir()
+                .unwrap()
+                .join("file.pdf")
+                .display()
+                .to_string()
+        ));
+        assert!(!rebased.contains("/old/data/chat-attachments"));
+    }
+
     #[tokio::test]
     async fn queued_user_message_blocks_hidden_turn_claim() {
         let host = Arc::new(ChatHost::new(
@@ -5354,11 +6683,16 @@ with other project runs using `orx runs p1` and inspect this run's logs using `o
             "owner".into(),
             VecDeque::from([QueuedMessage {
                 id: "q_1".into(),
+                client_turn_id: "ct_1".into(),
+                request_hash: "hash".into(),
                 text: "user first".into(),
                 transcript_text: None,
                 overrides: TurnOverrides::default(),
                 images: Vec::new(),
                 annotations: Vec::new(),
+                dispatch_attempts: 0,
+                dispatch_error: None,
+                next_retry_at: None,
             }]),
         );
 

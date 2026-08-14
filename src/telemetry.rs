@@ -708,7 +708,7 @@ fn pending() -> &'static std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>> {
 /// line) by up to the flush duration. Safe to call unconditionally — no-ops when
 /// telemetry is disabled. Deliberately not `async` beyond the spawn: nothing to
 /// await.
-fn capture(event: impl Into<String>, extra: serde_json::Value) {
+pub(crate) fn capture(event: impl Into<String>, extra: serde_json::Value) {
     if let Some(handle) = spawn_event(event, extra) {
         if let Ok(mut v) = pending().lock() {
             v.push(handle);

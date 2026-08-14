@@ -36,11 +36,11 @@ use super::detect::{
 use super::options::{
     HarnessOptions, OptionChoice, PermissionMode, PlanActivation, REASONING_DEFAULT_ID,
 };
-use super::{Harness, ResumeAction};
+use super::{Harness, ResumeAction, TurnFailure, TurnOutcome, TurnResult, ORX_MAX_ATTEMPTS};
 use crate::error::{anyhow, Result};
 use crate::local::chat::{
-    find_part_mut, prepare_env, ContextUsage, PromptAnswer, ResumeCtx, TurnCtx, WirePart,
-    WirePrompt, WireQuestionOption, WireToolState,
+    find_part_mut, prepare_env, ContextUsage, DeliveryState, PromptAnswer, ResumeCtx, TurnCtx,
+    WirePart, WirePrompt, WireQuestionOption, WireToolState,
 };
 use crate::local::claude::{SpawnConfig, SpawnSpec, TurnEvent};
 use crate::local::opencode::ensure_playbook;
@@ -516,8 +516,11 @@ impl Harness for ClaudeCode {
         Some(info)
     }
 
-    async fn run_turn(&self, ctx: &mut TurnCtx) -> Result<()> {
-        run_turn(ctx).await
+    async fn run_turn(&self, ctx: &mut TurnCtx) -> TurnResult {
+        run_turn(ctx)
+            .await
+            .map(|()| TurnOutcome::Completed)
+            .map_err(|error| TurnFailure::adapter(error, ctx.delivery_state()))
     }
 
     async fn generate_title(&self, first_message: &str) -> Option<String> {
@@ -1018,6 +1021,12 @@ fn belongs_to_current_turn(event: &Value, text: &str, saw_user_echo: &mut bool) 
     }
     *saw_user_echo = replays_user_message(event, text);
     false
+}
+
+fn observe_turn_boundary(event: &Value, text: &str, saw_user_echo: &mut bool) -> (bool, bool) {
+    let had_user_echo = *saw_user_echo;
+    let belongs = belongs_to_current_turn(event, text, saw_user_echo);
+    (belongs, !had_user_echo && *saw_user_echo)
 }
 
 /// The per-turn state `apply_event` folds each stream-json line into. Kept
@@ -1566,13 +1575,51 @@ fn spawn_config(ctx: &TurnCtx) -> SpawnConfig {
 /// or an API backoff burst emits nothing for minutes, legitimately).
 const FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(120);
 
+async fn ensure_claude_pre_accept(
+    ctx: &mut TurnCtx,
+    spec: SpawnSpec,
+) -> Result<std::sync::Arc<crate::local::claude::ClaudeClient>> {
+    loop {
+        let ensure = ctx.host.claude.ensure(spec.clone());
+        let result = match ctx.orx_retry_remaining() {
+            Some(remaining) => tokio::time::timeout(remaining, ensure)
+                .await
+                .map_err(|_| anyhow!("Claude Code setup exceeded the ORX retry budget"))?,
+            None => ensure.await,
+        };
+        match result {
+            Ok(client) => {
+                ctx.clear_retry_status();
+                return Ok(client);
+            }
+            Err(error) => {
+                ctx.host.claude.kill_session(&ctx.session_id).await;
+                let Some((retry_number, delay)) = ctx.schedule_orx_retry(None) else {
+                    ctx.mark_delivery(DeliveryState::NotSent);
+                    ctx.mark_terminal_failure("claude_setup", error.to_string());
+                    return Err(error);
+                };
+                ctx.show_retry_status(
+                    "orx",
+                    "Restarting Claude Code",
+                    retry_number as i64 + 1,
+                    Some(ORX_MAX_ATTEMPTS as i64),
+                    Some(crate::store::now_ms() + delay.as_millis() as i64),
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
 async fn run_attempt(ctx: &mut TurnCtx, spec: SpawnSpec) -> Result<(TurnState, u64)> {
-    let client = ctx.host.claude.ensure(spec).await?;
+    let client = ensure_claude_pre_accept(ctx, spec).await?;
     let auth_generation = client.auth_generation();
     let bridge_active = client.config().bridge_active;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let _route = client.register_turn(tx);
+    ctx.persist_delivery(DeliveryState::Unknown)?;
     if let Err(e) = client.send_user_message(&ctx.text).await {
         ctx.host.claude.kill_session(&ctx.session_id).await;
         return Err(anyhow!(
@@ -1626,7 +1673,12 @@ async fn run_attempt(ctx: &mut TurnCtx, spec: SpawnSpec) -> Result<(TurnState, u
         };
         match event {
             TurnEvent::Line(value) => {
-                if !belongs_to_current_turn(&value, &ctx.text, &mut saw_user_echo) {
+                let (belongs, accepted_now) =
+                    observe_turn_boundary(&value, &ctx.text, &mut saw_user_echo);
+                if accepted_now {
+                    ctx.mark_delivery(DeliveryState::Accepted);
+                }
+                if !belongs {
                     saw_event = true;
                     if value.get("type").and_then(Value::as_str) == Some("system")
                         && value.get("subtype").and_then(Value::as_str) == Some("init")
@@ -1667,6 +1719,10 @@ async fn run_attempt(ctx: &mut TurnCtx, spec: SpawnSpec) -> Result<(TurnState, u
             "claude ended the turn without a result; see {}",
             crate::store::data_dir().join("agent-claude.log").display()
         ));
+    }
+
+    if state.auth_failed && !saw_user_echo {
+        ctx.mark_delivery(DeliveryState::Rejected);
     }
     commit_attempt_session(ctx, &state);
     Ok((state, auth_generation))
@@ -1736,8 +1792,28 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
                 serde_json::json!({ "harness": "claude-code", "authState": snapshot.state }),
             );
         }
-        if auth == HarnessAuthState::Ready && !attempt.had_activity && retry_count == 0 {
+        if auth == HarnessAuthState::Ready
+            && !attempt.had_activity
+            && retry_count == 0
+            && ctx.delivery_state() == crate::local::chat::DeliveryState::Rejected
+        {
             retry_count += 1;
+            let Some((retry_number, delay)) = ctx.schedule_orx_retry(None) else {
+                state = attempt;
+                ctx.mark_terminal_failure(
+                    "claude_auth",
+                    "Claude Code authentication recovery exhausted the ORX retry budget",
+                );
+                break;
+            };
+            ctx.show_retry_status(
+                "orx",
+                "Claude Code authentication recovered",
+                retry_number as i64 + 1,
+                Some(ORX_MAX_ATTEMPTS as i64),
+                Some(crate::store::now_ms() + delay.as_millis() as i64),
+            );
+            tokio::time::sleep(delay).await;
             continue;
         }
 
@@ -1774,6 +1850,16 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
                 ..Default::default()
             },
         ));
+    }
+    if state.turn_errored {
+        let message = ctx
+            .assistant
+            .parts
+            .iter()
+            .rev()
+            .find_map(|part| part.state.as_ref()?.error.clone())
+            .unwrap_or_else(|| "Claude Code reported a terminal turn error".into());
+        ctx.mark_terminal_failure("claude_terminal", message);
     }
     let _ = ctx.flush();
     Ok(())
@@ -2184,10 +2270,16 @@ mod tests {
         let mut state = TurnState::default();
         for line in transcript {
             let event: Value = serde_json::from_str(line).unwrap();
-            if belongs_to_current_turn(&event, "repeat", &mut saw_user_echo) {
+            let (belongs, accepted_now) =
+                observe_turn_boundary(&event, "repeat", &mut saw_user_echo);
+            if accepted_now {
+                ctx.mark_delivery(DeliveryState::Accepted);
+            }
+            if belongs {
                 apply_event(&mut ctx, &mut state, &event);
             }
         }
+        assert_eq!(ctx.delivery_state(), DeliveryState::Accepted);
         assert!(state.saw_result);
         assert_eq!(ctx.assistant.parts.len(), 1);
         assert_eq!(ctx.assistant.parts[0].text.as_deref(), Some("I am Claude."));

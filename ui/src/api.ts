@@ -1104,7 +1104,19 @@ export function modelLabel(id: string): string {
 
 export interface ChatToolState {
   status: "running" | "completed" | "error";
-  input?: { command?: string; filePath?: string; description?: string; [k: string]: unknown };
+  input?: {
+    command?: string;
+    filePath?: string;
+    description?: string;
+    retryOwner?: "native" | "orx";
+    attempt?: number;
+    maximum?: number | null;
+    nextRetryAt?: number | null;
+    turnId?: string;
+    errorKind?: string;
+    recoveryAction?: "retry" | "continue";
+    [k: string]: unknown;
+  };
   output?: string;
   error?: string;
   title?: string;
@@ -1246,6 +1258,9 @@ export interface QueuedMessage {
   id: string;
   text: string;
   planMode?: boolean;
+  dispatchState?: "queued" | "retrying" | "blocked";
+  nextRetryAt?: number | null;
+  error?: string | null;
 }
 
 export const getChatMessages = (sessionId: string) =>
@@ -1282,9 +1297,11 @@ export const sendChatMessage = (
   opts: TurnOptions = {},
   images?: ChatImageAttachment[],
   annotations?: ChatTextAnnotation[],
+  clientTurnId?: string,
 ) =>
-  post<{ ok: boolean }>(`/api/chat/sessions/${sessionId}/message`, {
+  post<{ ok: boolean; turn: ChatTurnResult }>(`/api/chat/sessions/${sessionId}/message`, {
     text,
+    clientTurnId,
     model: opts.model,
     permissionMode: opts.permissionMode,
     planMode: opts.planMode,
@@ -1292,6 +1309,23 @@ export const sendChatMessage = (
     images,
     annotations,
   });
+
+export interface ChatTurnResult {
+  turnId: string;
+  queued: boolean;
+  existing: boolean;
+}
+
+export const recoverChatTurn = (
+  sessionId: string,
+  turnId: string,
+  action: "retry" | "continue",
+  opts: TurnOptions = {},
+) =>
+  post<{ ok: boolean; turn: ChatTurnResult }>(
+    `/api/chat/sessions/${sessionId}/turns/${turnId}/recover`,
+    { action, ...opts },
+  );
 
 export const interruptChat = (sessionId: string) =>
   post<{ ok: boolean }>(`/api/chat/sessions/${sessionId}/interrupt`);

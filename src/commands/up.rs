@@ -45,6 +45,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
     // Open early so the schema exists before any request or agent spawn.
     {
         let store = Store::open()?;
+        local::chat::reconcile_unfinished_turns(&store)?;
         for run in store.list_active_runs()? {
             if store.get_local_experiment(&run.experiment_id)?.is_some() {
                 if let Err(err) = crate::commands::exp::spawn_detached_supervise(&run.id) {
@@ -71,6 +72,20 @@ pub async fn run(args: UpArgs) -> Result<()> {
     };
     // Plan-mode turns hand this port to the `orx mcp-gate` permission bridge.
     state.chat.set_up_port(port);
+    state.chat.resume_persisted_queues();
+    {
+        let chat = state.chat.clone();
+        tokio::spawn(async move {
+            let interval =
+                Duration::from_millis((crate::store::CHAT_TURN_LEASE_TTL_MS + 1_000) as u64);
+            loop {
+                tokio::time::sleep(interval).await;
+                if let Err(err) = chat.reconcile_expired_turn_leases() {
+                    eprintln!("orx up: could not reconcile expired chat turns: {err}");
+                }
+            }
+        });
+    }
 
     spawn_agent_preflight();
     // Deliver explicitly registered run wake-ups once their chat becomes idle.
@@ -398,6 +413,10 @@ fn router(state: AppState) -> Router {
         .route("/api/chat/sessions/{id}/messages", get(chat_messages))
         .route("/api/chat/sessions/{id}/worktree", get(session_worktree))
         .route("/api/chat/sessions/{id}/message", post(send_chat_message))
+        .route(
+            "/api/chat/sessions/{id}/turns/{turnId}/recover",
+            post(recover_chat_turn),
+        )
         .route("/api/chat/sessions/{id}/interrupt", post(interrupt_chat))
         .route(
             "/api/chat/sessions/{id}/queue/{itemId}",
@@ -1455,7 +1474,7 @@ async fn delete_project(State(state): State<AppState>, Path(id): Path<String>) -
         );
     }
     for session in &sessions {
-        state.chat.clear_queue(&session.id);
+        state.chat.clear_queue(&session.id)?;
         let _ = state.chat.interrupt(&session.id).await;
         state.chat.opencode.kill_session(&session.id).await;
         state.chat.codex.kill_session(&session.id).await;
@@ -4249,8 +4268,8 @@ async fn chat_messages(State(state): State<AppState>, Path(id): Path<String>) ->
         .get_chat_session(&id)?
         .ok_or_else(|| not_found("chat session"))?;
     let messages = local::chat::list_messages(&id)?;
-    // Parked messages are in-memory, so a reload mid-turn recovers them here
-    // rather than from the store.
+    // The host restores its durable queue at startup; return the live snapshot
+    // so dispatch progress and cancellation are reflected immediately.
     let queued = state.chat.queued_items(&id);
     Ok(Json(json!({ "messages": messages, "queued": queued })))
 }
@@ -4259,6 +4278,7 @@ async fn chat_messages(State(state): State<AppState>, Path(id): Path<String>) ->
 #[serde(rename_all = "camelCase")]
 struct SendChatReq {
     text: String,
+    client_turn_id: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
     plan_mode: Option<bool>,
@@ -4293,12 +4313,61 @@ async fn send_chat_message(
         reasoning_level: req.reasoning_level,
     };
     // The turn runs in the background; progress streams over /api/events.
-    state
+    let result = state
         .chat
-        .send_message(&id, text, overrides, req.images, annotations)
+        .send_message(
+            &id,
+            text,
+            overrides,
+            req.images,
+            annotations,
+            req.client_turn_id,
+        )
         .await
-        .map_err(bad_request)?;
-    Ok(Json(json!({ "ok": true })))
+        .map_err(|error| {
+            if error.to_string().contains("clientTurnId was already used") {
+                ApiError(StatusCode::CONFLICT, error.to_string())
+            } else {
+                bad_request(error)
+            }
+        })?;
+    Ok(Json(json!({ "ok": true, "turn": result })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoverChatReq {
+    action: String,
+    model: Option<String>,
+    permission_mode: Option<String>,
+    plan_mode: Option<bool>,
+    reasoning_level: Option<String>,
+}
+
+async fn recover_chat_turn(
+    State(state): State<AppState>,
+    Path((id, turn_id)): Path<(String, String)>,
+    Json(req): Json<RecoverChatReq>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    let result = state
+        .chat
+        .recover_turn(
+            &id,
+            &turn_id,
+            &req.action,
+            local::chat::TurnOverrides {
+                model: req.model,
+                permission_mode: req.permission_mode,
+                permission_revision: None,
+                plan_mode: req.plan_mode,
+                plan_revision: None,
+                reasoning_level: req.reasoning_level,
+            },
+        )
+        .await
+        .map_err(|error| ApiError(StatusCode::CONFLICT, error.to_string()))?;
+    Ok(Json(json!({ "ok": true, "turn": result })))
 }
 
 /// Raw bytes of a chat attachment (image or PDF), by bare file name.
@@ -4349,7 +4418,7 @@ async fn cancel_queued_chat(
     State(state): State<AppState>,
     Path((id, item_id)): Path<(String, String)>,
 ) -> ApiResult {
-    let removed = state.chat.cancel_queued(&id, &item_id);
+    let removed = state.chat.cancel_queued(&id, &item_id)?;
     Ok(Json(json!({ "ok": true, "removed": removed })))
 }
 
