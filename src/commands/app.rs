@@ -10,28 +10,34 @@
 //! This is distinct from `orx up` launched in a terminal, which stays a plain
 //! CLI. The whole module is macOS-only; other targets compile it away.
 
-/// True when this process is the executable inside a `<name>.app/Contents/MacOS`
-/// bundle *and* was invoked under its own name — the signal to enter GUI app
-/// mode instead of parsing CLI args.
+/// True when `exe` is a `<name>.app/Contents/MacOS` bundle executable that was
+/// invoked under its own name — the signal to enter GUI app mode instead of
+/// parsing CLI args.
 ///
 /// The name check is what keeps the bundle's `orx` symlink (see
 /// `build-macos-app.sh`) a plain CLI: an agent shelling out to a bare `orx`
-/// must print help, not open a second dashboard. macOS `current_exe` reports
-/// the path the process was *launched as*, symlink included, so it has to be
-/// canonicalized before its name can be compared against argv's.
+/// must print help, not open a second dashboard. That relies on `exe` being
+/// canonicalized — it is the *symlink* whose name differs, so an uncanonicalized
+/// path would compare `orx` against `orx` and match.
+pub(crate) fn is_bundle_exe_launch(exe: &std::path::Path, argv0: Option<&std::ffi::OsStr>) -> bool {
+    let in_bundle = exe
+        .parent()
+        .is_some_and(|dir| dir.ends_with("Contents/MacOS"));
+    let invoked_as_bundle_exe = argv0
+        .map(std::path::Path::new)
+        .and_then(std::path::Path::file_name)
+        == exe.file_name();
+    in_bundle && invoked_as_bundle_exe
+}
+
+/// Whether to enter GUI app mode. macOS `current_exe` reports the path the
+/// process was *launched as*, symlink and all, so it is canonicalized first.
 #[cfg(target_os = "macos")]
 pub fn launched_as_app_bundle() -> bool {
     let Ok(exe) = std::env::current_exe().and_then(|exe| exe.canonicalize()) else {
         return false;
     };
-    let in_bundle = exe
-        .parent()
-        .is_some_and(|dir| dir.ends_with("Contents/MacOS"));
-    let invoked_as_bundle_exe = std::env::args_os()
-        .next()
-        .map(std::path::PathBuf::from)
-        .is_some_and(|argv0| argv0.file_name() == exe.file_name());
-    in_bundle && invoked_as_bundle_exe
+    is_bundle_exe_launch(&exe, std::env::args_os().next().as_deref())
 }
 
 /// Enter GUI app mode: adopt the user's shell PATH, pick a free port, start the
@@ -40,16 +46,23 @@ pub fn launched_as_app_bundle() -> bool {
 /// process just exits).
 #[cfg(target_os = "macos")]
 pub async fn run() {
-    // Before the port is reserved, so the reservation can't go stale while the
-    // probe runs — and long before detection reads PATH for `/api/harnesses`.
-    hydrate_search_path().await;
+    // First, so the store is never unprotected: the probe below can take
+    // seconds, and `orx delete` racing app startup would win that window.
     // App mode returns before `dispatch`, which is where `orx up` takes this
-    // read lock. Without it `orx delete` from a CLI install sees no reader and
-    // wipes the store out from under a running app.
+    // same read lock.
     let lifecycle = crate::store::open_lifecycle_lock()
         .inspect_err(|err| eprintln!("openresearch app: could not open the lifecycle lock: {err}"))
         .ok();
-    let _lifecycle_guard = lifecycle.as_ref().map(|lock| lock.read());
+    let _lifecycle_guard = lifecycle.as_ref().and_then(|lock| {
+        lock.read()
+            .inspect_err(|err| {
+                eprintln!("openresearch app: could not hold the lifecycle lock: {err}")
+            })
+            .ok()
+    });
+    // Before the port is reserved, so the reservation can't go stale while the
+    // probe runs — and long before detection reads PATH for `/api/harnesses`.
+    hydrate_search_path().await;
     // Ephemeral loopback port so the app never collides with a terminal
     // `orx up`. Bind-then-drop to reserve it; the tiny race is harmless locally.
     let port = std::net::TcpListener::bind(("127.0.0.1", 0))
@@ -73,7 +86,7 @@ async fn hydrate_search_path() {
     let marker = format!("__ORX_PATH_{}__", uuid::Uuid::new_v4().simple());
     let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
     let script = format!(r#"/bin/sh -c 'printf "{marker}%s{marker}" "$PATH"'"#);
-    let fut = tokio::process::Command::new(shell)
+    let fut = tokio::process::Command::new(&shell)
         .args(["-ilc".to_string(), script])
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true)
@@ -82,8 +95,14 @@ async fn hydrate_search_path() {
     // inherited PATH stays in force when the probe doesn't answer.
     let out = match tokio::time::timeout(std::time::Duration::from_secs(5), fut).await {
         Ok(Ok(out)) => out,
-        other => {
-            eprintln!("openresearch app: PATH probe failed ({other:?}); using the inherited PATH");
+        Ok(Err(err)) => {
+            eprintln!("openresearch app: could not run {shell:?}: {err}; using the inherited PATH");
+            return;
+        }
+        Err(_) => {
+            eprintln!(
+                "openresearch app: {shell:?} did not answer within 5s; using the inherited PATH"
+            );
             return;
         }
     };
@@ -178,5 +197,47 @@ mod imp {
         let delegate = Delegate::new(mtm, url);
         app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
         app.run();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_bundle_exe_launch;
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    const EXE: &str = "/Applications/OpenResearch.app/Contents/MacOS/OpenResearch";
+
+    #[test]
+    fn finder_and_direct_runs_of_the_bundle_exe_are_app_launches() {
+        assert!(is_bundle_exe_launch(Path::new(EXE), Some(OsStr::new(EXE))));
+        assert!(is_bundle_exe_launch(
+            Path::new(EXE),
+            Some(OsStr::new("./OpenResearch"))
+        ));
+    }
+
+    #[test]
+    fn the_bundles_orx_symlink_stays_a_cli() {
+        // `exe` is canonicalized, so the symlink shows up only in argv.
+        assert!(!is_bundle_exe_launch(
+            Path::new(EXE),
+            Some(OsStr::new("orx"))
+        ));
+        assert!(!is_bundle_exe_launch(
+            Path::new(EXE),
+            Some(OsStr::new(
+                "/Applications/OpenResearch.app/Contents/MacOS/orx"
+            ))
+        ));
+    }
+
+    #[test]
+    fn installs_outside_a_bundle_are_never_app_launches() {
+        assert!(!is_bundle_exe_launch(
+            Path::new("/usr/local/bin/orx"),
+            Some(OsStr::new("orx"))
+        ));
+        assert!(!is_bundle_exe_launch(Path::new(EXE), None));
     }
 }

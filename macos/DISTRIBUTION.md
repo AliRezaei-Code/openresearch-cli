@@ -111,10 +111,11 @@ terminal:
 
 ## Coexisting with a CLI install
 
-The app and a `curl`-installed `orx` share one data dir and one config dir by
-design, so both must be safe to have at once:
+The app and a `curl`-installed `orx` share one data dir and one config dir, so
+both must be safe to have at once:
 
-- **Ports** — the app binds an ephemeral loopback port, never `orx up`'s 4791.
+- **Ports** — the app binds an ephemeral loopback port rather than `orx up`'s
+  4791.
 - **Store** — SQLite in WAL with a 5s busy timeout; concurrent readers/writers
   are expected. Run supervisors hold a per-run exclusive lock, so a second
   server recovering the same active run exits instead of double-driving it.
@@ -125,5 +126,10 @@ design, so both must be safe to have at once:
   Agents shelling out to `orx` therefore get *this* build rather than whatever
   CLI version happens to be installed, and a DMG-only user needs no CLI at all.
   Invoked under that name the binary stays a plain CLI — see
-  `launched_as_app_bundle`, which enters GUI mode only under the bundle
-  executable's own name.
+  `launched_as_app_bundle`.
+
+Known gap: the startup probe imports only PATH, so `ORX_DATA_DIR`,
+`XDG_DATA_HOME`, or `XDG_CONFIG_HOME` exported from a shell rc apply to the CLI
+but not to a Finder-launched app — the two then use different directories, and
+the lock above guards a file neither shares. Setting the data directory from the
+dashboard's Storage settings persists it where both find it.

@@ -4,8 +4,9 @@
 //! startup: a bundle launched from Finder gets launchd's
 //! `/usr/bin:/bin:/usr/sbin:/sbin` and never sources the user's shell rc, so a
 //! `claude` or `codex` installed by Homebrew, nvm, or npm-global is invisible
-//! to `harness::detect::find_on_path` — the app reports every harness missing
-//! while a terminal `orx up` on the same machine detects them all.
+//! to `harness::detect::find_on_path` — the app finds no `codex` at all, and
+//! `claude`/`opencode` only at their installer drop locations, while a terminal
+//! `orx up` on the same machine detects them all.
 //!
 //! Scope is harnesses only. The other things orx shells out to (ray, slurm,
 //! modal, kubectl, gh) still resolve against the process PATH.
@@ -34,14 +35,14 @@ pub fn set(path: OsString) {
 /// The PATH a shell probe fenced between two `marker`s, if the payload ran to
 /// completion and produced something usable.
 ///
-/// The marker is a per-probe nonce, so rc-file chatter can't forge one. A shell
-/// in verbose mode still echoes the payload — markers and all — so the result
-/// is only accepted when it holds a real absolute directory, which the echoed
-/// `printf "…%s…"` template does not.
+/// Requiring an absolute directory is what rejects a garbage or empty capture —
+/// including the literal `%s` left behind if the fence ever wraps the `printf`
+/// template rather than its output.
 pub fn extract_path(stdout: &str, marker: &str) -> Option<String> {
     let mut parts = stdout.split(marker);
-    parts.next()?;
-    let path = parts.next()?;
+    // `split` always yields a first element; the *third* is what proves the
+    // closing fence arrived rather than the probe being cut short.
+    let path = parts.nth(1)?;
     parts.next()?;
     std::env::split_paths(path)
         .any(|dir| dir.is_absolute())
@@ -71,7 +72,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_verbose_shell_echoing_the_payload() {
+    fn rejects_a_fence_wrapping_the_template_instead_of_its_output() {
         let stdout = format!(r#"+ /bin/sh -c printf "{M}%s{M}" "$PATH""#);
         assert_eq!(extract_path(&stdout, M), None);
     }
