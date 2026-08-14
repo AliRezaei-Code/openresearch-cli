@@ -769,6 +769,24 @@ mod tests {
     }
 
     #[test]
+    fn playbook_requires_clickable_file_references() {
+        let md = sample_playbook();
+        assert!(md.contains("chip renders as a small pill"));
+        assert!(md.contains("every file or"));
+        assert!(md.contains("artifact mentioned in prose"));
+        assert!(md.contains("never a bare or backticked path"));
+        assert!(md.contains("Use repo-relative paths"));
+        assert!(md.contains("committed version"));
+        assert!(md.contains("Logs are the only evidence channel"));
+        assert!(md.contains("run ids come from `orx runs`"));
+        assert!(md.contains("Add a short label to name"));
+        assert!(md.contains("the claim when useful"));
+        assert!(md.contains("<file path=\"artifacts/<relative-path>\" />"));
+        assert!(md.contains("Wrong: Saved as"));
+        assert!(md.contains("<file path=\"artifacts/figures/result.png\" />"));
+    }
+
+    #[test]
     fn playbook_avoids_ui_navigation() {
         let mut local_only = sample_project();
         local_only.github_owner.clear();

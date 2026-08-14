@@ -387,6 +387,13 @@ mod tests {
     }
 
     #[test]
+    fn local_reports_skill_links_written_artifacts() {
+        assert!(REPORTS_LOCAL.contains("cite every relevant output as raw"));
+        assert!(REPORTS_LOCAL.contains("<file path=\"artifacts/<relative-path>\" />"));
+        assert!(REPORTS_LOCAL.contains("never as a bare or backticked path"));
+    }
+
+    #[test]
     fn ensure_session_skills_writes_local_set_idempotently() {
         let tmp = std::env::temp_dir().join(format!(
             "orx-agent-skills-test-{}-{}",
