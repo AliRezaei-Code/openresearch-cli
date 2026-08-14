@@ -163,7 +163,7 @@ impl HarnessInfo {
 }
 
 pub(super) fn find_on_path(bin: &str) -> Option<PathBuf> {
-    let paths = crate::local::search_path::current()?;
+    let paths = crate::local::shell_env::search_path()?;
     std::env::split_paths(&paths)
         // An empty component (`PATH=":/usr/bin"`) means cwd — never a place to
         // pick up a binary we are about to execute.

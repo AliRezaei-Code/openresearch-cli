@@ -30,7 +30,7 @@ pub mod openresearch;
 pub mod projects;
 pub mod ray;
 pub mod resolve;
-pub mod search_path;
+pub mod shell_env;
 pub mod skills;
 pub mod slurm;
 pub mod ssh;

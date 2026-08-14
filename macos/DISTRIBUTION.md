@@ -98,12 +98,12 @@ Finder launches the bundle through launchd, so the process starts with
 would then find no `codex` at all, and `claude`/`opencode` only at their default
 installer drop locations — the "works in my terminal, broken in the app" bug.
 
-`commands::app::hydrate_search_path` therefore probes the user's shell
-(`$SHELL -ilc`, interactive because `.zshrc` is where PATH edits live) once at
-startup and installs the result via `local::search_path`, which harness lookup
-and harness children consult instead of the process PATH. It is best-effort and
-capped at 5s; every outcome is logged. To see it, run the bundled binary from a
-terminal:
+`commands::app::hydrate_shell_env` therefore probes the user's shell
+(`$SHELL -ilc`, interactive because `.zshrc` is where these exports live) once at
+startup and installs the result via `local::shell_env`, which harness lookup,
+harness children, and directory resolution consult instead of the process
+environment. It is best-effort and capped at 5s; every outcome is logged. To see
+it, run the bundled binary from a terminal:
 
 ```bash
 /Applications/OpenResearch.app/Contents/MacOS/OpenResearch
@@ -128,8 +128,8 @@ both must be safe to have at once:
   Invoked under that name the binary stays a plain CLI — see
   `launched_as_app_bundle`.
 
-Known gap: the startup probe imports only PATH, so `ORX_DATA_DIR`,
-`XDG_DATA_HOME`, or `XDG_CONFIG_HOME` exported from a shell rc apply to the CLI
-but not to a Finder-launched app — the two then use different directories, and
-the lock above guards a file neither shares. Setting the data directory from the
-dashboard's Storage settings persists it where both find it.
+- **Directories** — `ORX_DATA_DIR`, `XDG_DATA_HOME`, and `XDG_CONFIG_HOME` are
+  imported by the same startup probe (`local::shell_env::IMPORTED`), so a rc
+  file that redirects the store moves the app with it. Otherwise the app would
+  read the default database while the CLI read the user's, and the lock above
+  would guard a file neither shares.

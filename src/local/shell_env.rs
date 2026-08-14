@@ -1,0 +1,117 @@
+//! The slice of the user's shell environment that a Finder-launched app never
+//! inherits, and everything that has to agree with a terminal `orx`.
+//!
+//! A bundle started by launchd gets `PATH=/usr/bin:/bin:/usr/sbin:/sbin` and no
+//! shell rc sourced, so without this the app finds no `codex` at all and
+//! `claude`/`opencode` only at their installer drop locations, and it resolves
+//! its data and config directories to the defaults while the CLI on the same
+//! machine uses whatever the user exported. Two OpenResearch installs then
+//! disagree about which database they are looking at.
+//!
+//! macOS app mode probes the shell once at startup ([`crate::commands::app`])
+//! and installs the answer here; every other entry point falls through to the
+//! process environment unchanged.
+
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::sync::OnceLock;
+
+/// Deliberately short. These are the variables whose divergence makes the app
+/// and the CLI behave like different installs; credentials reach harness
+/// children through `chat::prepare_env` instead.
+pub const IMPORTED: [&str; 4] = ["PATH", "ORX_DATA_DIR", "XDG_DATA_HOME", "XDG_CONFIG_HOME"];
+
+static OVERRIDE: OnceLock<HashMap<&'static str, OsString>> = OnceLock::new();
+
+/// Like `env::var_os`, but preferring what the user's shell reported.
+pub fn var(key: &str) -> Option<OsString> {
+    OVERRIDE
+        .get()
+        .and_then(|vars| vars.get(key).cloned())
+        .or_else(|| std::env::var_os(key))
+}
+
+/// The PATH to search for harness binaries and hand to harness children.
+pub fn search_path() -> Option<OsString> {
+    var("PATH")
+}
+
+/// Install the probe's answer; the first call wins. Deliberately not
+/// `env::set_var` — app mode enters inside an already-running tokio runtime,
+/// where mutating the process environment races every live thread.
+#[cfg(target_os = "macos")]
+pub fn set(vars: HashMap<&'static str, OsString>) {
+    let _ = OVERRIDE.set(vars);
+}
+
+/// Parse the probe's stdout: [`IMPORTED`]'s values in order, NUL-separated,
+/// fenced between two `marker`s.
+///
+/// Requiring PATH to hold an absolute directory is what rejects a garbage or
+/// empty capture — including the literal `%s` left behind if the fence ever
+/// wraps the `printf` template rather than its output. Empty values mean the
+/// variable was unset in the shell and are dropped, so lookups fall through to
+/// the process environment.
+pub fn parse_probe(stdout: &str, marker: &str) -> Option<HashMap<&'static str, OsString>> {
+    let mut fences = stdout.split(marker);
+    // `split` always yields a first element; the *third* is what proves the
+    // closing fence arrived rather than the probe being cut short.
+    let payload = fences.nth(1)?;
+    fences.next()?;
+
+    let vars: HashMap<&'static str, OsString> = IMPORTED
+        .iter()
+        .zip(payload.split('\0'))
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(key, value)| (*key, OsString::from(value)))
+        .collect();
+    let path = vars.get("PATH")?;
+    std::env::split_paths(path)
+        .any(|dir| dir.is_absolute())
+        .then_some(vars)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const M: &str = "__ORX_ENV_abc123__";
+
+    fn fenced(payload: &str) -> String {
+        format!("nvm loaded\n{M}{payload}{M}")
+    }
+
+    #[test]
+    fn reads_every_imported_variable() {
+        let vars = parse_probe(
+            &fenced("/opt/homebrew/bin:/usr/bin\0/data\0/share\0/config\0"),
+            M,
+        )
+        .unwrap();
+        assert_eq!(vars["PATH"], OsString::from("/opt/homebrew/bin:/usr/bin"));
+        assert_eq!(vars["ORX_DATA_DIR"], OsString::from("/data"));
+        assert_eq!(vars["XDG_DATA_HOME"], OsString::from("/share"));
+        assert_eq!(vars["XDG_CONFIG_HOME"], OsString::from("/config"));
+    }
+
+    #[test]
+    fn unset_variables_are_dropped_so_lookups_fall_through() {
+        let vars = parse_probe(&fenced("/usr/bin\0\0\0\0"), M).unwrap();
+        assert_eq!(vars["PATH"], OsString::from("/usr/bin"));
+        assert!(!vars.contains_key("ORX_DATA_DIR"));
+        assert_eq!(vars.len(), 1);
+    }
+
+    #[test]
+    fn rejects_truncated_empty_or_pathless_output() {
+        assert!(parse_probe("", M).is_none());
+        assert!(parse_probe(&format!("{M}/usr/bin\0"), M).is_none());
+        assert!(parse_probe(&fenced("\0/data\0\0\0"), M).is_none());
+    }
+
+    #[test]
+    fn rejects_a_fence_wrapping_the_template_instead_of_its_output() {
+        let stdout = format!(r#"+ /bin/sh -c printf "{M}%s\0{M}" "$PATH""#);
+        assert!(parse_probe(&stdout, M).is_none());
+    }
+}

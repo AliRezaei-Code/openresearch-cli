@@ -46,10 +46,14 @@ pub fn launched_as_app_bundle() -> bool {
 /// process just exits).
 #[cfg(target_os = "macos")]
 pub async fn run() {
-    // First, so the store is never unprotected: the probe below can take
-    // seconds, and `orx delete` racing app startup would win that window.
+    // First: everything below resolves a directory the probe can still change.
+    // The lock lives under `config_dir()`, so taking it earlier would lock the
+    // default path while the CLI locks the user's `XDG_CONFIG_HOME` one —
+    // protecting nothing at all.
+    hydrate_shell_env().await;
     // App mode returns before `dispatch`, which is where `orx up` takes this
-    // same read lock.
+    // same read lock. Without it `orx delete` from a CLI install sees no reader
+    // and wipes the store out from under a running app.
     let lifecycle = crate::store::open_lifecycle_lock()
         .inspect_err(|err| eprintln!("openresearch app: could not open the lifecycle lock: {err}"))
         .ok();
@@ -60,9 +64,6 @@ pub async fn run() {
             })
             .ok()
     });
-    // Before the port is reserved, so the reservation can't go stale while the
-    // probe runs — and long before detection reads PATH for `/api/harnesses`.
-    hydrate_search_path().await;
     // Ephemeral loopback port so the app never collides with a terminal
     // `orx up`. Bind-then-drop to reserve it; the tiny race is harmless locally.
     let port = std::net::TcpListener::bind(("127.0.0.1", 0))
@@ -72,20 +73,25 @@ pub async fn run() {
     imp::run_event_loop(format!("http://127.0.0.1:{port}/"), port);
 }
 
-/// Adopt the user's shell PATH in place of the one launchd handed us (see
-/// [`crate::local::search_path`]).
+/// Adopt the user's shell environment in place of the one launchd handed us
+/// (see [`crate::local::shell_env`]).
 ///
 /// `-ilc`, not `-lc`: zsh reads `.zshrc` only for *interactive* shells, and
-/// that is where PATH edits overwhelmingly live. The inner `sh -c` keeps the
+/// that is where these exports overwhelmingly live. The inner `sh -c` keeps the
 /// answer portable — the outer shell sees three plain words and execs
 /// `/bin/sh`, which prints the colon-separated PATH it inherited, where fish
-/// would have printed its own list-valued `$PATH` space-separated.
+/// would have printed its own list-valued `$PATH` space-separated. Values are
+/// NUL-separated because a directory may contain anything else.
 #[cfg(target_os = "macos")]
-async fn hydrate_search_path() {
-    // Nonce, so rc-file chatter can't forge the fence around the PATH.
-    let marker = format!("__ORX_PATH_{}__", uuid::Uuid::new_v4().simple());
+async fn hydrate_shell_env() {
+    // Nonce, so rc-file chatter can't forge the fence around the values.
+    let marker = format!("__ORX_ENV_{}__", uuid::Uuid::new_v4().simple());
     let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
-    let script = format!(r#"/bin/sh -c 'printf "{marker}%s{marker}" "$PATH"'"#);
+    let reads = crate::local::shell_env::IMPORTED
+        .map(|key| format!(r#""${key}""#))
+        .join(" ");
+    let template = "%s\\0".repeat(crate::local::shell_env::IMPORTED.len());
+    let script = format!(r#"/bin/sh -c 'printf "{marker}{template}{marker}" {reads}'"#);
     let fut = tokio::process::Command::new(&shell)
         .args(["-ilc".to_string(), script])
         .stdin(std::process::Stdio::null())
@@ -100,22 +106,20 @@ async fn hydrate_search_path() {
             return;
         }
         Err(_) => {
-            eprintln!(
-                "openresearch app: {shell:?} did not answer within 5s; using the inherited PATH"
-            );
+            eprintln!("openresearch app: {shell:?} did not answer within 5s; using the inherited environment");
             return;
         }
     };
     // The markers are the success signal, not the exit status — an interactive
     // rc file routinely ends on a failing command.
-    match crate::local::search_path::extract_path(&String::from_utf8_lossy(&out.stdout), &marker) {
-        Some(path) => {
-            eprintln!("openresearch app: adopted the shell PATH: {path}");
-            crate::local::search_path::set(path.into());
+    match crate::local::shell_env::parse_probe(&String::from_utf8_lossy(&out.stdout), &marker) {
+        Some(vars) => {
+            eprintln!("openresearch app: adopted the shell environment: {vars:?}");
+            crate::local::shell_env::set(vars);
         }
         None => eprintln!(
-            "openresearch app: PATH probe returned nothing usable; using the inherited PATH. \
-             shell stderr: {}",
+            "openresearch app: the environment probe returned nothing usable; using the inherited \
+             environment. shell stderr: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ),
     }
