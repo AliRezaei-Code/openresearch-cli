@@ -41,7 +41,7 @@ import { ArtifactsTab } from "./components/ArtifactsTab";
 import { SkillsTab } from "./components/SkillsTab";
 import { ClosableTab } from "./components/ClosableTab";
 import { DetailDrawer, type ExperimentView } from "./components/DetailDrawer";
-import { FileViewer } from "./components/FileViewer";
+import { FileViewer, type FileScrollPosition } from "./components/FileViewer";
 import { RailHeader } from "./components/Header";
 import { Onboarding } from "./components/Onboarding";
 import { NewProjectDialog, ProjectsHome } from "./components/ProjectsHome";
@@ -95,6 +95,8 @@ interface FileViewDef {
    * evidence chip). Not part of tab identity — reopening at a new line updates
    * the same tab. */
   line?: number;
+  /** One-shot generation for explicit line navigation; omitted on stored tabs. */
+  lineScrollRequest?: number;
 }
 
 const sameFileTab = (a: FileViewDef, b: FileViewDef) =>
@@ -105,6 +107,20 @@ const sameFileTab = (a: FileViewDef, b: FileViewDef) =>
 
 const fileTabKey = (t: FileViewDef) =>
   `${t.source ?? "repo"}:${t.sessionId ?? ""}:${t.ref ?? ""}:${t.path}`;
+
+const fileScrollKey = (projectId: string, ownerSessionId: string | null, tab: FileViewDef) =>
+  `${projectId}:${ownerSessionId ?? ""}:${fileTabKey(tab)}`;
+
+const persistentFileTab = (tab: FileViewDef): FileViewDef => ({
+  ...tab,
+  lineScrollRequest: undefined,
+});
+
+function persistentRightTab(tab: RightTab): RightTab {
+  return typeof tab === "object" && "path" in tab
+    ? persistentFileTab(tab)
+    : tab;
+}
 
 /** A proposed plan open as a right-panel tab (from the chat plan strip/card).
  * The markdown is already client-side (it rode the prompt part), so the tab
@@ -406,6 +422,8 @@ export default function App() {
   const [artifactsTabOpen, setArtifactsTabOpen] = useState(false);
   const [expTabs, setExpTabs] = useState<ExpViewDef[]>([]);
   const [fileTabs, setFileTabs] = useState<FileViewDef[]>([]);
+  const fileScrollPositionsRef = useRef(new Map<string, FileScrollPosition>());
+  const fileLineScrollRequestRef = useRef(0);
   const [planTabs, setPlanTabs] = useState<PlanViewDef[]>([]);
   const [subagentTabs, setSubagentTabs] = useState<SubagentViewDef[]>([]);
   const [codeTabs, setCodeTabs] = useState<CodeTabDef[]>([]);
@@ -433,7 +451,10 @@ export default function App() {
 
   const selectRightTab = useCallback((tab: RightTab) => {
     const key = rightTabKey(tab);
-    const next = [...tabHistoryRef.current.filter((item) => rightTabKey(item) !== key), tab];
+    const next = [
+      ...tabHistoryRef.current.filter((item) => rightTabKey(item) !== key),
+      persistentRightTab(tab),
+    ];
     tabHistoryRef.current = next;
     setTabHistory(next);
     setRightTab(tab);
@@ -454,7 +475,7 @@ export default function App() {
   }, []);
 
   currentRightPaneStateRef.current = {
-    rightTab,
+    rightTab: persistentRightTab(rightTab),
     tabHistory,
     experimentsTabOpen,
     filesTabOpen,
@@ -779,11 +800,21 @@ export default function App() {
       // Label an editable (ref-less) checkout with its branch, so a worktree on
       // a non-baseline branch still names it in the header.
       if (displayBranch && !tab.ref && tab.source !== "artifacts") tab.branchLabel = displayBranch;
-      if (line != null) tab.line = line;
+      if (line != null) {
+        tab.line = line;
+        tab.lineScrollRequest = ++fileLineScrollRequestRef.current;
+      }
       // Line is not part of tab identity: reopening a file at a new line reuses
       // the tab but makes the new (line-carrying) def the active one so the
       // viewer re-scrolls.
-      setFileTabs((prev) => (prev.some((t) => sameFileTab(t, tab)) ? prev : [...prev, tab]));
+      const persistentTab = persistentFileTab(tab);
+      setFileTabs((prev) => {
+        const idx = prev.findIndex((item) => sameFileTab(item, tab));
+        if (idx === -1) return [...prev, persistentTab];
+        const next = prev.slice();
+        next[idx] = persistentTab;
+        return next;
+      });
       selectRightTab(tab);
       setPanelOpen(true);
     },
@@ -803,10 +834,26 @@ export default function App() {
       const idx = fileTabs.findIndex((t) => sameFileTab(t, tab));
       if (idx === -1) return;
       setFileTabs((prev) => prev.filter((_, i) => i !== idx));
+      if (projectId) {
+        fileScrollPositionsRef.current.delete(fileScrollKey(projectId, activeSessionId, tab));
+      }
       forgetRightTab(tab, rightTabKey(rightTab) === rightTabKey(tab));
     },
-    [fileTabs, forgetRightTab, rightTab],
+    [activeSessionId, fileTabs, forgetRightTab, projectId, rightTab],
   );
+
+  const consumeFileLineScrollRequest = useCallback((tab: FileViewDef) => {
+    if (tab.lineScrollRequest === undefined) return;
+    setRightTab((current) => {
+      if (
+        typeof current !== "object" ||
+        !("path" in current) ||
+        !sameFileTab(current, tab) ||
+        current.lineScrollRequest !== tab.lineScrollRequest
+      ) return current;
+      return persistentRightTab(current);
+    });
+  }, []);
 
   // Open a proposed plan as a right-panel tab (the chat plan strip's "View
   // plan"). One tab per plan card; re-opening the same card refreshes its
@@ -1252,7 +1299,7 @@ export default function App() {
             </div>
           ) : rightTab === "experiments" ? (
             <div className={TAB_BODY_CLASS_NAME}>
-              <div className={`pane-toolbar flex items-center gap-2 flex-wrap pt-2.5 px-3 pb-0 shrink-0 bg-background [&.table-view]:pb-3${view === "table" ? " table-view" : ""}`}>
+              <div className="pane-toolbar flex shrink-0 flex-wrap items-center gap-2 bg-background px-3 pt-2.5 pb-2">
                 <span style={{ flex: 1 }} />
                 <div className="experiments-toolbar-controls inline-flex items-center gap-[5px]">
                   <div className="option-picker relative inline-flex" ref={scopeMenuRef}>
@@ -1390,7 +1437,7 @@ export default function App() {
             <div className={TAB_BODY_CLASS_NAME}>
               {projectId && (
                 <FileViewer
-                  key={fileTabKey(fileTab)}
+                  key={fileScrollKey(projectId, activeSessionId, fileTab)}
                   projectId={projectId}
                   path={fileTab.path}
                   source={fileTab.source}
@@ -1399,6 +1446,17 @@ export default function App() {
                   line={fileTab.line}
                   branchLabel={fileBranchLabel(fileTab, activeProject?.baselineBranch)}
                   onOpenFile={openFileTab}
+                  scrollPosition={fileScrollPositionsRef.current.get(
+                    fileScrollKey(projectId, activeSessionId, fileTab),
+                  )}
+                  onScrollPositionChange={(position) => {
+                    fileScrollPositionsRef.current.set(
+                      fileScrollKey(projectId, activeSessionId, fileTab),
+                      position,
+                    );
+                  }}
+                  lineScrollRequest={fileTab.lineScrollRequest}
+                  onLineScrollRequestHandled={() => consumeFileLineScrollRequest(fileTab)}
                 />
               )}
             </div>

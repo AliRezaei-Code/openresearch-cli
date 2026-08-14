@@ -30,6 +30,7 @@ use crate::local::harness::codex::{ensure_orx_data_dir, find_codex_required};
 /// Ceiling on a request's response wait — generous because `thread/start`
 /// blocks on the user's own MCP servers coming up.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(150);
+const HISTORY_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// Interrupts are best-effort and sit on the user-facing interrupt/delete
 /// paths — never let a wedged child hold those hostage.
 const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -187,6 +188,16 @@ impl CodexClient {
     /// (e.g. the thread/resume fallback) use this; everyone else wants
     /// [`Self::request`].
     pub async fn try_request(&self, method: &str, params: Value) -> Result<Result<Value, String>> {
+        self.try_request_with_timeout(method, params, REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn try_request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Result<Value, String>> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
@@ -197,14 +208,14 @@ impl CodexClient {
             self.pending.lock().unwrap().remove(&id);
             return Err(e);
         }
-        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(_)) => Err(anyhow!("codex app-server closed during {method}")),
             Err(_) => {
                 self.pending.lock().unwrap().remove(&id);
                 Err(anyhow!(
                     "codex app-server did not answer {method} within {}s",
-                    REQUEST_TIMEOUT.as_secs()
+                    timeout.as_secs()
                 ))
             }
         }
@@ -343,6 +354,27 @@ impl CodexClient {
 
     pub fn set_active_turn(&self, turn_id: &str) {
         *self.active_turn.lock().unwrap() = Some(turn_id.to_string());
+    }
+
+    pub async fn read_turn_items(&self, thread_id: &str, turn_id: &str) -> Option<Vec<Value>> {
+        let result = self
+            .try_request_with_timeout(
+                "thread/read",
+                json!({ "threadId": thread_id, "includeTurns": true }),
+                HISTORY_READ_TIMEOUT,
+            )
+            .await
+            .ok()?
+            .ok()?;
+        result
+            .get("thread")?
+            .get("turns")?
+            .as_array()?
+            .iter()
+            .find(|turn| turn.get("id").and_then(Value::as_str) == Some(turn_id))?
+            .get("items")?
+            .as_array()
+            .cloned()
     }
 
     /// Best-effort native interrupt of the in-flight turn. Bounded: this sits
@@ -484,8 +516,8 @@ async fn spawn_client(session_id: &str) -> Result<Arc<CodexClient>> {
         .kill_on_drop(true);
     crate::local::chat::prepare_env(&mut cmd);
     // Stamp the launching session (one app-server child per orx session) so a
-    // run the agent starts via `orx exp run` is tagged with it and the run
-    // watcher notifies this chat. After prepare_env so it isn't shadowed.
+    // run the agent starts via `orx exp run` is tagged with it and can be
+    // explicitly subscribed to. After prepare_env so it isn't shadowed.
     crate::local::chat::set_chat_session_env(&mut cmd, session_id);
     // Pin the child's store to the same canonicalized dir the sandbox policy
     // grants (see harness/codex.rs `ensure_orx_data_dir`) — after prepare_env
@@ -656,10 +688,16 @@ impl CodexHost {
     }
 
     /// Natively interrupt the session's in-flight turn (best-effort, bounded).
-    pub async fn interrupt_session(&self, session_id: &str) {
+    pub async fn interrupt_session(&self, session_id: &str) -> Option<Vec<Value>> {
         if let Some(client) = self.client_for(session_id).await {
+            let thread_id = client.resumed_thread();
+            let turn_id = client.active_turn.lock().unwrap().clone();
             client.interrupt_active_turn().await;
+            if let (Some(thread_id), Some(turn_id)) = (thread_id, turn_id) {
+                return client.read_turn_items(&thread_id, &turn_id).await;
+            }
         }
+        None
     }
 
     /// Kill and reap one session's child (on session delete).

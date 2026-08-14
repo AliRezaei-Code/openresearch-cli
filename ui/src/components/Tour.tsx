@@ -39,7 +39,7 @@ const STEPS: TourStep[] = [
     title: "Talk to your research agent",
     description:
       "Prompt your research agents to replicate a paper, create a baseline experiment, " +
-      "run an eval, or investigate any research question. Type / for skills like " +
+      "run an eval, or investigate any research question. Type / for commands like " +
       "/reproduce-paper.",
   },
   {

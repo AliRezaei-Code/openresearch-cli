@@ -8,6 +8,7 @@ import {
   harnessModelLabel,
   completeOnboarding,
   reasoningFor,
+  resolvePaper,
   searchPapers,
   type AgentSelection,
   type Harness,
@@ -173,6 +174,7 @@ export function Onboarding({
   }, [paperQuery]);
 
   const addPaper = (h: PaperHit) => {
+    const duplicate = papers.some((p) => p.paperId === h.paperId);
     setPapers((cur) =>
       cur.some((p) => p.paperId === h.paperId)
         ? cur
@@ -180,6 +182,17 @@ export function Onboarding({
     );
     setPaperQuery("");
     setPaperHits([]);
+    // The search hit's title is a Google-scraped string — truncated, id-prefixed,
+    // sometimes reworded. Resolve the canonical title and correct it in place.
+    if (!duplicate) {
+      void resolvePaper(h.paperId)
+        .then((r) => {
+          const title = r.title?.trim();
+          if (!title) return;
+          setPapers((cur) => cur.map((p) => (p.paperId === h.paperId ? { ...p, title } : p)));
+        })
+        .catch(() => {});
+    }
   };
   const removePaper = (id: string) => setPapers((cur) => cur.filter((p) => p.paperId !== id));
   const toggleResearchArea = (area: string) => {

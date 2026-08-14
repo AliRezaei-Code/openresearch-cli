@@ -39,7 +39,11 @@ pub fn data_dir() -> PathBuf {
 
 pub(crate) fn open_lifecycle_lock() -> Result<fd_lock::RwLock<std::fs::File>> {
     // The config dir stays put while the user can move the live data directory.
-    open_lifecycle_lock_at(&crate::config::config_dir().join("orx.lifecycle.lock"))
+    open_lifecycle_lock_at(&lifecycle_lock_path())
+}
+
+pub(crate) fn lifecycle_lock_path() -> PathBuf {
+    crate::config::config_dir().join("orx.lifecycle.lock")
 }
 
 pub(crate) fn open_lifecycle_lock_at(
@@ -54,6 +58,57 @@ pub(crate) fn open_lifecycle_lock_at(
         .write(true)
         .open(path)?;
     Ok(fd_lock::RwLock::new(file))
+}
+
+fn data_dir_move_lock_path() -> PathBuf {
+    crate::config::config_dir().join("orx.data-dir-move.lock")
+}
+
+pub(crate) struct DataDirMoveLock {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for DataDirMoveLock {
+    fn drop(&mut self) {
+        self.release.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn acquire_data_dir_move_lock(path: PathBuf) -> Result<DataDirMoveLock> {
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let result = (|| -> Result<()> {
+            let mut lock = open_lifecycle_lock_at(&path)?;
+            let _guard = lock.try_write()?;
+            ready_tx
+                .send(Ok(()))
+                .map_err(|_| anyhow!("data-directory move lock receiver closed"))?;
+            let _ = release_rx.recv();
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = ready_tx.send(Err(error.to_string()));
+        }
+    });
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok(DataDirMoveLock {
+            release: Some(release_tx),
+            thread: Some(thread),
+        }),
+        Ok(Err(error)) => {
+            let _ = thread.join();
+            Err(anyhow!(error))
+        }
+        Err(_) => {
+            let _ = thread.join();
+            Err(anyhow!("data-directory move lock thread exited"))
+        }
+    }
 }
 
 /// Read an env var as a path, treating unset **and empty** the same (an empty
@@ -165,20 +220,38 @@ pub struct StoredRun {
     pub cancel_requested: bool,
     /// The `orx up` chat session that launched this run, when it was started by
     /// an agent harness child (which exports `ORX_CHAT_SESSION_ID`). `None` for
-    /// CLI-launched or server runs. The run watcher routes the completion
-    /// notification to exactly this session — never a project-wide guess.
+    /// CLI-launched or server runs. This records attribution; wake-ups are
+    /// separately and explicitly registered in `chat_run_wakeups`.
     pub chat_session_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RunWakeup {
+    pub run: StoredRun,
+    pub chat_session_id: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunWakeupRegistration {
+    Scheduled,
+    AlreadyPending,
+    AlreadyDelivered,
+}
+
+const RUN_WAKEUP_CLAIM_TTL_MS: i64 = 60 * 1000;
+const CHAT_TURN_LEASE_TTL_MS: i64 = 60 * 1000;
+
 pub struct Store {
     conn: Connection,
+    data_dir_move_lock_path: PathBuf,
 }
 
 impl Store {
     /// Open (creating dirs/schema as needed). WAL so the supervise writers and
     /// the serve readers never block each other.
     pub fn open() -> Result<Self> {
-        Self::open_at(data_dir())
+        Self::open_at_with_move_lock(data_dir(), data_dir_move_lock_path())
     }
 
     /// Open a store rooted at an explicit directory, bypassing `data_dir()`
@@ -186,6 +259,11 @@ impl Store {
     /// process-global `$ORX_DATA_DIR`, which the localbox lifecycle test owns
     /// (tests in different modules share env under the parallel runner).
     pub fn open_at(dir: PathBuf) -> Result<Self> {
+        let move_lock_path = dir.join(".orx-data-dir-move.lock");
+        Self::open_at_with_move_lock(dir, move_lock_path)
+    }
+
+    fn open_at_with_move_lock(dir: PathBuf, data_dir_move_lock_path: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(dir.join("run-logs"))
             .map_err(|e| anyhow!("Could not create {}: {}", dir.display(), e))?;
         let conn = Connection::open(dir.join("orx.db"))?;
@@ -243,6 +321,8 @@ impl Store {
                 title_source      TEXT,
                 model             TEXT,
                 permission_mode   TEXT,
+                plan_mode         INTEGER NOT NULL DEFAULT 0,
+                plan_reset_pending INTEGER NOT NULL DEFAULT 0,
                 reasoning_level   TEXT,
                 archived          INTEGER NOT NULL DEFAULT 0,
                 context_usage_json TEXT,
@@ -259,6 +339,28 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_chat_messages_session
                 ON chat_messages(session_id, created_at);
+            CREATE TABLE IF NOT EXISTS chat_run_wakeups (
+                run_id          TEXT NOT NULL,
+                chat_session_id TEXT NOT NULL,
+                requested_at    INTEGER NOT NULL,
+                state           TEXT NOT NULL DEFAULT 'pending',
+                claim_token     TEXT,
+                claimed_at      INTEGER,
+                delivered_at    INTEGER,
+                PRIMARY KEY(run_id, chat_session_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_run_wakeups_requested
+                ON chat_run_wakeups(requested_at);
+            CREATE TABLE IF NOT EXISTS chat_turn_leases (
+                chat_session_id TEXT PRIMARY KEY,
+                claim_token     TEXT NOT NULL,
+                heartbeat_at    INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS data_dir_move_lease (
+                id           INTEGER PRIMARY KEY CHECK (id = 1),
+                claim_token  TEXT NOT NULL,
+                heartbeat_at INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS ssh_host_tests (
                 host      TEXT PRIMARY KEY,
                 reachable INTEGER NOT NULL,
@@ -285,6 +387,8 @@ impl Store {
             "ALTER TABLE runs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE runs ADD COLUMN chat_session_id TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN permission_mode TEXT",
+            "ALTER TABLE chat_sessions ADD COLUMN plan_mode INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE chat_sessions ADD COLUMN plan_reset_pending INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE chat_sessions ADD COLUMN reasoning_level TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE chat_sessions ADD COLUMN context_usage_json TEXT",
@@ -294,6 +398,10 @@ impl Store {
             "ALTER TABLE local_projects ADD COLUMN github_sync_enabled INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE local_experiments ADD COLUMN chat_session_id TEXT",
             "ALTER TABLE ssh_host_tests ADD COLUMN tools_found INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE chat_run_wakeups ADD COLUMN state TEXT NOT NULL DEFAULT 'pending'",
+            "ALTER TABLE chat_run_wakeups ADD COLUMN claim_token TEXT",
+            "ALTER TABLE chat_run_wakeups ADD COLUMN claimed_at INTEGER",
+            "ALTER TABLE chat_run_wakeups ADD COLUMN delivered_at INTEGER",
         ] {
             let _ = conn.execute(ddl, []);
         }
@@ -303,58 +411,65 @@ impl Store {
             "DROP INDEX IF EXISTS uidx_local_experiments_project_baseline",
             [],
         );
-        // Data migration: the chat_sessions.permission_mode wire ids were
-        // neutralized off Claude Code's `--permission-mode` spelling (`default`,
-        // `acceptEdits`, `bypassPermissions`) onto harness-agnostic ids (`ask`,
-        // `accept-edits`, `bypass`) once Codex's sandbox policies stopped mapping
-        // onto Claude's strings. Rewrite any rows written under the old scheme.
-        // `plan`/`auto` were already harness-agnostic and need no rewrite.
-        // Idempotent: after the first pass no old spellings remain to match.
-        for (old, new) in [
-            ("default", "ask"),
-            ("acceptEdits", "accept-edits"),
-            ("bypassPermissions", "bypass"),
-        ] {
-            let _ = conn.execute(
-                "UPDATE chat_sessions SET permission_mode = ?2 WHERE permission_mode = ?1",
-                params![old, new],
-            );
-        }
-        // Retired permission modes → `auto`, per harness:
-        //  * Claude Code KEEPS `plan` — it's a real mode again (the plan-gate
-        //    hook + mcp-gate permission bridge make read-only planning and
-        //    plan approval work headless). `ask`/`accept-edits` stay retired
-        //    from the *picker* (never grantable headless mid-turn), and a
-        //    session parked on them by an old build normalizes to `auto`.
-        //    NOTE: this list runs on every open — a mode offered by
-        //    `options()` must never appear in it, or picking that mode
-        //    silently degrades to `auto` on the next request (exactly what
-        //    happened to `plan` between #75 and this fix).
-        //  * Codex KEEPS `plan` — it's a real mode now too (native
-        //    collaboration mode over the app-server: the plan.md template,
-        //    `request_user_input` question cards, and the streamed plan item
-        //    make read-mostly planning and plan approval work). Only
-        //    `ask`/`accept-edits` stay retired (never grantable). Same rule as
-        //    Claude's `plan` above: a mode offered by `options()` must NEVER
-        //    appear in this list, or picking it silently degrades to `auto` on
-        //    the next request.
-        //  * OpenCode dropped its hollow `ask` (its default is permissive, so a
-        //    dedicated ask mode almost never fired) — but KEEPS `plan` (its real
-        //    plan agent), so that one is left untouched.
+        // Provider-owned permission ids + the independent Codex/OpenCode Plan
+        // axis. These updates are idempotent and intentionally do not touch
+        // Claude's native `plan`, Manual, or Accept edits modes.
         let _ = conn.execute(
-            "UPDATE chat_sessions SET permission_mode = 'auto'
-             WHERE (harness = 'claude-code'
-                    AND permission_mode IN ('ask', 'accept-edits'))
-                OR (harness = 'codex'
-                    AND permission_mode IN ('ask', 'accept-edits'))
-                OR (harness = 'opencode'
-                    AND permission_mode IN ('ask', 'accept-edits'))",
+            "UPDATE chat_sessions
+             SET plan_mode = 1, permission_mode = 'ask'
+             WHERE harness = 'codex' AND permission_mode = 'plan'",
             [],
         );
-
-        // Seed the singleton for existing databases without replaying first-run
-        // UI. The newest chat session is the best durable approximation of the
-        // browser-only agent preference older builds used.
+        let _ = conn.execute(
+            "UPDATE chat_sessions
+             SET plan_mode = 1, permission_mode = 'default'
+             WHERE harness = 'opencode' AND permission_mode = 'plan'",
+            [],
+        );
+        for (harness, old, new) in [
+            ("claude-code", "ask", "manual"),
+            ("claude-code", "default", "manual"),
+            ("claude-code", "accept-edits", "acceptEdits"),
+            ("claude-code", "bypass", "bypassPermissions"),
+            ("codex", "auto", "approve-for-me"),
+            ("codex", "bypass", "full-access"),
+            ("codex", "accept-edits", "ask"),
+            ("codex", "acceptEdits", "ask"),
+            ("opencode", "auto", "default"),
+            ("opencode", "bypass", "auto-approve"),
+            ("opencode", "ask", "default"),
+            ("opencode", "accept-edits", "default"),
+            ("opencode", "acceptEdits", "default"),
+        ] {
+            let _ = conn.execute(
+                "UPDATE chat_sessions SET permission_mode = ?3
+                 WHERE harness = ?1 AND permission_mode = ?2",
+                params![harness, old, new],
+            );
+        }
+        let _ = conn.execute(
+            "UPDATE chat_sessions SET permission_mode = 'auto'
+             WHERE harness = 'claude-code'
+               AND (permission_mode IS NULL OR permission_mode NOT IN
+                    ('manual', 'acceptEdits', 'plan', 'auto', 'bypassPermissions'))",
+            [],
+        );
+        let _ = conn.execute(
+            "UPDATE chat_sessions SET permission_mode = 'approve-for-me'
+             WHERE harness = 'codex'
+               AND (permission_mode IS NULL OR permission_mode NOT IN
+                    ('ask', 'approve-for-me', 'full-access'))",
+            [],
+        );
+        let _ = conn.execute(
+            "UPDATE chat_sessions SET permission_mode = 'default'
+             WHERE harness = 'opencode'
+               AND (permission_mode IS NULL OR permission_mode NOT IN
+                    ('default', 'auto-approve'))",
+            [],
+        );
+        // Seed before normalizing preferences: on the first open of an older
+        // database the latest session may itself carry a retired mode or Plan.
         conn.execute(
             "INSERT OR IGNORE INTO ui_state (
                  id, onboarding_completed, tour_completed,
@@ -371,7 +486,58 @@ impl Store {
              )",
             [],
         )?;
-
+        // Preferred-agent state never carries Plan for command-activated
+        // harnesses: new sessions start in Build/Default until `/plan` is used.
+        let _ = conn.execute(
+            "UPDATE ui_state SET preferred_permission_mode = 'ask'
+             WHERE preferred_harness = 'codex' AND preferred_permission_mode = 'plan'",
+            [],
+        );
+        let _ = conn.execute(
+            "UPDATE ui_state SET preferred_permission_mode = 'default'
+             WHERE preferred_harness = 'opencode' AND preferred_permission_mode = 'plan'",
+            [],
+        );
+        let _ = conn.execute(
+            "UPDATE ui_state SET preferred_permission_mode = 'auto'
+             WHERE preferred_harness = 'claude-code' AND preferred_permission_mode = 'plan'",
+            [],
+        );
+        for (harness, old, new) in [
+            ("claude-code", "ask", "manual"),
+            ("claude-code", "default", "manual"),
+            ("claude-code", "accept-edits", "acceptEdits"),
+            ("claude-code", "bypass", "bypassPermissions"),
+            ("codex", "auto", "approve-for-me"),
+            ("codex", "bypass", "full-access"),
+            ("opencode", "auto", "default"),
+            ("opencode", "bypass", "auto-approve"),
+        ] {
+            let _ = conn.execute(
+                "UPDATE ui_state SET preferred_permission_mode = ?3
+                 WHERE preferred_harness = ?1 AND preferred_permission_mode = ?2",
+                params![harness, old, new],
+            );
+        }
+        let _ = conn.execute(
+            "UPDATE ui_state SET preferred_permission_mode = 'auto'
+             WHERE preferred_harness = 'claude-code'
+               AND preferred_permission_mode NOT IN
+                   ('manual', 'acceptEdits', 'plan', 'auto', 'bypassPermissions')",
+            [],
+        );
+        let _ = conn.execute(
+            "UPDATE ui_state SET preferred_permission_mode = 'approve-for-me'
+             WHERE preferred_harness = 'codex'
+               AND preferred_permission_mode NOT IN ('ask', 'approve-for-me', 'full-access')",
+            [],
+        );
+        let _ = conn.execute(
+            "UPDATE ui_state SET preferred_permission_mode = 'default'
+             WHERE preferred_harness = 'opencode'
+               AND preferred_permission_mode NOT IN ('default', 'auto-approve')",
+            [],
+        );
         // NOTE: `reasoning_level` deliberately has NO migration for issue #123,
         // unlike the permission modes above. Rows written by older builds carry
         // an implicit effort (`high`), but every value the old builds wrote is
@@ -382,7 +548,10 @@ impl Store {
         // to do it safely exists: `reconcileReasoning` in `ui/src/api.ts` drops
         // one the selected model doesn't offer, and each harness's mapper drops
         // it again before it can reach a CLI.
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            data_dir_move_lock_path,
+        })
     }
 
     /// Short write transaction over this connection; rolls back when dropped
@@ -584,6 +753,239 @@ impl Store {
         Ok(run)
     }
 
+    pub fn register_run_wakeup(
+        &self,
+        run_id: &str,
+        chat_session_id: &str,
+    ) -> Result<RunWakeupRegistration> {
+        let inserted = self.conn.execute(
+            "INSERT OR IGNORE INTO chat_run_wakeups (run_id, chat_session_id, requested_at)
+             VALUES (?1, ?2, ?3)",
+            params![run_id, chat_session_id, now_ms()],
+        )?;
+        if inserted == 1 {
+            return Ok(RunWakeupRegistration::Scheduled);
+        }
+        let state: String = self.conn.query_row(
+            "SELECT state FROM chat_run_wakeups WHERE run_id = ?1 AND chat_session_id = ?2",
+            params![run_id, chat_session_id],
+            |row| row.get(0),
+        )?;
+        Ok(if state == "delivered" {
+            RunWakeupRegistration::AlreadyDelivered
+        } else {
+            RunWakeupRegistration::AlreadyPending
+        })
+    }
+
+    pub fn remove_run_wakeup(&self, run_id: &str, chat_session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM chat_run_wakeups WHERE run_id = ?1 AND chat_session_id = ?2",
+            params![run_id, chat_session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn prune_run_wakeups(&self) -> Result<()> {
+        self.clear_stale_data_dir_move_lease()?;
+        self.conn.execute(
+            "UPDATE chat_run_wakeups
+             SET state = 'pending', claim_token = NULL, claimed_at = NULL
+             WHERE state = 'claimed' AND claimed_at < ?1
+               AND NOT EXISTS (SELECT 1 FROM data_dir_move_lease WHERE id = 1)",
+            params![now_ms() - RUN_WAKEUP_CLAIM_TTL_MS],
+        )?;
+        self.conn.execute(
+            "DELETE FROM chat_run_wakeups
+             WHERE NOT EXISTS (SELECT 1 FROM data_dir_move_lease WHERE id = 1)
+               AND (
+                 NOT EXISTS (SELECT 1 FROM runs WHERE runs.id = chat_run_wakeups.run_id)
+                OR NOT EXISTS (
+                    SELECT 1 FROM chat_sessions
+                    WHERE chat_sessions.id = chat_run_wakeups.chat_session_id
+                )
+                OR EXISTS (
+                    SELECT 1 FROM runs
+                    WHERE runs.id = chat_run_wakeups.run_id
+                      AND runs.status = 'cancelled'
+                )
+               )",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_ready_run_wakeups(&self) -> Result<Vec<RunWakeup>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.experiment_id, r.project_id, r.status, r.backend_json, r.command,
+                    r.created_at, r.updated_at, r.ended_at, r.exit_code,
+                    r.commit_sha, r.result_markdown, r.cancel_requested, r.chat_session_id,
+                    w.chat_session_id, w.state
+             FROM chat_run_wakeups w
+             JOIN runs r ON r.id = w.run_id
+             WHERE w.state IN ('pending', 'claimed') AND r.status IN ('done', 'failed')
+             ORDER BY COALESCE(r.ended_at, r.updated_at), w.requested_at, r.id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RunWakeup {
+                run: row_to_run(row)?,
+                chat_session_id: row.get(14)?,
+                state: row.get(15)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn claim_run_wakeup(&self, run_id: &str, chat_session_id: &str) -> Result<Option<String>> {
+        let token = uuid::Uuid::new_v4().to_string();
+        let claimed = self.conn.execute(
+            "UPDATE chat_run_wakeups
+             SET state = 'claimed', claim_token = ?3, claimed_at = ?4
+             WHERE run_id = ?1 AND chat_session_id = ?2 AND state = 'pending'",
+            params![run_id, chat_session_id, token, now_ms()],
+        )?;
+        Ok((claimed == 1).then_some(token))
+    }
+
+    pub fn renew_run_wakeup_claim(
+        &self,
+        run_id: &str,
+        chat_session_id: &str,
+        token: &str,
+    ) -> Result<bool> {
+        let renewed = self.conn.execute(
+            "UPDATE chat_run_wakeups SET claimed_at = ?4
+             WHERE run_id = ?1 AND chat_session_id = ?2
+               AND state = 'claimed' AND claim_token = ?3",
+            params![run_id, chat_session_id, token, now_ms()],
+        )?;
+        Ok(renewed == 1)
+    }
+
+    pub fn release_run_wakeup(
+        &self,
+        run_id: &str,
+        chat_session_id: &str,
+        token: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chat_run_wakeups
+             SET state = 'pending', claim_token = NULL, claimed_at = NULL
+             WHERE run_id = ?1 AND chat_session_id = ?2
+               AND state = 'claimed' AND claim_token = ?3",
+            params![run_id, chat_session_id, token],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_run_wakeup_delivered(
+        &self,
+        run_id: &str,
+        chat_session_id: &str,
+        token: &str,
+    ) -> Result<bool> {
+        let delivered = self.conn.execute(
+            "UPDATE chat_run_wakeups
+             SET state = 'delivered', claim_token = NULL, claimed_at = NULL, delivered_at = ?4
+             WHERE run_id = ?1 AND chat_session_id = ?2
+               AND state = 'claimed' AND claim_token = ?3",
+            params![run_id, chat_session_id, token, now_ms()],
+        )?;
+        Ok(delivered == 1)
+    }
+
+    pub fn claim_chat_turn(&self, chat_session_id: &str, token: &str) -> Result<bool> {
+        self.clear_stale_data_dir_move_lease()?;
+        self.conn.execute(
+            "DELETE FROM chat_turn_leases
+             WHERE heartbeat_at < ?1
+                OR NOT EXISTS (
+                    SELECT 1 FROM chat_sessions
+                    WHERE chat_sessions.id = chat_turn_leases.chat_session_id
+                )",
+            params![now_ms() - CHAT_TURN_LEASE_TTL_MS],
+        )?;
+        let claimed = self.conn.execute(
+            "INSERT OR IGNORE INTO chat_turn_leases
+                 (chat_session_id, claim_token, heartbeat_at)
+             SELECT ?1, ?2, ?3
+             WHERE NOT EXISTS (SELECT 1 FROM data_dir_move_lease WHERE id = 1)",
+            params![chat_session_id, token, now_ms()],
+        )?;
+        Ok(claimed == 1)
+    }
+
+    pub fn renew_chat_turn(&self, chat_session_id: &str, token: &str) -> Result<bool> {
+        let renewed = self.conn.execute(
+            "UPDATE chat_turn_leases SET heartbeat_at = ?3
+             WHERE chat_session_id = ?1 AND claim_token = ?2",
+            params![chat_session_id, token, now_ms()],
+        )?;
+        Ok(renewed == 1)
+    }
+
+    pub fn release_chat_turn(&self, chat_session_id: &str, token: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM chat_turn_leases
+             WHERE chat_session_id = ?1 AND claim_token = ?2",
+            params![chat_session_id, token],
+        )?;
+        Ok(())
+    }
+
+    pub fn claim_data_dir_move(&self, token: &str) -> Result<bool> {
+        self.conn.execute(
+            "DELETE FROM chat_turn_leases WHERE heartbeat_at < ?1",
+            params![now_ms() - CHAT_TURN_LEASE_TTL_MS],
+        )?;
+        self.clear_stale_data_dir_move_lease()?;
+        let claimed = self.conn.execute(
+            "INSERT OR IGNORE INTO data_dir_move_lease (id, claim_token, heartbeat_at)
+             SELECT 1, ?1, ?2
+             WHERE NOT EXISTS (SELECT 1 FROM chat_turn_leases)",
+            params![token, now_ms()],
+        )?;
+        Ok(claimed == 1)
+    }
+
+    pub(crate) fn acquire_data_dir_move_lock(&self) -> Result<DataDirMoveLock> {
+        acquire_data_dir_move_lock(self.data_dir_move_lock_path.clone())
+    }
+
+    fn clear_stale_data_dir_move_lease(&self) -> Result<()> {
+        let token = self
+            .conn
+            .query_row(
+                "SELECT claim_token FROM data_dir_move_lease WHERE id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(token) = token else {
+            return Ok(());
+        };
+        let mut lock = open_lifecycle_lock_at(&self.data_dir_move_lock_path)?;
+        match lock.try_write() {
+            Ok(_guard) => {
+                self.conn.execute(
+                    "DELETE FROM data_dir_move_lease WHERE id = 1 AND claim_token = ?1",
+                    params![token],
+                )?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    pub fn release_data_dir_move(&self, token: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM data_dir_move_lease WHERE id = 1 AND claim_token = ?1",
+            params![token],
+        )?;
+        Ok(())
+    }
+
     pub fn set_cancel_requested(&self, run_id: &str, requested: bool) -> Result<()> {
         self.conn.execute(
             "UPDATE runs SET cancel_requested = ?2, updated_at = ?3 WHERE id = ?1",
@@ -687,10 +1089,11 @@ impl Store {
         for session in sessions {
             tx.execute(
                 "INSERT INTO chat_sessions (id, project_id, harness, native_session_id, title,
-                                            title_source, model, permission_mode, reasoning_level,
+                                            title_source, model, permission_mode, plan_mode,
+                                            plan_reset_pending, reasoning_level,
                                             archived, context_usage_json, bootstrap_context,
                                             created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     session.id,
                     session.project_id,
@@ -700,6 +1103,8 @@ impl Store {
                     session.title_source,
                     session.model,
                     session.permission_mode,
+                    session.plan_mode,
+                    session.plan_reset_pending,
                     session.reasoning_level,
                     session.archived,
                     session.context_usage_json,
@@ -886,9 +1291,9 @@ impl Store {
     pub fn create_chat_session(&self, s: &StoredChatSession) -> Result<()> {
         self.conn.execute(
             "INSERT INTO chat_sessions (id, project_id, harness, native_session_id, title, title_source, model,
-                                        permission_mode, reasoning_level, archived, bootstrap_context,
+                                        permission_mode, plan_mode, plan_reset_pending, reasoning_level, archived, bootstrap_context,
                                         created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 s.id,
                 s.project_id,
@@ -898,6 +1303,8 @@ impl Store {
                 s.title_source,
                 s.model,
                 s.permission_mode,
+                s.plan_mode,
+                s.plan_reset_pending,
                 s.reasoning_level,
                 s.archived,
                 s.bootstrap_context,
@@ -970,6 +1377,29 @@ impl Store {
         self.conn.execute(
             "UPDATE chat_sessions SET permission_mode = ?2, updated_at = ?3 WHERE id = ?1",
             params![id, mode, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_chat_session_plan_state(
+        &self,
+        id: &str,
+        plan_mode: bool,
+        reset_pending: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chat_sessions
+             SET plan_mode = ?2, plan_reset_pending = ?3, updated_at = ?4
+             WHERE id = ?1",
+            params![id, plan_mode, reset_pending, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_chat_session_plan_reset(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chat_sessions SET plan_reset_pending = 0 WHERE id = ?1",
+            params![id],
         )?;
         Ok(())
     }
@@ -1147,6 +1577,12 @@ pub struct StoredChatSession {
     pub model: Option<String>,
     /// Permission-mode wire id (`"auto"` / `"plan"` / …); None = harness default.
     pub permission_mode: Option<String>,
+    /// Independent Plan state for Codex/OpenCode. Claude keeps Plan in
+    /// `permission_mode`, matching its native permission-mode model.
+    pub plan_mode: bool,
+    /// Codex must send one `collaborationMode: default` after leaving Plan;
+    /// persisted so a restart cannot strand the native thread in Plan.
+    pub plan_reset_pending: bool,
     /// Reasoning-level wire id (`"low"` / `"medium"` / `"high"`); None = default.
     pub reasoning_level: Option<String>,
     /// Hidden from the default Recents list, but fully intact and resumable.
@@ -1190,8 +1626,8 @@ pub struct StoredChatMessage {
 }
 
 const CHAT_SESSION_COLS: &str = "id, project_id, harness, native_session_id, title, model, \
-     permission_mode, reasoning_level, archived, context_usage_json, created_at, updated_at, \
-     title_source, bootstrap_context";
+     permission_mode, plan_mode, plan_reset_pending, reasoning_level, archived, context_usage_json, \
+     created_at, updated_at, title_source, bootstrap_context";
 
 fn row_to_chat_session(
     row: &rusqlite::Row<'_>,
@@ -1204,13 +1640,15 @@ fn row_to_chat_session(
         title: row.get(4)?,
         model: row.get(5)?,
         permission_mode: row.get(6)?,
-        reasoning_level: row.get(7)?,
-        archived: row.get(8)?,
-        context_usage_json: row.get(9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
-        title_source: row.get(12)?,
-        bootstrap_context: row.get(13)?,
+        plan_mode: row.get(7)?,
+        plan_reset_pending: row.get(8)?,
+        reasoning_level: row.get(9)?,
+        archived: row.get(10)?,
+        context_usage_json: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+        title_source: row.get(14)?,
+        bootstrap_context: row.get(15)?,
     })
 }
 
@@ -1322,8 +1760,9 @@ mod tests {
         older.harness = "codex".into();
         store.create_chat_session(&older).unwrap();
         let mut session = chat_session_fixture("latest");
-        session.harness = "opencode".into();
+        session.harness = "claude-code".into();
         session.model = Some("model".into());
+        session.permission_mode = Some("plan".into());
         session.updated_at = 2;
         store.create_chat_session(&session).unwrap();
         store.conn.execute("DELETE FROM ui_state", []).unwrap();
@@ -1332,7 +1771,9 @@ mod tests {
         let migrated = Store::open_at(dir.clone()).unwrap().ui_state().unwrap();
         assert!(migrated.onboarding_completed);
         assert!(migrated.tour_completed);
-        assert_eq!(migrated.preferred_agent.unwrap().harness, "opencode");
+        let preferred = migrated.preferred_agent.unwrap();
+        assert_eq!(preferred.harness, "claude-code");
+        assert_eq!(preferred.permission_mode.as_deref(), Some("auto"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1363,6 +1804,78 @@ mod tests {
                 .context_usage_json
                 .as_deref(),
             Some(json)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn permission_and_plan_migration_preserves_each_harness_native_contract() {
+        let dir =
+            std::env::temp_dir().join(format!("orx-store-plan-migrate-{}", uuid::Uuid::new_v4()));
+        {
+            let store = Store::open_at(dir.clone()).unwrap();
+            for (id, harness, mode) in [
+                ("claude_manual", "claude-code", "ask"),
+                ("claude_edits", "claude-code", "accept-edits"),
+                ("claude_plan", "claude-code", "plan"),
+                ("codex_plan", "codex", "plan"),
+                ("codex_auto", "codex", "auto"),
+                ("codex_bypass", "codex", "bypass"),
+                ("codex_invalid", "codex", "retired-mode"),
+                ("open_plan", "opencode", "plan"),
+                ("open_auto", "opencode", "auto"),
+                ("open_bypass", "opencode", "bypass"),
+            ] {
+                let mut session = chat_session_fixture(id);
+                session.harness = harness.into();
+                session.permission_mode = Some(mode.into());
+                store.create_chat_session(&session).unwrap();
+            }
+        }
+        let store = Store::open_at(dir.clone()).unwrap();
+        let state = |id: &str| {
+            let session = store.get_chat_session(id).unwrap().unwrap();
+            (session.permission_mode.unwrap(), session.plan_mode)
+        };
+        assert_eq!(state("claude_manual"), ("manual".into(), false));
+        assert_eq!(state("claude_edits"), ("acceptEdits".into(), false));
+        assert_eq!(state("claude_plan"), ("plan".into(), false));
+        assert_eq!(state("codex_plan"), ("ask".into(), true));
+        assert_eq!(state("codex_auto"), ("approve-for-me".into(), false));
+        assert_eq!(state("codex_bypass"), ("full-access".into(), false));
+        assert_eq!(state("codex_invalid"), ("approve-for-me".into(), false));
+        assert_eq!(state("open_plan"), ("default".into(), true));
+        assert_eq!(state("open_auto"), ("default".into(), false));
+        assert_eq!(state("open_bypass"), ("auto-approve".into(), false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn codex_plan_reset_marker_roundtrips_and_clears() {
+        let dir =
+            std::env::temp_dir().join(format!("orx-store-plan-reset-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let mut session = chat_session_fixture("codex");
+        session.harness = "codex".into();
+        session.permission_mode = Some("approve-for-me".into());
+        store.create_chat_session(&session).unwrap();
+        store
+            .set_chat_session_plan_state("codex", false, true)
+            .unwrap();
+        assert!(
+            store
+                .get_chat_session("codex")
+                .unwrap()
+                .unwrap()
+                .plan_reset_pending
+        );
+        store.clear_chat_session_plan_reset("codex").unwrap();
+        assert!(
+            !store
+                .get_chat_session("codex")
+                .unwrap()
+                .unwrap()
+                .plan_reset_pending
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1400,6 +1913,8 @@ mod tests {
             title_source: None,
             model: None,
             permission_mode: None,
+            plan_mode: false,
+            plan_reset_pending: false,
             reasoning_level: None,
             archived: false,
             context_usage_json: None,
@@ -1578,6 +2093,204 @@ mod tests {
             None
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_wakeups_are_idempotent_ready_only_at_success_or_failure_and_pruned() {
+        let dir = std::env::temp_dir().join(format!("orx-store-wake-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store
+            .create_chat_session(&chat_session_fixture("chat_A"))
+            .unwrap();
+        for (id, status) in [
+            ("run_active", "running"),
+            ("run_done", "done"),
+            ("run_failed", "failed"),
+            ("run_cancelled", "cancelled"),
+        ] {
+            store
+                .upsert_run(&run_fixture(id, status, Some("chat_A")))
+                .unwrap();
+            assert_eq!(
+                store.register_run_wakeup(id, "chat_A").unwrap(),
+                RunWakeupRegistration::Scheduled
+            );
+            assert_eq!(
+                store.register_run_wakeup(id, "chat_A").unwrap(),
+                RunWakeupRegistration::AlreadyPending
+            );
+        }
+        store.register_run_wakeup("missing_run", "chat_A").unwrap();
+        store
+            .register_run_wakeup("run_done", "missing_chat")
+            .unwrap();
+
+        store.prune_run_wakeups().unwrap();
+        let ready = store.list_ready_run_wakeups().unwrap();
+        assert_eq!(
+            ready
+                .iter()
+                .map(|wakeup| wakeup.run.id.as_str())
+                .collect::<Vec<_>>(),
+            ["run_done", "run_failed"]
+        );
+
+        store
+            .update_status("run_active", "done", Some(2), Some(0))
+            .unwrap();
+        assert_eq!(store.list_ready_run_wakeups().unwrap().len(), 3);
+        let token = store
+            .claim_run_wakeup("run_done", "chat_A")
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .claim_run_wakeup("run_done", "chat_A")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .list_ready_run_wakeups()
+            .unwrap()
+            .iter()
+            .any(|wakeup| wakeup.run.id == "run_done" && wakeup.state == "claimed"));
+        store
+            .release_run_wakeup("run_done", "chat_A", &token)
+            .unwrap();
+        assert!(store
+            .list_ready_run_wakeups()
+            .unwrap()
+            .iter()
+            .any(|wakeup| wakeup.run.id == "run_done"));
+        let token = store
+            .claim_run_wakeup("run_done", "chat_A")
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .mark_run_wakeup_delivered("run_done", "chat_A", &token)
+            .unwrap());
+        assert_eq!(
+            store.register_run_wakeup("run_done", "chat_A").unwrap(),
+            RunWakeupRegistration::AlreadyDelivered
+        );
+        assert!(store
+            .list_ready_run_wakeups()
+            .unwrap()
+            .iter()
+            .all(|wakeup| wakeup.run.id != "run_done"));
+
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn run_wakeup_claim_is_atomic_across_store_connections_and_recoverable() {
+        let dir = std::env::temp_dir().join(format!("orx-store-claim-{}", uuid::Uuid::new_v4()));
+        let first = Store::open_at(dir.clone()).unwrap();
+        first
+            .create_chat_session(&chat_session_fixture("chat_A"))
+            .unwrap();
+        first
+            .upsert_run(&run_fixture("run_done", "done", Some("chat_A")))
+            .unwrap();
+        first.register_run_wakeup("run_done", "chat_A").unwrap();
+        let second = Store::open_at(dir.clone()).unwrap();
+
+        let stale_token = first
+            .claim_run_wakeup("run_done", "chat_A")
+            .unwrap()
+            .unwrap();
+        assert!(second
+            .claim_run_wakeup("run_done", "chat_A")
+            .unwrap()
+            .is_none());
+        first
+            .conn
+            .execute(
+                "UPDATE chat_run_wakeups SET claimed_at = 0 WHERE run_id = 'run_done'",
+                [],
+            )
+            .unwrap();
+        second.prune_run_wakeups().unwrap();
+        let current_token = second
+            .claim_run_wakeup("run_done", "chat_A")
+            .unwrap()
+            .unwrap();
+        first
+            .release_run_wakeup("run_done", "chat_A", &stale_token)
+            .unwrap();
+        assert!(!first
+            .mark_run_wakeup_delivered("run_done", "chat_A", &stale_token)
+            .unwrap());
+        assert!(second
+            .renew_run_wakeup_claim("run_done", "chat_A", &current_token)
+            .unwrap());
+        second
+            .release_run_wakeup("run_done", "chat_A", &current_token)
+            .unwrap();
+        assert!(first
+            .claim_run_wakeup("run_done", "chat_A")
+            .unwrap()
+            .is_some());
+
+        drop(second);
+        drop(first);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ready_run_wakeups_are_ordered_by_terminal_time() {
+        let dir = std::env::temp_dir().join(format!("orx-store-order-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store
+            .create_chat_session(&chat_session_fixture("chat_A"))
+            .unwrap();
+        for (id, ended_at) in [("run_late", 20), ("run_early", 10)] {
+            let mut run = run_fixture(id, "done", Some("chat_A"));
+            run.ended_at = Some(ended_at);
+            store.upsert_run(&run).unwrap();
+            store.register_run_wakeup(id, "chat_A").unwrap();
+        }
+
+        assert_eq!(
+            store
+                .list_ready_run_wakeups()
+                .unwrap()
+                .iter()
+                .map(|wakeup| wakeup.run.id.as_str())
+                .collect::<Vec<_>>(),
+            ["run_early", "run_late"]
+        );
+
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn chat_turn_lease_is_cross_process_and_token_scoped() {
+        let dir = std::env::temp_dir().join(format!("orx-store-turn-{}", uuid::Uuid::new_v4()));
+        let first = Store::open_at(dir.clone()).unwrap();
+        first
+            .create_chat_session(&chat_session_fixture("chat_A"))
+            .unwrap();
+        let second = Store::open_at(dir.clone()).unwrap();
+
+        assert!(first.claim_chat_turn("chat_A", "token_A").unwrap());
+        assert!(!second.claim_chat_turn("chat_A", "token_B").unwrap());
+        assert!(!second.renew_chat_turn("chat_A", "token_B").unwrap());
+        assert!(!second.claim_data_dir_move("move_A").unwrap());
+        second.release_chat_turn("chat_A", "token_B").unwrap();
+        assert!(!second.claim_chat_turn("chat_A", "token_B").unwrap());
+        first.release_chat_turn("chat_A", "token_A").unwrap();
+        let move_lock = first.acquire_data_dir_move_lock().unwrap();
+        assert!(first.claim_data_dir_move("move_A").unwrap());
+        assert!(!second.claim_chat_turn("chat_A", "token_B").unwrap());
+        second.release_data_dir_move("move_B").unwrap();
+        assert!(!second.claim_chat_turn("chat_A", "token_B").unwrap());
+        drop(move_lock);
+        assert!(second.claim_chat_turn("chat_A", "token_B").unwrap());
+
+        drop(second);
+        drop(first);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

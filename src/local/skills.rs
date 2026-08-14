@@ -285,14 +285,14 @@ pub const CATALOG: &[Skill] = &[
         description: "Reproduce a paper claim by claim on compute you specify",
         arg_hint: "[paper] on [compute]",
         template: REPRODUCE_PAPER_TEMPLATE,
-        no_args: "(none given — infer the paper from the current repository: read the README, docs, and code, and if the repo clearly corresponds to an identifiable paper, reproduce that one; only ask the user if no paper can be identified. For compute, use the configured default target when one is set, per the rules below; otherwise ask before launching.)",
+        no_args: "(none given — reproduce the linked paper named in your instructions (the `Paper:` line, the one this project starts from) when present; otherwise infer the paper from the current repository: read the README, docs, and code, and if the repo clearly corresponds to an identifiable paper, reproduce that one; only ask the user if no paper can be identified. For compute, use the configured default target when one is set, per the rules below; otherwise ask before launching.)",
     },
     Skill {
         name: "paper-to-marimo",
         description: "Reproduce a paper and publish an interactive molab tutorial",
         arg_hint: "[paper] on [compute]",
         template: PAPER_TO_MARIMO_TEMPLATE,
-        no_args: "(none given — infer the paper from the current repository: read the README, docs, and code, and if the repo clearly corresponds to an identifiable paper, use that one; only ask the user if no paper can be identified. For compute, use the configured default target when one is set, per the rules below; otherwise ask before launching.)",
+        no_args: "(none given — use the linked paper named in your instructions (the `Paper:` line, the one this project starts from) when present; otherwise infer the paper from the current repository: read the README, docs, and code, and if the repo clearly corresponds to an identifiable paper, use that one; only ask the user if no paper can be identified. For compute, use the configured default target when one is set, per the rules below; otherwise ask before launching.)",
     },
 ];
 

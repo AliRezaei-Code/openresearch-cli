@@ -14,6 +14,8 @@ import {
   GitBranch,
   Globe,
   HelpCircle,
+  Lightbulb,
+  MessageSquareQuote,
   MoreHorizontal,
   PanelLeft,
   Paperclip,
@@ -24,6 +26,7 @@ import {
   SlidersHorizontal,
   SquareTerminal,
   ToggleRight,
+  TriangleAlert,
   Users,
   X,
 } from "lucide-react";
@@ -31,6 +34,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useReducer,
@@ -57,11 +61,14 @@ import {
   respondChat,
   sendChatMessage,
   setChatSessionArchived,
+  setChatSessionPermissionMode,
+  setChatSessionPlanMode,
   type ChatImageAttachment,
   type ChatMessage,
   type ChatPart,
   type ChatPrompt,
   type ChatSession,
+  type ChatTextAnnotation,
   type Harness,
   type PromptAnswer,
   type QueuedMessage,
@@ -78,14 +85,33 @@ import {
   defaultSelection,
   HARNESS_LABELS,
   ModelPicker,
-  OptionPicker,
   usePopover,
   type ModelSelection,
 } from "./ModelPicker";
 import { ContextMeter } from "./ContextMeter";
 import { renderNote } from "./agentNote";
+import {
+  commandsForSlashContext,
+  commandsForHarness,
+  effectiveCommandPlanMode,
+  parsePlanCommand,
+  removeSlashCommand,
+  slashCommandContext,
+  type SlashCommandContext,
+} from "../planCommand";
 import { loadReadDemoSessions, markDemoSessionRead } from "../demoSessionState";
 import { ICON_BUTTON_BASE_CLASS_NAME, ICON_BUTTON_CLASS_NAME, MODEL_ITEM_CLASS_NAME, PAPER_TITLE_CLASS_NAME, SPINNER_CLASS_NAME } from "../styleClasses";
+import {
+  escapeMarkdownText,
+  fencedCodeMarkdown,
+  formatMath,
+  headingMarkdown,
+  isLegacyFingerprintMatch,
+  inlineCodeMarkdown,
+  listItemMarkdown,
+  shouldRecoverLegacyMath,
+  tableMarkdown,
+} from "./annotationMarkdown";
 
 const TOOL_LINE_CLASS_NAME = [
   "tool-line flex-1 min-w-0 overflow-hidden text-ellipsis whitespace-nowrap",
@@ -94,6 +120,531 @@ const TOOL_LINE_CLASS_NAME = [
 const TOOL_TARGET_LIMIT = 256;
 const TOOL_TARGET_INSPECTION_LIMIT = 1_024;
 const TOOL_OUTPUT_SCAN_LIMIT = 20_000;
+const SELECTION_ACTION_GAP_PX = 8;
+const CHAT_ANNOTATION_HIGHLIGHT_NAME = "chat-annotations";
+
+interface ComposerAnnotation extends ChatTextAnnotation {
+  id: string;
+  range?: Range;
+}
+
+interface SelectionAction {
+  text: string;
+  range: Range;
+  x: number;
+  top: number;
+}
+
+function elementForNode(node: Node): Element | null {
+  return node instanceof Element ? node : node.parentElement;
+}
+
+interface DomPoint {
+  container: Node;
+  offset: number;
+}
+
+function pointRange(point: DomPoint): Range {
+  const range = document.createRange();
+  range.setStart(point.container, point.offset);
+  range.collapse(true);
+  return range;
+}
+
+function pointBefore(left: DomPoint, right: DomPoint): boolean {
+  return pointRange(left).compareBoundaryPoints(Range.START_TO_START, pointRange(right)) < 0;
+}
+
+function cloneBetween(start: DomPoint, end: DomPoint): DocumentFragment {
+  const range = document.createRange();
+  range.setStart(start.container, start.offset);
+  range.setEnd(end.container, end.offset);
+  return range.cloneContents();
+}
+
+const INLINE_MARKDOWN_TAGS = new Set(["A", "B", "CODE", "EM", "I", "STRONG"]);
+
+function preservePartialInlineContext(range: Range, container: HTMLElement): void {
+  const end = elementForNode(range.endContainer);
+  if (Array.from(container.childNodes).every((node) => node.nodeType === Node.TEXT_NODE)) {
+    let ancestor = elementForNode(range.startContainer);
+    while (ancestor && ancestor.matches(".md *") && ancestor.contains(end)) {
+      if (INLINE_MARKDOWN_TAGS.has(ancestor.tagName)) {
+        const wrapper = ancestor.cloneNode(false);
+        if (wrapper instanceof HTMLElement) {
+          wrapper.replaceChildren(...Array.from(container.childNodes));
+          container.replaceChildren(wrapper);
+        }
+      }
+      ancestor = ancestor.parentElement;
+    }
+  }
+  const sourcePre = elementForNode(range.startContainer)?.closest("pre");
+  if (sourcePre?.contains(end)) {
+    const code = sourcePre.querySelector("code")?.cloneNode(false);
+    const pre = sourcePre.cloneNode(false);
+    if (pre instanceof HTMLElement && code instanceof HTMLElement) {
+      code.replaceChildren(...Array.from(container.childNodes));
+      pre.replaceChildren(code);
+      container.replaceChildren(pre);
+    }
+  }
+}
+
+function pruneAnnotationSelection(container: HTMLElement): void {
+  container.querySelectorAll("button").forEach((button) => {
+    button.replaceWith(document.createTextNode(button.textContent ?? ""));
+  });
+  container
+    .querySelectorAll("script, style, iframe, object, embed, input, textarea, select")
+    .forEach((element) => element.remove());
+  container.querySelectorAll("*").forEach((element) => {
+    for (const attribute of Array.from(element.attributes)) {
+      if (
+        attribute.name.toLowerCase().startsWith("on") ||
+        attribute.name === "contenteditable" ||
+        attribute.name === "tabindex"
+      ) {
+        element.removeAttribute(attribute.name);
+      }
+    }
+  });
+}
+
+function selectionContent(range: Range, root: HTMLElement): HTMLDivElement {
+  const container = document.createElement("div");
+  const selectionEnd = { container: range.endContainer, offset: range.endOffset };
+  let cursor = { container: range.startContainer, offset: range.startOffset };
+  const katexNodes = Array.from(root.querySelectorAll<HTMLElement>(".katex")).filter((katex) =>
+    range.intersectsNode(katex),
+  );
+  for (const katex of katexNodes) {
+    const math = katex.closest<HTMLElement>(".katex-display") ?? katex;
+    const mathRange = document.createRange();
+    mathRange.selectNode(math);
+    const mathStart = { container: mathRange.startContainer, offset: mathRange.startOffset };
+    const mathEnd = { container: mathRange.endContainer, offset: mathRange.endOffset };
+    if (pointBefore(cursor, mathStart)) container.append(cloneBetween(cursor, mathStart));
+    container.append(math.cloneNode(true));
+    cursor = mathEnd;
+    if (!pointBefore(cursor, selectionEnd)) break;
+  }
+  if (katexNodes.length === 0) {
+    container.append(range.cloneContents());
+  } else if (pointBefore(cursor, selectionEnd)) {
+    container.append(cloneBetween(cursor, selectionEnd));
+  }
+  preservePartialInlineContext(range, container);
+  pruneAnnotationSelection(container);
+  return container;
+}
+
+function markdownTable(table: HTMLElement): string {
+  const rows = Array.from(table.querySelectorAll("tr")).map((row) =>
+    Array.from(row.querySelectorAll(":scope > th, :scope > td"))
+      .map((cell) => markdownFromSelectionNode(cell).trim().replaceAll("|", "\\|")),
+  ).filter((row) => row.length > 0);
+  return rows.length > 0
+    ? `\n\n${tableMarkdown(rows, Boolean(table.querySelector("tr:first-child th")))}\n\n`
+    : "";
+}
+
+function markdownList(list: HTMLElement): string {
+  const ordered = list.tagName === "OL";
+  const startAttribute = list.getAttribute("start");
+  const parsedStart = startAttribute === null ? 1 : Number(startAttribute);
+  let next = Number.isFinite(parsedStart) ? parsedStart : 1;
+  const lines: string[] = [];
+  for (const item of Array.from(list.children).filter(
+    (child): child is HTMLElement => child instanceof HTMLElement && child.tagName === "LI",
+  )) {
+    const explicitValue = item.getAttribute("value");
+    const parsedValue = explicitValue === null ? next : Number(explicitValue);
+    const value = Number.isFinite(parsedValue) ? parsedValue : next;
+    next = value + 1;
+    const content = Array.from(item.childNodes)
+      .map((child) => child instanceof HTMLElement && child.matches("UL, OL")
+        ? `\n${markdownList(child).trim()}\n`
+        : markdownFromSelectionNode(child))
+      .join("")
+      .trim();
+    lines.push(listItemMarkdown(ordered ? `${value}.` : "-", content));
+  }
+  return `\n\n${lines.join("\n")}\n\n`;
+}
+
+function markdownFromSelectionNode(node: Node): string {
+  if (node.nodeType === Node.TEXT_NODE) return escapeMarkdownText(node.textContent ?? "");
+  if (!(node instanceof HTMLElement)) {
+    return Array.from(node.childNodes).map(markdownFromSelectionNode).join("");
+  }
+  if (node.matches(".katex-display")) {
+    const tex = node.querySelector("annotation[encoding='application/x-tex']")?.textContent?.trim();
+    return tex ? formatMath(tex, true) : "";
+  }
+  if (node.matches(".katex")) {
+    const tex = node.querySelector("annotation[encoding='application/x-tex']")?.textContent?.trim();
+    return tex ? formatMath(tex, false) : "";
+  }
+  if (node.tagName === "BR") return "\n";
+  if (node.tagName === "TABLE") return markdownTable(node);
+  if (node.matches("UL, OL")) return markdownList(node);
+  if (node.tagName === "CODE" && node.parentElement?.tagName !== "PRE") {
+    return inlineCodeMarkdown(node.textContent ?? "");
+  }
+  if (node.tagName === "PRE") return fencedCodeMarkdown(node.textContent ?? "");
+  const inner = Array.from(node.childNodes).map(markdownFromSelectionNode).join("");
+  if (!inner) return "";
+  if (node.matches("strong, b")) return `**${inner}**`;
+  if (node.matches("em, i")) return `*${inner}*`;
+  if (node.tagName === "A") {
+    const href = node.getAttribute("href");
+    return href ? `[${inner}](${href})` : inner;
+  }
+  if (node.tagName === "LI") return `${inner.trim()}\n`;
+  if (node.matches("TH, TD")) return `${inner.trim()} | `;
+  if (node.tagName === "TR") return `${inner.replace(/ \| $/, "")}\n`;
+  if (node.tagName === "BLOCKQUOTE") {
+    return `\n\n${inner.trim().split("\n").map((line) => `> ${line}`).join("\n")}\n\n`;
+  }
+  const heading = headingMarkdown(node.tagName, inner);
+  if (heading) return `\n\n${heading}\n\n`;
+  if (node.matches("P, DIV, UL, OL, TABLE")) {
+    return `\n\n${inner.trim()}\n\n`;
+  }
+  return inner;
+}
+
+function semanticSelectionText(content: HTMLElement, fallback: string): string {
+  const text = markdownFromSelectionNode(content)
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return text || fallback;
+}
+
+function annotationFingerprint(text: string): string {
+  return text.normalize("NFKC").replace(/[\s\u200B-\u200D\u2060\uFEFF]/g, "").toLowerCase();
+}
+
+function legacyAnnotationMarkdown(text: string, root: HTMLElement): string | undefined {
+  if (!shouldRecoverLegacyMath(text)) return undefined;
+  const target = annotationFingerprint(text);
+  if (target.length < 8) return undefined;
+  let best: { markdown: string; delta: number } | undefined;
+  for (const katex of root.querySelectorAll<HTMLElement>(".msg-assistant > .md .katex")) {
+    const fingerprints = [
+      katex.querySelector(".katex-mathml")?.textContent,
+      katex.querySelector(".katex-html")?.textContent,
+      katex.textContent,
+    ]
+      .filter((value): value is string => Boolean(value))
+      .map(annotationFingerprint);
+    const match = fingerprints.find((candidate) => isLegacyFingerprintMatch(candidate, target));
+    if (!match) continue;
+    const tex = katex.querySelector("annotation[encoding='application/x-tex']")?.textContent?.trim();
+    if (!tex) continue;
+    const display = Boolean(katex.closest(".katex-display"));
+    const candidate = {
+      markdown: formatMath(tex, display).trim(),
+      delta: Math.abs(match.length - target.length),
+    };
+    if (!best || candidate.delta < best.delta) best = candidate;
+  }
+  return best?.markdown;
+}
+
+function currentTranscriptSelection(root: HTMLElement): SelectionAction | null {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) return null;
+  const range = selection.getRangeAt(0);
+  const focusNode = selection.focusNode;
+  if (!focusNode) return null;
+  const commonElement = elementForNode(range.commonAncestorContainer);
+  const focusElement = elementForNode(focusNode);
+  if (!commonElement || !root.contains(commonElement)) return null;
+  if (!focusElement || !root.contains(focusElement)) return null;
+  const startElement = elementForNode(range.startContainer);
+  const endElement = elementForNode(range.endContainer);
+  const startMarkdown = startElement?.closest<HTMLElement>(".md");
+  const endMarkdown = endElement?.closest<HTMLElement>(".md");
+  const assistant = startMarkdown?.parentElement;
+  if (
+    !startMarkdown || !endMarkdown || !assistant?.classList.contains("msg-assistant") ||
+    endMarkdown.parentElement !== assistant || startMarkdown.dataset.streaming === "true" ||
+    endMarkdown.dataset.streaming === "true"
+  ) return null;
+  const fallbackText = selection
+    .toString()
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (!fallbackText) return null;
+  const content = selectionContent(range, root);
+
+  const selectionRects = Array.from(range.getClientRects()).filter(
+    (rect) => rect.width > 0 && rect.height > 0,
+  );
+  const firstRect = selectionRects[0] ?? range.getBoundingClientRect();
+  const firstLineRects = selectionRects.filter(
+    (rect) => rect.top < firstRect.bottom && rect.bottom > firstRect.top,
+  );
+  const lineRects = firstLineRects.length > 0 ? firstLineRects : [firstRect];
+  const left = Math.min(...lineRects.map((rect) => rect.left));
+  const right = Math.max(...lineRects.map((rect) => rect.right));
+  const selectionTop = Math.min(...lineRects.map((rect) => rect.top));
+  const selectionBottom = Math.max(...lineRects.map((rect) => rect.bottom));
+  const actionHeight = 34;
+  const actionHalfWidth = 74;
+  const top = selectionTop >= actionHeight + SELECTION_ACTION_GAP_PX
+    ? selectionTop - actionHeight - SELECTION_ACTION_GAP_PX
+    : selectionBottom + SELECTION_ACTION_GAP_PX;
+  return {
+    text: semanticSelectionText(content, fallbackText),
+    range: range.cloneRange(),
+    x: Math.min(window.innerWidth - actionHalfWidth, Math.max(actionHalfWidth, left + (right - left) / 2)),
+    top,
+  };
+}
+
+function useTranscriptSelection(
+  rootRef: React.RefObject<HTMLDivElement | null>,
+  onAdd: (selection: Pick<SelectionAction, "text" | "range">) => void,
+) {
+  const [action, setAction] = useState<SelectionAction | null>(null);
+  const selectingWithPointer = useRef(false);
+  const update = useCallback(() => {
+    const root = rootRef.current;
+    setAction(root ? currentTranscriptSelection(root) : null);
+  }, [rootRef]);
+
+  useEffect(() => {
+    let updateFrame: number | null = null;
+    const selectionChanged = () => {
+      if (!selectingWithPointer.current) update();
+    };
+    const pointerDown = (event: PointerEvent) => {
+      const root = rootRef.current;
+      const target = event.target;
+      if (
+        !event.isPrimary ||
+        event.button !== 0 ||
+        !root ||
+        !(target instanceof Node) ||
+        !root.contains(target)
+      ) {
+        return;
+      }
+      selectingWithPointer.current = true;
+      setAction(null);
+    };
+    const pointerFinished = (event: PointerEvent) => {
+      if (!event.isPrimary || !selectingWithPointer.current) return;
+      selectingWithPointer.current = false;
+      updateFrame = window.requestAnimationFrame(update);
+    };
+
+    document.addEventListener("selectionchange", selectionChanged);
+    document.addEventListener("pointerdown", pointerDown, true);
+    window.addEventListener("pointerup", pointerFinished, true);
+    window.addEventListener("pointercancel", pointerFinished, true);
+    return () => {
+      document.removeEventListener("selectionchange", selectionChanged);
+      document.removeEventListener("pointerdown", pointerDown, true);
+      window.removeEventListener("pointerup", pointerFinished, true);
+      window.removeEventListener("pointercancel", pointerFinished, true);
+      if (updateFrame !== null) window.cancelAnimationFrame(updateFrame);
+      selectingWithPointer.current = false;
+    };
+  }, [update]);
+
+  useEffect(() => {
+    if (!action) return;
+    const dismiss = (event: MouseEvent) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest(".chat-selection-action")) return;
+      setAction(null);
+    };
+    document.addEventListener("mousedown", dismiss, true);
+    window.addEventListener("resize", update);
+    return () => {
+      document.removeEventListener("mousedown", dismiss, true);
+      window.removeEventListener("resize", update);
+    };
+  }, [action, update]);
+
+  const add = useCallback(() => {
+    if (!action) return;
+    onAdd({ text: action.text, range: action.range });
+    setAction(null);
+    window.getSelection()?.removeAllRanges();
+  }, [action, onAdd]);
+  const dismiss = useCallback(() => setAction(null), []);
+
+  return { action, add, dismiss };
+}
+
+function useAnnotationHighlights(annotations: ComposerAnnotation[]) {
+  useLayoutEffect(() => {
+    if (!("highlights" in CSS) || typeof Highlight === "undefined") return;
+    const ranges = annotations.flatMap((annotation) =>
+      annotation.range ? [annotation.range] : [],
+    );
+    if (ranges.length === 0) {
+      CSS.highlights.delete(CHAT_ANNOTATION_HIGHLIGHT_NAME);
+      return;
+    }
+
+    const highlight = new Highlight(...ranges);
+    CSS.highlights.set(CHAT_ANNOTATION_HIGHLIGHT_NAME, highlight);
+    return () => {
+      if (CSS.highlights.get(CHAT_ANNOTATION_HIGHLIGHT_NAME) === highlight) {
+        CSS.highlights.delete(CHAT_ANNOTATION_HIGHLIGHT_NAME);
+      }
+    };
+  }, [annotations]);
+}
+
+function AnnotationPreview({ annotation }: { annotation: ComposerAnnotation }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [legacyMarkdown, setLegacyMarkdown] = useState<string>();
+  useLayoutEffect(() => {
+    const root = ref.current?.closest<HTMLElement>(".chat-thread-inner");
+    setLegacyMarkdown(root ? legacyAnnotationMarkdown(annotation.text, root) : undefined);
+  }, [annotation.id, annotation.text]);
+  return <div ref={ref}><Md text={legacyMarkdown ?? annotation.text} /></div>;
+}
+
+function AnnotationEntries({
+  annotations,
+  onRemove,
+}: {
+  annotations: ComposerAnnotation[];
+  onRemove?: (id: string) => void;
+}) {
+  return annotations.map((annotation, index) => (
+    <div
+      key={annotation.id}
+      className={`annotation-item grid gap-2 py-2 px-1 [&+&]:border-t [&+&]:border-border-variant ${onRemove ? "grid-cols-[24px_minmax(0,_1fr)_24px]" : "grid-cols-[24px_minmax(0,_1fr)]"}`}
+    >
+      <span className="text-sm text-muted text-right">{index + 1}.</span>
+      <div className="min-w-0">
+        <div className="text-sm text-muted mb-1">Selected text:</div>
+        <AnnotationPreview annotation={annotation} />
+      </div>
+      {onRemove && (
+        <button
+          type="button"
+          className="inline-flex items-center justify-center w-6 h-6 rounded-sm text-muted [&:hover]:bg-surface [&:hover]:text-text"
+          title="Remove annotation"
+          aria-label={`Remove annotation ${index + 1}`}
+          onClick={() => onRemove(annotation.id)}
+        >
+          <X size={13} />
+        </button>
+      )}
+    </div>
+  ));
+}
+
+function AnnotationsPopover({
+  annotations,
+  variant,
+  onClear,
+  onRemove,
+}: {
+  annotations: ComposerAnnotation[];
+  variant: "composer" | "sent";
+  onClear?: () => void;
+  onRemove?: (id: string) => void;
+}) {
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const dialogId = useId();
+  const popover = usePopover(triggerRef);
+  const sent = variant === "sent";
+  const closeTimer = useRef<number | null>(null);
+  const openSent = () => {
+    if (closeTimer.current !== null) window.clearTimeout(closeTimer.current);
+    closeTimer.current = null;
+    popover.setOpen(true);
+  };
+  const closeSent = () => {
+    closeTimer.current = window.setTimeout(() => {
+      if (!dialogRef.current?.contains(document.activeElement)) popover.setOpen(false);
+    }, 160);
+  };
+  const toggleFromTrigger = () => {
+    const opening = sent || !popover.open;
+    popover.setOpen(opening);
+    if (opening) window.requestAnimationFrame(() => dialogRef.current?.focus());
+  };
+  const removeAnnotation = (id: string) => {
+    onRemove?.(id);
+    window.requestAnimationFrame(() => {
+      const next = dialogRef.current?.querySelector<HTMLButtonElement>("button[aria-label^='Remove annotation']");
+      (next ?? dialogRef.current ?? triggerRef.current)?.focus();
+    });
+  };
+  useEffect(
+    () => () => {
+      if (closeTimer.current !== null) window.clearTimeout(closeTimer.current);
+    },
+    [],
+  );
+  return (
+    <div
+      className={sent ? "sent-annotations relative flex w-fit" : "composer-annotations relative flex w-fit pt-2 px-3 pb-0"}
+      ref={popover.ref}
+      onMouseEnter={sent ? openSent : undefined}
+      onMouseLeave={sent ? closeSent : undefined}
+    >
+      <div className={`inline-flex items-center border border-border bg-background overflow-hidden ${sent ? "rounded-full" : "rounded-sm"}`}>
+        <button
+          ref={triggerRef}
+          type="button"
+          className={`inline-flex items-center gap-1.5 py-1 text-sm font-medium text-text [&:hover]:bg-surface ${sent ? "px-2.5" : "pl-2 pr-1.5"}`}
+          aria-expanded={popover.open}
+          aria-haspopup="dialog"
+          aria-controls={dialogId}
+          onClick={toggleFromTrigger}
+        >
+          <MessageSquareQuote size={sent ? 13 : 14} className="text-muted" />
+          {annotations.length} {annotations.length === 1 ? "annotation" : "annotations"}
+        </button>
+        {onClear && (
+          <button
+            type="button"
+            className="inline-flex items-center justify-center self-stretch w-6.5 text-muted border-l border-border [&:hover]:bg-surface [&:hover]:text-text"
+            title="Clear annotations"
+            aria-label="Clear annotations"
+            onClick={onClear}
+          >
+            <X size={13} />
+          </button>
+        )}
+      </div>
+      {popover.open && (
+        <div
+          id={dialogId}
+          ref={dialogRef}
+          tabIndex={-1}
+          className={`annotation-menu absolute bottom-[calc(100%_+_8px)] z-50 w-[min(440px,_calc(100vw_-_48px))] max-h-80 overflow-y-auto overscroll-contain bg-background border border-border rounded-lg shadow-[0_4px_16px_rgba(0,_0,_0,_0.10)] p-2 text-left ${sent ? "right-0 after:absolute after:top-full after:left-0 after:right-0 after:h-2 after:content-['']" : "left-3"}`}
+          role="dialog"
+          aria-label="Selected chat text"
+        >
+          <AnnotationEntries annotations={annotations} onRemove={onRemove ? removeAnnotation : undefined} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ComposerAnnotations(props: Omit<React.ComponentProps<typeof AnnotationsPopover>, "variant">) {
+  return <AnnotationsPopover {...props} variant="composer" />;
+}
 
 const PROMPT_COLLAPSED_CLASS_NAME = [
   "prompt-collapsed text-muted text-lg font-[375] my-3.5 mx-0 [&_summary]:flex",
@@ -168,6 +719,7 @@ type Action =
       sessionId: string;
       text: string;
       attachments: { url: string; mediaType: string; name?: string }[];
+      annotations: ComposerAnnotation[];
     }
   | { type: "busy"; sessionId: string; busy: boolean }
   // `known` scopes the reseed: flags for sessions outside it (other projects —
@@ -186,9 +738,8 @@ function upsertMessage(list: ChatMessage[], message: ChatMessage): ChatMessage[]
     return next;
   }
   // The server's copy of the user message replaces the optimistic local one.
-  const cleaned =
-    message.role === "user" ? list.filter((m) => !m.id.startsWith(LOCAL_PREFIX)) : list;
-  return [...cleaned, message];
+  if (message.role !== "user") return [...list, message];
+  return [...list.filter((m) => !m.id.startsWith(LOCAL_PREFIX)), message];
 }
 
 function reducer(state: ChatState, action: Action): ChatState {
@@ -227,6 +778,13 @@ function reducer(state: ChatState, action: Action): ChatState {
       // Data URLs stand in until the server's copy arrives with file names.
       action.attachments.forEach((a, i) =>
         parts.push({ id: `img${i}`, type: "image", text: a.url, name: a.name }),
+      );
+      action.annotations.forEach((annotation, i) =>
+        parts.push({
+          id: `annotation${i}`,
+          type: "annotation",
+          text: annotation.text,
+        }),
       );
       const msg: ChatMessage = {
         id: `${LOCAL_PREFIX}${Date.now()}`,
@@ -1494,6 +2052,34 @@ function activityInProgress(activity: ToolActivity): ToolActivity {
   return { ...activity, label };
 }
 
+function permissionActivityLabel(tool: string | undefined, input: Record<string, unknown> | undefined): string {
+  const activity = toolActivity({
+    id: "permission-preview",
+    type: "tool",
+    tool,
+    state: { status: "running", input },
+  });
+  const replacements: Array<[RegExp, string]> = [
+    [/^Reviewed /, "Review "],
+    [/^Searched /, "Search "],
+    [/^Listed /, "List "],
+    [/^Edited /, "Edit "],
+    [/^Updated /, "Update "],
+    [/^Created /, "Create "],
+    [/^Deleted /, "Delete "],
+    [/^Ran /, "Run "],
+    [/^Started /, "Start "],
+    [/^Waited /, "Wait "],
+    [/^Checked /, "Check "],
+    [/^Built /, "Build "],
+    [/^Cancelled /, "Cancel "],
+  ];
+  for (const [pattern, replacement] of replacements) {
+    if (pattern.test(activity.label)) return activity.label.replace(pattern, replacement);
+  }
+  return activity.label;
+}
+
 function resolvedActivityLabel(
   activity: ToolActivity,
   runExperimentName?: (runId: string) => string,
@@ -1852,28 +2438,35 @@ function PromptCard({
     // custom answer). No echo at all (stale-resolved): neutral "Resolved",
     // matching the plan row.
     const chosen = (p.answers ?? []).join(", ") || p.note || "";
+    const annotations: ComposerAnnotation[] = (p.annotations ?? []).map((annotation, index) => ({
+      id: `${part.id}-annotation-${index}`,
+      text: annotation.text,
+    }));
     return (
-      <details className={PROMPT_COLLAPSED_CLASS_NAME}>
-        <summary>
-          <span className="prompt-collapsed-title font-[375] wrap-anywhere">{p.header || p.question || "Question"}</span>
-          <span className={`prompt-outcome font-[375] text-subtext wrap-anywhere [&.approved]:text-accent-green [&.chosen]:text-accent-green [&.approved::before]:content-['✓_'] [&.chosen::before]:content-['✓_'] [&.revised]:text-accent-amber [&.rejected]:text-accent-amber ${chosen ? "chosen" : ""}`}>{chosen || "Resolved"}</span>
-        </summary>
-        <div className={PROMPT_COLLAPSED_BODY_CLASS_NAME}>
-          {/* The summary title already shows the question when there's no header. */}
-          {p.header && p.question && <div className="prompt-q text-base font-semibold leading-normal text-text">{p.question}</div>}
-          {(p.options ?? []).length > 0 && (
-            <ul className="prompt-collapsed-options mt-1.5 mx-0 mb-0 pl-4.5 [&_.sel]:text-text [&_.sel]:font-semibold">
-              {(p.options ?? []).map((o) => (
-                <li key={o.label} className={p.answers?.includes(o.label) ? "sel" : ""}>
-                  {o.label}
-                </li>
-              ))}
-            </ul>
-          )}
-          {/* A note-only answer is already the summary outcome — don't echo it twice. */}
-          {p.note && p.note !== chosen && <div className="prompt-collapsed-note mt-1.5 italic">{p.note}</div>}
-        </div>
-      </details>
+      <div className="flex flex-col items-end gap-1.5">
+        {annotations.length > 0 && <AnnotationsPopover annotations={annotations} variant="sent" />}
+        <details className={PROMPT_COLLAPSED_CLASS_NAME}>
+          <summary>
+            <span className="prompt-collapsed-title font-[375] wrap-anywhere">{p.header || p.question || "Question"}</span>
+            <span className={`prompt-outcome font-[375] text-subtext wrap-anywhere [&.approved]:text-accent-green [&.chosen]:text-accent-green [&.approved::before]:content-['✓_'] [&.chosen::before]:content-['✓_'] [&.revised]:text-accent-amber [&.rejected]:text-accent-amber ${chosen ? "chosen" : ""}`}>{chosen || "Resolved"}</span>
+          </summary>
+          <div className={PROMPT_COLLAPSED_BODY_CLASS_NAME}>
+            {/* The summary title already shows the question when there's no header. */}
+            {p.header && p.question && <div className="prompt-q text-base font-semibold leading-normal text-text">{p.question}</div>}
+            {(p.options ?? []).length > 0 && (
+              <ul className="prompt-collapsed-options mt-1.5 mx-0 mb-0 pl-4.5 [&_.sel]:text-text [&_.sel]:font-semibold">
+                {(p.options ?? []).map((o) => (
+                  <li key={o.label} className={p.answers?.includes(o.label) ? "sel" : ""}>
+                    {o.label}
+                  </li>
+                ))}
+              </ul>
+            )}
+            {/* A note-only answer is already the summary outcome — don't echo it twice. */}
+            {p.note && p.note !== chosen && <div className="prompt-collapsed-note mt-1.5 italic">{p.note}</div>}
+          </div>
+        </details>
+      </div>
     );
   }
 
@@ -1886,7 +2479,7 @@ function PromptCard({
     const docked = !!onOpenPlan;
     return (
       <div className={`prompt-card my-2 mx-0 py-3 px-3.5 border border-border border-l-[3px] border-l-border rounded-sm bg-surface flex flex-col gap-[9px] [&.plan]:border-l-accent-blue [&.permission]:border-l-accent-amber [&.question]:border-l-accent-purple [&.readonly]:opacity-60 plan ${done ? "readonly" : ""}`}>
-        <div className={PROMPT_HEAD_CLASS_NAME}>
+        <div className="prompt-head text-lg font-semibold text-text">
           {p.synthesized ? "Plan mode — ready to proceed?" : "Proposed plan"}
         </div>
         <div className={`prompt-plan text-base leading-[1.6] text-text max-h-85 overflow-y-auto [&.clamped]:max-h-[9.5em] [&.clamped]:overflow-hidden [&.clamped]:relative [&.clamped::after]:content-[''] [&.clamped::after]:absolute [&.clamped::after]:inset-x-0 [&.clamped::after]:bottom-0 [&.clamped::after]:top-auto [&.clamped::after]:h-8.5 [&.clamped::after]:bg-[linear-gradient(to_bottom,_transparent,_var(--surface))] [&.clamped::after]:pointer-events-none ${docked ? "clamped" : ""}`}>
@@ -1904,7 +2497,7 @@ function PromptCard({
             <button className="btn-primary" onClick={() => respond({ approve: true, resumeMode: "auto" })}>
               Accept and auto mode
             </button>
-            <button className="btn-ghost" onClick={() => respond({ approve: true, resumeMode: "bypass" })}>
+            <button className="btn-ghost" onClick={() => respond({ approve: true, resumeMode: "bypassPermissions" })}>
               Accept and bypass all
             </button>
             <button className="btn-ghost" onClick={() => respond({ approve: false })}>
@@ -1917,35 +2510,57 @@ function PromptCard({
   }
 
   if (p.kind === "permission") {
+    const toolInput = p.toolInput ?? {};
     const summary =
-      (typeof p.toolInput?.command === "string" && p.toolInput.command) ||
-      (typeof p.toolInput?.filePath === "string" && p.toolInput.filePath) ||
+      inputString(toolInput, "command", "cmd", "filePath", "file_path", "path") ||
       "";
     // Codex approval cards ship a human-readable reason (and fileChange cards
     // carry nothing else) — show it so the user knows what they're granting.
     const reason =
       (typeof p.toolInput?.reason === "string" && p.toolInput.reason) || "";
+    const description = inputString(toolInput, "description") || "";
+    const explanation = reason || description || permissionActivityLabel(p.tool, toolInput);
+    const headingId = `permission-heading-${part.id}`;
     return (
-      <div className={`prompt-card my-2 mx-0 py-3 px-3.5 border border-border border-l-[3px] border-l-border rounded-sm bg-surface flex flex-col gap-[9px] [&.plan]:border-l-accent-blue [&.permission]:border-l-accent-amber [&.question]:border-l-accent-purple [&.readonly]:opacity-60 permission ${done ? "readonly" : ""}`}>
-        <div className={PROMPT_HEAD_CLASS_NAME}>
-          Permission needed: <code>{p.tool}</code>
+      <div
+        className={`prompt-card permission my-3 w-full max-w-2xl overflow-hidden rounded-md border border-border bg-background shadow-[0_1px_2px_rgb(0_0_0_/_4%)] [&.readonly]:opacity-60 ${done ? "readonly" : ""}`}
+        role="group"
+        aria-labelledby={headingId}
+      >
+        <div className="flex items-center gap-2.5 px-3.5 pt-3 pb-0">
+          <span className="flex size-7 shrink-0 items-center justify-center rounded-md bg-accent-amber-subtle text-accent-amber">
+            <TriangleAlert size={15} strokeWidth={1.8} aria-hidden="true" />
+          </span>
+          <span id={headingId} className="text-base font-semibold text-text">Approval required</span>
         </div>
-        {summary && <div className="prompt-sub text-sm text-subtext wrap-anywhere">{summary}</div>}
-        {reason && <div className="prompt-sub text-sm text-subtext wrap-anywhere">{reason}</div>}
-        {!done && (
-          // No resumeMode: the harness picks the right one for an approval.
-          // Claude resumes under `bypass` (the only mode that actually grants a
-          // blocked tool — acceptEdits would re-deny Bash); inline harnesses
-          // (opencode) reply once/reject keyed off `approve`. Deny denies either way.
-          <div className={PROMPT_ACTIONS_CLASS_NAME}>
-            <button className="btn-primary" onClick={() => respond({ approve: true })}>
-              Allow
-            </button>
-            <button className="btn-ghost" onClick={() => respond({ approve: false })}>
-              Deny
-            </button>
-          </div>
-        )}
+        <div className="flex flex-col gap-3 px-3.5 py-3">
+          <div className="prompt-sub text-base font-normal leading-normal text-text wrap-anywhere">{explanation}</div>
+          {summary && (
+            <code className="prompt-command block max-h-36 overflow-auto whitespace-pre-wrap wrap-anywhere rounded-md border border-border-variant bg-surface px-3 py-2 font-mono text-sm leading-relaxed text-text">
+              {summary}
+            </code>
+          )}
+          {!done && (
+            // No resumeMode: the harness picks the right one for an approval.
+            // Claude resumes under `bypassPermissions` (the only mode that grants a
+            // blocked tool — acceptEdits would re-deny Bash); inline harnesses
+            // (opencode) reply once/reject keyed off `approve`. Deny denies either way.
+            <div className="prompt-actions flex items-center justify-end gap-2 pt-0.5">
+              <button
+                className="rounded-sm border border-transparent bg-transparent px-3 py-1.5 text-sm font-semibold text-subtext transition-[background,color] duration-80 ease-standard hover:bg-surface hover:text-text"
+                onClick={() => respond({ approve: false })}
+              >
+                Deny
+              </button>
+              <button
+                className="rounded-sm border border-text bg-text px-3 py-1.5 text-sm font-semibold text-background transition-opacity duration-80 ease-standard hover:opacity-85"
+                onClick={() => respond({ approve: true })}
+              >
+                Allow
+              </button>
+            </div>
+          )}
+        </div>
       </div>
     );
   }
@@ -1999,9 +2614,15 @@ function PromptCard({
  * stored these before the harness-side skip existed) and resolved permission
  * cards (which leave no trace). Shared by `messageHasVisibleContent` and
  * `renderParts` so the two can't drift. */
-function partIsVisible(part: ChatPart): boolean {
-  if (part.type === "prompt")
-    return !!part.prompt && !(part.prompt.resolved && part.prompt.kind === "permission");
+function partIsVisible(part: ChatPart, activePermissionId?: string | null): boolean {
+  if (part.type === "prompt") {
+    if (!part.prompt) return false;
+    if (part.prompt.kind === "permission") {
+      if (part.prompt.resolved) return false;
+      if (activePermissionId !== undefined) return part.id === activePermissionId;
+    }
+    return true;
+  }
   if (part.type === "text" || part.type === "reasoning") return !!part.text;
   return true; // tool, image, …
 }
@@ -2009,9 +2630,9 @@ function partIsVisible(part: ChatPart): boolean {
 /** Whether a message renders anything once resolved-permission cards vanish —
  * a bridge permission card rides its own message, so resolving it leaves the
  * message empty and it must drop out of the transcript entirely. */
-function messageHasVisibleContent(m: ChatMessage): boolean {
+function messageHasVisibleContent(m: ChatMessage, activePermissionId?: string | null): boolean {
   if (m.role === "user") return true;
-  return m.parts.some(partIsVisible);
+  return m.parts.some((part) => partIsVisible(part, activePermissionId));
 }
 
 /** Memoized: streaming re-broadcasts the whole updated message up to ~13x/sec, and
@@ -2042,6 +2663,7 @@ function attachmentPartView(p: ChatPart): { src: string; isPdf: boolean; name: s
 
 const Message = memo(function Message({
   message,
+  activePermissionId,
   pendingTailToolId,
   onOpenFile,
   onOpenRun,
@@ -2055,6 +2677,7 @@ const Message = memo(function Message({
   predictTextTail = false,
 }: {
   message: ChatMessage;
+  activePermissionId: string | null;
   pendingTailToolId?: string | null;
   onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
@@ -2085,41 +2708,53 @@ const Message = memo(function Message({
       .map(attachmentPartView);
     const images = attachments.filter((a) => !a.isPdf);
     const files = attachments.filter((a) => a.isPdf);
+    const annotations: ComposerAnnotation[] = message.parts
+      .filter((part) => part.type === "annotation" && part.text)
+      .map((part) => ({
+        id: part.id,
+        text: part.text ?? "",
+      }));
     return (
-      <div className="msg-user self-end max-w-[88%] bg-surface rounded-[16px] py-2.5 px-[15px] text-base whitespace-pre-wrap wrap-anywhere [&_.skill-chip]:mr-0.5 [&_.skill-chip]:align-baseline">
-        {command ? (
-          <>
-            <span className="skill-chip inline-flex items-center py-px px-[7px] font-mono text-md font-medium text-primary bg-primary-subtle border border-border-variant rounded-sm">/{command.name}</span>
-            {slash![2]}
-          </>
-        ) : (
-          text
+      <div className="msg-user-group self-end flex max-w-[88%] flex-col items-end gap-1.5">
+        {annotations.length > 0 && (
+          <AnnotationsPopover annotations={annotations} variant="sent" />
         )}
-        {images.length > 0 && (
-          <div className="msg-images flex flex-wrap gap-1.5 mt-2 [&_img]:max-w-55 [&_img]:max-h-40 [&_img]:border [&_img]:border-border-variant [&_img]:rounded-xs [&_img]:block">
-            {images.map((a, i) => (
-              <a key={i} href={a.src} target="_blank" rel="noreferrer">
-                <img src={a.src} alt="attachment" />
-              </a>
-            ))}
-          </div>
-        )}
-        {files.length > 0 && (
-          <div className="msg-files flex flex-wrap gap-1.5 mt-2">
-            {files.map((a, i) => (
-              <a key={i} className="msg-file inline-flex items-center gap-1.5 max-w-60 py-1.5 px-2.5 border border-border-variant rounded-sm text-text no-underline [&:hover]:border-text [&_span]:overflow-hidden [&_span]:text-ellipsis [&_span]:whitespace-nowrap" href={a.src} target="_blank" rel="noreferrer">
-                <FileText size={15} />
-                <span>{a.name}</span>
-              </a>
-            ))}
-          </div>
-        )}
+        <div className="msg-user max-w-full bg-surface rounded-[16px] py-2.5 px-[15px] text-base whitespace-pre-wrap wrap-anywhere [&_.skill-chip]:mr-0.5 [&_.skill-chip]:align-baseline">
+          {command ? (
+            <>
+              <span className="skill-chip inline-flex items-center py-px px-[7px] font-mono text-md font-medium text-primary bg-primary-subtle border border-border-variant rounded-sm">/{command.name}</span>
+              {slash![2]}
+            </>
+          ) : (
+            text
+          )}
+          {images.length > 0 && (
+            <div className="msg-images flex flex-wrap gap-1.5 mt-2 [&_img]:max-w-55 [&_img]:max-h-40 [&_img]:border [&_img]:border-border-variant [&_img]:rounded-xs [&_img]:block">
+              {images.map((a, i) => (
+                <a key={i} href={a.src} target="_blank" rel="noreferrer">
+                  <img src={a.src} alt="attachment" />
+                </a>
+              ))}
+            </div>
+          )}
+          {files.length > 0 && (
+            <div className="msg-files flex flex-wrap gap-1.5 mt-2">
+              {files.map((a, i) => (
+                <a key={i} className="msg-file inline-flex items-center gap-1.5 max-w-60 py-1.5 px-2.5 border border-border-variant rounded-sm text-text no-underline [&:hover]:border-text [&_span]:overflow-hidden [&_span]:text-ellipsis [&_span]:whitespace-nowrap" href={a.src} target="_blank" rel="noreferrer">
+                  <FileText size={15} />
+                  <span>{a.name}</span>
+                </a>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
     );
   }
   return (
     <div className="msg-assistant text-lg leading-[1.62] text-text min-w-0">
       {renderParts(message.parts, {
+        activePermissionId,
         pendingTailToolId,
         onOpenFile,
         onOpenRun,
@@ -2143,6 +2778,7 @@ const Message = memo(function Message({
 function renderParts(
   parts: ChatPart[],
   opts: {
+    activePermissionId?: string | null;
     pendingTailToolId?: string | null;
     onOpenFile?: OpenTranscriptFile;
     onOpenRun?: (runId: string) => void;
@@ -2156,6 +2792,7 @@ function renderParts(
   },
 ): React.ReactNode[] {
   const {
+    activePermissionId,
     pendingTailToolId,
     onOpenFile,
     onOpenRun,
@@ -2167,7 +2804,7 @@ function renderParts(
     onOpenSubagent,
     predictTextTail = false,
   } = opts;
-  const visibleTail = parts.filter(partIsVisible).at(-1);
+  const visibleTail = parts.filter((part) => partIsVisible(part, activePermissionId)).at(-1);
   const rendered: React.ReactNode[] = [];
   let toolRun: ChatPart[] = [];
   const flushTools = () => {
@@ -2192,7 +2829,7 @@ function renderParts(
     // transcripts predating the ingest-side skip still carry them), or a
     // resolved permission card. Without this, each invisible part splits
     // consecutive tools into single-row groups.
-    if (!partIsVisible(part)) continue;
+    if (!partIsVisible(part, activePermissionId)) continue;
     // A sub-agent spawn part streams its own transcript in `children` — render
     // it as a standalone nested block, not folded into a tool run. The signal is
     // harness-agnostic: Codex tags the row `subagent`, while Claude's `Task` /
@@ -2396,25 +3033,67 @@ function latestToolStates(messages: ChatMessage[]): { messageId: string; states:
   return { messageId: message.id, states };
 }
 
-interface ToolAnnouncement {
+function firstPendingPermission(messages: ChatMessage[]): { id: string; path: string; label: string } | null {
+  const visit = (parts: ChatPart[], parent: string): { id: string; path: string; label: string } | null => {
+    for (const part of parts) {
+      const prompt = part.prompt;
+      if (part.type === "prompt" && prompt?.kind === "permission" && !prompt.resolved) {
+        const toolInput = prompt.toolInput ?? {};
+        const reason = inputString(toolInput, "reason", "description");
+        const label = reason || permissionActivityLabel(prompt.tool, toolInput);
+        return { id: part.id, path: `${parent}/${part.id}`, label };
+      }
+      if (part.children?.length) {
+        const nested = visit(part.children, `${parent}/${part.id}`);
+        if (nested) return nested;
+      }
+    }
+    return null;
+  };
+  for (const message of messages) {
+    if (message.role !== "assistant") continue;
+    const pending = visit(message.parts, message.id);
+    if (pending) return pending;
+  }
+  return null;
+}
+
+interface TranscriptAnnouncement {
   text: string;
   sequence: number;
 }
 
-function useToolActivityAnnouncement(messages: ChatMessage[]): ToolAnnouncement {
-  const [announcement, setAnnouncement] = useState<ToolAnnouncement>({ text: "", sequence: 0 });
-  const previous = useRef<{ transcript: string; messageId: string; states: Map<string, AnnouncedToolState> } | null>(null);
+function useTranscriptAnnouncement(messages: ChatMessage[]): TranscriptAnnouncement {
+  const [announcement, setAnnouncement] = useState<TranscriptAnnouncement>({ text: "", sequence: 0 });
+  const previous = useRef<{
+    transcript: string;
+    messageId: string;
+    states: Map<string, AnnouncedToolState>;
+    permissionPath: string | null;
+  } | null>(null);
   useEffect(() => {
     const transcript = messages[0]?.id ?? "";
     const { messageId, states } = latestToolStates(messages);
+    const pendingPermission = firstPendingPermission(messages);
     if (!previous.current || previous.current.transcript !== transcript) {
-      previous.current = { transcript, messageId, states };
-      setAnnouncement((current) => ({ text: "", sequence: current.sequence + 1 }));
+      previous.current = { transcript, messageId, states, permissionPath: pendingPermission?.path ?? null };
+      setAnnouncement((current) => ({
+        text: pendingPermission ? `Approval required: ${pendingPermission.label}` : "",
+        sequence: current.sequence + 1,
+      }));
       return;
     }
     const previousStates = previous.current.messageId === messageId ? previous.current.states : new Map<string, AnnouncedToolState>();
+    const previousPermissionPath = previous.current.permissionPath;
     const changes = [...states].filter(([path, state]) => previousStates.get(path)?.status !== state.status);
-    previous.current = { transcript, messageId, states };
+    previous.current = { transcript, messageId, states, permissionPath: pendingPermission?.path ?? null };
+    if (pendingPermission && pendingPermission.path !== previousPermissionPath) {
+      setAnnouncement((current) => ({
+        text: `Approval required: ${pendingPermission.label}`,
+        sequence: current.sequence + 1,
+      }));
+      return;
+    }
     const failures = changes.filter(([, state]) => state.status === "error");
     if (failures.length > 0) {
       const labels = failures.slice(0, 2).map(([, state]) => toolActivity(state.part).label).join(", ");
@@ -2477,19 +3156,23 @@ const Transcript = memo(function Transcript({
   onOpenSubagent?: (spawnPartId: string) => void;
   skills?: SkillInfo[];
 }) {
-  const visibleMessages = messages.filter(messageHasVisibleContent);
+  const activePermissionId = firstPendingPermission(messages)?.id ?? null;
+  const visibleMessages = messages.filter((message) =>
+    messageHasVisibleContent(message, activePermissionId),
+  );
   const activeMessage = visibleMessages.at(-1);
-  const activityAnnouncement = useToolActivityAnnouncement(messages);
+  const transcriptAnnouncement = useTranscriptAnnouncement(messages);
   const pendingTailTool = busy ? streamTailTool(messages) : null;
   return (
     <>
       <span className="sr-only" role="status" aria-live="polite">
-        <span key={activityAnnouncement.sequence}>{activityAnnouncement.text}</span>
+        <span key={transcriptAnnouncement.sequence}>{transcriptAnnouncement.text}</span>
       </span>
       {visibleMessages.map((m) => (
         <Message
           key={m.id}
           message={m}
+          activePermissionId={activePermissionId}
           pendingTailToolId={pendingTailTool?.messageId === m.id ? pendingTailTool.toolId : null}
           onOpenFile={onOpenFile}
           onOpenRun={onOpenRun}
@@ -2863,11 +3546,22 @@ export function ChatPanel({
   const [unreadSessionIds, setUnreadSessionIds] = useState<ReadonlySet<string>>(new Set());
   const [sessionFilter, setSessionFilter] = useState<SessionFilter>("active");
   const [draft, setDraft] = useState("");
+  const [annotations, setAnnotations] = useState<ComposerAnnotation[]>([]);
+  const annotationId = useRef(0);
+  const composerScopeRef = useRef({ projectId, activeId });
+  composerScopeRef.current = { projectId, activeId };
   // Pasted/dropped/uploaded attachments waiting in the composer, as data URLs.
   const [attachments, setAttachments] = useState<
     { dataUrl: string; mediaType: string; name?: string; size: number }[]
   >([]);
   const [attachError, setAttachError] = useState<string | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const settingsMutationTail = useRef<Promise<void>>(Promise.resolve());
+  const settingsMutationSeq = useRef(0);
+  const planMutationSeq = useRef(0);
+  const [planModeOverride, setPlanModeOverride] = useState<boolean | null>(null);
+  const planModeOverrideRef = useRef<boolean | null>(null);
+  const queuedPlanOverrideSeen = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [state, dispatch] = useReducer(reducer, {
     messagesBySession: {},
@@ -2906,15 +3600,29 @@ export function ChatPanel({
   const threadInnerRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const composerRef = useRef<HTMLTextAreaElement>(null);
-  // Consolidated chat-settings popover (permissions/reasoning/sources), opened
-  // by the switch icon in the composer footer.
-  const chatSettings = usePopover();
+  const dataSources = usePopover();
+  const addTranscriptSelection = useCallback((selection: Pick<SelectionAction, "text" | "range">) => {
+    annotationId.current += 1;
+    setAnnotations((current) => [
+      ...current,
+      { id: `annotation-${annotationId.current}`, ...selection },
+    ]);
+    composerRef.current?.focus();
+  }, []);
+  const transcriptSelection = useTranscriptSelection(threadInnerRef, addTranscriptSelection);
+  useAnnotationHighlights(annotations);
+
+  useEffect(() => {
+    setAnnotations([]);
+    transcriptSelection.dismiss();
+  }, [activeId, projectId, transcriptSelection.dismiss]);
 
   // Slash-skills: menu state is derived from the draft — open while the first
   // token is an unfinished `/command` (no whitespace yet) with matches.
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [skillIdx, setSkillIdx] = useState(0);
   const [skillMenuDismissed, setSkillMenuDismissed] = useState(false);
+  const [composerCursor, setComposerCursor] = useState(0);
   // A picked skill renders as a chip on the textarea's first line
   // (Claude-desktop style); the textarea then holds only the args. send()
   // reassembles `/name args`, so the wire and transcript keep the plain-text
@@ -2943,17 +3651,26 @@ export function ChatPanel({
   useEffect(() => {
     getSkills(projectId).then(setSkills).catch(() => {});
   }, [projectId, mainView]);
-  const slashToken =
-    !pickedSkill && draft.startsWith("/") && !/\s/.test(draft) ? draft.slice(1) : null;
-  const skillMatches =
-    slashToken !== null && !skillMenuDismissed
-      ? skills.filter((s) => s.name.startsWith(slashToken.toLowerCase()))
-      : [];
-  const skillMenuOpen = skillMatches.length > 0;
-  const activeSkillIdx = Math.min(skillIdx, Math.max(0, skillMatches.length - 1));
-  useEffect(() => setSkillIdx(0), [slashToken]);
-
   function pickSkill(skill: SkillInfo) {
+    if (skill.source === "command" && skill.name === "plan" && slashContext) {
+      activatePlanCommand(draft, slashContext);
+      return;
+    }
+    if (slashContext?.inline) {
+      const before = draft.slice(0, slashContext.start);
+      const after = draft.slice(slashContext.end);
+      const insertion = `/${skill.name}`;
+      const separator = after ? "" : " ";
+      const cursor = before.length + insertion.length + separator.length;
+      setDraft(`${before}${insertion}${separator}${after}`);
+      setSkillMenuDismissed(true);
+      window.requestAnimationFrame(() => {
+        composerRef.current?.focus();
+        composerRef.current?.setSelectionRange(cursor, cursor);
+        setComposerCursor(cursor);
+      });
+      return;
+    }
     setPickedSkill(skill);
     setDraft("");
     composerRef.current?.focus();
@@ -3022,6 +3739,7 @@ export function ChatPanel({
   //  * with a session open — that session's stored settings, with any unsent
   //    picker tweaks layered on. The harness is the session's, not the global.
   //  * with no session — the sticky global preference (seeds a new session).
+  const savedSelection = selection ?? defaultSelection(harnesses);
   const rawSelection: ModelSelection | null = openSession
     ? {
         harness: openSession.harness,
@@ -3029,11 +3747,25 @@ export function ChatPanel({
         permissionMode: sessionOverride.permissionMode ?? openSession.permissionMode,
         reasoningLevel: sessionOverride.reasoningLevel ?? openSession.reasoningLevel,
       }
-    : (selection ?? defaultSelection(harnesses));
+    : savedSelection
+      ? { ...savedSelection, ...sessionOverride }
+      : null;
   const activeHarness = rawSelection
     ? harnesses.find((h) => h.id === rawSelection.harness)
     : undefined;
   const opts = activeHarness?.options;
+  const commands = commandsForHarness(skills, opts?.planActivation);
+  const slashContext = !pickedSkill ? slashCommandContext(draft, composerCursor) : null;
+  const slashToken = slashContext?.query ?? null;
+  const skillMatches =
+    slashToken !== null && !skillMenuDismissed
+      ? commandsForSlashContext(commands, slashContext?.inline ?? false).filter((command) =>
+          command.name.startsWith(slashToken),
+        )
+      : [];
+  const skillMenuOpen = skillMatches.length > 0;
+  const activeSkillIdx = Math.min(skillIdx, Math.max(0, skillMatches.length - 1));
+  useEffect(() => setSkillIdx(0), [slashToken]);
   // Reconcile the reasoning level against the *currently selected model* here
   // rather than only in the picker's `pick`. Two paths reach the composer with
   // a level nobody chose for this model: a session row stored by an older build
@@ -3071,10 +3803,138 @@ export function ChatPanel({
     const merged = { ...composerSelection, ...next };
     setSelection(merged);
     void onPreferredAgentChange(merged).catch(() => {});
-    if (openSession) setSessionOverride((cur) => ({ ...cur, ...next }));
+    if (openSession) {
+      setSessionOverride((cur) => ({ ...cur, ...next }));
+    } else if (next.harness && next.harness !== composerSelection.harness) {
+      setSessionOverride({});
+    }
   };
-  const setPermissionMode = (id: string) => selectModel({ permissionMode: id });
+  const queueSessionMutation = useCallback(<T,>(mutation: () => Promise<T>): Promise<T> => {
+    const result = settingsMutationTail.current.catch(() => {}).then(mutation);
+    settingsMutationTail.current = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
+  }, []);
+  const setPermissionMode = (id: string) => {
+    // Plan is session-scoped. Claude exposes it in the permission dropdown,
+    // but it must not become the saved default for future sessions.
+    if (id === "plan" && activeHarness?.id === "claude-code") {
+      setSessionOverride((current) => ({ ...current, permissionMode: id }));
+    } else {
+      setSessionOverride((current) => {
+        const next = { ...current };
+        delete next.permissionMode;
+        return next;
+      });
+      selectModel({ permissionMode: id });
+    }
+    if (!openSession) return;
+    const sessionId = openSession.id;
+    const mutation = ++settingsMutationSeq.current;
+    setSettingsError(null);
+    void queueSessionMutation(() => setChatSessionPermissionMode(sessionId, id))
+      .then((session) => {
+        setSessions((current) =>
+          current.map((candidate) => (candidate.id === session.id ? session : candidate)),
+        );
+        if (settingsMutationSeq.current === mutation) {
+          setSessionOverride((current) => {
+            const next = { ...current };
+            delete next.permissionMode;
+            return next;
+          });
+        }
+      })
+      .catch(() => {
+        if (settingsMutationSeq.current !== mutation) return;
+        setSessionOverride((current) => {
+          const next = { ...current };
+          delete next.permissionMode;
+          return next;
+        });
+        setSettingsError("Could not update permissions. Try again.");
+      });
+  };
   const setReasoningLevel = (id: string) => selectModel({ reasoningLevel: id });
+  const planActive = composerSelection?.harness === "claude-code"
+    ? composerSelection.permissionMode === "plan"
+    : opts?.planActivation === "command"
+      ? planModeOverride ?? openSession?.planMode ?? false
+      : false;
+  useEffect(() => {
+    if (planModeOverride === null || openSession?.planMode !== planModeOverride) return;
+    planModeOverrideRef.current = null;
+    setPlanModeOverride(null);
+  }, [openSession?.planMode, planModeOverride]);
+
+  async function setIndependentPlanMode(planMode: boolean) {
+    planModeOverrideRef.current = planMode;
+    setPlanModeOverride(planMode);
+    if (!openSession) return;
+    const sessionId = openSession.id;
+    const mutation = ++planMutationSeq.current;
+    setSettingsError(null);
+    try {
+      const session = await queueSessionMutation(() => setChatSessionPlanMode(sessionId, planMode));
+      setSessions((current) =>
+        current.map((candidate) => (candidate.id === session.id ? session : candidate)),
+      );
+      if (planMutationSeq.current === mutation) {
+        planModeOverrideRef.current = null;
+        setPlanModeOverride(null);
+        setSettingsError(null);
+      }
+    } catch (error) {
+      if (planMutationSeq.current === mutation) {
+        planModeOverrideRef.current = null;
+        setPlanModeOverride(null);
+      }
+      throw error;
+    }
+  }
+
+  async function exitPlanMode() {
+    if (composerSelection?.harness === "claude-code") {
+      setPermissionMode("auto");
+      return;
+    }
+    if (!openSession) return;
+    try {
+      await setIndependentPlanMode(false);
+    } catch {
+      setSettingsError("Could not exit Plan mode. Try again.");
+    }
+  }
+
+  async function togglePlanMode() {
+    const nextPlanMode = !planActive;
+    try {
+      if (composerSelection?.harness === "claude-code") {
+        setPermissionMode(nextPlanMode ? "plan" : "auto");
+      } else if (opts?.planActivation === "command") {
+        await setIndependentPlanMode(nextPlanMode);
+      } else {
+        throw new Error("The selected harness is unavailable");
+      }
+    } catch {
+      setSettingsError("Could not toggle Plan mode. Try again.");
+    }
+  }
+
+  function activatePlanCommand(text: string, context: SlashCommandContext) {
+    const next = removeSlashCommand(text, context);
+    setDraft(next.text);
+    setPickedSkill(null);
+    setSkillMenuDismissed(true);
+    void togglePlanMode();
+    window.requestAnimationFrame(() => {
+      composerRef.current?.focus();
+      composerRef.current?.setSelectionRange(next.cursor, next.cursor);
+      setComposerCursor(next.cursor);
+    });
+  }
 
   sessionsRef.current = sessions;
 
@@ -3285,6 +4145,21 @@ export function ChatPanel({
   // Messages the user parked behind the running turn (oldest first). Populated
   // by chat.queued events and the seed snapshot; each runs when its turn ends.
   const queued = activeId ? (state.queuedBySession[activeId] ?? []) : [];
+  useEffect(() => {
+    const queuedMode = queued.reduce<boolean | undefined>(
+      (mode, item) => item.planMode ?? mode,
+      undefined,
+    );
+    if (queuedMode !== undefined) {
+      queuedPlanOverrideSeen.current = true;
+      planModeOverrideRef.current = queuedMode;
+      setPlanModeOverride(queuedMode);
+    } else if (queuedPlanOverrideSeen.current) {
+      queuedPlanOverrideSeen.current = false;
+      planModeOverrideRef.current = null;
+      setPlanModeOverride(null);
+    }
+  }, [queued]);
   // A session whose transcript hasn't been seeded yet: its key is absent from
   // messagesBySession (vs. present-but-empty for a genuinely empty session).
   // Switching to an existing session leaves this true for the getChatMessages
@@ -3409,7 +4284,18 @@ export function ChatPanel({
 
   // Drop any unsent composer tweak when switching sessions, so it never bleeds
   // from one session's pickers onto another's.
-  useEffect(() => setSessionOverride({}), [activeId]);
+  useEffect(() => {
+    settingsMutationSeq.current += 1;
+    planMutationSeq.current += 1;
+    const queuedMode = (activeId ? state.queuedBySession[activeId] ?? [] : []).reduce<
+      boolean | undefined
+    >((mode, item) => item.planMode ?? mode, undefined);
+    queuedPlanOverrideSeen.current = queuedMode !== undefined;
+    planModeOverrideRef.current = queuedMode ?? null;
+    setPlanModeOverride(queuedMode ?? null);
+    setSessionOverride({});
+    setSettingsError(null);
+  }, [activeId]);
 
   // Surface the open session to the shell (Agent-scoped panes key off it).
   useEffect(() => {
@@ -3449,20 +4335,93 @@ export function ChatPanel({
     const args = draft.trim();
     // Reassemble the picked skill chip into the plain `/name args` wire form —
     // the backend's slash expansion and the transcript both see only text.
-    const text = pickedSkill ? `/${pickedSkill.name}${args ? ` ${args}` : ""}` : args;
+    const originalText = pickedSkill ? `/${pickedSkill.name}${args ? ` ${args}` : ""}` : args;
+    const planCommand = !pendingQuestion
+      ? parsePlanCommand(originalText, opts?.planActivation)
+      : null;
+    const planRequested = !!planCommand;
+    const toggledPlanMode = !planActive;
+    const independentPlanMode = effectiveCommandPlanMode(
+      opts?.planActivation,
+      planRequested ? toggledPlanMode : undefined,
+      planModeOverrideRef.current,
+    );
+    const planPermissionMode = planRequested && activeHarness?.id === "claude-code"
+      ? toggledPlanMode ? "plan" : "auto"
+      : undefined;
+    const text = planCommand ? planCommand.prompt : originalText;
     const pending = attachments;
-    if (!text && pending.length === 0) return;
+    const pendingAnnotations = annotations;
+    const wireAnnotations = pendingAnnotations.map((annotation) => ({
+      text: annotation.text,
+    }));
+    const sourceProjectId = projectId;
+    let sourceSessionId = activeId;
+    const inSourceScope = () => {
+      const current = composerScopeRef.current;
+      return current.projectId === sourceProjectId && current.activeId === sourceSessionId;
+    };
+    const restoreComposer = () => {
+      if (!inSourceScope()) return;
+      setDraft((current) => current || originalText);
+      setAttachments((current) => (current.length ? current : pending));
+      setAnnotations((current) => (current.length ? current : pendingAnnotations));
+    };
+    if (planRequested && !text && pending.length === 0 && pendingAnnotations.length === 0) {
+      setDraft("");
+      setPickedSkill(null);
+      setSkillMenuDismissed(false);
+      try {
+        if (activeHarness?.id === "claude-code") {
+          setPermissionMode(toggledPlanMode ? "plan" : "auto");
+        } else if (opts?.planActivation === "command") {
+          await setIndependentPlanMode(toggledPlanMode);
+        } else {
+          throw new Error("The selected harness is unavailable");
+        }
+      } catch {
+        setSettingsError("Could not toggle Plan mode. Try again.");
+        restoreComposer();
+      }
+      return;
+    }
+    const effective = composerSelection
+      ? {
+          ...composerSelection,
+          ...(planPermissionMode ? { permissionMode: planPermissionMode } : {}),
+        }
+      : null;
+    if (planPermissionMode) setPermissionMode(planPermissionMode);
+    let planCommandMutation: number | null = null;
+    const previousPlanModeOverride = planModeOverrideRef.current;
+    if (planRequested && opts?.planActivation === "command") {
+      planCommandMutation = ++planMutationSeq.current;
+      planModeOverrideRef.current = toggledPlanMode;
+      setPlanModeOverride(toggledPlanMode);
+    }
+    const clearFailedPlanCommand = () => {
+      if (planCommandMutation === null || planMutationSeq.current !== planCommandMutation) return;
+      planModeOverrideRef.current = previousPlanModeOverride;
+      setPlanModeOverride(previousPlanModeOverride);
+    };
+    if (!text && pending.length === 0 && pendingAnnotations.length === 0) return;
     // A pending question card owns plain typed text as a custom answer
     // (Claude-desktop behavior). This also works while the turn is HELD on
     // the card — where a new message would be rejected as busy and silently
     // dropped. A failed answer restores the draft so the text isn't lost.
     // (Auto-convert is off while a card is pending; a chip picked from the
     // menu or left over just serializes into the note text, same as typing it.)
-    if (text && pendingQuestion && pending.length === 0) {
+    if ((text || pendingAnnotations.length > 0) && pendingQuestion && pending.length === 0) {
       setDraft("");
       setPickedSkill(null);
-      void respond({ promptId: pendingQuestion, answers: [], note: text }).then((ok) => {
-        if (!ok) setDraft((cur) => cur || text);
+      setAnnotations([]);
+      void respond({
+        promptId: pendingQuestion,
+        answers: [],
+        note: text || undefined,
+        annotations: wireAnnotations,
+      }).then((ok) => {
+        if (!ok) restoreComposer();
       });
       return;
     }
@@ -3471,17 +4430,22 @@ export function ChatPanel({
       // so it runs when the turn ends, instead of dropping it. The server
       // enqueues it and echoes chat.queued to render the chip — no optimistic
       // transcript bubble, since it hasn't run yet.
-      if (!activeId || !activeHarness?.agentReady) return;
+      if (!activeId || !activeHarness?.agentReady) {
+        clearFailedPlanCommand();
+        return;
+      }
       const sid = activeId;
       setDraft("");
       setPickedSkill(null);
       setAttachments([]);
+      setAnnotations([]);
       setAttachError(null);
-      const turnOpts = composerSelection
+      const turnOpts = effective
         ? {
-            model: composerSelection.model,
-            permissionMode: composerSelection.permissionMode,
-            reasoningLevel: composerSelection.reasoningLevel,
+            model: effective.model,
+            permissionMode: effective.permissionMode,
+            planMode: independentPlanMode,
+            reasoningLevel: effective.reasoningLevel,
           }
         : {};
       setSessionOverride({});
@@ -3491,41 +4455,59 @@ export function ChatPanel({
         name: a.name,
       }));
       try {
-        await sendChatMessage(sid, text, turnOpts, images.length ? images : undefined);
+        const sendQueued = () =>
+          sendChatMessage(
+            sid,
+            text,
+            turnOpts,
+            images.length ? images : undefined,
+            wireAnnotations,
+          );
+        await queueSessionMutation(sendQueued);
       } catch {
         // Never reached the queue — restore the composer so a retry is one keypress.
-        setDraft((cur) => cur || text);
-        setAttachments((cur) => (cur.length ? cur : pending));
+        clearFailedPlanCommand();
+        restoreComposer();
       }
       return;
     }
-    if (!activeHarness?.agentReady) return;
+    if (!activeHarness?.agentReady) {
+      clearFailedPlanCommand();
+      return;
+    }
     // `composerSelection` already resolves to the open session's settings (+ any
     // unsent tweak) or, for a new session, the global preference.
-    const effective = composerSelection;
-    if (!effective && !activeId) return; // no harness available at all
+    if (!effective) {
+      clearFailedPlanCommand();
+      return;
+    }
     setDraft("");
     setPickedSkill(null);
     setAttachments([]);
+    setAnnotations([]);
     setAttachError(null);
     let sid = activeId;
     try {
       if (!sid) {
-        const session = await createChatSession(projectId, effective!.harness, {
-          model: effective!.model,
-          permissionMode: effective!.permissionMode,
-          reasoningLevel: effective!.reasoningLevel,
+        const session = await createChatSession(projectId, effective.harness, {
+          model: effective.model,
+          permissionMode: effective.permissionMode,
+          planMode: independentPlanMode,
+          reasoningLevel: effective.reasoningLevel,
         });
         loadedSessions.current.add(session.id);
         setSessions((cur) => [session, ...cur]);
         setActiveId(session.id);
         sid = session.id;
+        sourceSessionId = session.id;
+        composerScopeRef.current = { projectId, activeId: session.id };
       }
       dispatch({
         type: "optimisticUser",
         sessionId: sid,
-        text,
+        text: text || "Asked about selected text",
         attachments: pending.map((a) => ({ url: a.dataUrl, mediaType: a.mediaType, name: a.name })),
+        annotations: pendingAnnotations,
       });
       dispatch({ type: "busy", sessionId: sid, busy: true });
       stickToBottom.current = true;
@@ -3540,6 +4522,7 @@ export function ChatPanel({
         ? {
             model: effective.model,
             permissionMode: effective.permissionMode,
+            planMode: independentPlanMode,
             reasoningLevel: effective.reasoningLevel,
           }
         : {};
@@ -3549,12 +4532,22 @@ export function ChatPanel({
         dataBase64: a.dataUrl.slice(a.dataUrl.indexOf(",") + 1),
         name: a.name,
       }));
-      await sendChatMessage(sid, text, turnOpts, images.length ? images : undefined);
+      const targetSessionId = sid;
+      if (!targetSessionId) throw new Error("chat session was not created");
+      const sendTurn = () =>
+        sendChatMessage(
+          targetSessionId,
+          text,
+          turnOpts,
+          images.length ? images : undefined,
+          wireAnnotations,
+        );
+      await queueSessionMutation(sendTurn);
     } catch (err) {
       // The message never reached a turn — put it back in the composer so a
       // retry is one keypress, whichever branch below applies.
-      setDraft((cur) => cur || text);
-      setAttachments((cur) => (cur.length ? cur : pending));
+      restoreComposer();
+      clearFailedPlanCommand();
       if (!sid) return; // session creation failed; no transcript to annotate
       const msg = err instanceof Error ? err.message : String(err);
       // A *network* failure does not prove no turn started — the backend
@@ -3569,8 +4562,11 @@ export function ChatPanel({
           .catch(() => false);
         if (busyNow) {
           // The turn is real and streaming — undo the restore, nothing failed.
-          setDraft((cur) => (cur === text ? "" : cur));
-          setAttachments((cur) => (cur === pending ? [] : cur));
+          if (inSourceScope()) {
+            setDraft((cur) => (cur === text ? "" : cur));
+            setAttachments((cur) => (cur === pending ? [] : cur));
+            setAnnotations((cur) => (cur === pendingAnnotations ? [] : cur));
+          }
           return;
         }
       }
@@ -3714,7 +4710,7 @@ export function ChatPanel({
       const sid = activeId;
       // The resumed turn streams over SSE; optimistically mark busy.
       dispatch({ type: "busy", sessionId: sid, busy: true });
-      return respondChat(sid, answer)
+      return queueSessionMutation(() => respondChat(sid, answer))
         .then(() => true)
         .catch(() => false)
         .finally(() => {
@@ -3743,7 +4739,7 @@ export function ChatPanel({
             .catch(() => {});
         });
     },
-    [activeId, projectId],
+    [activeId, projectId, queueSessionMutation],
   );
 
   const visibleSessions = sessions.filter((s) => matchesFilter(sessionFilter, s.archived));
@@ -3774,7 +4770,7 @@ export function ChatPanel({
   }, [startNewTask]);
 
   const rail = (
-    <aside className="session-rail w-68 shrink-0 flex flex-col mt-2.5 mr-3.5 mb-2.5 ml-0 bg-background min-h-0 [&_.rail-body]:flex-1 [&_.rail-body]:min-h-0 [&_.rail-body]:overflow-y-auto [&_.rail-body]:py-1 [&_.rail-body]:px-2 floating-panel border border-border rounded-lg shadow-[0_6px_24px_color-mix(in_oklab,_var(--text)_5%,_transparent),_0_1px_4px_color-mix(in_oklab,_var(--text)_4%,_transparent)] overflow-hidden">
+    <aside className="session-rail w-68 shrink-0 flex flex-col mt-2.5 mr-3.5 mb-2.5 ml-0 bg-background min-h-0 [&_.rail-body]:flex-1 [&_.rail-body]:min-h-0 [&_.rail-body]:overflow-y-auto [&_.rail-body]:py-1 [&_.rail-body]:px-2 floating-panel border border-border rounded-lg shadow-[0_6px_24px_color-mix(in_oklab,_var(--text)_5%,_transparent),_0_1px_4px_color-mix(in_oklab,_var(--text)_4%,_transparent)] overflow-visible">
       {railHeader}
       {/* Workspace tools open beside chat; settings sections replace the middle pane. */}
       <nav className="rail-nav flex flex-col gap-0.5 p-2 shrink-0">
@@ -3972,13 +4968,15 @@ export function ChatPanel({
               onClick={() => {
                 const skill = skills.find((s) => s.name === "reproduce-paper");
                 if (paperId && skill) {
+                  // Both args are optional (the playbook injects the linked paper;
+                  // compute defaults to the configured target) — arm with an empty draft.
                   setPickedSkill(skill);
-                  setDraft(`${paperId} on `);
+                  setDraft("");
                 } else {
                   setPickedSkill(null);
                   setDraft(
                     paperId
-                      ? `/reproduce-paper ${paperId} on `
+                      ? `/reproduce-paper `
                       : "Find and summarize the research most relevant to this project.",
                   );
                 }
@@ -4021,6 +5019,7 @@ export function ChatPanel({
           onScroll={(e) => {
             const el = e.currentTarget;
             stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+            transcriptSelection.dismiss();
           }}
         >
           <div className="chat-thread-inner max-w-readable my-0 mx-auto pt-4 px-4 pb-8 flex flex-col gap-4" ref={threadInnerRef}>
@@ -4035,7 +5034,7 @@ export function ChatPanel({
               onRespond={respond}
               onOpenPlan={openPlan}
               onOpenSubagent={openSubagent}
-              skills={skills}
+              skills={commands}
             />
             {busy &&
               (awaitingInput ? (
@@ -4047,6 +5046,23 @@ export function ChatPanel({
               ))}
           </div>
         </div>
+      )}
+
+      {transcriptSelection.action && (
+        <button
+          type="button"
+          className="chat-selection-action fixed z-50 inline-flex items-center gap-1.5 py-1.5 px-3 border border-border rounded-md bg-background text-text text-sm font-medium shadow-[0_2px_8px_rgba(0,_0,_0,_0.10)] whitespace-nowrap [&:hover]:bg-surface"
+          style={{
+            left: transcriptSelection.action.x,
+            top: transcriptSelection.action.top,
+            transform: "translateX(-50%)",
+          }}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={transcriptSelection.add}
+        >
+          <MessageSquareQuote size={14} />
+          Ask about this
+        </button>
       )}
 
       {/* Docked while a plan awaits a decision, so the approval controls never
@@ -4066,9 +5082,14 @@ export function ChatPanel({
             agentLabel={
               activeSession ? HARNESS_LABELS[activeSession.harness] : "The agent"
             }
+            showResumeModes={activeSession?.harness === "claude-code"}
             onView={() => openPlan?.(pendingPlan.plan, pendingPlan.promptId)}
             onApprove={(resumeMode) =>
-              respond({ promptId: pendingPlan.promptId, approve: true, resumeMode })
+              respond({
+                promptId: pendingPlan.promptId,
+                approve: true,
+                ...(resumeMode ? { resumeMode } : {}),
+              })
             }
             // Plain rejection — no note; the model stops and waits.
             onReject={() => respond({ promptId: pendingPlan.promptId, approve: false })}
@@ -4121,6 +5142,22 @@ export function ChatPanel({
               onHover={setSkillIdx}
             />
           )}
+          {annotations.length > 0 && (
+            <ComposerAnnotations
+              annotations={annotations}
+              onClear={() => {
+                setAnnotations([]);
+                window.requestAnimationFrame(() => composerRef.current?.focus());
+              }}
+              onRemove={(id) => {
+                const remaining = annotations.filter((annotation) => annotation.id !== id);
+                setAnnotations(remaining);
+                if (remaining.length === 0) {
+                  window.requestAnimationFrame(() => composerRef.current?.focus());
+                }
+              }}
+            />
+          )}
           {attachments.length > 0 && (
             <div className="composer-attachments flex flex-wrap gap-1.5 pt-2 px-3 pb-0">
               {attachments.map((a, i) => {
@@ -4150,6 +5187,11 @@ export function ChatPanel({
               {attachError}
             </div>
           )}
+          {settingsError && (
+            <div className="composer-settings-error pt-1.5 px-3 pb-0 text-sm text-accent-red" role="alert">
+              {settingsError}
+            </div>
+          )}
           <div className="composer-input relative flex overflow-hidden [&_textarea]:flex-1">
             {pickedSkill && (
               // Inert like inline text: clicks fall through to the textarea
@@ -4165,10 +5207,10 @@ export function ChatPanel({
               onScroll={syncChipScroll}
               placeholder={
                 // A pending question card owns typed text (see send()); say so.
-                // With a chip active, the skill's arg hint says what to type —
-                // and when the project already has a paper attached, the paper
-                // part of the paper-reproduction skills defaults to it, so mark
-                // just that part optional (compute is still expected).
+                // With a chip active, the skill's arg hint says what to type. For
+                // the paper-reproduction skills with a paper attached, both parts
+                // are optional — paper defaults to it, compute to the configured
+                // target — so the hint just states the defaults.
                 // Otherwise follow `composerSelection` so the name tracks the
                 // picker for a new session and the open session once one exists.
                 pendingQuestion
@@ -4176,13 +5218,13 @@ export function ChatPanel({
                   : pickedSkill
                     ? ["reproduce-paper", "paper-to-marimo"].includes(pickedSkill.name) &&
                       paperId
-                      ? `[paper — optional, defaults to ${paperId}] on [compute]`
+                      ? `[optional — defaults to ${paperId} on your default compute]`
                       : pickedSkill.argHint
                     : composerSelection
                       ? activeHarness?.agentReady
-                        ? `Message ${HARNESS_LABELS[composerSelection.harness]}… ( / for skills)`
+                        ? `Message ${HARNESS_LABELS[composerSelection.harness]}… ( / for commands)`
                         : `${HARNESS_LABELS[composerSelection.harness]} is unavailable — open the model picker`
-                      : "Ask the research agent… ( / for skills)"
+                      : "Ask the research agent… ( / for commands)"
               }
               rows={2}
               onPaste={onComposerPaste}
@@ -4196,6 +5238,15 @@ export function ChatPanel({
               }}
               onChange={(e) => {
                 const v = e.target.value;
+                const cursor = e.target.selectionStart;
+                setComposerCursor(cursor);
+                const completedCommand = cursor > 0 && /\s/.test(v[cursor - 1])
+                  ? slashCommandContext(v, cursor - 1)
+                  : null;
+                if (completedCommand?.query === "plan") {
+                  activatePlanCommand(v, completedCommand);
+                  return;
+                }
                 // Auto-convert a typed/pasted full `/name ` into the chip the
                 // moment the space lands. Known names only — unknown `/foo`
                 // stays plain text (server-side pass-through contract). Not
@@ -4203,7 +5254,7 @@ export function ChatPanel({
                 // skill-expanded) and not mid-IME-composition.
                 if (!pickedSkill && !pendingQuestion && !composingRef.current) {
                   const m = v.match(/^\/(\S+)\s([\s\S]*)$/);
-                  const hit = m && skills.find((s) => s.name === m[1].toLowerCase());
+                  const hit = m && commands.find((command) => command.name === m[1].toLowerCase());
                   if (hit) {
                     setPickedSkill(hit);
                     setDraft(m[2]);
@@ -4214,6 +5265,7 @@ export function ChatPanel({
                 setDraft(v);
                 setSkillMenuDismissed(false);
               }}
+              onSelect={(e) => setComposerCursor(e.currentTarget.selectionStart)}
               onCompositionStart={() => {
                 composingRef.current = true;
               }}
@@ -4262,53 +5314,22 @@ export function ChatPanel({
             />
           </div>
           <div className="composer-actions flex justify-end items-center gap-2 pt-1.5 px-2 pb-2">
-            {/* Chat settings (permissions, reasoning, sources) live behind the
-                switch icon. */}
-            <div className="option-picker relative inline-flex" ref={chatSettings.ref}>
+            <div className="option-picker relative inline-flex" ref={dataSources.ref}>
               <button
                 type="button"
-                className="composer-bare inline-flex items-center gap-[3px] text-md text-text py-[5px] px-1 rounded-sm transition-[background] duration-150 ease-standard [&:hover]:bg-surface"
-                title="Chat settings"
-                aria-label="Chat settings"
+                className="composer-bare inline-flex items-center justify-center rounded-sm p-1.5 text-text transition-[background] duration-150 ease-standard hover:bg-surface"
+                title="Data sources"
+                aria-label="Data sources"
                 aria-haspopup="dialog"
-                aria-expanded={chatSettings.open}
-                onClick={() => chatSettings.setOpen((v) => !v)}
+                aria-expanded={dataSources.open}
+                onClick={() => dataSources.setOpen((open) => !open)}
               >
                 <ToggleRight size={16} />
               </button>
-              {chatSettings.open && (
-                <div className="composer-settings-menu absolute bottom-[calc(100%_+_8px)] left-0 flex flex-col gap-0.5 min-w-55 bg-background border border-border rounded-lg shadow-[0_12px_32px_rgba(0,_0,_0,_0.18)] z-50 p-1.5 [&_.composer-pill]:px-1.5 [&_.composer-bare]:px-1.5 [&_.option-menu]:bottom-0 [&_.option-menu]:top-auto [&_.option-menu]:left-[calc(100%_+_8px)] [&_.option-menu]:right-auto">
-                  <div className="flex items-center justify-between gap-3 pl-2">
-                    <span className="text-md text-muted">Permissions</span>
-                    <OptionPicker
-                      choices={activeHarness?.agentReady ? (opts?.permissionModes ?? []) : []}
-                      value={composerSelection?.permissionMode ?? null}
-                      defaultId={opts?.defaultPermissionMode ?? null}
-                      header="Permissions"
-                      align="left"
-                      variant="pill"
-                      numbered
-                      title="Permission mode for this chat"
-                      onSelect={setPermissionMode}
-                    />
-                  </div>
-                  <div className="flex items-center justify-between gap-3 pl-2">
-                    <span className="text-md text-muted">Reasoning</span>
-                    <OptionPicker
-                      choices={activeHarness?.agentReady ? reasoning.choices : []}
-                      value={composerSelection?.reasoningLevel ?? null}
-                      defaultId={reasoning.defaultId}
-                      header="Reasoning"
-                      align="left"
-                      variant="bare"
-                      title="Reasoning level for this chat — Default sends no override, so the harness CLI's own configured effort applies"
-                      onSelect={setReasoningLevel}
-                    />
-                  </div>
-                  <div className="flex flex-col gap-0.5 mt-1 pt-2 border-t border-border">
-                    <span className="text-md text-muted pl-2">Sources</span>
-                    <LitSourcesList />
-                  </div>
+              {dataSources.open && (
+                <div className="composer-sources-menu absolute bottom-[calc(100%_+_8px)] left-0 z-50 flex min-w-55 flex-col gap-1 rounded-md border border-border bg-background p-2 shadow-[0_10px_26px_rgba(0,_0,_0,_0.16)]">
+                  <span className="px-1 text-sm font-medium text-muted">Data sources</span>
+                  <LitSourcesList />
                 </div>
               )}
             </div>
@@ -4332,6 +5353,21 @@ export function ChatPanel({
             >
               <Paperclip size={16} />
             </button>
+            {planActive && (
+              <button
+                type="button"
+                className="plan-indicator group inline-flex h-7.5 items-center gap-1.5 rounded-sm bg-surface px-2 text-sm text-muted transition-colors hover:text-text focus-visible:text-text"
+                title="Exit Plan mode"
+                aria-label="Exit Plan mode"
+                onClick={() => void exitPlanMode()}
+              >
+                <span className="relative size-4" aria-hidden="true">
+                  <Lightbulb className="absolute inset-0 transition-opacity group-hover:opacity-0 group-focus-visible:opacity-0" size={16} strokeWidth={1.6} />
+                  <X className="absolute inset-0 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100" size={16} strokeWidth={1.8} />
+                </span>
+                <span>Plan</span>
+              </button>
+            )}
             <div style={{ flex: 1 }} />
             {/* The model picker reflects the open session (harness locked once it
                 exists); the global default only applies before the first
@@ -4339,6 +5375,12 @@ export function ChatPanel({
             <ModelPicker
               value={composerSelection}
               onSelect={selectModel}
+              permissionChoices={activeHarness?.agentReady ? (opts?.permissionModes ?? []) : []}
+              defaultPermissionId={opts?.defaultPermissionMode ?? null}
+              onSelectPermission={setPermissionMode}
+              reasoningChoices={activeHarness?.agentReady ? reasoning.choices : []}
+              defaultReasoningId={reasoning.defaultId}
+              onSelectReasoning={setReasoningLevel}
               onHarnesses={setHarnesses}
               lockHarness={!!openSession}
             />
@@ -4360,7 +5402,10 @@ export function ChatPanel({
                 onClick={() => void send()}
                 disabled={
                   !activeHarness?.agentReady ||
-                  (!pickedSkill && !draft.trim() && attachments.length === 0)
+                  (!pickedSkill &&
+                    !draft.trim() &&
+                    attachments.length === 0 &&
+                    annotations.length === 0)
                 }
               >
                 <CornerDownLeft size={16} />

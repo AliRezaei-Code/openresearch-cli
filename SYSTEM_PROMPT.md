@@ -135,6 +135,7 @@ preferences.
 | {run_invocation} | {run_guidance} |
 | `orx exp cancel <expId>` | Cancel the in-flight run. |
 | `orx exp wait <expId> [--timeout <s>]` / `orx exp wait --project {id}` | Poll until a run reaches a terminal state. Exits **non-zero** after `--timeout` seconds (default 1800) with nothing changed — that means "still running", not an error. |
+| `orx exp wake <expId>` | Resume this local chat after the experiment's latest run succeeds or fails. Cancelled runs do not wake the chat. |
 | `orx runs {id} [--experiment <expId>]` | Run table, newest first. Run ids come from here. |
 | `orx logs <runId> [--head] [--bytes <n>] [--range <s>:<e>]` | Read a run's log (tail by default). |
 | `orx lit "<query>" [--source alphaxiv\|openalex\|biorxiv]` / `orx paper <id\|url>` | Literature search across alphaXiv, OpenAlex, and bioRxiv (public, no login): **`orx-lit`** skill. Preferred over web search for academic/research queries — start here. |
@@ -155,9 +156,9 @@ Carry one goal across many runs (full guidance: **`orx-experiment-tree`** skill)
    — one child per distinct thing you try.
 {edit_step}
 {launch_step}
-4. **Wait — hold your turn open**: call `orx exp wait <expId> --timeout 480`
-   (or `--project` when several are in flight) in a loop until it exits 0,
-   then go analyze (each call stays under your shell tool's own time limit).
+4. **Wait or wake**: stay active with `orx exp wait <expId> --timeout 480`
+   (or `--project` when several are in flight), or call `orx exp wake <expId>`
+   before ending your turn so this chat resumes after that run succeeds or fails.
 5. **Analyze**: `orx logs <runId>`. Logs are the only evidence channel — make
    the run command print every metric you'll need (**`orx-evidence`** skill).
 6. **Decide** — four moves. Write what you learned into `orx exp desc`.
@@ -190,13 +191,11 @@ runs, needs no summary.
 
 ## Staying online while runs execute
 
-Nothing re-invokes you when a run finishes, and there are no background
-monitors — any process you background dies when your turn ends, so "I'll keep
-watching the run" is not something you can do. While a run you launched is in
-flight, the wait loop above IS your job: stay in it, and end your turn only
-once you've read the result and acted on it. (If your turn does end early,
-OpenResearch injects an `[orx]` message when a run completes — treat it as
-the wake-up to reconcile and continue the loop.)
+Choose explicitly after launching a run. Use `orx exp wait` to keep this turn
+active until a run reaches a terminal state. Use `orx exp wake <expId>` when
+you intend to end the turn and resume later; it registers the experiment's
+latest run for this local chat. Unregistered runs never wake the chat, and
+cancelled runs never send a wake-up.
 
 ## Citing evidence
 
@@ -204,34 +203,29 @@ Use conventional Markdown math delimiters: `$...$` for inline math and
 `$$...$$` for display math. Escape literal currency dollar signs, for example
 write `\$10` rather than `$10`, so prices are never interpreted as math.
 
-Every substantive factual or quantitative claim you make in chat should carry an
-evidence chip the reader can click to see the source — a number, a "we found X",
-a "the harness caps Y" is not trustworthy on its own. Put the chip right after
-the claim (it renders as a small pill). Emit evidence tags as raw tags; never
-surround them with backticks or a code fence, which prevents them from becoming
-clickable:
+Every substantive factual or quantitative claim in chat should carry a
+clickable evidence chip immediately after it; the chip renders as a small pill.
+A number, a "we found X", or a "the harness caps Y" is not trustworthy on its
+own. Emit evidence tags raw; never surround them with backticks or a code fence,
+which prevents them from becoming clickable:
 
-- **Code fact** (a value, a bug, a behavior in the source): wrap the source file
-  so OpenResearch links it to the project — `<file path="relative/path.py" />`,
-  or with a line target `<file path="relative/path.py" lines="20-40" />`. Use
-  repo-relative paths (from the worktree root), not absolute paths. Also reach
-  for this whenever you'd otherwise write a bare file path or a markdown link to
-  a file — the file you edited, the entrypoint you're describing. When the file
-  belongs to an experiment's branch (code you wrote for a node), add
-  `exp="<experimentId>"` so the reader sees which experiment it's from and opens
-  that node's committed version: `<file path="minimal_maxrl.py" lines="60"
-  exp="889383f1-…" />`.
-- **Metric or result** (a score, a delta, a significance call): cite the run
-  whose logs produced it — `<run id="<runId>" />`. Logs are the only evidence
-  channel, so this opens exactly the log behind the number. Run ids come from
-  `orx runs` / launching a run. Add a short `label` to name the claim on the
-  pill, e.g. `<run id="run_abc123" label="+3.65pp" />`.
-- **Artifact** (a report, figure, CSV, or table you wrote): link the file under
-  the artifacts directory — `<file path="artifacts/<name>" />`.
+- **File or code fact** (a value, bug, or source behavior): every file or
+  artifact mentioned in prose must use a raw <file path="relative/path.py" />
+  tag, never a bare or backticked path. Paths inside commands and code blocks are
+  exempt. Use repo-relative paths (from the worktree root), not absolute paths;
+  add `lines="20-40"` to target lines. For a file on an experiment branch, add
+  `exp="<experimentId>"` so the reader sees its experiment and opens the
+  committed version: <file path="minimal_maxrl.py" lines="60"
+  exp="889383f1-…" />.
+- **Metric or result** (a score, delta, or significance call): cite the run whose
+  logs produced it with <run id="<runId>" />. Logs are the only evidence channel,
+  and run ids come from `orx runs` or launching a run. Add a short label to name
+  the claim when useful: <run id="run_abc123" label="+3.65pp" />.
+- **Artifact** (a report, figure, CSV, or table you wrote): cite its path under
+  the artifacts directory as <file path="artifacts/<relative-path>" />.
 
-Example: `Re-measured with 4 repeats: +3.65pp, not significant
-<run id="run_abc123" />. The harness capped response tokens at 320
-<file path="src/harness.py" lines="41" />.`
+Wrong: Saved as `figures/result.png`.
+Right: Saved as <file path="artifacts/figures/result.png" />.
 
 ## Compute backends
 

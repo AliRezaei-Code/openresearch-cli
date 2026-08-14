@@ -67,14 +67,18 @@ pub async fn run(args: UpArgs) -> Result<()> {
         project_lifecycle: Arc::new(ProjectLifecycle::default()),
         publication_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         data_dir_move_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        data_dir_gate: Arc::new(tokio::sync::Mutex::new(())),
     };
     // Plan-mode turns hand this port to the `orx mcp-gate` permission bridge.
     state.chat.set_up_port(port);
 
     spawn_agent_preflight();
-    // Wake an idle chat session when a run completes (the agent's wait loop
-    // covers the busy case; this covers turns that ended early).
-    tokio::spawn(local::chat::watch_runs(state.chat.clone()));
+    // Deliver explicitly registered run wake-ups once their chat becomes idle.
+    tokio::spawn(local::chat::watch_runs(
+        state.chat.clone(),
+        state.data_dir_move_in_progress.clone(),
+        state.data_dir_gate.clone(),
+    ));
     spawn_claude_auth_monitor(state.chat.clone(), claude.clone(), state.harnesses.clone());
 
     let app = router(state);
@@ -153,6 +157,8 @@ struct AppState {
     /// check it and refuse (409) so nothing starts writing the store mid-move —
     /// closing the window between the move's in-flight check and its completion.
     data_dir_move_in_progress: Arc<std::sync::atomic::AtomicBool>,
+    /// Serializes wake-up store writes with a live data-directory move.
+    data_dir_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 async fn project_publication_lock(
@@ -516,6 +522,13 @@ struct CompleteOnboardingReq {
 
 const RESEARCH_AREAS: [&str; 4] = ["AI/ML", "Biology", "Physics", "Other"];
 
+fn preferred_permission_mode(harness: &str, mode: Option<String>) -> Option<String> {
+    match mode.as_deref() {
+        Some("plan") => local::harness::effective_permission_id(harness, None),
+        _ => mode,
+    }
+}
+
 fn normalize_research_profile(
     research_areas: Vec<String>,
     other_area: Option<String>,
@@ -565,10 +578,17 @@ async fn complete_onboarding(
         return Err(bad_request(format!("unknown harness: {}", req.harness)));
     }
     let nonempty = |value: Option<String>| value.filter(|item| !item.trim().is_empty());
+    let permission_mode = nonempty(req.permission_mode);
+    if permission_mode
+        .as_deref()
+        .is_some_and(|mode| local::harness::permission_mode_for(&req.harness, mode).is_none())
+    {
+        return Err(bad_request("invalid permission mode for selected harness"));
+    }
     let selection = local::demo::DemoSelection {
         harness: req.harness,
         model: nonempty(req.model),
-        permission_mode: nonempty(req.permission_mode),
+        permission_mode,
         reasoning_level: nonempty(req.reasoning_level),
     };
     let profile = normalize_research_profile(
@@ -585,7 +605,10 @@ async fn complete_onboarding(
         store.set_preferred_agent(&StoredAgentSelection {
             harness: completion.selection.harness.clone(),
             model: completion.selection.model.clone(),
-            permission_mode: completion.selection.permission_mode.clone(),
+            permission_mode: preferred_permission_mode(
+                &completion.selection.harness,
+                completion.selection.permission_mode.clone(),
+            ),
             reasoning_level: completion.selection.reasoning_level.clone(),
         })?;
         store.set_onboarding_completed(true)?;
@@ -2925,6 +2948,39 @@ async fn move_data_dir(State(state): State<AppState>, Json(req): Json<DataDirReq
             .store(false, Ordering::SeqCst);
     };
 
+    let data_dir_guard = state.data_dir_gate.clone().lock_owned().await;
+    let source_data_dir = crate::store::data_dir();
+    let move_token = uuid::Uuid::new_v4().to_string();
+    let (move_store, move_lock) = match Store::open().and_then(|store| {
+        let lock = store.acquire_data_dir_move_lock()?;
+        Ok((store, lock))
+    }) {
+        Ok(claim) => claim,
+        Err(_) => {
+            release(&state);
+            return ApiError(
+                StatusCode::CONFLICT,
+                "Another dashboard is moving the data directory.".into(),
+            )
+            .into_response();
+        }
+    };
+    let move_claimed = move_store.claim_data_dir_move(&move_token).unwrap_or(false);
+    if !move_claimed {
+        release(&state);
+        return ApiError(
+            StatusCode::CONFLICT,
+            "Can't move while another dashboard has an active chat turn or storage move.".into(),
+        )
+        .into_response();
+    }
+
+    let release_move_claim = |token: &str| {
+        if let Ok(store) = Store::open() {
+            let _ = store.release_data_dir_move(token);
+        }
+    };
+
     // In-flight guard: block if a chat turn or a run is active right now. (The
     // flag we just set prevents *new* ones from starting past this point.)
     let busy = state.chat.busy_sessions().await;
@@ -2933,6 +2989,7 @@ async fn move_data_dir(State(state): State<AppState>, Json(req): Json<DataDirReq
         .unwrap_or(0);
     let active_operations = state.project_lifecycle.operation_count();
     if !busy.is_empty() || active_runs > 0 || active_operations > 0 {
+        release_move_claim(&move_token);
         release(&state);
         return ApiError(
             StatusCode::CONFLICT,
@@ -2955,10 +3012,12 @@ async fn move_data_dir(State(state): State<AppState>, Json(req): Json<DataDirReq
     match validated {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
+            release_move_claim(&move_token);
             release(&state);
             return bad_request(e).into_response();
         }
         Err(e) => {
+            release_move_claim(&move_token);
             release(&state);
             return ApiError::from(anyhow!("validate task failed: {e}")).into_response();
         }
@@ -2970,6 +3029,8 @@ async fn move_data_dir(State(state): State<AppState>, Json(req): Json<DataDirReq
     let flag = state.data_dir_move_in_progress.clone();
     let target = std::path::PathBuf::from(path);
     tokio::spawn(async move {
+        let _data_dir_guard = data_dir_guard;
+        let _move_lock = move_lock;
         use crate::local::datadir::MoveProgress;
         let chat_for_progress = chat.clone();
         // Throttle: forward at most one progress event per ~120ms of copy, but
@@ -3003,6 +3064,16 @@ async fn move_data_dir(State(state): State<AppState>, Json(req): Json<DataDirReq
                 "datadir.move.error",
                 json!({ "error": format!("move task panicked: {e}") }),
             ),
+        }
+        // A cross-filesystem copy retains the source DB, while a rename removes
+        // it. Avoid reopening a removed source path and recreating it.
+        if source_data_dir.exists() {
+            if let Ok(store) = Store::open_at(source_data_dir) {
+                let _ = store.release_data_dir_move(&move_token);
+            }
+        }
+        if let Ok(store) = Store::open() {
+            let _ = store.release_data_dir_move(&move_token);
         }
         flag.store(false, Ordering::SeqCst);
     });
@@ -3303,10 +3374,16 @@ async fn set_ui_state(Json(req): Json<SetUiStateReq>) -> ApiResult {
                     return Err(anyhow!("unknown harness: {}", selection.harness));
                 }
                 let nonempty = |value: Option<String>| value.filter(|item| !item.trim().is_empty());
+                let permission_mode = nonempty(selection.permission_mode);
+                if permission_mode.as_deref().is_some_and(|mode| {
+                    local::harness::permission_mode_for(&selection.harness, mode).is_none()
+                }) {
+                    return Err(anyhow!("invalid permission mode for selected harness"));
+                }
                 Ok(StoredAgentSelection {
-                    harness: selection.harness,
+                    harness: selection.harness.clone(),
                     model: nonempty(selection.model),
-                    permission_mode: nonempty(selection.permission_mode),
+                    permission_mode: preferred_permission_mode(&selection.harness, permission_mode),
                     reasoning_level: nonempty(selection.reasoning_level),
                 })
             })
@@ -4153,6 +4230,8 @@ struct CreateChatSessionReq {
     harness: String,
     model: Option<String>,
     permission_mode: Option<String>,
+    #[serde(default)]
+    plan_mode: bool,
     reasoning_level: Option<String>,
 }
 
@@ -4173,6 +4252,18 @@ async fn create_chat_session(
         .get_local_project(&req.project_id)?
         .ok_or_else(|| not_found("project"))?;
     let nonempty = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
+    let permission_mode = nonempty(req.permission_mode);
+    if permission_mode
+        .as_deref()
+        .is_some_and(|mode| local::harness::permission_mode_for(&req.harness, mode).is_none())
+    {
+        return Err(bad_request("invalid permission mode for selected harness"));
+    }
+    if req.plan_mode && !local::harness::supports_command_plan(&req.harness) {
+        return Err(bad_request(
+            "this harness activates Plan through permissions",
+        ));
+    }
     let session = StoredChatSession {
         id: format!("chat_{}", uuid::Uuid::new_v4()),
         project_id: req.project_id,
@@ -4181,7 +4272,9 @@ async fn create_chat_session(
         title: None,
         title_source: None,
         model: nonempty(req.model),
-        permission_mode: nonempty(req.permission_mode),
+        permission_mode,
+        plan_mode: req.plan_mode,
+        plan_reset_pending: false,
         reasoning_level: nonempty(req.reasoning_level),
         archived: false,
         context_usage_json: None,
@@ -4206,6 +4299,8 @@ async fn delete_chat_session(State(state): State<AppState>, Path(id): Path<Strin
 struct UpdateChatSessionReq {
     archived: Option<bool>,
     title: Option<String>,
+    plan_mode: Option<bool>,
+    permission_mode: Option<String>,
 }
 
 async fn update_chat_session(
@@ -4228,6 +4323,18 @@ async fn update_chat_session(
         state
             .chat
             .set_archived(&id, archived)
+            .await?
+            .ok_or_else(|| not_found("chat session"))?
+    } else if let Some(plan_mode) = req.plan_mode {
+        state
+            .chat
+            .set_plan_mode(&id, plan_mode)
+            .await?
+            .ok_or_else(|| not_found("chat session"))?
+    } else if let Some(permission_mode) = req.permission_mode {
+        state
+            .chat
+            .set_permission_mode(&id, &permission_mode)
             .await?
             .ok_or_else(|| not_found("chat session"))?
     } else {
@@ -4256,9 +4363,12 @@ struct SendChatReq {
     text: String,
     model: Option<String>,
     permission_mode: Option<String>,
+    plan_mode: Option<bool>,
     reasoning_level: Option<String>,
     #[serde(default)]
     images: Vec<local::chat::ImageAttachment>,
+    #[serde(default)]
+    annotations: Vec<local::chat::TextAnnotation>,
 }
 
 async fn send_chat_message(
@@ -4268,18 +4378,26 @@ async fn send_chat_message(
 ) -> ApiResult {
     reject_if_moving(&state)?;
     let text = req.text.trim().to_string();
-    if text.is_empty() && req.images.is_empty() {
+    let annotations = req
+        .annotations
+        .into_iter()
+        .filter(|annotation| !annotation.text.trim().is_empty())
+        .collect::<Vec<_>>();
+    if text.is_empty() && req.images.is_empty() && annotations.is_empty() {
         return Err(bad_request("text is required"));
     }
     let overrides = local::chat::TurnOverrides {
         model: req.model,
         permission_mode: req.permission_mode,
+        permission_revision: None,
+        plan_mode: req.plan_mode,
+        plan_revision: None,
         reasoning_level: req.reasoning_level,
     };
     // The turn runs in the background; progress streams over /api/events.
     state
         .chat
-        .send_message(&id, text, overrides, req.images)
+        .send_message(&id, text, overrides, req.images, annotations)
         .await
         .map_err(bad_request)?;
     Ok(Json(json!({ "ok": true })))
@@ -4349,6 +4467,8 @@ struct RespondReq {
     answers: Vec<String>,
     #[serde(default)]
     note: Option<String>,
+    #[serde(default)]
+    annotations: Vec<local::chat::TextAnnotation>,
 }
 
 fn default_true() -> bool {
@@ -4370,6 +4490,11 @@ async fn respond_chat(
             resume_mode: req.resume_mode,
             answers: req.answers,
             note: req.note,
+            annotations: req
+                .annotations
+                .into_iter()
+                .filter(|annotation| !annotation.text.trim().is_empty())
+                .collect(),
         })
         .await
         .map_err(bad_request)?;
@@ -4681,6 +4806,22 @@ async fn spa(uri: Uri) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_never_becomes_the_preferred_mode_for_new_sessions() {
+        assert_eq!(
+            preferred_permission_mode("claude-code", Some("plan".into())).as_deref(),
+            Some("auto")
+        );
+        assert_eq!(
+            preferred_permission_mode("codex", Some("plan".into())).as_deref(),
+            Some("approve-for-me")
+        );
+        assert_eq!(
+            preferred_permission_mode("opencode", Some("plan".into())).as_deref(),
+            Some("default")
+        );
+    }
 
     fn expect_profile(
         result: std::result::Result<crate::telemetry::ResearchProfile, ApiError>,

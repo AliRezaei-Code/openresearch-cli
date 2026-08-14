@@ -70,11 +70,17 @@ pub enum ResumeAction {
     SendMessage {
         text: String,
         mode: Option<PermissionMode>,
+        /// Independent Plan transition (Codex); `None` preserves it.
+        plan_mode: Option<bool>,
     },
     /// The harness already delivered the answer to its live process (OpenCode
     /// inline reply). `ChatHost` leaves the still-running turn alone — the
     /// paused process resumes and finishes its own turn.
-    Handled,
+    Handled {
+        /// Independent Plan transition applied after the inline reply succeeds
+        /// (OpenCode's native `plan_exit` question).
+        plan_mode: Option<bool>,
+    },
     /// No resume — e.g. a denied permission that just closes the card.
     Nothing,
 }
@@ -203,6 +209,44 @@ pub trait Harness: Send + Sync {
     fn session_skills_dir(&self) -> Option<&'static str> {
         None
     }
+}
+
+/// Resolve a provider-owned permission id only when that harness advertises it.
+/// This is the validation boundary for stored and incoming session values.
+pub fn permission_mode_for(harness_id: &str, id: &str) -> Option<PermissionMode> {
+    let harness = chat_harness(harness_id)?;
+    harness
+        .options()
+        .permission_modes
+        .iter()
+        .any(|choice| choice.id == id)
+        .then(|| PermissionMode::from_id(id))
+        .flatten()
+}
+
+/// The valid wire id to expose for a session. Unknown/stale values fall back to
+/// the harness default instead of leaving the composer on an impossible mode.
+pub fn effective_permission_id(harness_id: &str, stored: Option<&str>) -> Option<String> {
+    let harness = chat_harness(harness_id)?;
+    let options = harness.options();
+    if let Some(id) = stored.filter(|id| options.permission_modes.iter().any(|c| c.id == *id)) {
+        return Some(id.to_string());
+    }
+    options.default_permission_mode.map(str::to_string)
+}
+
+pub fn supports_command_plan(harness_id: &str) -> bool {
+    chat_harness(harness_id).and_then(|harness| harness.options().plan_activation)
+        == Some(options::PlanActivation::Command)
+}
+
+pub fn permission_id_for_mode(harness_id: &str, mode: PermissionMode) -> Option<String> {
+    chat_harness(harness_id)?
+        .options()
+        .permission_modes
+        .into_iter()
+        .find(|choice| PermissionMode::from_id(&choice.id) == Some(mode))
+        .map(|choice| choice.id)
 }
 
 /// The one registry. Every consumer — chat dispatch, detection sweep, the
@@ -357,7 +401,7 @@ $ARGUMENTS
 
 #[cfg(test)]
 mod tests {
-    use super::options::REASONING_DEFAULT_ID;
+    use super::options::{PlanActivation, REASONING_DEFAULT_ID};
     use super::*;
 
     fn options_for(id: &str) -> HarnessOptions {
@@ -368,25 +412,47 @@ mod tests {
             .options()
     }
 
-    fn mode_ids(o: &HarnessOptions) -> Vec<&str> {
-        o.permission_modes.iter().map(|c| c.id.as_str()).collect()
-    }
     fn reasoning_ids(o: &HarnessOptions) -> Vec<&str> {
         o.reasoning_levels.iter().map(|c| c.id.as_str()).collect()
     }
 
-    /// Pin each harness's advertised composer vocabulary — this is the wire
-    /// contract the UI renders, and the whole point of the parity work. All ids
-    /// must be the neutralized (harness-agnostic) permission-mode spellings.
+    fn permission_contract(o: &HarnessOptions) -> Vec<(&str, &str, &str)> {
+        o.permission_modes
+            .iter()
+            .map(|choice| {
+                (
+                    choice.id.as_str(),
+                    choice.label.as_str(),
+                    choice.description.as_deref().unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    /// Pin each harness's native permission vocabulary and Plan activation.
     #[test]
     fn advertised_options_per_harness() {
-        // Claude: Plan + Auto + Bypass. `ask`/`accept-edits` aren't grantable
-        // headless (dropped). `plan` is back: a PreToolUse hook lets read-only
-        // `orx` inspection through while launches/edits stay gated (see
-        // `plan_gate`). Default stays `auto`.
         let claude = options_for("claude-code");
-        assert_eq!(mode_ids(&claude), ["plan", "auto", "bypass"]);
+        assert_eq!(
+            permission_contract(&claude),
+            [
+                ("manual", "Manual", "Always ask before making changes"),
+                (
+                    "acceptEdits",
+                    "Accept edits",
+                    "Automatically accept all file edits"
+                ),
+                ("plan", "Plan", "Create a plan before making changes"),
+                ("auto", "Auto", "Claude handles permission decisions"),
+                (
+                    "bypassPermissions",
+                    "Bypass permissions",
+                    "Accepts all permissions"
+                ),
+            ]
+        );
         assert_eq!(claude.default_permission_mode, Some("auto"));
+        assert_eq!(claude.plan_activation, Some(PlanActivation::Permission));
         // The harness-wide list is the *fallback* and always leads with
         // `default` (no `--effort` sent). `ultracode` is deliberately absent
         // here — it's version-gated and added per-model in `detect`, where the
@@ -400,14 +466,29 @@ mod tests {
             Some(REASONING_DEFAULT_ID)
         );
 
-        // Codex: Plan + Auto + Bypass. Plan is a native collaboration mode over
-        // the app-server (codex ≥ 0.144): its plan.md template + request_user_input
-        // question cards + the streamed plan item (the legacy exec fallback
-        // degrades it to a read-only sandbox with no cards). Default stays `auto`.
-        // Codex reasoning tiers.
         let codex = options_for("codex");
-        assert_eq!(mode_ids(&codex), ["plan", "auto", "bypass"]);
-        assert_eq!(codex.default_permission_mode, Some("auto"));
+        assert_eq!(
+            permission_contract(&codex),
+            [
+                (
+                    "ask",
+                    "Ask for approval",
+                    "Ask before commands that need elevated access"
+                ),
+                (
+                    "approve-for-me",
+                    "Approve for me",
+                    "Codex reviews approval requests automatically"
+                ),
+                (
+                    "full-access",
+                    "Full access",
+                    "Run without sandbox or approval prompts"
+                ),
+            ]
+        );
+        assert_eq!(codex.default_permission_mode, Some("approve-for-me"));
+        assert_eq!(codex.plan_activation, Some(PlanActivation::Command));
         // Only the conservative fallback intersection — per-model tiers
         // (`max`/`ultra` on Sol/Terra) ride on each `ModelInfo`.
         assert_eq!(
@@ -419,14 +500,24 @@ mod tests {
             Some(REASONING_DEFAULT_ID)
         );
 
-        // OpenCode: Plan (the native plan agent) + Auto (its permissive default)
-        // + Bypass. No `ask` — opencode's default rarely prompts, so a dedicated
-        // ask mode would be hollow. Still no harness-wide reasoning axis: in
-        // opencode reasoning is genuinely per-model (`variants`), so the choices
-        // come from each `ModelInfo` and a model without variants shows none.
         let opencode = options_for("opencode");
-        assert_eq!(mode_ids(&opencode), ["plan", "auto", "bypass"]);
-        assert_eq!(opencode.default_permission_mode, Some("auto"));
+        assert_eq!(
+            permission_contract(&opencode),
+            [
+                (
+                    "default",
+                    "Default",
+                    "Ask before actions that need your approval"
+                ),
+                (
+                    "auto-approve",
+                    "Auto-approve",
+                    "Approve requests automatically, except actions you have denied"
+                ),
+            ]
+        );
+        assert_eq!(opencode.default_permission_mode, Some("default"));
+        assert_eq!(opencode.plan_activation, Some(PlanActivation::Command));
         assert!(opencode.reasoning_levels.is_empty());
     }
 
@@ -437,11 +528,18 @@ mod tests {
     fn advertised_permission_ids_all_parse() {
         for h in registry() {
             for choice in h.options().permission_modes {
+                let mode = PermissionMode::from_id(&choice.id);
                 assert!(
-                    PermissionMode::from_id(&choice.id).is_some(),
+                    mode.is_some(),
                     "{} advertises unparseable mode {:?}",
                     h.id(),
                     choice.id
+                );
+                assert_eq!(
+                    permission_id_for_mode(h.id(), mode.unwrap()).as_deref(),
+                    Some(choice.id.as_str()),
+                    "{} permission id does not round-trip",
+                    h.id()
                 );
             }
         }

@@ -75,20 +75,18 @@ const EVIDENCE_CLOUD: &str = include_str!("../../agent-skills/orx-evidence/SKILL
 // works blind). Keep each ≤400 chars — Codex's ambient budget is ~8k across
 // the whole set.
 
-// The compute and experiment-tree descriptions are shared by the local and
-// cloud body variants (same public name, same triggers — only the body
-// changes), so they live in one const each.
-const D_COMPUTE: &str = "Launch experiment runs with `orx exp run`: backends (hf, modal, k8s, ssh, slurm, ray, openresearch, local), flavors, timeouts, images, sizing, and `orx exp wait`. Use before launching or re-launching any run, when choosing or switching a backend or GPU flavor, when a job OOMs, stalls, or times out, or when deciding GPU vs CPU.";
+const D_COMPUTE_LOCAL: &str = "Launch experiment runs with `orx exp run`: backends (hf, modal, k8s, ssh, slurm, ray, openresearch, local), flavors, timeouts, images, sizing, and choosing `orx exp wait` vs `orx exp wake`. Use before launching or re-launching any run, when choosing or switching a backend or GPU flavor, when a job OOMs, stalls, or times out, or when deciding GPU vs CPU.";
+const D_COMPUTE_CLOUD: &str = "Launch experiment runs with `orx exp run`: backends (hf, modal, k8s, ssh, slurm, ray, openresearch, local), flavors, timeouts, images, sizing, and `orx exp wait`. Use before launching or re-launching any run, when choosing or switching a backend or GPU flavor, when a job OOMs, stalls, or times out, or when deciding GPU vs CPU.";
 const D_EXPERIMENT_TREE: &str = "The experiment-tree model and the auto-research loop: shape the tree (stacked bushes), branch/launch/wait/promote, and `orx exp desc` notes. Use before creating, planning, or reorganizing experiments, when deciding what to try next, when a round of runs finishes, or whenever you're unsure how work maps onto the tree.";
 
 const S_COMPUTE_LOCAL: AgentSkill = AgentSkill {
     name: "orx-compute",
-    description: D_COMPUTE,
+    description: D_COMPUTE_LOCAL,
     content: COMPUTE_LOCAL,
 };
 const S_COMPUTE_CLOUD: AgentSkill = AgentSkill {
     name: "orx-compute",
-    description: D_COMPUTE,
+    description: D_COMPUTE_CLOUD,
     content: COMPUTE_CLOUD,
 };
 const S_COMPUTE_K8S: AgentSkill = AgentSkill {
@@ -386,6 +384,13 @@ mod tests {
             assert_eq!(local.content, local_body, "{name} served a non-local body");
             assert_eq!(cloud.content, cloud_body, "{name} served a non-cloud body");
         }
+    }
+
+    #[test]
+    fn local_reports_skill_links_written_artifacts() {
+        assert!(REPORTS_LOCAL.contains("cite every relevant output as raw"));
+        assert!(REPORTS_LOCAL.contains("<file path=\"artifacts/<relative-path>\" />"));
+        assert!(REPORTS_LOCAL.contains("never as a bare or backticked path"));
     }
 
     #[test]
