@@ -90,3 +90,21 @@ and an `/Applications` alias to drag it onto, over a branded background.
   headless shell; if it fails, a functional but unstyled DMG still ships. The
   window/icon constants live at the top of the "styled DMG" block, and the
   matching canvas size lives in `generate-dmg-background.mjs`.
+
+## App-mode runtime environment
+
+Finder launches the bundle through launchd, so the process starts with
+`PATH=/usr/bin:/bin:/usr/sbin:/sbin` and no shell rc ever sourced. Harness
+detection would find no `claude`/`codex`/`opencode` at all — the "works in my
+terminal, broken in the app" class of bug.
+
+`commands::app::hydrate_search_path` therefore probes the user's shell
+(`$SHELL -ilc`, interactive because `.zshrc` is where PATH edits live) once at
+startup and installs the result via `local::search_path`, which harness lookup
+and harness children consult instead of the process PATH. It is best-effort and
+capped at 5s; every outcome is logged. To see it, run the bundled binary from a
+terminal:
+
+```
+/Applications/OpenResearch.app/Contents/MacOS/OpenResearch
+```

@@ -21,11 +21,15 @@ pub fn launched_as_app_bundle() -> bool {
         .is_some_and(|dir| dir.ends_with("Contents/MacOS"))
 }
 
-/// Enter GUI app mode: pick a free port, start the dashboard server on
-/// background threads, and hand the main thread to the AppKit run loop. Returns
-/// only when the user quits the app (usually the process just exits).
+/// Enter GUI app mode: adopt the user's shell PATH, pick a free port, start the
+/// dashboard server on background threads, and hand the main thread to the
+/// AppKit run loop. Returns only when the user quits the app (usually the
+/// process just exits).
 #[cfg(target_os = "macos")]
-pub fn run() {
+pub async fn run() {
+    // Before the port is reserved, so the reservation can't go stale while the
+    // probe runs — and long before detection reads PATH for `/api/harnesses`.
+    hydrate_search_path().await;
     // Ephemeral loopback port so the app never collides with a terminal
     // `orx up`. Bind-then-drop to reserve it; the tiny race is harmless locally.
     let port = std::net::TcpListener::bind(("127.0.0.1", 0))
@@ -33,6 +37,49 @@ pub fn run() {
         .map(|a| a.port())
         .unwrap_or(4791);
     imp::run_event_loop(format!("http://127.0.0.1:{port}/"), port);
+}
+
+/// Adopt the user's shell PATH in place of the one launchd handed us (see
+/// [`crate::local::search_path`]).
+///
+/// `-ilc`, not `-lc`: zsh reads `.zshrc` only for *interactive* shells, and
+/// that is where PATH edits overwhelmingly live. The inner `sh -c` keeps the
+/// answer portable — the outer shell sees three plain words and execs
+/// `/bin/sh`, which prints the colon-separated PATH it inherited, where fish
+/// would have printed its own list-valued `$PATH` space-separated.
+#[cfg(target_os = "macos")]
+async fn hydrate_search_path() {
+    // Nonce, so rc-file chatter can't forge the fence around the PATH.
+    let marker = format!("__ORX_PATH_{}__", uuid::Uuid::new_v4().simple());
+    let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
+    let script = format!(r#"/bin/sh -c 'printf "{marker}%s{marker}" "$PATH"'"#);
+    let fut = tokio::process::Command::new(shell)
+        .args(["-ilc".to_string(), script])
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    // A slow rc file (nvm, conda) delays the dashboard, so cap the wait; the
+    // inherited PATH stays in force when the probe doesn't answer.
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(5), fut).await {
+        Ok(Ok(out)) => out,
+        other => {
+            eprintln!("openresearch app: PATH probe failed ({other:?}); using the inherited PATH");
+            return;
+        }
+    };
+    // The markers are the success signal, not the exit status — an interactive
+    // rc file routinely ends on a failing command.
+    match crate::local::search_path::extract_path(&String::from_utf8_lossy(&out.stdout), &marker) {
+        Some(path) => {
+            eprintln!("openresearch app: adopted the shell PATH: {path}");
+            crate::local::search_path::set(path.into());
+        }
+        None => eprintln!(
+            "openresearch app: PATH probe returned nothing usable; using the inherited PATH. \
+             shell stderr: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    }
 }
 
 #[cfg(target_os = "macos")]

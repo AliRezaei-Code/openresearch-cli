@@ -4173,7 +4173,7 @@ pub fn prepare_env(cmd: &mut tokio::process::Command) {
     if let Ok(exe) = std::env::current_exe().and_then(|p| p.canonicalize()) {
         if let Some(dir) = exe.parent() {
             let mut path = std::ffi::OsString::from(dir);
-            if let Some(existing) = std::env::var_os("PATH").filter(|p| !p.is_empty()) {
+            if let Some(existing) = crate::local::search_path::current().filter(|p| !p.is_empty()) {
                 path.push(":");
                 path.push(existing);
             }

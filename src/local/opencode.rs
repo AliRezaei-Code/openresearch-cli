@@ -31,7 +31,7 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `opencode` on PATH, else the installer's default drop location.
 pub fn find_opencode() -> Result<PathBuf> {
-    if let Some(paths) = std::env::var_os("PATH") {
+    if let Some(paths) = crate::local::search_path::current() {
         for dir in std::env::split_paths(&paths) {
             let candidate = dir.join("opencode");
             if candidate.is_file() {
@@ -514,7 +514,7 @@ async fn spawn_agent(
     if let Ok(exe) = std::env::current_exe().and_then(|p| p.canonicalize()) {
         if let Some(dir) = exe.parent() {
             let mut path = std::ffi::OsString::from(dir);
-            match std::env::var_os("PATH") {
+            match crate::local::search_path::current() {
                 Some(existing) if !existing.is_empty() => {
                     path.push(":");
                     path.push(existing);

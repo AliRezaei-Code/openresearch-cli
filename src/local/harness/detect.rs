@@ -163,8 +163,11 @@ impl HarnessInfo {
 }
 
 pub(super) fn find_on_path(bin: &str) -> Option<PathBuf> {
-    let paths = std::env::var_os("PATH")?;
+    let paths = crate::local::search_path::current()?;
     std::env::split_paths(&paths)
+        // An empty component (`PATH=":/usr/bin"`) means cwd — never a place to
+        // pick up a binary we are about to execute.
+        .filter(|dir| !dir.as_os_str().is_empty())
         .map(|dir| dir.join(bin))
         .find(|c| c.is_file())
 }
@@ -182,10 +185,12 @@ pub(super) fn resolve_symlinks(path: PathBuf) -> PathBuf {
 
 /// `<bin> --version`, first line, with a timeout (node CLIs can be slow).
 pub(super) async fn bin_version(bin: &PathBuf) -> Option<String> {
-    let fut = tokio::process::Command::new(bin)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .output();
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("--version").stdin(std::process::Stdio::null());
+    // A node-shebang install needs `node` on PATH to answer at all, and an
+    // unparseable version downgrades a signed-in harness to `Unknown`.
+    crate::local::chat::prepare_env(&mut cmd);
+    let fut = cmd.output();
     let out = tokio::time::timeout(VERSION_TIMEOUT, fut)
         .await
         .ok()?

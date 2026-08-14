@@ -185,10 +185,11 @@ pub(crate) fn auth_recovery_note() -> &'static str {
 /// Any failure reports unsupported: a missing choice is a smaller harm than a
 /// choice that silently runs at the default effort.
 async fn claude_accepts_ultracode(bin: &Path) -> bool {
-    let fut = Command::new(bin)
-        .args(["--effort", CLAUDE_ULTRACODE, "--version"])
-        .stdin(Stdio::null())
-        .output();
+    let mut cmd = Command::new(bin);
+    cmd.args(["--effort", CLAUDE_ULTRACODE, "--version"])
+        .stdin(Stdio::null());
+    prepare_env(&mut cmd);
+    let fut = cmd.output();
     match tokio::time::timeout(Duration::from_secs(10), fut).await {
         Ok(Ok(out)) => {
             let text = format!(
@@ -214,15 +215,17 @@ async fn claude_accepts_ultracode(bin: &Path) -> bool {
 /// caller falls back to the static table.
 async fn claude_list_models(bin: &Path, ultracode: bool) -> Option<Vec<ModelInfo>> {
     let fut = async {
-        let mut child = Command::new(bin)
-            .args([
-                "--print",
-                "--input-format",
-                "stream-json",
-                "--output-format",
-                "stream-json",
-                "--verbose",
-            ])
+        let mut cmd = Command::new(bin);
+        cmd.args([
+            "--print",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ]);
+        prepare_env(&mut cmd);
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
