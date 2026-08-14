@@ -10,6 +10,7 @@
 //! `main().catch(err => { console.error(err.message); process.exit(1) })`.
 
 mod browser;
+mod editors;
 // DTOs faithfully mirror every API wire field; not all are read by the CLI yet.
 #[allow(dead_code)]
 mod client;

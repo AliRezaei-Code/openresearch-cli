@@ -4,18 +4,21 @@
 // refractor-highlighted, opened as a right-pane tab from chat tool rows or
 // the code browser.
 
-import { Code, FileText, GitBranch, RotateCw } from "lucide-react";
+import { Code, ExternalLink, FileText, GitBranch, RotateCw } from "lucide-react";
 import { useEffect, useState } from "react";
 import {
   artifactUrl,
   getArtifactFileMetadata,
   getArtifactFileText,
   getProjectFile,
+  openFileInEditor,
   projectFileUrl,
+  saveProjectFile,
   type CheckoutRoot,
   type ProjectFile,
 } from "../api";
 import { CodeView } from "./CodeView";
+import { CodeEditor } from "./CodeEditor";
 import { ArtifactMarkdown } from "./ArtifactsTab";
 import { isMarkdownFile } from "./FileTypeIcon";
 import { MediaPreview, mediaPreviewKind } from "./MediaPreview";
@@ -65,10 +68,78 @@ export function FileViewer({
   const isMarkdown = isMarkdownFile(path);
   const artifactsFolder = path.split("/").slice(0, -1).join("/");
   const [showSource, setShowSource] = useState(false);
+  // Live edit buffer for the code file. It IS the view for editable files (no
+  // edit mode); it tracks the loaded content and diverges as the user types.
+  const [draft, setDraft] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const data = loaded?.file ?? null;
   const mediaKind = mediaPreviewKind(data?.presentation);
   const viaArtifacts = loaded?.source === "artifact" && !isArtifacts;
   const artifactsMode = isArtifacts || loaded?.source === "artifact";
+  // A file that exists in the live checkout on disk (not a committed branch tree
+  // or an artifact) — the only source the write/open endpoints can resolve.
+  const onDisk =
+    !isArtifacts && !gitRef && loaded?.source === "checkout" && data != null && !data.notFound;
+  // Only live checkout text files are writable: a truncated read can't be saved
+  // whole, and binary/media have no text form to edit.
+  const editable =
+    !isArtifacts &&
+    !gitRef &&
+    loaded?.source === "checkout" &&
+    data != null &&
+    !data.notFound &&
+    !data.binary &&
+    !data.truncated &&
+    !mediaKind;
+  // The editor replaces the read-only view for editable files — except markdown,
+  // which stays rendered until its source toggle is on.
+  const showingEditor = editable && !(isMarkdown && !showSource);
+  const dirty = editable && data != null && draft !== data.content;
+
+  // Seed (and reseed on reload/switch) the edit buffer from the loaded content.
+  // Typing changes `draft`, not `data.content`, so this doesn't clobber edits.
+  useEffect(() => {
+    setDraft(data?.content ?? "");
+    setSaveError(null);
+  }, [data?.content, path]);
+
+  const save = async () => {
+    if (!editable || data == null || !dirty || saving) return;
+    const content = draft;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await saveProjectFile(projectId, path, content, { sessionId });
+      // Advance the loaded baseline to what we wrote so `dirty` clears without a
+      // refetch — the editor stays mounted and the caret is preserved.
+      setLoaded((prev) =>
+        prev && prev.source === "checkout"
+          ? { source: "checkout", file: { ...prev.file, content } }
+          : prev,
+      );
+    } catch (e) {
+      setSaveError((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const [openingEditor, setOpeningEditor] = useState(false);
+  const [editorError, setEditorError] = useState<string | null>(null);
+  // Hand the file to the OS, which opens it in the user's default app for the
+  // type (their editor for source files) — no picker.
+  const openInEditor = async () => {
+    setOpeningEditor(true);
+    setEditorError(null);
+    try {
+      await openFileInEditor(projectId, path, { sessionId });
+    } catch (e) {
+      setEditorError((e as Error).message);
+    } finally {
+      setOpeningEditor(false);
+    }
+  };
   const rawUrlBase = artifactsMode
     ? artifactUrl(projectId, path)
     : projectFileUrl(projectId, path, { sessionId, ref: gitRef });
@@ -153,6 +224,22 @@ export function FileViewer({
             {branchLabel}
           </span>
         )}
+        {showingEditor && (saving || dirty || saveError) && (
+          <span
+            className={`file-view-save-status inline-flex items-center gap-1 text-xs shrink-0 ${saveError ? "text-accent-red" : "text-muted"}`}
+            title={saveError ?? (saving ? "Saving…" : "Unsaved — ⌘S or click away to save")}
+          >
+            {saving ? (
+              <>
+                <span className={SPINNER_CLASS_NAME} /> Saving…
+              </>
+            ) : saveError ? (
+              "Save failed"
+            ) : (
+              "Unsaved"
+            )}
+          </span>
+        )}
         {isMarkdown && (
           <button
             className={`${ICON_BUTTON_CLASS_NAME} ${showSource ? "active" : ""}`}
@@ -162,6 +249,18 @@ export function FileViewer({
             onClick={() => setShowSource((s) => !s)}
           >
             <Code size={13} />
+          </button>
+        )}
+        {onDisk && (
+          <button
+            className={ICON_BUTTON_CLASS_NAME}
+            data-tip={editorError ?? "Open in default editor"}
+            data-tip-align="end"
+            aria-label="Open in default editor"
+            disabled={openingEditor}
+            onClick={() => void openInEditor()}
+          >
+            {openingEditor ? <span className={SPINNER_CLASS_NAME} /> : <ExternalLink size={13} />}
           </button>
         )}
         <button
@@ -175,12 +274,12 @@ export function FileViewer({
         </button>
       </div>
       <div className="file-view-body flex-1 min-h-0 overflow-auto bg-background">
-        {!error && loaded?.source === "checkout" && !loaded.file.notFound && !gitRef && sessionId && loaded.file.root === "clone" && (
+        {!showingEditor && !error && loaded?.source === "checkout" && !loaded.file.notFound && !gitRef && sessionId && loaded.file.root === "clone" && (
           <div className="file-view-note py-2.5 px-4 text-sm text-muted">
             This session&apos;s worktree isn&apos;t available — showing the project clone&apos;s copy.
           </div>
         )}
-        {!error && loaded?.source === "artifact" && !loaded.file.notFound && viaArtifacts && (
+        {!showingEditor && !error && loaded?.source === "artifact" && !loaded.file.notFound && viaArtifacts && (
           <div className="file-view-note py-2.5 px-4 text-sm text-muted">
             Not in the {loaded.checkoutRoot === "worktree" ? "session's worktree" : "project clone"} —
             showing the copy from the project&apos;s artifacts.
@@ -204,26 +303,37 @@ export function FileViewer({
           <div className="file-view-note py-2.5 px-4 text-sm text-muted">
             Binary file — no inline preview. <a href={rawUrl} download={path.split("/").pop() ?? path}>Download</a>
           </div>
+        ) : isMarkdown && !showSource ? (
+          <div className="file-view-md max-w-readable pt-4.5 px-5 pb-8 [&_.md]:text-base [&_.md_h1]:text-[1.5em] [&_.md_h1]:mt-4.5 [&_.md_h1]:mx-0 [&_.md_h1]:mb-2 [&_.md_h2]:text-[1.25em] [&_.md_h2]:mt-4 [&_.md_h2]:mx-0 [&_.md_h2]:mb-2 [&_.md_h3]:text-[1.1em]">
+            {artifactsMode ? (
+              <ArtifactMarkdown
+                projectId={projectId}
+                folder={artifactsFolder}
+                markdown={data.content}
+              />
+            ) : (
+              <Md
+                text={data.content}
+                onOpenFile={onOpenFile && ((p) => onOpenFile(p, sessionId, gitRef))}
+              />
+            )}
+          </div>
+        ) : showingEditor ? (
+          // Editable files open straight into the editor — click and type.
+          <CodeEditor
+            value={draft}
+            onChange={(next) => {
+              setDraft(next);
+              if (saveError) setSaveError(null);
+            }}
+            onSave={() => void save()}
+            onBlur={() => void save()}
+            path={path}
+            highlightLine={line}
+          />
         ) : (
           <>
-            {isMarkdown && !showSource ? (
-              <div className="file-view-md max-w-readable pt-4.5 px-5 pb-8 [&_.md]:text-base [&_.md_h1]:text-[1.5em] [&_.md_h1]:mt-4.5 [&_.md_h1]:mx-0 [&_.md_h1]:mb-2 [&_.md_h2]:text-[1.25em] [&_.md_h2]:mt-4 [&_.md_h2]:mx-0 [&_.md_h2]:mb-2 [&_.md_h3]:text-[1.1em]">
-                {artifactsMode ? (
-                  <ArtifactMarkdown
-                    projectId={projectId}
-                    folder={artifactsFolder}
-                    markdown={data.content}
-                  />
-                ) : (
-                  <Md
-                    text={data.content}
-                    onOpenFile={onOpenFile && ((p) => onOpenFile(p, sessionId, gitRef))}
-                  />
-                )}
-              </div>
-            ) : (
-              <CodeView text={data.content} path={path} highlightLine={line} />
-            )}
+            <CodeView text={data.content} path={path} highlightLine={line} />
             {data.truncated && (
               <div className="file-view-note py-2.5 px-4 text-sm text-muted">File truncated — showing the first 512 KB.</div>
             )}

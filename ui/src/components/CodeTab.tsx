@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   getCodeTree,
+  getSessionWorktree,
   githubBranchUrl,
   type CodeTree,
   type Experiment,
@@ -46,6 +47,10 @@ export function CodeTab({
   const [loading, setLoading] = useState(false);
   const [changesLoading, setChangesLoading] = useState(false);
   const [changesRefreshKey, setChangesRefreshKey] = useState(0);
+  // The experiment's session worktree, when it exists and is still checked out
+  // on this branch, is the on-disk copy to edit — so files open editable there
+  // instead of as read-only committed blobs. Absent → committed view (read-only).
+  const [editSessionId, setEditSessionId] = useState<string | undefined>(undefined);
   // A request id drops stale responses — from earlier sources, superseded
   // refreshes, and (via the effect-cleanup bump) post-unmount completions.
   const reqId = useRef(0);
@@ -87,6 +92,25 @@ export function CodeTab({
   useEffect(() => {
     if (view === "files" && requestedSource.current !== sourceKey) load();
   }, [view, sourceKey, load]);
+
+  // Resolve whether this branch is live on the creating session's worktree; only
+  // then are its files on disk under that branch and safe to edit via the
+  // session. Any other case (no session, pruned worktree, session moved to
+  // another branch) leaves files read-only.
+  useEffect(() => {
+    setEditSessionId(undefined);
+    const sid = experiment.chatSessionId;
+    if (!sid) return;
+    let cancelled = false;
+    getSessionWorktree(sid)
+      .then((wt) => {
+        if (!cancelled && wt.exists && wt.branch === branch) setEditSessionId(sid);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [experiment.chatSessionId, branch]);
 
   const tree = useMemo(() => (data ? buildTree(data.entries) : null), [data]);
   const refreshing = view === "files" ? loading : changesLoading;
@@ -145,7 +169,11 @@ export function CodeTab({
                   depth={0}
                   toggled={toggled}
                   onToggle={toggle}
-                  onOpenFile={(path) => onOpenFile(path, undefined, branch)}
+                  onOpenFile={(path) =>
+                    editSessionId
+                      ? onOpenFile(path, editSessionId)
+                      : onOpenFile(path, undefined, branch)
+                  }
                 />
               </div>
             )}

@@ -87,6 +87,10 @@ interface FileViewDef {
   /** Branch whose committed copy to show (code browser in branch mode);
    * overrides the live checkout. */
   ref?: string;
+  /** Branch to show in the header chip when the file is read from a checkout
+   * (no `ref`) whose branch isn't the baseline — e.g. an experiment's worktree.
+   * Display-only, so it's kept out of tab identity. */
+  branchLabel?: string;
   /** 1-based line to scroll to and highlight on open (from a `file:line`
    * evidence chip). Not part of tab identity — reopening at a new line updates
    * the same tab. */
@@ -288,7 +292,7 @@ function parseFilePath(
  * branch its contents came from. Artifacts have no branch. */
 function fileBranchLabel(tab: FileViewDef, baselineBranch?: string): string | undefined {
   if (tab.source === "artifacts") return undefined;
-  return tab.ref ?? baselineBranch;
+  return tab.ref ?? tab.branchLabel ?? baselineBranch;
 }
 
 const PANEL_WIDTH_KEY = "orx:panel-width";
@@ -744,7 +748,14 @@ export default function App() {
   // session (or viewed file's session) the click came from — see
   // parseFilePath for how it resolves against the reported path.
   const openFileTab = useCallback(
-    (rawPath: string, contextSessionId?: string, ref?: string, line?: number, exp?: string) => {
+    (
+      rawPath: string,
+      contextSessionId?: string,
+      ref?: string,
+      line?: number,
+      exp?: string,
+      displayBranch?: string,
+    ) => {
       const project = projects?.find((p) => p.id === projectId);
       const tab = parseFilePath(
         rawPath,
@@ -765,6 +776,9 @@ export default function App() {
       const effectiveRef = ref ?? experiment?.branchName;
       // A branch ref only applies to repo files; artifacts have no branch.
       if (effectiveRef && tab.source !== "artifacts") tab.ref = effectiveRef;
+      // Label an editable (ref-less) checkout with its branch, so a worktree on
+      // a non-baseline branch still names it in the header.
+      if (displayBranch && !tab.ref && tab.source !== "artifacts") tab.branchLabel = displayBranch;
       if (line != null) tab.line = line;
       // Line is not part of tab identity: reopening a file at a new line reuses
       // the tab but makes the new (line-carrying) def the active one so the
@@ -1424,7 +1438,9 @@ export default function App() {
                   toggled={codeTab.toggled}
                   onViewChange={(view) => updateCodeTab(codeTab, { view })}
                   onToggledChange={(toggled) => updateCodeTab(codeTab, { toggled })}
-                  onOpenFile={openFileTab}
+                  onOpenFile={(path, sessionId, ref) =>
+                    openFileTab(path, sessionId, ref, undefined, undefined, codeExperiment.branchName)
+                  }
                 />
               )}
             </div>
