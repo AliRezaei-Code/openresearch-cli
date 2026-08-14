@@ -15,6 +15,8 @@ export function CodeEditor({
   onBlur,
   path,
   highlightLine,
+  scrollRequest,
+  onScrollRequestHandled,
 }: {
   value: string;
   onChange: (next: string) => void;
@@ -25,6 +27,10 @@ export function CodeEditor({
   path: string;
   /** 1-based line to scroll to and place the caret on (from a `file:line` chip). */
   highlightLine?: number;
+  /** Bumped when a `file:line` chip reopens the already-open file at a new line,
+   * so the caret re-navigates even though `path` didn't change. */
+  scrollRequest?: number;
+  onScrollRequestHandled?: () => void;
 }) {
   const rendered = useMemo(
     () => highlight(value, detectSyntaxLanguageFromFilePath(path)),
@@ -52,7 +58,8 @@ export function CodeEditor({
   useLayoutEffect(syncScroll, [value]);
 
   // On open via a `file:line` chip, park the caret on that line and center it.
-  // Runs once per file (keyed by path); `value` is the freshly loaded content.
+  // Re-runs when the file changes (path) or a new chip targets the open file
+  // (scrollRequest), mirroring CodeView's re-navigation.
   useLayoutEffect(() => {
     const ta = taRef.current;
     if (!ta || !highlightLine) return;
@@ -66,8 +73,9 @@ export function CodeEditor({
     ta.setSelectionRange(caret, caret);
     if (lineH) ta.scrollTop = Math.max(0, padTop + (target - 1) * lineH - ta.clientHeight / 2);
     syncScroll();
+    onScrollRequestHandled?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [path]);
+  }, [path, scrollRequest]);
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {

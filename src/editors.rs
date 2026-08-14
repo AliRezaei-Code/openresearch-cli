@@ -18,10 +18,11 @@ pub fn open_in_default_app(path: &std::path::Path) -> std::io::Result<()> {
     };
     #[cfg(target_os = "windows")]
     let mut cmd = {
-        // `start` is a cmd.exe builtin; the empty title arg keeps a quoted path
-        // from being consumed as the window title.
-        let mut c = Command::new("cmd");
-        c.args(["/C", "start", ""]).arg(path);
+        // `explorer.exe <path>` opens the file with its associated app (like a
+        // double-click) and takes the path as one argv element — no cmd.exe
+        // reparse, so a filename with shell metacharacters can't inject.
+        let mut c = Command::new("explorer.exe");
+        c.arg(path);
         c
     };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]

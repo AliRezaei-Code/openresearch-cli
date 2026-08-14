@@ -2221,10 +2221,18 @@ async fn project_file(
     .map_err(|e| ApiError::from(anyhow!("file task failed: {e}")))?
 }
 
-/// Upper bound on a single save. Inline editing is offered only for text files
-/// the reader returned whole (≤ `FILE_READ_LIMIT`); this leaves generous room to
-/// grow while still bounding one write.
+/// Upper bound on a single save — generous room to grow past the read cap while
+/// still bounding one write.
 const FILE_WRITE_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// True when a repo-relative path steps into the `.git` metadata dir. Reads may
+/// expose it, but writes there (`config`, `hooks/*`) are an arbitrary-command
+/// vector, so the mutating endpoints refuse it.
+fn touches_git_dir(rel_path: &std::path::Path) -> bool {
+    rel_path
+        .components()
+        .any(|c| matches!(c, std::path::Component::Normal(name) if name == ".git"))
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2245,6 +2253,9 @@ async fn write_project_file(
 ) -> ApiResult {
     blocking_api(move || {
         let (rel, rel_path) = validated_project_file_path(&req.path)?;
+        if touches_git_dir(&rel_path) {
+            return Err(bad_request("cannot edit files under .git"));
+        }
         if req.content.len() as u64 > FILE_WRITE_LIMIT {
             return Err(bad_request("file too large to save"));
         }
@@ -2259,6 +2270,13 @@ async fn write_project_file(
             .get_local_project(&id)?
             .ok_or_else(|| not_found("project"))?;
         let (root, root_kind) = resolve_checkout_root(&store, &project, req.session_id.as_deref())?;
+        // A session write that fell back to the clone means the worktree was
+        // pruned mid-edit — refuse rather than silently write another checkout.
+        if req.session_id.is_some() && root_kind == "clone" {
+            return Err(bad_request(
+                "this session's worktree is no longer available — reload the file",
+            ));
+        }
         // Canonicalize the existing target so a symlinked path can't escape the
         // checkout; a missing file means the editor's copy is stale.
         let full = match std::fs::canonicalize(root.join(&rel_path)) {
@@ -2299,6 +2317,9 @@ async fn open_project_file(
 ) -> ApiResult {
     blocking_api(move || {
         let (_, rel_path) = validated_project_file_path(&req.path)?;
+        if touches_git_dir(&rel_path) {
+            return Err(bad_request("cannot open files under .git"));
+        }
         let store = Store::open()?;
         let project = store
             .get_local_project(&id)?
@@ -2311,6 +2332,9 @@ async fn open_project_file(
         };
         if !full.starts_with(&root) {
             return Err(bad_request("path escapes repository"));
+        }
+        if full.is_dir() {
+            return Err(bad_request("path is a directory"));
         }
         crate::editors::open_in_default_app(&full)
             .map_err(|e| ApiError::from(anyhow!("could not open file: {e}")))?;

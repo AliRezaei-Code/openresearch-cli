@@ -5,7 +5,7 @@
 // the code browser.
 
 import { Code, ExternalLink, FileText, GitBranch, RotateCw } from "lucide-react";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   artifactUrl,
   getArtifactFileMetadata,
@@ -96,45 +96,56 @@ export function FileViewer({
   // or an artifact) — the only source the write/open endpoints can resolve.
   const onDisk =
     !isArtifacts && !gitRef && loaded?.source === "checkout" && data != null && !data.notFound;
-  // Only live checkout text files are writable: a truncated read can't be saved
-  // whole, and binary/media have no text form to edit.
+  // Editable = a live checkout text file. A session read that fell back to the
+  // clone (root "clone" with a sessionId) is not the worktree it names, so it
+  // stays read-only rather than silently editing another checkout; a truncated
+  // read can't be saved whole, and binary/media have no text form.
   const editable =
-    !isArtifacts &&
-    !gitRef &&
-    loaded?.source === "checkout" &&
+    onDisk &&
     data != null &&
-    !data.notFound &&
     !data.binary &&
     !data.truncated &&
-    !mediaKind;
+    !mediaKind &&
+    !(sessionId != null && loaded?.source === "checkout" && loaded.file.root === "clone");
   // The editor replaces the read-only view for editable files — except markdown,
   // which stays rendered until its source toggle is on.
   const showingEditor = editable && !(isMarkdown && !showSource);
-  const dirty = editable && data != null && draft !== data.content;
+  // A <textarea> normalizes line endings to LF, so track/compare the buffer in
+  // LF and re-apply the file's original EOL on write (else a one-char edit to a
+  // CRLF file rewrites every line).
+  const baseline = useMemo(() => (data?.content ?? "").replace(/\r\n/g, "\n"), [data?.content]);
+  const dirty = editable && draft !== baseline;
 
-  // Seed (and reseed on reload/switch) the edit buffer from the loaded content.
-  // Typing changes `draft`, not `data.content`, so this doesn't clobber edits.
+  // Reseed the buffer only on a genuine load/reload — skip the optimistic
+  // baseline bump `save()` makes, so a keystroke typed mid-save isn't clobbered.
+  const lastWriteRef = useRef<string | null>(null);
   useEffect(() => {
-    setDraft(data?.content ?? "");
+    const incoming = data?.content ?? "";
+    if (lastWriteRef.current !== null && incoming === lastWriteRef.current) {
+      lastWriteRef.current = null;
+      return;
+    }
+    setDraft(incoming.replace(/\r\n/g, "\n"));
     setSaveError(null);
   }, [data?.content, path]);
 
   const save = async () => {
     if (!editable || data == null || !dirty || saving) return;
-    const content = draft;
+    const content = data.content.includes("\r\n") ? draft.replace(/\n/g, "\r\n") : draft;
     setSaving(true);
     setSaveError(null);
     try {
       await saveProjectFile(projectId, path, content, { sessionId });
-      // Advance the loaded baseline to what we wrote so `dirty` clears without a
-      // refetch — the editor stays mounted and the caret is preserved.
+      // Advance the baseline to what we wrote so `dirty` clears without a refetch;
+      // mark it so the reseed effect ignores this self-inflicted change.
+      lastWriteRef.current = content;
       setLoaded((prev) =>
         prev && prev.source === "checkout"
           ? { source: "checkout", file: { ...prev.file, content } }
           : prev,
       );
     } catch (e) {
-      setSaveError((e as Error).message);
+      setSaveError(e instanceof Error ? e.message : String(e));
     } finally {
       setSaving(false);
     }
@@ -150,7 +161,7 @@ export function FileViewer({
     try {
       await openFileInEditor(projectId, path, { sessionId });
     } catch (e) {
-      setEditorError((e as Error).message);
+      setEditorError(e instanceof Error ? e.message : String(e));
     } finally {
       setOpeningEditor(false);
     }
@@ -364,6 +375,8 @@ export function FileViewer({
             onBlur={() => void save()}
             path={path}
             highlightLine={line}
+            scrollRequest={lineScrollRequest}
+            onScrollRequestHandled={onLineScrollRequestHandled}
           />
         ) : (
           <>
