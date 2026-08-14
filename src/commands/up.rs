@@ -306,8 +306,12 @@ fn router(state: AppState) -> Router {
         )
         .route("/api/projects/{id}/working-tree", get(project_working_tree))
         .route("/api/projects/{id}/code-tree", get(project_code_tree))
-        .route("/api/projects/{id}/file", get(project_file))
+        .route(
+            "/api/projects/{id}/file",
+            get(project_file).put(write_project_file),
+        )
         .route("/api/projects/{id}/file/raw", get(project_raw_file))
+        .route("/api/projects/{id}/file/open", post(open_project_file))
         .route(
             "/api/projects/{id}/files",
             get(list_artifacts).delete(delete_artifact),
@@ -2215,6 +2219,128 @@ async fn project_file(
     })
     .await
     .map_err(|e| ApiError::from(anyhow!("file task failed: {e}")))?
+}
+
+/// Upper bound on a single save — generous room to grow past the read cap while
+/// still bounding one write.
+const FILE_WRITE_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// True when a repo-relative path steps into the `.git` metadata dir — writing
+/// there (`config`, `hooks/*`) is an arbitrary-command vector. Case-insensitive
+/// so `.GIT` can't slip past on macOS/Windows.
+fn touches_git_dir(rel_path: &std::path::Path) -> bool {
+    rel_path.components().any(
+        |c| matches!(c, std::path::Component::Normal(name) if name.eq_ignore_ascii_case(".git")),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WriteProjectFileReq {
+    path: String,
+    content: String,
+    /// Chat session whose worktree owns the file; absent writes the hub clone.
+    session_id: Option<String>,
+}
+
+/// Overwrite an existing text file in the project's live checkout with edited
+/// content. Only the worktree/clone is writable — committed branch trees have no
+/// `ref` path here and stay read-only. Traversal and symlink escapes are
+/// rejected by canonicalizing the target and confirming it stays under the root.
+async fn write_project_file(
+    Path(id): Path<String>,
+    Json(req): Json<WriteProjectFileReq>,
+) -> ApiResult {
+    blocking_api(move || {
+        let (rel, rel_path) = validated_project_file_path(&req.path)?;
+        if touches_git_dir(&rel_path) {
+            return Err(bad_request("cannot edit files under .git"));
+        }
+        if req.content.len() as u64 > FILE_WRITE_LIMIT {
+            return Err(bad_request("file too large to save"));
+        }
+        if !matches!(
+            local::files::presentation_for_path(&rel),
+            local::files::FilePresentation::Text | local::files::FilePresentation::Unknown
+        ) {
+            return Err(bad_request("not an editable text file"));
+        }
+        let store = Store::open()?;
+        let project = store
+            .get_local_project(&id)?
+            .ok_or_else(|| not_found("project"))?;
+        let (root, root_kind) = resolve_checkout_root(&store, &project, req.session_id.as_deref())?;
+        // A session write that fell back to the clone means the worktree was
+        // pruned mid-edit — refuse rather than silently write another checkout.
+        if req.session_id.is_some() && root_kind == "clone" {
+            return Err(bad_request(
+                "this session's worktree is no longer available — reload the file",
+            ));
+        }
+        // Canonicalize the existing target so a symlinked path can't escape the
+        // checkout; a missing file means the editor's copy is stale.
+        let full = match std::fs::canonicalize(root.join(&rel_path)) {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(not_found("file")),
+            Err(e) => return Err(ApiError::from(anyhow!("save failed: {e}"))),
+        };
+        if !full.starts_with(&root) {
+            return Err(bad_request("path escapes repository"));
+        }
+        if full.is_dir() {
+            return Err(bad_request("path is a directory"));
+        }
+        std::fs::write(&full, req.content.as_bytes())
+            .map_err(|e| ApiError::from(anyhow!("save failed: {e}")))?;
+        Ok(Json(json!({
+            "ok": true,
+            "root": root_kind,
+            "bytesWritten": req.content.len(),
+        })))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenProjectFileReq {
+    path: String,
+    session_id: Option<String>,
+}
+
+/// Open a checkout file in the machine's default app for its type (the user's
+/// editor for source files). Resolves the same worktree/clone the reader uses
+/// and confirms the file is inside it before handing the path to the OS opener.
+async fn open_project_file(
+    Path(id): Path<String>,
+    Json(req): Json<OpenProjectFileReq>,
+) -> ApiResult {
+    blocking_api(move || {
+        let (_, rel_path) = validated_project_file_path(&req.path)?;
+        if touches_git_dir(&rel_path) {
+            return Err(bad_request("cannot open files under .git"));
+        }
+        let store = Store::open()?;
+        let project = store
+            .get_local_project(&id)?
+            .ok_or_else(|| not_found("project"))?;
+        let (root, _) = resolve_checkout_root(&store, &project, req.session_id.as_deref())?;
+        let full = match std::fs::canonicalize(root.join(&rel_path)) {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(not_found("file")),
+            Err(e) => return Err(ApiError::from(anyhow!("open failed: {e}"))),
+        };
+        if !full.starts_with(&root) {
+            return Err(bad_request("path escapes repository"));
+        }
+        if full.is_dir() {
+            return Err(bad_request("path is a directory"));
+        }
+        crate::editors::open_in_default_app(&full)
+            .map_err(|e| ApiError::from(anyhow!("could not open file: {e}")))?;
+        Ok(Json(json!({ "ok": true })))
+    })
+    .await
 }
 
 enum RawProjectFileSource {

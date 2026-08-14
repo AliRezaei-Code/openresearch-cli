@@ -4,18 +4,21 @@
 // refractor-highlighted, opened as a right-pane tab from chat tool rows or
 // the code browser.
 
-import { Code, FileText, GitBranch, RotateCw } from "lucide-react";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Code, ExternalLink, FileText, GitBranch, RotateCw } from "lucide-react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   artifactUrl,
   getArtifactFileMetadata,
   getArtifactFileText,
   getProjectFile,
+  openFileInEditor,
   projectFileUrl,
+  saveProjectFile,
   type CheckoutRoot,
   type ProjectFile,
 } from "../api";
 import { CodeView } from "./CodeView";
+import { CodeEditor } from "./CodeEditor";
 import { ArtifactMarkdown } from "./ArtifactsTab";
 import { isMarkdownFile } from "./FileTypeIcon";
 import { MediaPreview, mediaPreviewKind } from "./MediaPreview";
@@ -78,12 +81,89 @@ export function FileViewer({
   const isMarkdown = isMarkdownFile(path);
   const artifactsFolder = path.split("/").slice(0, -1).join("/");
   const [showSource, setShowSource] = useState(false);
+  // Live edit buffer for the code file. It IS the view for editable files (no
+  // edit mode); it tracks the loaded content and diverges as the user types.
+  const [draft, setDraft] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
   const scrollPositionRef = useRef(scrollPosition);
   const data = loaded?.file ?? null;
   const mediaKind = mediaPreviewKind(data?.presentation);
   const viaArtifacts = loaded?.source === "artifact" && !isArtifacts;
   const artifactsMode = isArtifacts || loaded?.source === "artifact";
+  // A file that exists in the live checkout on disk (not a committed branch tree
+  // or an artifact) — the only source the write/open endpoints can resolve.
+  const onDisk =
+    !isArtifacts && !gitRef && loaded?.source === "checkout" && data != null && !data.notFound;
+  // Editable = a live checkout text file. A session read that fell back to the
+  // clone isn't the worktree it names, so it stays read-only rather than
+  // silently editing another checkout.
+  const editable =
+    onDisk &&
+    data != null &&
+    !data.binary &&
+    !data.truncated &&
+    !mediaKind &&
+    !(sessionId != null && loaded?.source === "checkout" && loaded.file.root === "clone");
+  // The editor replaces the read-only view for editable files — except markdown,
+  // which stays rendered until its source toggle is on.
+  const showingEditor = editable && !(isMarkdown && !showSource);
+  // A <textarea> normalizes line endings to LF, so track the buffer in LF and
+  // re-apply the file's original EOL on write (else a CRLF file's every line flips).
+  const baseline = useMemo(() => (data?.content ?? "").replace(/\r\n/g, "\n"), [data?.content]);
+  const dirty = editable && draft !== baseline;
+
+  // Reseed the buffer only on a genuine load/reload — skip the optimistic
+  // baseline bump `save()` makes, so a keystroke typed mid-save isn't clobbered.
+  const lastWriteRef = useRef<string | null>(null);
+  useEffect(() => {
+    const incoming = data?.content ?? "";
+    if (lastWriteRef.current !== null && incoming === lastWriteRef.current) {
+      lastWriteRef.current = null;
+      return;
+    }
+    setDraft(incoming.replace(/\r\n/g, "\n"));
+    setSaveError(null);
+  }, [data?.content, path]);
+
+  const save = async () => {
+    if (!editable || data == null || !dirty || saving) return;
+    const content = data.content.includes("\r\n") ? draft.replace(/\n/g, "\r\n") : draft;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await saveProjectFile(projectId, path, content, { sessionId });
+      // Advance the baseline to what we wrote so `dirty` clears without a refetch;
+      // mark it so the reseed effect ignores this self-inflicted change.
+      lastWriteRef.current = content;
+      setLoaded((prev) =>
+        prev && prev.source === "checkout"
+          ? { source: "checkout", file: { ...prev.file, content } }
+          : prev,
+      );
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const [openingEditor, setOpeningEditor] = useState(false);
+  const [editorError, setEditorError] = useState<string | null>(null);
+  // Hand the file to the OS, which opens it in the user's default app for the
+  // type (their editor for source files) — no picker.
+  const openInEditor = async () => {
+    setOpeningEditor(true);
+    setEditorError(null);
+    try {
+      await openFileInEditor(projectId, path, { sessionId });
+    } catch (e) {
+      setEditorError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setOpeningEditor(false);
+    }
+  };
   const rawUrlBase = artifactsMode
     ? artifactUrl(projectId, path)
     : projectFileUrl(projectId, path, { sessionId, ref: gitRef });
@@ -176,6 +256,22 @@ export function FileViewer({
             {branchLabel}
           </span>
         )}
+        {showingEditor && (saving || dirty || saveError) && (
+          <span
+            className={`file-view-save-status inline-flex items-center gap-1 text-xs shrink-0 ${saveError ? "text-accent-red" : "text-muted"}`}
+            title={saveError ?? (saving ? "Saving…" : "Unsaved — ⌘S or click away to save")}
+          >
+            {saving ? (
+              <>
+                <span className={SPINNER_CLASS_NAME} /> Saving…
+              </>
+            ) : saveError ? (
+              "Save failed"
+            ) : (
+              "Unsaved"
+            )}
+          </span>
+        )}
         {isMarkdown && (
           <button
             className={`${ICON_BUTTON_CLASS_NAME} ${showSource ? "active" : ""}`}
@@ -185,6 +281,18 @@ export function FileViewer({
             onClick={() => setShowSource((s) => !s)}
           >
             <Code size={13} />
+          </button>
+        )}
+        {onDisk && (
+          <button
+            className={ICON_BUTTON_CLASS_NAME}
+            data-tip={editorError ?? "Open in default editor"}
+            data-tip-align="end"
+            aria-label="Open in default editor"
+            disabled={openingEditor}
+            onClick={() => void openInEditor()}
+          >
+            {openingEditor ? <span className={SPINNER_CLASS_NAME} /> : <ExternalLink size={13} />}
           </button>
         )}
         <button
@@ -209,12 +317,12 @@ export function FileViewer({
           onScrollPositionChange?.(position);
         }}
       >
-        {!error && loaded?.source === "checkout" && !loaded.file.notFound && !gitRef && sessionId && loaded.file.root === "clone" && (
+        {!showingEditor && !error && loaded?.source === "checkout" && !loaded.file.notFound && !gitRef && sessionId && loaded.file.root === "clone" && (
           <div className="file-view-note py-2.5 px-4 text-sm text-muted">
             This session&apos;s worktree isn&apos;t available — showing the project clone&apos;s copy.
           </div>
         )}
-        {!error && loaded?.source === "artifact" && !loaded.file.notFound && viaArtifacts && (
+        {!showingEditor && !error && loaded?.source === "artifact" && !loaded.file.notFound && viaArtifacts && (
           <div className="file-view-note py-2.5 px-4 text-sm text-muted">
             Not in the {loaded.checkoutRoot === "worktree" ? "session's worktree" : "project clone"} —
             showing the copy from the project&apos;s artifacts.
@@ -238,32 +346,45 @@ export function FileViewer({
           <div className="file-view-note py-2.5 px-4 text-sm text-muted">
             Binary file — no inline preview. <a href={rawUrl} download={path.split("/").pop() ?? path}>Download</a>
           </div>
-        ) : (
-          <>
-            {isMarkdown && !showSource ? (
-              <div className="file-view-md max-w-readable pt-4.5 px-5 pb-8 [&_.md]:text-base [&_.md_h1]:text-[1.5em] [&_.md_h1]:mt-4.5 [&_.md_h1]:mx-0 [&_.md_h1]:mb-2 [&_.md_h2]:text-[1.25em] [&_.md_h2]:mt-4 [&_.md_h2]:mx-0 [&_.md_h2]:mb-2 [&_.md_h3]:text-[1.1em]">
-                {artifactsMode ? (
-                  <ArtifactMarkdown
-                    projectId={projectId}
-                    folder={artifactsFolder}
-                    markdown={data.content}
-                  />
-                ) : (
-                  <Md
-                    text={data.content}
-                    onOpenFile={onOpenFile && ((p) => onOpenFile(p, sessionId, gitRef))}
-                  />
-                )}
-              </div>
+        ) : isMarkdown && !showSource ? (
+          <div className="file-view-md max-w-readable pt-4.5 px-5 pb-8 [&_.md]:text-base [&_.md_h1]:text-[1.5em] [&_.md_h1]:mt-4.5 [&_.md_h1]:mx-0 [&_.md_h1]:mb-2 [&_.md_h2]:text-[1.25em] [&_.md_h2]:mt-4 [&_.md_h2]:mx-0 [&_.md_h2]:mb-2 [&_.md_h3]:text-[1.1em]">
+            {artifactsMode ? (
+              <ArtifactMarkdown
+                projectId={projectId}
+                folder={artifactsFolder}
+                markdown={data.content}
+              />
             ) : (
-              <CodeView
+              <Md
                 text={data.content}
-                path={path}
-                highlightLine={line}
-                scrollRequest={lineScrollRequest}
-                onScrollRequestHandled={onLineScrollRequestHandled}
+                onOpenFile={onOpenFile && ((p) => onOpenFile(p, sessionId, gitRef))}
               />
             )}
+          </div>
+        ) : showingEditor ? (
+          // Editable files open straight into the editor — click and type.
+          <CodeEditor
+            value={draft}
+            onChange={(next) => {
+              setDraft(next);
+              if (saveError) setSaveError(null);
+            }}
+            onSave={() => void save()}
+            onBlur={() => void save()}
+            path={path}
+            highlightLine={line}
+            scrollRequest={lineScrollRequest}
+            onScrollRequestHandled={onLineScrollRequestHandled}
+          />
+        ) : (
+          <>
+            <CodeView
+              text={data.content}
+              path={path}
+              highlightLine={line}
+              scrollRequest={lineScrollRequest}
+              onScrollRequestHandled={onLineScrollRequestHandled}
+            />
             {data.truncated && (
               <div className="file-view-note py-2.5 px-4 text-sm text-muted">File truncated — showing the first 512 KB.</div>
             )}

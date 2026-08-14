@@ -96,6 +96,12 @@ const patch = <T>(url: string, body: unknown) =>
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   }).then((r) => json<T>(r));
+const put = <T>(url: string, body: unknown) =>
+  fetch(url, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  }).then((r) => json<T>(r));
 
 export const listProjects = () =>
   get<{ projects: Project[] }>("/api/projects").then((r) => r.projects);
@@ -301,6 +307,32 @@ export const getProjectFile = (projectId: string, path: string, opts: CheckoutRe
 /** Byte-exact checkout file for browser-native media rendering or download. */
 export const projectFileUrl = (projectId: string, path: string, opts: CheckoutRef = {}) =>
   `/api/projects/${projectId}/file/raw?${checkoutQuery(opts, new URLSearchParams({ path }))}`;
+
+/** Overwrite a text file in the project's live checkout (worktree when
+ * `sessionId` is given, else the hub clone). Committed branch trees are
+ * read-only, so pass no `ref`. */
+export const saveProjectFile = (
+  projectId: string,
+  path: string,
+  content: string,
+  opts: { sessionId?: string } = {},
+) =>
+  put<{ ok: boolean; root: CheckoutRoot; bytesWritten: number }>(
+    `/api/projects/${projectId}/file`,
+    { path, content, sessionId: opts.sessionId },
+  );
+
+/** Open a checkout file on the machine running `orx up`, in the OS default app
+ * for its type (the user's editor for source files). */
+export const openFileInEditor = (
+  projectId: string,
+  path: string,
+  opts: { sessionId?: string } = {},
+) =>
+  post<{ ok: boolean }>(`/api/projects/${projectId}/file/open`, {
+    path,
+    sessionId: opts.sessionId,
+  });
 
 export interface CodeTree {
   root: CheckoutRoot;
