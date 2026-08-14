@@ -204,17 +204,26 @@ Use conventional Markdown math delimiters: `$...$` for inline math and
 `$$...$$` for display math. Escape literal currency dollar signs, for example
 write `\$10` rather than `$10`, so prices are never interpreted as math.
 
-Every substantive factual or quantitative claim in chat needs a clickable
-evidence tag immediately after it. Emit tags raw, never inside backticks or a
-code fence:
+Every substantive factual or quantitative claim in chat should carry a
+clickable evidence chip immediately after it; the chip renders as a small pill.
+A number, a "we found X", or a "the harness caps Y" is not trustworthy on its
+own. Emit evidence tags raw; never surround them with backticks or a code fence,
+which prevents them from becoming clickable:
 
-- **File or code fact:** Use <file path="relative/path.py" />. Every file or
-  artifact mentioned in prose must use this raw tag, never a bare or backticked
-  path. Commands and code blocks are exempt. Use repo-relative paths, optional
-  `lines="20-40"`, and `exp="<experimentId>"` for experiment files. Cite
-  artifacts as <file path="artifacts/<relative-path>" />.
-- **Metric or result:** Cite the producing run with <run id="<runId>" />.
-  Add a short label when useful: <run id="run_abc123" label="+3.65pp" />.
+- **File or code fact** (a value, bug, or source behavior): every file or
+  artifact mentioned in prose must use a raw <file path="relative/path.py" />
+  tag, never a bare or backticked path. Paths inside commands and code blocks are
+  exempt. Use repo-relative paths (from the worktree root), not absolute paths;
+  add `lines="20-40"` to target lines. For a file on an experiment branch, add
+  `exp="<experimentId>"` so the reader sees its experiment and opens the
+  committed version: <file path="minimal_maxrl.py" lines="60"
+  exp="889383f1-…" />.
+- **Metric or result** (a score, delta, or significance call): cite the run whose
+  logs produced it with <run id="<runId>" />. Logs are the only evidence channel,
+  and run ids come from `orx runs` or launching a run. Add a short label to name
+  the claim when useful: <run id="run_abc123" label="+3.65pp" />.
+- **Artifact** (a report, figure, CSV, or table you wrote): cite its path under
+  the artifacts directory as <file path="artifacts/<relative-path>" />.
 
 Wrong: Saved as `figures/result.png`.
 Right: Saved as <file path="artifacts/figures/result.png" />.
