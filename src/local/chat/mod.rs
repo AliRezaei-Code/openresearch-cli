@@ -1357,6 +1357,8 @@ pub struct ChatHost {
     /// A key remains present throughout the lifecycle, so a replacement turn
     /// cannot race native shutdown for the preceding one.
     turns: Mutex<HashMap<String, TurnState>>,
+    /// Cross-process ownership tokens for locally active turn slots.
+    durable_turns: std::sync::Mutex<HashMap<String, String>>,
     deleting_sessions: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Per-session serialization for `respond`. Answering a prompt reads the
     /// card, delivers the answer (a non-idempotent POST for inline harnesses),
@@ -1453,6 +1455,13 @@ enum TurnAdmission {
     Preclaimed(TurnGuard),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnSubmission {
+    Started,
+    Queued,
+    NotStarted,
+}
+
 fn contextualize_messages(
     messages: Vec<AnnotatedText>,
     mut expand: impl FnMut(&str) -> String,
@@ -1466,6 +1475,30 @@ fn contextualize_messages(
         .filter(|text| !text.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+fn transcript_parts(
+    display_text: &str,
+    saved_images: &[SavedAttachment],
+    annotations: &[TextAnnotation],
+) -> Vec<WirePart> {
+    let mut parts = Vec::new();
+    if !display_text.is_empty() {
+        parts.push(WirePart::text("p0", display_text.to_string()));
+    }
+    for (i, attachment) in saved_images.iter().enumerate() {
+        parts.push(WirePart::image(
+            format!("img{i}"),
+            attachment.file_name.clone(),
+        ));
+    }
+    for (i, annotation) in annotations.iter().enumerate() {
+        parts.push(WirePart::annotation(
+            format!("annotation{i}"),
+            annotation.text.trim(),
+        ));
+    }
+    parts
 }
 
 /// Chip label for a parked message: its text, or an attachment count for an
@@ -1525,6 +1558,9 @@ impl TurnGuard {
         {
             return None;
         }
+        if !host.claim_durable_turn(session_id) {
+            return None;
+        }
         turns.insert(session_id.to_string(), TurnState::Reserved);
         if let Some(overrides) = overrides {
             let mut plan_changes = host.plan_changes.lock().unwrap();
@@ -1543,6 +1579,32 @@ impl TurnGuard {
         })
     }
 
+    /// Reserve a wake-up turn only when no turn or queued user message exists.
+    async fn claim_hidden(host: &Arc<ChatHost>, session_id: &str) -> Option<Self> {
+        if host.deleting_sessions.lock().unwrap().contains(session_id) {
+            return None;
+        }
+        let mut turns = host.turns.lock().await;
+        let queued = host.queued.lock().unwrap();
+        if host.deleting_sessions.lock().unwrap().contains(session_id)
+            || turns.contains_key(session_id)
+            || queued
+                .get(session_id)
+                .is_some_and(|messages| !messages.is_empty())
+        {
+            return None;
+        }
+        if !host.claim_durable_turn(session_id) {
+            return None;
+        }
+        turns.insert(session_id.to_string(), TurnState::Reserved);
+        Some(Self {
+            host: host.clone(),
+            session_id: session_id.to_string(),
+            armed: true,
+        })
+    }
+
     /// Hand ownership of the slot to the spawned turn — stop clearing it on drop.
     fn defuse(mut self) {
         self.armed = false;
@@ -1553,20 +1615,35 @@ impl TurnGuard {
             return;
         }
         self.armed = false;
-        let removed = {
+        let (removed, drain_queued) = {
             let mut turns = self.host.turns.lock().await;
             if matches!(turns.get(&self.session_id), Some(TurnState::Reserved)) {
-                turns.remove(&self.session_id);
-                true
+                let drain_queued = self
+                    .host
+                    .queued
+                    .lock()
+                    .unwrap()
+                    .get(&self.session_id)
+                    .is_some_and(|queue| !queue.is_empty());
+                if drain_queued {
+                    turns.insert(self.session_id.clone(), TurnState::Draining);
+                } else {
+                    self.host.release_durable_turn(&self.session_id);
+                    turns.remove(&self.session_id);
+                }
+                (true, drain_queued)
             } else {
-                false
+                (false, false)
             }
         };
         if removed {
             self.host.emit(
                 "chat.busy",
-                json!({ "sessionId": &self.session_id, "busy": false }),
+                json!({ "sessionId": &self.session_id, "busy": drain_queued }),
             );
+            if drain_queued {
+                self.host.drain_queue(&self.session_id).await;
+            }
         }
     }
 }
@@ -1579,21 +1656,34 @@ impl Drop for TurnGuard {
         let host = self.host.clone();
         let session_id = self.session_id.clone();
         tokio::spawn(async move {
-            let removed = {
+            let (removed, drain_queued) = {
                 let mut turns = host.turns.lock().await;
                 if matches!(turns.get(&session_id), Some(TurnState::Reserved)) {
-                    turns.remove(&session_id);
-                    true
+                    let drain_queued = host
+                        .queued
+                        .lock()
+                        .unwrap()
+                        .get(&session_id)
+                        .is_some_and(|queue| !queue.is_empty());
+                    if drain_queued {
+                        turns.insert(session_id.clone(), TurnState::Draining);
+                    } else {
+                        host.release_durable_turn(&session_id);
+                        turns.remove(&session_id);
+                    }
+                    (true, drain_queued)
                 } else {
-                    false
+                    (false, false)
                 }
             };
             if removed {
                 host.emit(
                     "chat.busy",
-                    json!({ "sessionId": &session_id, "busy": false }),
+                    json!({ "sessionId": &session_id, "busy": drain_queued }),
                 );
-                host.drain_queue(&session_id).await;
+                if drain_queued {
+                    host.drain_queue(&session_id).await;
+                }
             }
         });
     }
@@ -1613,6 +1703,7 @@ impl ChatHost {
             http: reqwest::Client::new(),
             events,
             turns: Mutex::new(HashMap::new()),
+            durable_turns: std::sync::Mutex::new(HashMap::new()),
             deleting_sessions: Arc::new(std::sync::Mutex::new(HashSet::new())),
             respond_locks: Mutex::new(HashMap::new()),
             msg_write: std::sync::Mutex::new(()),
@@ -1918,6 +2009,43 @@ impl ChatHost {
         self.turns.lock().await.contains_key(session_id)
     }
 
+    fn claim_durable_turn(&self, session_id: &str) -> bool {
+        let mut claims = self.durable_turns.lock().unwrap();
+        if claims.contains_key(session_id) {
+            return false;
+        }
+        let token = uuid::Uuid::new_v4().to_string();
+        let Ok(store) = Store::open() else {
+            return false;
+        };
+        if !matches!(store.claim_chat_turn(session_id, &token), Ok(true)) {
+            return false;
+        }
+        claims.insert(session_id.to_string(), token);
+        true
+    }
+
+    fn release_durable_turn(&self, session_id: &str) {
+        let token = self.durable_turns.lock().unwrap().remove(session_id);
+        if let (Some(token), Ok(store)) = (token, Store::open()) {
+            let _ = store.release_chat_turn(session_id, &token);
+        }
+    }
+
+    fn renew_turn_leases(&self) -> Vec<String> {
+        let claims = self.durable_turns.lock().unwrap().clone();
+        let Ok(store) = Store::open() else {
+            return Vec::new();
+        };
+        let mut lost = Vec::new();
+        for (session_id, token) in claims {
+            if matches!(store.renew_chat_turn(&session_id, &token), Ok(false)) {
+                lost.push(session_id);
+            }
+        }
+        lost
+    }
+
     pub fn begin_session_delete(&self, session_id: &str) -> Option<SessionDeletionLease> {
         let mut deleting = self.deleting_sessions.lock().unwrap();
         if !deleting.insert(session_id.to_string()) {
@@ -2155,6 +2283,30 @@ impl ChatHost {
             TurnAdmission::QueueIfBusy,
         )
         .await
+        .map(|_| ())
+    }
+
+    async fn send_hidden_message(
+        self: &Arc<Self>,
+        session_id: &str,
+        text: String,
+        guard: TurnGuard,
+    ) -> Result<TurnSubmission> {
+        self.send_message_showing(
+            session_id,
+            vec![AnnotatedText {
+                text,
+                annotations: Vec::new(),
+            }],
+            TranscriptDisplay {
+                text: Some(String::new()),
+                annotations: None,
+            },
+            TurnOverrides::default(),
+            Vec::new(),
+            TurnAdmission::Preclaimed(guard),
+        )
+        .await
     }
 
     /// Persists one displayed user turn, then expands and contextualizes each
@@ -2168,7 +2320,7 @@ impl ChatHost {
         mut overrides: TurnOverrides,
         images: Vec<ImageAttachment>,
         admission: TurnAdmission,
-    ) -> Result<()> {
+    ) -> Result<TurnSubmission> {
         let TranscriptDisplay {
             text: transcript_text,
             annotations: transcript_annotations,
@@ -2214,80 +2366,90 @@ impl ChatHost {
         // same session. `_guard` releases the reservation on any early error.
         let mut guard = match admission {
             TurnAdmission::Preclaimed(guard) => guard,
-            admission => {
-                let queue_if_busy = matches!(admission, TurnAdmission::QueueIfBusy);
+            TurnAdmission::RejectIfBusy => {
                 match TurnGuard::claim(self, session_id, Some(&mut overrides)).await {
                     Some(guard) => guard,
-                    // Busy: park a genuine user send (Claude-desktop steering) so it
-                    // runs when the turn ends, instead of rejecting it. System/resume
-                    // sends pass `queue_if_busy = false` and keep the old rejection.
-                    None if queue_if_busy
-                        && !(text.trim().is_empty() && images.is_empty() && !has_annotations) =>
-                    {
-                        let message = messages
-                            .into_iter()
-                            .next()
-                            .ok_or_else(|| anyhow!("message content is required"))?;
-                        let AnnotatedText { text, annotations } = message;
-                        let idle = {
-                            let turns = self.turns.lock().await;
-                            if matches!(turns.get(session_id), Some(TurnState::Cancelling)) {
-                                return Err(anyhow!(
-                                    "session is stopping — send again once it is idle"
-                                ));
-                            }
-                            let mut plan_changes = self.plan_changes.lock().unwrap();
-                            let mut permission_changes = self.permission_changes.lock().unwrap();
-                            let mut queued = self.queued.lock().unwrap();
-                            stamp_turn_revisions(
-                                &mut overrides,
-                                session_id,
-                                &mut plan_changes,
-                                &mut permission_changes,
-                            );
-                            if let Some(plan_mode) = overrides.plan_mode {
-                                let current = store
-                                    .get_chat_session(session_id)?
-                                    .ok_or_else(|| anyhow!("chat session not found"))?;
-                                let reset_pending = !plan_mode
-                                    && current.harness == "codex"
-                                    && (current.plan_mode || current.plan_reset_pending);
-                                store.set_chat_session_plan_state(
-                                    session_id,
-                                    plan_mode,
-                                    reset_pending,
-                                )?;
-                                overrides.plan_mode = None;
-                                overrides.plan_revision = None;
-                            }
-                            if let Some(permission_mode) = overrides.permission_mode.take() {
-                                store.set_chat_session_permission_mode(
-                                    session_id,
-                                    &permission_mode,
-                                )?;
-                                overrides.permission_revision = None;
-                            }
-                            queued.entry(session_id.to_string()).or_default().push_back(
-                                QueuedMessage {
-                                    id: format!("q_{}", uuid::Uuid::new_v4()),
-                                    text,
-                                    transcript_text,
-                                    overrides,
-                                    images,
-                                    annotations,
-                                },
-                            );
-                            !turns.contains_key(session_id)
-                        };
-                        self.emit_queued(session_id);
-                        self.emit_session(store.get_chat_session(session_id)?).await;
-                        if idle {
-                            self.drain_queue(session_id).await;
-                        }
-                        return Ok(());
-                    }
                     None => return Err(anyhow!("session is busy — interrupt it first")),
                 }
+            }
+            TurnAdmission::QueueIfBusy => {
+                let mut turns = self.turns.lock().await;
+                if self.deleting_sessions.lock().unwrap().contains(session_id) {
+                    return Err(anyhow!("chat session not found"));
+                }
+                if turns.contains_key(session_id) {
+                    if matches!(turns.get(session_id), Some(TurnState::Cancelling)) {
+                        return Err(anyhow!("session is stopping — send again once it is idle"));
+                    }
+                    if text.trim().is_empty() && images.is_empty() && !has_annotations {
+                        return Err(anyhow!("message content is required"));
+                    }
+                    let message = messages
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| anyhow!("message content is required"))?;
+                    let AnnotatedText { text, annotations } = message;
+                    let mut plan_changes = self.plan_changes.lock().unwrap();
+                    let mut permission_changes = self.permission_changes.lock().unwrap();
+                    let mut queued = self.queued.lock().unwrap();
+                    stamp_turn_revisions(
+                        &mut overrides,
+                        session_id,
+                        &mut plan_changes,
+                        &mut permission_changes,
+                    );
+                    if let Some(plan_mode) = overrides.plan_mode {
+                        let current = store
+                            .get_chat_session(session_id)?
+                            .ok_or_else(|| anyhow!("chat session not found"))?;
+                        let reset_pending = !plan_mode
+                            && current.harness == "codex"
+                            && (current.plan_mode || current.plan_reset_pending);
+                        store.set_chat_session_plan_state(session_id, plan_mode, reset_pending)?;
+                        overrides.plan_mode = None;
+                        overrides.plan_revision = None;
+                    }
+                    if let Some(permission_mode) = overrides.permission_mode.take() {
+                        store.set_chat_session_permission_mode(session_id, &permission_mode)?;
+                        overrides.permission_revision = None;
+                    }
+                    queued
+                        .entry(session_id.to_string())
+                        .or_default()
+                        .push_back(QueuedMessage {
+                            id: format!("q_{}", uuid::Uuid::new_v4()),
+                            text,
+                            transcript_text,
+                            overrides,
+                            images,
+                            annotations,
+                        });
+                    drop(queued);
+                    drop(permission_changes);
+                    drop(plan_changes);
+                    drop(turns);
+                    self.emit_queued(session_id);
+                    if let Some(session) = store.get_chat_session(session_id)? {
+                        self.emit(
+                            "chat.session",
+                            json!({ "session": session_json(&session, true) }),
+                        );
+                    }
+                    return Ok(TurnSubmission::Queued);
+                }
+                if !self.claim_durable_turn(session_id) {
+                    return Err(anyhow!("session is busy in another `orx up` process"));
+                }
+                turns.insert(session_id.to_string(), TurnState::Reserved);
+                let mut plan_changes = self.plan_changes.lock().unwrap();
+                let mut permission_changes = self.permission_changes.lock().unwrap();
+                stamp_turn_revisions(
+                    &mut overrides,
+                    session_id,
+                    &mut plan_changes,
+                    &mut permission_changes,
+                );
+                TurnGuard::adopt(self, session_id)
             }
         };
         // Composer selections are sticky: an override that differs from the
@@ -2405,19 +2567,7 @@ impl ChatHost {
             }
         }
 
-        let mut parts = Vec::new();
-        if !display_text.is_empty() {
-            parts.push(WirePart::text("p0", display_text.to_string()));
-        }
-        for (i, att) in saved_images.iter().enumerate() {
-            parts.push(WirePart::image(format!("img{i}"), att.file_name.clone()));
-        }
-        for (i, annotation) in transcript_annotations.iter().enumerate() {
-            parts.push(WirePart::annotation(
-                format!("annotation{i}"),
-                annotation.text.trim(),
-            ));
-        }
+        let parts = transcript_parts(display_text, &saved_images, &transcript_annotations);
         // A resume whose transcript text is empty (e.g. a note-less plan
         // approval) records no user message: the resolved card already tells
         // that part of the story, and an empty bubble would just be noise.
@@ -2527,7 +2677,7 @@ impl ChatHost {
             {
                 drop(turns);
                 guard.release().await;
-                return Ok(());
+                return Ok(TurnSubmission::NotStarted);
             }
             let (target_path, target_event_offset) =
                 target_event_start(&session.id, &ctx.assistant.id);
@@ -2572,36 +2722,19 @@ impl ChatHost {
             }
             guard.defuse();
         }
-        Ok(())
+        Ok(TurnSubmission::Started)
     }
 
     /// Turn cleanup: drop the handle, bump the session, broadcast idle.
     async fn finish_turn(&self, session_id: &str, message_id: Option<&str>) {
-        let (should_finish, reserved_queue) = {
-            let mut turns = self.turns.lock().await;
-            let matches = match (turns.get(session_id), message_id) {
+        let should_finish = {
+            let turns = self.turns.lock().await;
+            match (turns.get(session_id), message_id) {
                 (Some(TurnState::Active(active)), Some(message_id)) => {
                     active.message_id == message_id
                 }
                 (Some(TurnState::Cancelling), None) => true,
                 _ => false,
-            };
-            if matches {
-                let reserved_queue = message_id.is_some()
-                    && self
-                        .queued
-                        .lock()
-                        .unwrap()
-                        .get(session_id)
-                        .is_some_and(|queue| !queue.is_empty());
-                if reserved_queue {
-                    turns.insert(session_id.to_string(), TurnState::Draining);
-                } else {
-                    turns.remove(session_id);
-                }
-                (true, reserved_queue)
-            } else {
-                (false, false)
             }
         };
         if !should_finish {
@@ -2610,14 +2743,44 @@ impl ChatHost {
         // Any bridge card still pending belongs to the turn that just ended —
         // deny it so the (dying) bridge child's long-poll unblocks.
         self.cancel_pending_permissions(session_id);
-        if let Ok(store) = Store::open() {
+        let session = if let Ok(store) = Store::open() {
             let _ = store.touch_chat_session(session_id);
-            if let Ok(Some(session)) = store.get_chat_session(session_id) {
-                self.emit(
-                    "chat.session",
-                    json!({ "session": session_json(&session, false) }),
-                );
+            store.get_chat_session(session_id).ok().flatten()
+        } else {
+            None
+        };
+        let reserved_queue = {
+            let mut turns = self.turns.lock().await;
+            let matches = match (turns.get(session_id), message_id) {
+                (Some(TurnState::Active(active)), Some(message_id)) => {
+                    active.message_id == message_id
+                }
+                (Some(TurnState::Cancelling), None) => true,
+                _ => false,
+            };
+            if !matches {
+                return;
             }
+            let reserved_queue = message_id.is_some()
+                && self
+                    .queued
+                    .lock()
+                    .unwrap()
+                    .get(session_id)
+                    .is_some_and(|queue| !queue.is_empty());
+            if reserved_queue {
+                turns.insert(session_id.to_string(), TurnState::Draining);
+            } else {
+                self.release_durable_turn(session_id);
+                turns.remove(session_id);
+            }
+            reserved_queue
+        };
+        if let Some(session) = session {
+            self.emit(
+                "chat.session",
+                json!({ "session": session_json(&session, reserved_queue) }),
+            );
         }
         self.emit(
             "chat.busy",
@@ -3893,80 +4056,114 @@ pub fn list_messages(session_id: &str) -> Result<Vec<WireMessage>> {
 
 // --- run watcher ----------------------------------------------------------------
 
-fn is_terminal(status: &str) -> bool {
-    matches!(status, "done" | "failed" | "cancelled")
+fn run_wakeup_text(run: &crate::store::StoredRun) -> Option<String> {
+    matches!(run.status.as_str(), "done" | "failed").then(|| {
+        format!(
+            "[orx] Run `{}` finished with status **{}**. You can compare this result with other \
+             project runs using `orx runs {}` and inspect this run's logs using `orx logs {}`.",
+            run.id, run.status, run.project_id, run.id
+        )
+    })
 }
 
-/// The chat session a completed run should notify: the one that *launched* it
-/// (recorded on the run), provided it still exists and has history. Returns
-/// `None` for an orphan run (no owning session — CLI-launched or pre-migration)
-/// or a launcher since deleted/emptied. Store-only (the busy check and send stay
-/// in `watch_runs`), which also keeps the routing decision unit-testable.
-fn notify_target(store: &Store, run: &crate::store::StoredRun) -> Option<String> {
-    let session_id = run.chat_session_id.clone()?;
-    let session = store.get_chat_session(&session_id).ok().flatten()?;
-    let has_history = store
-        .list_chat_messages(&session.id)
-        .map(|m| !m.is_empty())
-        .unwrap_or(false);
-    has_history.then_some(session.id)
+fn first_wakeup_per_session(wakeups: Vec<crate::store::RunWakeup>) -> Vec<crate::store::RunWakeup> {
+    let mut seen_sessions = HashSet::new();
+    wakeups
+        .into_iter()
+        .filter(|wakeup| seen_sessions.insert(wakeup.chat_session_id.clone()))
+        .collect()
 }
 
-/// Poke the chat session that *launched* a run when it completes while no turn
-/// is in flight — the local stand-in for the cloud agent staying online inside
-/// a blocking `orx exp wait`. Routing is by the run's recorded
-/// `chat_session_id` (stamped from the harness child's `ORX_CHAT_SESSION_ID`),
-/// never a project-wide guess, so a second idle agent in the same project is
-/// never handed another agent's run. The first pass only seeds the cursor, so a
-/// server restart doesn't replay old completions. A busy owner is skipped (the
-/// agent is awake — likely in its wait loop — and will see the completion
-/// itself); a run with no owning session (CLI-launched) pokes nothing.
-pub async fn watch_runs(chat: Arc<ChatHost>) {
-    let mut seen: HashMap<String, String> = HashMap::new();
-    let mut first = true;
-    loop {
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        // Store hiccups (locked db) just skip a tick.
-        let Ok(store) = Store::open() else { continue };
-        let Ok(runs) = store.list_runs(200) else {
+async fn process_run_wakeups(
+    chat: &Arc<ChatHost>,
+    store: Store,
+    data_dir_move_in_progress: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    if data_dir_move_in_progress.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+    {
+        return Ok(());
+    }
+    store.prune_run_wakeups()?;
+    for wakeup in first_wakeup_per_session(store.list_ready_run_wakeups()?) {
+        if wakeup.state != "pending" {
+            continue;
+        }
+        let Some(mut guard) = TurnGuard::claim_hidden(chat, &wakeup.chat_session_id).await else {
             continue;
         };
-        for run in runs {
-            let prev = seen.insert(run.id.clone(), run.status.clone());
-            let newly_terminal =
-                is_terminal(&run.status) && !matches!(prev.as_deref(), Some(s) if is_terminal(s));
-            if first || !newly_terminal {
-                continue;
+        if data_dir_move_in_progress
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            guard.release().await;
+            return Ok(());
+        }
+        let Some(token) = store.claim_run_wakeup(&wakeup.run.id, &wakeup.chat_session_id)? else {
+            guard.release().await;
+            continue;
+        };
+        if !store.renew_run_wakeup_claim(&wakeup.run.id, &wakeup.chat_session_id, &token)? {
+            guard.release().await;
+            continue;
+        }
+        let Some(text) = run_wakeup_text(&wakeup.run) else {
+            store.release_run_wakeup(&wakeup.run.id, &wakeup.chat_session_id, &token)?;
+            guard.release().await;
+            continue;
+        };
+        match chat
+            .send_hidden_message(&wakeup.chat_session_id, text, guard)
+            .await
+        {
+            Ok(TurnSubmission::Started) => {
+                if !store.mark_run_wakeup_delivered(
+                    &wakeup.run.id,
+                    &wakeup.chat_session_id,
+                    &token,
+                )? {
+                    return Err(anyhow!(
+                        "run wake-up claim expired before delivery was recorded"
+                    ));
+                }
             }
-            // The launching session (see `notify_target`); `None` skips.
-            let Some(session_id) = notify_target(&store, &run) else {
-                continue;
-            };
-            if chat.is_busy(&session_id).await {
-                // The owner is awake — likely blocking in its own `orx exp
-                // wait` — and will observe the completion itself.
-                continue;
+            Ok(TurnSubmission::Queued | TurnSubmission::NotStarted) => {
+                store.release_run_wakeup(&wakeup.run.id, &wakeup.chat_session_id, &token)?;
             }
-            let text = format!(
-                "[orx] Run `{}` finished with status **{}**. Reconcile with \
-                 `orx runs {}`, analyze the result (`orx logs {}`), and \
-                 continue the loop.",
-                run.id, run.status, run.project_id, run.id
-            );
-            if let Err(err) = chat
-                .send_message(
-                    &session_id,
-                    text,
-                    TurnOverrides::default(),
-                    Vec::new(),
-                    Vec::new(),
-                )
-                .await
-            {
-                eprintln!("orx up: run watcher: {err}");
+            Err(err) => {
+                store.release_run_wakeup(&wakeup.run.id, &wakeup.chat_session_id, &token)?;
+                if !chat.is_busy(&wakeup.chat_session_id).await {
+                    eprintln!("orx up: run watcher: {err}");
+                }
             }
         }
-        first = false;
+    }
+    Ok(())
+}
+
+/// Resume explicitly subscribed agent sessions after a run finishes. Busy and
+/// draining sessions retain their durable wake-up until they become idle.
+pub async fn watch_runs(
+    chat: Arc<ChatHost>,
+    data_dir_move_in_progress: Arc<std::sync::atomic::AtomicBool>,
+    data_dir_gate: Arc<tokio::sync::Mutex<()>>,
+) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        if data_dir_move_in_progress.load(std::sync::atomic::Ordering::SeqCst) {
+            continue;
+        }
+        let _data_dir_guard = data_dir_gate.lock().await;
+        if data_dir_move_in_progress.load(std::sync::atomic::Ordering::SeqCst) {
+            continue;
+        }
+        for session_id in chat.renew_turn_leases() {
+            let _ = chat.interrupt(&session_id).await;
+        }
+        let Ok(store) = Store::open() else { continue };
+        if let Err(err) =
+            process_run_wakeups(&chat, store, Some(data_dir_move_in_progress.as_ref())).await
+        {
+            eprintln!("orx up: run watcher: {err}");
+        }
     }
 }
 
@@ -3993,8 +4190,7 @@ pub fn prepare_env(cmd: &mut tokio::process::Command) {
 /// Env var carrying the launching chat session's id into a harness child. The
 /// agent shells out `orx exp run`, a fresh `orx` subprocess that inherits this,
 /// so run creation can stamp `StoredRun::chat_session_id` (see
-/// `launching_chat_session`) and the run watcher can route the completion
-/// notification back to exactly the session that started it.
+/// `launching_chat_session`) and `orx exp wake` can register the current chat.
 pub const CHAT_SESSION_ENV: &str = "ORX_CHAT_SESSION_ID";
 
 /// Marks a process as a child of a local `orx up` harness. Separate from
@@ -5049,15 +5245,15 @@ mod bridge_tests {
 }
 
 #[cfg(test)]
-mod notify_target_tests {
+mod run_wakeup_tests {
     use super::*;
-    use crate::store::{Store, StoredChatMessage, StoredChatSession, StoredRun};
+    use crate::store::{Store, StoredChatSession, StoredRun};
 
-    fn session(store: &Store, id: &str, project: &str, updated_at: i64, msgs: usize) {
+    fn session(store: &Store, id: &str) {
         store
             .create_chat_session(&StoredChatSession {
                 id: id.into(),
-                project_id: project.into(),
+                project_id: "p1".into(),
                 harness: "codex".into(),
                 native_session_id: None,
                 title: None,
@@ -5071,28 +5267,17 @@ mod notify_target_tests {
                 context_usage_json: None,
                 bootstrap_context: None,
                 created_at: 1,
-                updated_at,
+                updated_at: 1,
             })
             .unwrap();
-        for i in 0..msgs {
-            store
-                .upsert_chat_message(&StoredChatMessage {
-                    id: format!("{id}-m{i}"),
-                    session_id: id.into(),
-                    role: "user".into(),
-                    parts_json: "[]".into(),
-                    created_at: 1,
-                })
-                .unwrap();
-        }
     }
 
-    fn run(project: &str, owner: Option<&str>) -> StoredRun {
+    fn run(status: &str) -> StoredRun {
         StoredRun {
             id: "run_x".into(),
             experiment_id: "exp_1".into(),
-            project_id: project.into(),
-            status: "failed".into(),
+            project_id: "p1".into(),
+            status: status.into(),
             backend_json: "{}".into(),
             command: "echo hi".into(),
             created_at: 1,
@@ -5102,50 +5287,153 @@ mod notify_target_tests {
             commit_sha: None,
             result_markdown: None,
             cancel_requested: false,
-            chat_session_id: owner.map(str::to_string),
+            chat_session_id: Some("owner".into()),
         }
     }
 
     fn temp_store(tag: &str) -> (Store, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("orx-notify-{tag}-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("orx-wakeup-{tag}-{}", uuid::Uuid::new_v4()));
         (Store::open_at(dir.clone()).unwrap(), dir)
     }
 
-    /// The reported bug: an idle bystander is the *most recently updated*
-    /// session in the project, while an older session actually launched the
-    /// run. Routing must follow ownership, not recency.
     #[test]
-    fn routes_to_launcher_not_the_newest_bystander() {
-        let (store, dir) = temp_store("owner");
-        let proj = "p1";
-        // Owner is older; bystander is the newest — what the old project-wide
-        // heuristic would have wrongly picked.
-        session(&store, "owner", proj, 100, 3);
-        session(&store, "bystander", proj, 999, 3);
-
-        let target = notify_target(&store, &run(proj, Some("owner")));
-        assert_eq!(target.as_deref(), Some("owner"));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn wakeup_messages_are_exact_and_exclude_cancellation() {
+        assert_eq!(
+            run_wakeup_text(&run("done")).as_deref(),
+            Some(
+                "[orx] Run `run_x` finished with status **done**. You can compare this result \
+with other project runs using `orx runs p1` and inspect this run's logs using `orx logs run_x`."
+            )
+        );
+        assert_eq!(
+            run_wakeup_text(&run("failed")).as_deref(),
+            Some(
+                "[orx] Run `run_x` finished with status **failed**. You can compare this result \
+with other project runs using `orx runs p1` and inspect this run's logs using `orx logs run_x`."
+            )
+        );
+        assert!(run_wakeup_text(&run("cancelled")).is_none());
     }
 
-    /// A run with no recorded owner (CLI-launched / pre-migration) pokes no one
-    /// — never a project-wide guess.
     #[test]
-    fn orphan_run_notifies_no_one() {
-        let (store, dir) = temp_store("orphan");
-        session(&store, "bystander", "p1", 999, 3);
-        assert_eq!(notify_target(&store, &run("p1", None)), None);
-        let _ = std::fs::remove_dir_all(&dir);
+    fn hidden_transcript_override_creates_no_user_parts() {
+        assert!(transcript_parts("", &[], &[]).is_empty());
     }
 
-    /// The owner must still exist and have history; an empty (or vanished)
-    /// launcher is skipped rather than poked.
     #[test]
-    fn empty_or_missing_owner_is_skipped() {
-        let (store, dir) = temp_store("empty");
-        session(&store, "empty_owner", "p1", 100, 0);
-        assert_eq!(notify_target(&store, &run("p1", Some("empty_owner"))), None);
-        assert_eq!(notify_target(&store, &run("p1", Some("ghost"))), None);
-        let _ = std::fs::remove_dir_all(&dir);
+    fn only_earliest_wakeup_per_session_is_attempted_each_tick() {
+        let mut first = run("done");
+        first.id = "run_first".into();
+        let mut second = run("done");
+        second.id = "run_second".into();
+        let selected = first_wakeup_per_session(vec![
+            crate::store::RunWakeup {
+                run: first,
+                chat_session_id: "owner".into(),
+                state: "pending".into(),
+            },
+            crate::store::RunWakeup {
+                run: second,
+                chat_session_id: "owner".into(),
+                state: "pending".into(),
+            },
+        ]);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].run.id, "run_first");
+    }
+
+    #[tokio::test]
+    async fn queued_user_message_blocks_hidden_turn_claim() {
+        let host = Arc::new(ChatHost::new(
+            Arc::new(crate::local::opencode::AgentHost::new(None)),
+            Arc::new(crate::local::codex::CodexHost::new()),
+            Arc::new(crate::local::claude::ClaudeHost::new()),
+        ));
+        host.queued.lock().unwrap().insert(
+            "owner".into(),
+            VecDeque::from([QueuedMessage {
+                id: "q_1".into(),
+                text: "user first".into(),
+                transcript_text: None,
+                overrides: TurnOverrides::default(),
+                images: Vec::new(),
+                annotations: Vec::new(),
+            }]),
+        );
+
+        assert!(TurnGuard::claim_hidden(&host, "owner").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_run_without_subscription_starts_no_turn() {
+        let (store, dir) = temp_store("unsubscribed");
+        session(&store, "owner");
+        store.upsert_run(&run("done")).unwrap();
+        let host = Arc::new(ChatHost::new(
+            Arc::new(crate::local::opencode::AgentHost::new(None)),
+            Arc::new(crate::local::codex::CodexHost::new()),
+            Arc::new(crate::local::claude::ClaudeHost::new()),
+        ));
+
+        drop(store);
+        process_run_wakeups(&host, Store::open_at(dir.clone()).unwrap(), None)
+            .await
+            .unwrap();
+
+        assert!(!host.is_busy("owner").await);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn data_directory_move_keeps_wakeup_pending() {
+        let (store, dir) = temp_store("moving");
+        session(&store, "owner");
+        store.upsert_run(&run("done")).unwrap();
+        store.register_run_wakeup("run_x", "owner").unwrap();
+        let host = Arc::new(ChatHost::new(
+            Arc::new(crate::local::opencode::AgentHost::new(None)),
+            Arc::new(crate::local::codex::CodexHost::new()),
+            Arc::new(crate::local::claude::ClaudeHost::new()),
+        ));
+        let moving = std::sync::atomic::AtomicBool::new(true);
+
+        drop(store);
+        process_run_wakeups(&host, Store::open_at(dir.clone()).unwrap(), Some(&moving))
+            .await
+            .unwrap();
+
+        let store = Store::open_at(dir.clone()).unwrap();
+        assert_eq!(store.list_ready_run_wakeups().unwrap().len(), 1);
+        assert!(!host.is_busy("owner").await);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn draining_user_messages_keep_wakeup_pending() {
+        let (store, dir) = temp_store("draining");
+        session(&store, "owner");
+        store.upsert_run(&run("done")).unwrap();
+        store.register_run_wakeup("run_x", "owner").unwrap();
+        let host = Arc::new(ChatHost::new(
+            Arc::new(crate::local::opencode::AgentHost::new(None)),
+            Arc::new(crate::local::codex::CodexHost::new()),
+            Arc::new(crate::local::claude::ClaudeHost::new()),
+        ));
+        host.turns
+            .lock()
+            .await
+            .insert("owner".into(), TurnState::Draining);
+
+        drop(store);
+        process_run_wakeups(&host, Store::open_at(dir.clone()).unwrap(), None)
+            .await
+            .unwrap();
+
+        let store = Store::open_at(dir.clone()).unwrap();
+        assert_eq!(store.list_ready_run_wakeups().unwrap().len(), 1);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

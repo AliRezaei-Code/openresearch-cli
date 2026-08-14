@@ -135,6 +135,7 @@ preferences.
 | {run_invocation} | {run_guidance} |
 | `orx exp cancel <expId>` | Cancel the in-flight run. |
 | `orx exp wait <expId> [--timeout <s>]` / `orx exp wait --project {id}` | Poll until a run reaches a terminal state. Exits **non-zero** after `--timeout` seconds (default 1800) with nothing changed — that means "still running", not an error. |
+| `orx exp wake <expId>` | Resume this local chat after the experiment's latest run succeeds or fails. Cancelled runs do not wake the chat. |
 | `orx runs {id} [--experiment <expId>]` | Run table, newest first. Run ids come from here. |
 | `orx logs <runId> [--head] [--bytes <n>] [--range <s>:<e>]` | Read a run's log (tail by default). |
 | `orx lit "<query>" [--source alphaxiv\|openalex\|biorxiv]` / `orx paper <id\|url>` | Literature search across alphaXiv, OpenAlex, and bioRxiv (public, no login): **`orx-lit`** skill. Preferred over web search for academic/research queries — start here. |
@@ -155,9 +156,9 @@ Carry one goal across many runs (full guidance: **`orx-experiment-tree`** skill)
    — one child per distinct thing you try.
 {edit_step}
 {launch_step}
-4. **Wait — hold your turn open**: call `orx exp wait <expId> --timeout 480`
-   (or `--project` when several are in flight) in a loop until it exits 0,
-   then go analyze (each call stays under your shell tool's own time limit).
+4. **Wait or wake**: stay active with `orx exp wait <expId> --timeout 480`
+   (or `--project` when several are in flight), or call `orx exp wake <expId>`
+   before ending your turn so this chat resumes after that run succeeds or fails.
 5. **Analyze**: `orx logs <runId>`. Logs are the only evidence channel — make
    the run command print every metric you'll need (**`orx-evidence`** skill).
 6. **Decide** — four moves. Write what you learned into `orx exp desc`.
@@ -190,13 +191,11 @@ runs, needs no summary.
 
 ## Staying online while runs execute
 
-Nothing re-invokes you when a run finishes, and there are no background
-monitors — any process you background dies when your turn ends, so "I'll keep
-watching the run" is not something you can do. While a run you launched is in
-flight, the wait loop above IS your job: stay in it, and end your turn only
-once you've read the result and acted on it. (If your turn does end early,
-OpenResearch injects an `[orx]` message when a run completes — treat it as
-the wake-up to reconcile and continue the loop.)
+Choose explicitly after launching a run. Use `orx exp wait` to keep this turn
+active until a run reaches a terminal state. Use `orx exp wake <expId>` when
+you intend to end the turn and resume later; it registers the experiment's
+latest run for this local chat. Unregistered runs never wake the chat, and
+cancelled runs never send a wake-up.
 
 ## Citing evidence
 

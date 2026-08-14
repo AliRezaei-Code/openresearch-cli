@@ -525,6 +525,9 @@ pub enum ExpCommand {
     /// Cancel the in-flight run.
     Cancel { exp_id: String },
 
+    /// Resume this agent after the experiment's latest run succeeds or fails.
+    Wake { exp_id: String },
+
     /// Wait for a run to finish: one experiment (`<expId>`) or the next completion in a project (`--project`).
     Wait {
         /// Experiment to watch; its latest run is polled until it reaches a

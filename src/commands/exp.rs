@@ -4,6 +4,7 @@
 //!   orx exp cmd    <expId> [--set …]  view or set the run command
 //!   orx exp run    <expId> …          launch a run on new or existing compute
 //!   orx exp cancel <expId>            cancel the in-flight run
+//!   orx exp wake   <expId>            resume this agent when the run succeeds or fails
 //!
 //! Unlike the project-scoped data commands, every verb here takes an
 //! *experiment* id (from `orx experiments <projectId>`).
@@ -51,6 +52,7 @@ pub async fn run(args: crate::ExpArgs) -> Result<()> {
                 .await
         }
         ExpCommand::Cancel { exp_id } => resolve_experiment(store, &exp_id)?.cancel().await,
+        ExpCommand::Wake { exp_id } => wake(&store, &exp_id),
         ExpCommand::Wait {
             exp_id,
             project,
@@ -58,6 +60,39 @@ pub async fn run(args: crate::ExpArgs) -> Result<()> {
             interval,
         } => wait(store, exp_id, project, timeout, interval).await,
     }
+}
+
+fn wake(store: &Store, exp_id: &str) -> Result<()> {
+    if !crate::local::chat::in_local_session() {
+        return Err(anyhow!(
+            "`orx exp wake` is only available inside a local `orx up` agent session."
+        ));
+    }
+    let session_id = crate::local::chat::launching_chat_session()
+        .ok_or_else(|| anyhow!("This agent session has no chat id to wake."))?;
+    if store.get_chat_session(&session_id)?.is_none() {
+        return Err(anyhow!("The current chat session no longer exists."));
+    }
+    let run = store
+        .latest_run_for_experiment(exp_id)?
+        .ok_or_else(|| anyhow!("Experiment {exp_id} has no runs to wake for."))?;
+    if run.status == "cancelled" {
+        store.remove_run_wakeup(&run.id, &session_id)?;
+        println!("Run {} was cancelled; no wake-up scheduled.", run.id);
+        return Ok(());
+    }
+    match store.register_run_wakeup(&run.id, &session_id)? {
+        crate::store::RunWakeupRegistration::Scheduled => {
+            println!("Wake-up scheduled for run {}.", run.id);
+        }
+        crate::store::RunWakeupRegistration::AlreadyPending => {
+            println!("Wake-up already scheduled for run {}.", run.id);
+        }
+        crate::store::RunWakeupRegistration::AlreadyDelivered => {
+            println!("Run {} already delivered its wake-up.", run.id);
+        }
+    }
+    Ok(())
 }
 
 /// `orx exp wait …` — block on run state, for agents driving a research loop.

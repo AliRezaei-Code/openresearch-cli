@@ -67,14 +67,18 @@ pub async fn run(args: UpArgs) -> Result<()> {
         project_lifecycle: Arc::new(ProjectLifecycle::default()),
         publication_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         data_dir_move_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        data_dir_gate: Arc::new(tokio::sync::Mutex::new(())),
     };
     // Plan-mode turns hand this port to the `orx mcp-gate` permission bridge.
     state.chat.set_up_port(port);
 
     spawn_agent_preflight();
-    // Wake an idle chat session when a run completes (the agent's wait loop
-    // covers the busy case; this covers turns that ended early).
-    tokio::spawn(local::chat::watch_runs(state.chat.clone()));
+    // Deliver explicitly registered run wake-ups once their chat becomes idle.
+    tokio::spawn(local::chat::watch_runs(
+        state.chat.clone(),
+        state.data_dir_move_in_progress.clone(),
+        state.data_dir_gate.clone(),
+    ));
     spawn_claude_auth_monitor(state.chat.clone(), claude.clone(), state.harnesses.clone());
 
     let app = router(state);
@@ -153,6 +157,8 @@ struct AppState {
     /// check it and refuse (409) so nothing starts writing the store mid-move —
     /// closing the window between the move's in-flight check and its completion.
     data_dir_move_in_progress: Arc<std::sync::atomic::AtomicBool>,
+    /// Serializes wake-up store writes with a live data-directory move.
+    data_dir_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 async fn project_publication_lock(
@@ -2840,6 +2846,39 @@ async fn move_data_dir(State(state): State<AppState>, Json(req): Json<DataDirReq
             .store(false, Ordering::SeqCst);
     };
 
+    let data_dir_guard = state.data_dir_gate.clone().lock_owned().await;
+    let source_data_dir = crate::store::data_dir();
+    let move_token = uuid::Uuid::new_v4().to_string();
+    let (move_store, move_lock) = match Store::open().and_then(|store| {
+        let lock = store.acquire_data_dir_move_lock()?;
+        Ok((store, lock))
+    }) {
+        Ok(claim) => claim,
+        Err(_) => {
+            release(&state);
+            return ApiError(
+                StatusCode::CONFLICT,
+                "Another dashboard is moving the data directory.".into(),
+            )
+            .into_response();
+        }
+    };
+    let move_claimed = move_store.claim_data_dir_move(&move_token).unwrap_or(false);
+    if !move_claimed {
+        release(&state);
+        return ApiError(
+            StatusCode::CONFLICT,
+            "Can't move while another dashboard has an active chat turn or storage move.".into(),
+        )
+        .into_response();
+    }
+
+    let release_move_claim = |token: &str| {
+        if let Ok(store) = Store::open() {
+            let _ = store.release_data_dir_move(token);
+        }
+    };
+
     // In-flight guard: block if a chat turn or a run is active right now. (The
     // flag we just set prevents *new* ones from starting past this point.)
     let busy = state.chat.busy_sessions().await;
@@ -2848,6 +2887,7 @@ async fn move_data_dir(State(state): State<AppState>, Json(req): Json<DataDirReq
         .unwrap_or(0);
     let active_operations = state.project_lifecycle.operation_count();
     if !busy.is_empty() || active_runs > 0 || active_operations > 0 {
+        release_move_claim(&move_token);
         release(&state);
         return ApiError(
             StatusCode::CONFLICT,
@@ -2870,10 +2910,12 @@ async fn move_data_dir(State(state): State<AppState>, Json(req): Json<DataDirReq
     match validated {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
+            release_move_claim(&move_token);
             release(&state);
             return bad_request(e).into_response();
         }
         Err(e) => {
+            release_move_claim(&move_token);
             release(&state);
             return ApiError::from(anyhow!("validate task failed: {e}")).into_response();
         }
@@ -2885,6 +2927,8 @@ async fn move_data_dir(State(state): State<AppState>, Json(req): Json<DataDirReq
     let flag = state.data_dir_move_in_progress.clone();
     let target = std::path::PathBuf::from(path);
     tokio::spawn(async move {
+        let _data_dir_guard = data_dir_guard;
+        let _move_lock = move_lock;
         use crate::local::datadir::MoveProgress;
         let chat_for_progress = chat.clone();
         // Throttle: forward at most one progress event per ~120ms of copy, but
@@ -2918,6 +2962,16 @@ async fn move_data_dir(State(state): State<AppState>, Json(req): Json<DataDirReq
                 "datadir.move.error",
                 json!({ "error": format!("move task panicked: {e}") }),
             ),
+        }
+        // A cross-filesystem copy retains the source DB, while a rename removes
+        // it. Avoid reopening a removed source path and recreating it.
+        if source_data_dir.exists() {
+            if let Ok(store) = Store::open_at(source_data_dir) {
+                let _ = store.release_data_dir_move(&move_token);
+            }
+        }
+        if let Ok(store) = Store::open() {
+            let _ = store.release_data_dir_move(&move_token);
         }
         flag.store(false, Ordering::SeqCst);
     });
