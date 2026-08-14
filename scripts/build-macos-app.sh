@@ -59,6 +59,10 @@ rm -rf "$APP"
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
 cp "$BIN" "$CONTENTS/MacOS/OpenResearch"
 chmod +x "$CONTENTS/MacOS/OpenResearch"
+# Agents shell out to `orx`, and chat::prepare_env prepends this dir so they get
+# THIS build rather than whatever CLI install the user happens to have. Invoked
+# under this name the binary stays a plain CLI (see launched_as_app_bundle).
+ln -sf OpenResearch "$CONTENTS/MacOS/orx"
 iconutil -c icns "$ICONSET" -o "$CONTENTS/Resources/AppIcon.icns"
 sed "s/__VERSION__/$VERSION/g" "$ROOT/macos/Info.plist" > "$CONTENTS/Info.plist"
 printf 'APPL????' > "$CONTENTS/PkgInfo"

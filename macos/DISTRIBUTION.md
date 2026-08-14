@@ -94,9 +94,9 @@ and an `/Applications` alias to drag it onto, over a branded background.
 ## App-mode runtime environment
 
 Finder launches the bundle through launchd, so the process starts with
-`PATH=/usr/bin:/bin:/usr/sbin:/sbin` and no shell rc ever sourced. Harness
-detection would find no `claude`/`codex`/`opencode` at all — the "works in my
-terminal, broken in the app" class of bug.
+`PATH=/usr/bin:/bin:/usr/sbin:/sbin` and no shell rc ever sourced. Detection
+would then find no `codex` at all, and `claude`/`opencode` only at their default
+installer drop locations — the "works in my terminal, broken in the app" bug.
 
 `commands::app::hydrate_search_path` therefore probes the user's shell
 (`$SHELL -ilc`, interactive because `.zshrc` is where PATH edits live) once at
@@ -105,6 +105,25 @@ and harness children consult instead of the process PATH. It is best-effort and
 capped at 5s; every outcome is logged. To see it, run the bundled binary from a
 terminal:
 
-```
+```bash
 /Applications/OpenResearch.app/Contents/MacOS/OpenResearch
 ```
+
+## Coexisting with a CLI install
+
+The app and a `curl`-installed `orx` share one data dir and one config dir by
+design, so both must be safe to have at once:
+
+- **Ports** — the app binds an ephemeral loopback port, never `orx up`'s 4791.
+- **Store** — SQLite in WAL with a 5s busy timeout; concurrent readers/writers
+  are expected. Run supervisors hold a per-run exclusive lock, so a second
+  server recovering the same active run exits instead of double-driving it.
+- **Lifecycle lock** — app mode takes the same read lock `dispatch` takes for
+  `orx up`, so `orx delete` refuses to wipe the store under a running app.
+- **`orx` on the agent's PATH** — the bundle ships `Contents/MacOS/orx`, a
+  symlink to the executable, and `chat::prepare_env` prepends that directory.
+  Agents shelling out to `orx` therefore get *this* build rather than whatever
+  CLI version happens to be installed, and a DMG-only user needs no CLI at all.
+  Invoked under that name the binary stays a plain CLI — see
+  `launched_as_app_bundle`, which enters GUI mode only under the bundle
+  executable's own name.

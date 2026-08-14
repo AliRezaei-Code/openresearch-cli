@@ -11,14 +11,27 @@
 //! CLI. The whole module is macOS-only; other targets compile it away.
 
 /// True when this process is the executable inside a `<name>.app/Contents/MacOS`
-/// bundle — the signal to enter GUI app mode instead of parsing CLI args.
+/// bundle *and* was invoked under its own name — the signal to enter GUI app
+/// mode instead of parsing CLI args.
+///
+/// The name check is what keeps the bundle's `orx` symlink (see
+/// `build-macos-app.sh`) a plain CLI: an agent shelling out to a bare `orx`
+/// must print help, not open a second dashboard. macOS `current_exe` reports
+/// the path the process was *launched as*, symlink included, so it has to be
+/// canonicalized before its name can be compared against argv's.
 #[cfg(target_os = "macos")]
 pub fn launched_as_app_bundle() -> bool {
-    std::env::current_exe()
-        .ok()
-        .as_deref()
-        .and_then(std::path::Path::parent)
-        .is_some_and(|dir| dir.ends_with("Contents/MacOS"))
+    let Ok(exe) = std::env::current_exe().and_then(|exe| exe.canonicalize()) else {
+        return false;
+    };
+    let in_bundle = exe
+        .parent()
+        .is_some_and(|dir| dir.ends_with("Contents/MacOS"));
+    let invoked_as_bundle_exe = std::env::args_os()
+        .next()
+        .map(std::path::PathBuf::from)
+        .is_some_and(|argv0| argv0.file_name() == exe.file_name());
+    in_bundle && invoked_as_bundle_exe
 }
 
 /// Enter GUI app mode: adopt the user's shell PATH, pick a free port, start the
@@ -30,6 +43,13 @@ pub async fn run() {
     // Before the port is reserved, so the reservation can't go stale while the
     // probe runs — and long before detection reads PATH for `/api/harnesses`.
     hydrate_search_path().await;
+    // App mode returns before `dispatch`, which is where `orx up` takes this
+    // read lock. Without it `orx delete` from a CLI install sees no reader and
+    // wipes the store out from under a running app.
+    let lifecycle = crate::store::open_lifecycle_lock()
+        .inspect_err(|err| eprintln!("openresearch app: could not open the lifecycle lock: {err}"))
+        .ok();
+    let _lifecycle_guard = lifecycle.as_ref().map(|lock| lock.read());
     // Ephemeral loopback port so the app never collides with a terminal
     // `orx up`. Bind-then-drop to reserve it; the tiny race is harmless locally.
     let port = std::net::TcpListener::bind(("127.0.0.1", 0))
