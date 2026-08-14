@@ -18,6 +18,7 @@ mod compute;
 mod config;
 mod error;
 mod folder_picker;
+mod invocation;
 mod jobs;
 // Local mode (`orx up`): builds out across stages; not all of it is wired yet.
 #[allow(dead_code)]
