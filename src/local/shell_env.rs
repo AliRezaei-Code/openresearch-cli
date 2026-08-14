@@ -36,6 +36,20 @@ pub fn search_path() -> Option<OsString> {
     var("PATH")
 }
 
+/// Hand the imported variables to a child process. Every `orx` child re-resolves
+/// its directories from its own environment and only app mode ever probes, so
+/// without this a supervisor spawned by the app would write to the default
+/// store while the app read the user's. PATH is excluded: callers prepend this
+/// binary's own directory to it and set it themselves.
+pub fn export_to(mut set: impl FnMut(&'static str, &OsString)) {
+    let Some(vars) = OVERRIDE.get() else {
+        return;
+    };
+    for (key, value) in vars.iter().filter(|(key, _)| **key != "PATH") {
+        set(key, value);
+    }
+}
+
 /// Install the probe's answer; the first call wins. Deliberately not
 /// `env::set_var` — app mode enters inside an already-running tokio runtime,
 /// where mutating the process environment races every live thread.

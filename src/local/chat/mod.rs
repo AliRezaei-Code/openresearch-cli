@@ -4168,7 +4168,8 @@ pub async fn watch_runs(
 }
 
 /// Env prep shared by the CLI adapters: this orx first on PATH (agents shell
-/// out to `orx`) and the dashboard-managed env vars, real env winning.
+/// out to `orx`), the shell environment app mode imported, and the
+/// dashboard-managed env vars, real env winning.
 pub fn prepare_env(cmd: &mut tokio::process::Command) {
     if let Ok(exe) = std::env::current_exe().and_then(|p| p.canonicalize()) {
         if let Some(dir) = exe.parent() {
@@ -4181,6 +4182,11 @@ pub fn prepare_env(cmd: &mut tokio::process::Command) {
             cmd.env("PATH", path);
         }
     }
+    // So an agent's `orx exp run` resolves the same store the dashboard is
+    // showing it, rather than re-resolving to the default.
+    crate::local::shell_env::export_to(|key, value| {
+        cmd.env(key, value);
+    });
     for (key, value) in crate::config::list_synced_env() {
         if std::env::var_os(&key).is_none() {
             cmd.env(key, value);

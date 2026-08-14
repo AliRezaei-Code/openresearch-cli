@@ -511,28 +511,9 @@ async fn spawn_agent(
         .stderr(Stdio::from(log))
         // Dies with `orx up` when the runtime drops the handle (Ctrl-C, exit).
         .kill_on_drop(true);
-    // The agent shells out to plain `orx`; prepend this binary's dir so it
-    // resolves to THIS orx (with local mode), not an older install on PATH.
-    if let Ok(exe) = std::env::current_exe().and_then(|p| p.canonicalize()) {
-        if let Some(dir) = exe.parent() {
-            let mut path = std::ffi::OsString::from(dir);
-            match crate::local::shell_env::search_path() {
-                Some(existing) if !existing.is_empty() => {
-                    path.push(":");
-                    path.push(existing);
-                }
-                _ => {}
-            }
-            cmd.env("PATH", path);
-        }
-    }
-    // Vars saved in the dashboard's Environment tab reach the agent too;
-    // the real process env still wins on conflicts.
-    for (key, value) in crate::config::list_synced_env() {
-        if std::env::var_os(&key).is_none() {
-            cmd.env(key, value);
-        }
-    }
+    // This orx first on PATH (the agent shells out to plain `orx`), the imported
+    // shell environment, and the dashboard's Environment tab vars.
+    crate::local::chat::prepare_env(&mut cmd);
     // Tag runs the agent launches (`orx exp run`) with this session so they can
     // be explicitly subscribed to. One serve child per session; set after the
     // synced-env loop so it isn't shadowed.
