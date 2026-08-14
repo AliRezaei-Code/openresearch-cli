@@ -97,9 +97,8 @@ export function FileViewer({
   const onDisk =
     !isArtifacts && !gitRef && loaded?.source === "checkout" && data != null && !data.notFound;
   // Editable = a live checkout text file. A session read that fell back to the
-  // clone (root "clone" with a sessionId) is not the worktree it names, so it
-  // stays read-only rather than silently editing another checkout; a truncated
-  // read can't be saved whole, and binary/media have no text form.
+  // clone isn't the worktree it names, so it stays read-only rather than
+  // silently editing another checkout.
   const editable =
     onDisk &&
     data != null &&
@@ -110,9 +109,8 @@ export function FileViewer({
   // The editor replaces the read-only view for editable files — except markdown,
   // which stays rendered until its source toggle is on.
   const showingEditor = editable && !(isMarkdown && !showSource);
-  // A <textarea> normalizes line endings to LF, so track/compare the buffer in
-  // LF and re-apply the file's original EOL on write (else a one-char edit to a
-  // CRLF file rewrites every line).
+  // A <textarea> normalizes line endings to LF, so track the buffer in LF and
+  // re-apply the file's original EOL on write (else a CRLF file's every line flips).
   const baseline = useMemo(() => (data?.content ?? "").replace(/\r\n/g, "\n"), [data?.content]);
   const dirty = editable && draft !== baseline;
 

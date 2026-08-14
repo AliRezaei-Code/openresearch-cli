@@ -2225,13 +2225,13 @@ async fn project_file(
 /// still bounding one write.
 const FILE_WRITE_LIMIT: u64 = 8 * 1024 * 1024;
 
-/// True when a repo-relative path steps into the `.git` metadata dir. Reads may
-/// expose it, but writes there (`config`, `hooks/*`) are an arbitrary-command
-/// vector, so the mutating endpoints refuse it.
+/// True when a repo-relative path steps into the `.git` metadata dir — writing
+/// there (`config`, `hooks/*`) is an arbitrary-command vector. Case-insensitive
+/// so `.GIT` can't slip past on macOS/Windows.
 fn touches_git_dir(rel_path: &std::path::Path) -> bool {
-    rel_path
-        .components()
-        .any(|c| matches!(c, std::path::Component::Normal(name) if name == ".git"))
+    rel_path.components().any(
+        |c| matches!(c, std::path::Component::Normal(name) if name.eq_ignore_ascii_case(".git")),
+    )
 }
 
 #[derive(Deserialize)]
