@@ -60,6 +60,57 @@ pub(crate) fn open_lifecycle_lock_at(
     Ok(fd_lock::RwLock::new(file))
 }
 
+fn data_dir_move_lock_path() -> PathBuf {
+    crate::config::config_dir().join("orx.data-dir-move.lock")
+}
+
+pub(crate) struct DataDirMoveLock {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for DataDirMoveLock {
+    fn drop(&mut self) {
+        self.release.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn acquire_data_dir_move_lock(path: PathBuf) -> Result<DataDirMoveLock> {
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let result = (|| -> Result<()> {
+            let mut lock = open_lifecycle_lock_at(&path)?;
+            let _guard = lock.try_write()?;
+            ready_tx
+                .send(Ok(()))
+                .map_err(|_| anyhow!("data-directory move lock receiver closed"))?;
+            let _ = release_rx.recv();
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = ready_tx.send(Err(error.to_string()));
+        }
+    });
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok(DataDirMoveLock {
+            release: Some(release_tx),
+            thread: Some(thread),
+        }),
+        Ok(Err(error)) => {
+            let _ = thread.join();
+            Err(anyhow!(error))
+        }
+        Err(_) => {
+            let _ = thread.join();
+            Err(anyhow!("data-directory move lock thread exited"))
+        }
+    }
+}
+
 /// Read an env var as a path, treating unset **and empty** the same (an empty
 /// `export ORX_DATA_DIR=` is a shell footgun that must not resolve to `""`).
 fn env_path(key: &str) -> Option<PathBuf> {
@@ -169,20 +220,38 @@ pub struct StoredRun {
     pub cancel_requested: bool,
     /// The `orx up` chat session that launched this run, when it was started by
     /// an agent harness child (which exports `ORX_CHAT_SESSION_ID`). `None` for
-    /// CLI-launched or server runs. The run watcher routes the completion
-    /// notification to exactly this session — never a project-wide guess.
+    /// CLI-launched or server runs. This records attribution; wake-ups are
+    /// separately and explicitly registered in `chat_run_wakeups`.
     pub chat_session_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RunWakeup {
+    pub run: StoredRun,
+    pub chat_session_id: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunWakeupRegistration {
+    Scheduled,
+    AlreadyPending,
+    AlreadyDelivered,
+}
+
+const RUN_WAKEUP_CLAIM_TTL_MS: i64 = 60 * 1000;
+const CHAT_TURN_LEASE_TTL_MS: i64 = 60 * 1000;
+
 pub struct Store {
     conn: Connection,
+    data_dir_move_lock_path: PathBuf,
 }
 
 impl Store {
     /// Open (creating dirs/schema as needed). WAL so the supervise writers and
     /// the serve readers never block each other.
     pub fn open() -> Result<Self> {
-        Self::open_at(data_dir())
+        Self::open_at_with_move_lock(data_dir(), data_dir_move_lock_path())
     }
 
     /// Open a store rooted at an explicit directory, bypassing `data_dir()`
@@ -190,6 +259,11 @@ impl Store {
     /// process-global `$ORX_DATA_DIR`, which the localbox lifecycle test owns
     /// (tests in different modules share env under the parallel runner).
     pub fn open_at(dir: PathBuf) -> Result<Self> {
+        let move_lock_path = dir.join(".orx-data-dir-move.lock");
+        Self::open_at_with_move_lock(dir, move_lock_path)
+    }
+
+    fn open_at_with_move_lock(dir: PathBuf, data_dir_move_lock_path: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(dir.join("run-logs"))
             .map_err(|e| anyhow!("Could not create {}: {}", dir.display(), e))?;
         let conn = Connection::open(dir.join("orx.db"))?;
@@ -265,6 +339,28 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_chat_messages_session
                 ON chat_messages(session_id, created_at);
+            CREATE TABLE IF NOT EXISTS chat_run_wakeups (
+                run_id          TEXT NOT NULL,
+                chat_session_id TEXT NOT NULL,
+                requested_at    INTEGER NOT NULL,
+                state           TEXT NOT NULL DEFAULT 'pending',
+                claim_token     TEXT,
+                claimed_at      INTEGER,
+                delivered_at    INTEGER,
+                PRIMARY KEY(run_id, chat_session_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_run_wakeups_requested
+                ON chat_run_wakeups(requested_at);
+            CREATE TABLE IF NOT EXISTS chat_turn_leases (
+                chat_session_id TEXT PRIMARY KEY,
+                claim_token     TEXT NOT NULL,
+                heartbeat_at    INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS data_dir_move_lease (
+                id           INTEGER PRIMARY KEY CHECK (id = 1),
+                claim_token  TEXT NOT NULL,
+                heartbeat_at INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS ssh_host_tests (
                 host      TEXT PRIMARY KEY,
                 reachable INTEGER NOT NULL,
@@ -302,6 +398,10 @@ impl Store {
             "ALTER TABLE local_projects ADD COLUMN github_sync_enabled INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE local_experiments ADD COLUMN chat_session_id TEXT",
             "ALTER TABLE ssh_host_tests ADD COLUMN tools_found INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE chat_run_wakeups ADD COLUMN state TEXT NOT NULL DEFAULT 'pending'",
+            "ALTER TABLE chat_run_wakeups ADD COLUMN claim_token TEXT",
+            "ALTER TABLE chat_run_wakeups ADD COLUMN claimed_at INTEGER",
+            "ALTER TABLE chat_run_wakeups ADD COLUMN delivered_at INTEGER",
         ] {
             let _ = conn.execute(ddl, []);
         }
@@ -448,7 +548,10 @@ impl Store {
         // to do it safely exists: `reconcileReasoning` in `ui/src/api.ts` drops
         // one the selected model doesn't offer, and each harness's mapper drops
         // it again before it can reach a CLI.
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            data_dir_move_lock_path,
+        })
     }
 
     /// Short write transaction over this connection; rolls back when dropped
@@ -648,6 +751,239 @@ impl Store {
             )
             .optional()?;
         Ok(run)
+    }
+
+    pub fn register_run_wakeup(
+        &self,
+        run_id: &str,
+        chat_session_id: &str,
+    ) -> Result<RunWakeupRegistration> {
+        let inserted = self.conn.execute(
+            "INSERT OR IGNORE INTO chat_run_wakeups (run_id, chat_session_id, requested_at)
+             VALUES (?1, ?2, ?3)",
+            params![run_id, chat_session_id, now_ms()],
+        )?;
+        if inserted == 1 {
+            return Ok(RunWakeupRegistration::Scheduled);
+        }
+        let state: String = self.conn.query_row(
+            "SELECT state FROM chat_run_wakeups WHERE run_id = ?1 AND chat_session_id = ?2",
+            params![run_id, chat_session_id],
+            |row| row.get(0),
+        )?;
+        Ok(if state == "delivered" {
+            RunWakeupRegistration::AlreadyDelivered
+        } else {
+            RunWakeupRegistration::AlreadyPending
+        })
+    }
+
+    pub fn remove_run_wakeup(&self, run_id: &str, chat_session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM chat_run_wakeups WHERE run_id = ?1 AND chat_session_id = ?2",
+            params![run_id, chat_session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn prune_run_wakeups(&self) -> Result<()> {
+        self.clear_stale_data_dir_move_lease()?;
+        self.conn.execute(
+            "UPDATE chat_run_wakeups
+             SET state = 'pending', claim_token = NULL, claimed_at = NULL
+             WHERE state = 'claimed' AND claimed_at < ?1
+               AND NOT EXISTS (SELECT 1 FROM data_dir_move_lease WHERE id = 1)",
+            params![now_ms() - RUN_WAKEUP_CLAIM_TTL_MS],
+        )?;
+        self.conn.execute(
+            "DELETE FROM chat_run_wakeups
+             WHERE NOT EXISTS (SELECT 1 FROM data_dir_move_lease WHERE id = 1)
+               AND (
+                 NOT EXISTS (SELECT 1 FROM runs WHERE runs.id = chat_run_wakeups.run_id)
+                OR NOT EXISTS (
+                    SELECT 1 FROM chat_sessions
+                    WHERE chat_sessions.id = chat_run_wakeups.chat_session_id
+                )
+                OR EXISTS (
+                    SELECT 1 FROM runs
+                    WHERE runs.id = chat_run_wakeups.run_id
+                      AND runs.status = 'cancelled'
+                )
+               )",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_ready_run_wakeups(&self) -> Result<Vec<RunWakeup>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.experiment_id, r.project_id, r.status, r.backend_json, r.command,
+                    r.created_at, r.updated_at, r.ended_at, r.exit_code,
+                    r.commit_sha, r.result_markdown, r.cancel_requested, r.chat_session_id,
+                    w.chat_session_id, w.state
+             FROM chat_run_wakeups w
+             JOIN runs r ON r.id = w.run_id
+             WHERE w.state IN ('pending', 'claimed') AND r.status IN ('done', 'failed')
+             ORDER BY COALESCE(r.ended_at, r.updated_at), w.requested_at, r.id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RunWakeup {
+                run: row_to_run(row)?,
+                chat_session_id: row.get(14)?,
+                state: row.get(15)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn claim_run_wakeup(&self, run_id: &str, chat_session_id: &str) -> Result<Option<String>> {
+        let token = uuid::Uuid::new_v4().to_string();
+        let claimed = self.conn.execute(
+            "UPDATE chat_run_wakeups
+             SET state = 'claimed', claim_token = ?3, claimed_at = ?4
+             WHERE run_id = ?1 AND chat_session_id = ?2 AND state = 'pending'",
+            params![run_id, chat_session_id, token, now_ms()],
+        )?;
+        Ok((claimed == 1).then_some(token))
+    }
+
+    pub fn renew_run_wakeup_claim(
+        &self,
+        run_id: &str,
+        chat_session_id: &str,
+        token: &str,
+    ) -> Result<bool> {
+        let renewed = self.conn.execute(
+            "UPDATE chat_run_wakeups SET claimed_at = ?4
+             WHERE run_id = ?1 AND chat_session_id = ?2
+               AND state = 'claimed' AND claim_token = ?3",
+            params![run_id, chat_session_id, token, now_ms()],
+        )?;
+        Ok(renewed == 1)
+    }
+
+    pub fn release_run_wakeup(
+        &self,
+        run_id: &str,
+        chat_session_id: &str,
+        token: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chat_run_wakeups
+             SET state = 'pending', claim_token = NULL, claimed_at = NULL
+             WHERE run_id = ?1 AND chat_session_id = ?2
+               AND state = 'claimed' AND claim_token = ?3",
+            params![run_id, chat_session_id, token],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_run_wakeup_delivered(
+        &self,
+        run_id: &str,
+        chat_session_id: &str,
+        token: &str,
+    ) -> Result<bool> {
+        let delivered = self.conn.execute(
+            "UPDATE chat_run_wakeups
+             SET state = 'delivered', claim_token = NULL, claimed_at = NULL, delivered_at = ?4
+             WHERE run_id = ?1 AND chat_session_id = ?2
+               AND state = 'claimed' AND claim_token = ?3",
+            params![run_id, chat_session_id, token, now_ms()],
+        )?;
+        Ok(delivered == 1)
+    }
+
+    pub fn claim_chat_turn(&self, chat_session_id: &str, token: &str) -> Result<bool> {
+        self.clear_stale_data_dir_move_lease()?;
+        self.conn.execute(
+            "DELETE FROM chat_turn_leases
+             WHERE heartbeat_at < ?1
+                OR NOT EXISTS (
+                    SELECT 1 FROM chat_sessions
+                    WHERE chat_sessions.id = chat_turn_leases.chat_session_id
+                )",
+            params![now_ms() - CHAT_TURN_LEASE_TTL_MS],
+        )?;
+        let claimed = self.conn.execute(
+            "INSERT OR IGNORE INTO chat_turn_leases
+                 (chat_session_id, claim_token, heartbeat_at)
+             SELECT ?1, ?2, ?3
+             WHERE NOT EXISTS (SELECT 1 FROM data_dir_move_lease WHERE id = 1)",
+            params![chat_session_id, token, now_ms()],
+        )?;
+        Ok(claimed == 1)
+    }
+
+    pub fn renew_chat_turn(&self, chat_session_id: &str, token: &str) -> Result<bool> {
+        let renewed = self.conn.execute(
+            "UPDATE chat_turn_leases SET heartbeat_at = ?3
+             WHERE chat_session_id = ?1 AND claim_token = ?2",
+            params![chat_session_id, token, now_ms()],
+        )?;
+        Ok(renewed == 1)
+    }
+
+    pub fn release_chat_turn(&self, chat_session_id: &str, token: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM chat_turn_leases
+             WHERE chat_session_id = ?1 AND claim_token = ?2",
+            params![chat_session_id, token],
+        )?;
+        Ok(())
+    }
+
+    pub fn claim_data_dir_move(&self, token: &str) -> Result<bool> {
+        self.conn.execute(
+            "DELETE FROM chat_turn_leases WHERE heartbeat_at < ?1",
+            params![now_ms() - CHAT_TURN_LEASE_TTL_MS],
+        )?;
+        self.clear_stale_data_dir_move_lease()?;
+        let claimed = self.conn.execute(
+            "INSERT OR IGNORE INTO data_dir_move_lease (id, claim_token, heartbeat_at)
+             SELECT 1, ?1, ?2
+             WHERE NOT EXISTS (SELECT 1 FROM chat_turn_leases)",
+            params![token, now_ms()],
+        )?;
+        Ok(claimed == 1)
+    }
+
+    pub(crate) fn acquire_data_dir_move_lock(&self) -> Result<DataDirMoveLock> {
+        acquire_data_dir_move_lock(self.data_dir_move_lock_path.clone())
+    }
+
+    fn clear_stale_data_dir_move_lease(&self) -> Result<()> {
+        let token = self
+            .conn
+            .query_row(
+                "SELECT claim_token FROM data_dir_move_lease WHERE id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(token) = token else {
+            return Ok(());
+        };
+        let mut lock = open_lifecycle_lock_at(&self.data_dir_move_lock_path)?;
+        match lock.try_write() {
+            Ok(_guard) => {
+                self.conn.execute(
+                    "DELETE FROM data_dir_move_lease WHERE id = 1 AND claim_token = ?1",
+                    params![token],
+                )?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    pub fn release_data_dir_move(&self, token: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM data_dir_move_lease WHERE id = 1 AND claim_token = ?1",
+            params![token],
+        )?;
+        Ok(())
     }
 
     pub fn set_cancel_requested(&self, run_id: &str, requested: bool) -> Result<()> {
@@ -1757,6 +2093,204 @@ mod tests {
             None
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_wakeups_are_idempotent_ready_only_at_success_or_failure_and_pruned() {
+        let dir = std::env::temp_dir().join(format!("orx-store-wake-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store
+            .create_chat_session(&chat_session_fixture("chat_A"))
+            .unwrap();
+        for (id, status) in [
+            ("run_active", "running"),
+            ("run_done", "done"),
+            ("run_failed", "failed"),
+            ("run_cancelled", "cancelled"),
+        ] {
+            store
+                .upsert_run(&run_fixture(id, status, Some("chat_A")))
+                .unwrap();
+            assert_eq!(
+                store.register_run_wakeup(id, "chat_A").unwrap(),
+                RunWakeupRegistration::Scheduled
+            );
+            assert_eq!(
+                store.register_run_wakeup(id, "chat_A").unwrap(),
+                RunWakeupRegistration::AlreadyPending
+            );
+        }
+        store.register_run_wakeup("missing_run", "chat_A").unwrap();
+        store
+            .register_run_wakeup("run_done", "missing_chat")
+            .unwrap();
+
+        store.prune_run_wakeups().unwrap();
+        let ready = store.list_ready_run_wakeups().unwrap();
+        assert_eq!(
+            ready
+                .iter()
+                .map(|wakeup| wakeup.run.id.as_str())
+                .collect::<Vec<_>>(),
+            ["run_done", "run_failed"]
+        );
+
+        store
+            .update_status("run_active", "done", Some(2), Some(0))
+            .unwrap();
+        assert_eq!(store.list_ready_run_wakeups().unwrap().len(), 3);
+        let token = store
+            .claim_run_wakeup("run_done", "chat_A")
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .claim_run_wakeup("run_done", "chat_A")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .list_ready_run_wakeups()
+            .unwrap()
+            .iter()
+            .any(|wakeup| wakeup.run.id == "run_done" && wakeup.state == "claimed"));
+        store
+            .release_run_wakeup("run_done", "chat_A", &token)
+            .unwrap();
+        assert!(store
+            .list_ready_run_wakeups()
+            .unwrap()
+            .iter()
+            .any(|wakeup| wakeup.run.id == "run_done"));
+        let token = store
+            .claim_run_wakeup("run_done", "chat_A")
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .mark_run_wakeup_delivered("run_done", "chat_A", &token)
+            .unwrap());
+        assert_eq!(
+            store.register_run_wakeup("run_done", "chat_A").unwrap(),
+            RunWakeupRegistration::AlreadyDelivered
+        );
+        assert!(store
+            .list_ready_run_wakeups()
+            .unwrap()
+            .iter()
+            .all(|wakeup| wakeup.run.id != "run_done"));
+
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn run_wakeup_claim_is_atomic_across_store_connections_and_recoverable() {
+        let dir = std::env::temp_dir().join(format!("orx-store-claim-{}", uuid::Uuid::new_v4()));
+        let first = Store::open_at(dir.clone()).unwrap();
+        first
+            .create_chat_session(&chat_session_fixture("chat_A"))
+            .unwrap();
+        first
+            .upsert_run(&run_fixture("run_done", "done", Some("chat_A")))
+            .unwrap();
+        first.register_run_wakeup("run_done", "chat_A").unwrap();
+        let second = Store::open_at(dir.clone()).unwrap();
+
+        let stale_token = first
+            .claim_run_wakeup("run_done", "chat_A")
+            .unwrap()
+            .unwrap();
+        assert!(second
+            .claim_run_wakeup("run_done", "chat_A")
+            .unwrap()
+            .is_none());
+        first
+            .conn
+            .execute(
+                "UPDATE chat_run_wakeups SET claimed_at = 0 WHERE run_id = 'run_done'",
+                [],
+            )
+            .unwrap();
+        second.prune_run_wakeups().unwrap();
+        let current_token = second
+            .claim_run_wakeup("run_done", "chat_A")
+            .unwrap()
+            .unwrap();
+        first
+            .release_run_wakeup("run_done", "chat_A", &stale_token)
+            .unwrap();
+        assert!(!first
+            .mark_run_wakeup_delivered("run_done", "chat_A", &stale_token)
+            .unwrap());
+        assert!(second
+            .renew_run_wakeup_claim("run_done", "chat_A", &current_token)
+            .unwrap());
+        second
+            .release_run_wakeup("run_done", "chat_A", &current_token)
+            .unwrap();
+        assert!(first
+            .claim_run_wakeup("run_done", "chat_A")
+            .unwrap()
+            .is_some());
+
+        drop(second);
+        drop(first);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ready_run_wakeups_are_ordered_by_terminal_time() {
+        let dir = std::env::temp_dir().join(format!("orx-store-order-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store
+            .create_chat_session(&chat_session_fixture("chat_A"))
+            .unwrap();
+        for (id, ended_at) in [("run_late", 20), ("run_early", 10)] {
+            let mut run = run_fixture(id, "done", Some("chat_A"));
+            run.ended_at = Some(ended_at);
+            store.upsert_run(&run).unwrap();
+            store.register_run_wakeup(id, "chat_A").unwrap();
+        }
+
+        assert_eq!(
+            store
+                .list_ready_run_wakeups()
+                .unwrap()
+                .iter()
+                .map(|wakeup| wakeup.run.id.as_str())
+                .collect::<Vec<_>>(),
+            ["run_early", "run_late"]
+        );
+
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn chat_turn_lease_is_cross_process_and_token_scoped() {
+        let dir = std::env::temp_dir().join(format!("orx-store-turn-{}", uuid::Uuid::new_v4()));
+        let first = Store::open_at(dir.clone()).unwrap();
+        first
+            .create_chat_session(&chat_session_fixture("chat_A"))
+            .unwrap();
+        let second = Store::open_at(dir.clone()).unwrap();
+
+        assert!(first.claim_chat_turn("chat_A", "token_A").unwrap());
+        assert!(!second.claim_chat_turn("chat_A", "token_B").unwrap());
+        assert!(!second.renew_chat_turn("chat_A", "token_B").unwrap());
+        assert!(!second.claim_data_dir_move("move_A").unwrap());
+        second.release_chat_turn("chat_A", "token_B").unwrap();
+        assert!(!second.claim_chat_turn("chat_A", "token_B").unwrap());
+        first.release_chat_turn("chat_A", "token_A").unwrap();
+        let move_lock = first.acquire_data_dir_move_lock().unwrap();
+        assert!(first.claim_data_dir_move("move_A").unwrap());
+        assert!(!second.claim_chat_turn("chat_A", "token_B").unwrap());
+        second.release_data_dir_move("move_B").unwrap();
+        assert!(!second.claim_chat_turn("chat_A", "token_B").unwrap());
+        drop(move_lock);
+        assert!(second.claim_chat_turn("chat_A", "token_B").unwrap());
+
+        drop(second);
+        drop(first);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

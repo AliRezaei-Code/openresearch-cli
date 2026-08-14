@@ -531,8 +531,8 @@ async fn spawn_agent(
             cmd.env(key, value);
         }
     }
-    // Tag runs the agent launches (`orx exp run`) with this session so the run
-    // watcher notifies this chat. One serve child per session; set after the
+    // Tag runs the agent launches (`orx exp run`) with this session so they can
+    // be explicitly subscribed to. One serve child per session; set after the
     // synced-env loop so it isn't shadowed.
     crate::local::chat::set_chat_session_env(&mut cmd, session_id);
     if let Some(config) = &config_override {
@@ -757,6 +757,15 @@ mod tests {
         assert!(md.contains("Do not push just to launch compute"));
         assert!(md.contains("orx-compute-k8s"));
         assert!(md.contains("--backend <hf|modal"));
+    }
+
+    #[test]
+    fn playbook_explains_opt_in_run_wakeups() {
+        let md = sample_playbook();
+        assert!(md.contains("`orx exp wake <expId>`"));
+        assert!(md.contains("Unregistered runs never wake the chat"));
+        assert!(md.contains("cancelled runs never send a wake-up"));
+        assert!(!md.contains("OpenResearch injects an `[orx]` message"));
     }
 
     #[test]

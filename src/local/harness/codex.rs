@@ -2657,7 +2657,7 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
     cmd.arg(prompt);
     prepare_env(&mut cmd);
     // Tag the run this sandboxed turn may launch (`orx exp run`) with the
-    // session, so the run watcher notifies this chat. After prepare_env so it
+    // session so it can be explicitly subscribed to. After prepare_env so it
     // isn't shadowed by a synced value.
     set_chat_session_env(&mut cmd, &ctx.session_id);
     // Pin the sandboxed turn's store to the exact path granted above. The
