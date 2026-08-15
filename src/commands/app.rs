@@ -78,13 +78,15 @@ pub async fn run() {
 ///
 /// `-ilc`, not `-lc`: zsh reads `.zshrc` only for *interactive* shells, and
 /// that is where these exports overwhelmingly live. The inner `sh -c` keeps the
-/// answer portable — the outer shell sees three plain words and execs
-/// `/bin/sh`, which prints the colon-separated PATH it inherited, where fish
-/// would have printed its own list-valued `$PATH` space-separated. Values are
-/// NUL-separated because a directory may contain anything else.
+/// answer portable — the outer shell execs `/bin/sh`, which prints the values it
+/// inherited, where fish would have printed its own list-valued `$PATH`
+/// space-separated. NUL separates them because a PATH or a directory may
+/// contain spaces, colons, and newlines, but never NUL.
 #[cfg(target_os = "macos")]
 async fn hydrate_shell_env() {
-    // Nonce, so rc-file chatter can't forge the fence around the values.
+    // Nonce, so rc-file chatter can't forge the fence around the values. The
+    // leading `_` is load-bearing: `printf` reads `\0` plus up to three octal
+    // digits, so a marker starting with a digit would be eaten by the escape.
     let marker = format!("__ORX_ENV_{}__", uuid::Uuid::new_v4().simple());
     let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
     let reads = crate::local::shell_env::IMPORTED
@@ -98,11 +100,13 @@ async fn hydrate_shell_env() {
         .kill_on_drop(true)
         .output();
     // A slow rc file (nvm, conda) delays the dashboard, so cap the wait; the
-    // inherited PATH stays in force when the probe doesn't answer.
+    // inherited environment stays in force when the probe doesn't answer.
     let out = match tokio::time::timeout(std::time::Duration::from_secs(5), fut).await {
         Ok(Ok(out)) => out,
         Ok(Err(err)) => {
-            eprintln!("openresearch app: could not run {shell:?}: {err}; using the inherited PATH");
+            eprintln!(
+                "openresearch app: could not run {shell:?}: {err}; using the inherited environment"
+            );
             return;
         }
         Err(_) => {
@@ -110,11 +114,21 @@ async fn hydrate_shell_env() {
             return;
         }
     };
+    // The lock below is still taken after this, so `orx delete` can win a
+    // few-second window at startup. Locking first is worse: the lock path comes
+    // from `config_dir()`, which this probe can still change.
     // The markers are the success signal, not the exit status — an interactive
     // rc file routinely ends on a failing command.
     match crate::local::shell_env::parse_probe(&String::from_utf8_lossy(&out.stdout), &marker) {
         Some(vars) => {
-            eprintln!("openresearch app: adopted the shell environment: {vars:?}");
+            let adopted: Vec<String> = crate::local::shell_env::IMPORTED
+                .iter()
+                .filter_map(|key| Some(format!("{key}={:?}", vars.get(key)?)))
+                .collect();
+            eprintln!(
+                "openresearch app: adopted the shell environment: {}",
+                adopted.join(" ")
+            );
             crate::local::shell_env::set(vars);
         }
         None => eprintln!(

@@ -160,10 +160,9 @@ pub(crate) fn spawn_detached_supervise(run_id: &str) -> Result<()> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    // The supervisor is a fresh CLI process that re-resolves the data dir from
-    // its own environment, and it hands this env on to the run payload. Without
-    // it, a run launched from the macOS app writes to a different store than the
-    // app is reading — and its `bash run.sh` loses the user's PATH.
+    // The supervisor re-resolves its directories from its own environment, so
+    // without this a run launched from the macOS app is tracked in a different
+    // store than the app is reading.
     if let Some(path) = crate::local::shell_env::search_path() {
         cmd.env("PATH", path);
     }

@@ -43,7 +43,7 @@ pub fn no_run_command(project_id: &str) -> String {
 }
 
 fn resolves_on_path(bin: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
+    let Some(paths) = crate::local::shell_env::search_path() else {
         return false;
     };
     std::env::split_paths(&paths)

@@ -200,7 +200,7 @@ impl Harness for OpenCode {
 }
 
 fn opencode_auth_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
+    let base = crate::local::shell_env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")))?;
     Some(base.join("opencode").join("auth.json"))

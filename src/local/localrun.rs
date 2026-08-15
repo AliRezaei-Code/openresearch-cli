@@ -80,6 +80,14 @@ pub async fn submit_local_run_with_source(
     if let Ok(hf_token) = crate::jobs::huggingface::resolve_token() {
         env.entry("HF_TOKEN".to_string()).or_insert(hf_token);
     }
+    // run.sh executes the user's own script, so it needs the shell's PATH — a
+    // run launched from the macOS app would otherwise have no python/uv/conda.
+    if let Some(path) = crate::local::shell_env::search_path() {
+        env.insert("PATH".to_string(), path.to_string_lossy().into_owned());
+    }
+    crate::local::shell_env::export_to(|key, value| {
+        env.insert(key.to_string(), value.to_string_lossy().into_owned());
+    });
 
     let dir = localbox::run_job(&localbox::LocalJobSpec {
         run_id: run_id.clone(),

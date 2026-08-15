@@ -11,6 +11,10 @@
 //! macOS app mode probes the shell once at startup ([`crate::commands::app`])
 //! and installs the answer here; every other entry point falls through to the
 //! process environment unchanged.
+//!
+//! Scope is orx's own resolution and the children it spawns. The other things
+//! orx shells out to — `git`, `gh`, `kubectl`, `ssh`, the detached
+//! `publish-branch` worker — still inherit the process environment.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -39,14 +43,18 @@ pub fn search_path() -> Option<OsString> {
 /// Hand the imported variables to a child process. Every `orx` child re-resolves
 /// its directories from its own environment and only app mode ever probes, so
 /// without this a supervisor spawned by the app would write to the default
-/// store while the app read the user's. PATH is excluded: callers prepend this
-/// binary's own directory to it and set it themselves.
+/// store while the app read the user's. PATH is excluded — callers set it
+/// themselves, some of them prepending this binary's own directory first.
 pub fn export_to(mut set: impl FnMut(&'static str, &OsString)) {
     let Some(vars) = OVERRIDE.get() else {
         return;
     };
-    for (key, value) in vars.iter().filter(|(key, _)| **key != "PATH") {
-        set(key, value);
+    // In `IMPORTED` order: the adopted set is logged at startup, and a stable
+    // order keeps that line diffable across launches.
+    for key in IMPORTED.iter().filter(|key| **key != "PATH") {
+        if let Some(value) = vars.get(key) {
+            set(key, value);
+        }
     }
 }
 

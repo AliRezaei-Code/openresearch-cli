@@ -4188,7 +4188,7 @@ pub fn prepare_env(cmd: &mut tokio::process::Command) {
         cmd.env(key, value);
     });
     for (key, value) in crate::config::list_synced_env() {
-        if std::env::var_os(&key).is_none() {
+        if crate::local::shell_env::var(&key).is_none() {
             cmd.env(key, value);
         }
     }
