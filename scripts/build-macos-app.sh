@@ -59,6 +59,10 @@ rm -rf "$APP"
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
 cp "$BIN" "$CONTENTS/MacOS/OpenResearch"
 chmod +x "$CONTENTS/MacOS/OpenResearch"
+# Agents shell out to `orx` and chat::prepare_env prepends this dir. A symlink,
+# not a copy: `launched_as_app_bundle` tells CLI from GUI by comparing argv[0]
+# against the *resolved* executable name, and a copy would defeat that.
+ln -sf OpenResearch "$CONTENTS/MacOS/orx"
 iconutil -c icns "$ICONSET" -o "$CONTENTS/Resources/AppIcon.icns"
 sed "s/__VERSION__/$VERSION/g" "$ROOT/macos/Info.plist" > "$CONTENTS/Info.plist"
 printf 'APPL????' > "$CONTENTS/PkgInfo"

@@ -19,6 +19,7 @@ mod compute;
 mod config;
 mod error;
 mod folder_picker;
+mod invocation;
 mod jobs;
 // Local mode (`orx up`): builds out across stages; not all of it is wired yet.
 #[allow(dead_code)]
@@ -886,7 +887,7 @@ async fn main() {
     // the bundle itself launches it with no arguments. See commands::app.
     #[cfg(target_os = "macos")]
     if commands::app::launched_as_app_bundle() && std::env::args_os().len() == 1 {
-        commands::app::run();
+        commands::app::run().await;
         return;
     }
 

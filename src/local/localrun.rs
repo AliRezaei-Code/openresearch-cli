@@ -20,8 +20,8 @@ pub async fn launch_local_run(args: &crate::ExpRunArgs) -> Result<()> {
     println!("  dir  {}", backend.job_id.as_deref().unwrap_or(""));
     println!("  run  {}", run.id);
     println!(
-        "  Follow it with `orx exp wait {}` or `orx logs {}`.",
-        run.experiment_id, run.id
+        "{}",
+        crate::invocation::follow_up(&run.experiment_id, &run.id)
     );
     Ok(())
 }
@@ -69,14 +69,7 @@ pub async fn submit_local_run_with_source(
     let run_command = Some(exp.run_command.clone())
         .filter(|c| !c.trim().is_empty())
         .or_else(|| project.run_command.clone().filter(|c| !c.trim().is_empty()))
-        .ok_or_else(|| {
-            anyhow!(
-                "No run command set for this experiment or its project. Set the project \
-                 default with `orx project edit {} --run-command '<cmd>'`, or pass \
-                 `--run-command '<cmd>'` to `orx create-experiment` — then relaunch.",
-                project.id
-            )
-        })?;
+        .ok_or_else(|| anyhow!("{}", crate::invocation::no_run_command(&project.id)))?;
 
     // One run in flight per experiment unless deliberately forced.
     let script = crate::compute::snapshot_script(&source.path.to_string_lossy(), &run_command);
@@ -87,6 +80,14 @@ pub async fn submit_local_run_with_source(
     if let Ok(hf_token) = crate::jobs::huggingface::resolve_token() {
         env.entry("HF_TOKEN".to_string()).or_insert(hf_token);
     }
+    // run.sh executes the user's own script, so it needs the shell's PATH — a
+    // run launched from the macOS app would otherwise have no python/uv/conda.
+    if let Some(path) = crate::local::shell_env::search_path() {
+        env.insert("PATH".to_string(), path.to_string_lossy().into_owned());
+    }
+    crate::local::shell_env::export_to(|key, value| {
+        env.insert(key.to_string(), value.to_string_lossy().into_owned());
+    });
 
     let dir = localbox::run_job(&localbox::LocalJobSpec {
         run_id: run_id.clone(),
