@@ -19,6 +19,8 @@
 /// must print help, not open a second dashboard. That relies on `exe` being
 /// canonicalized — it is the *symlink* whose name differs, so an uncanonicalized
 /// path would compare `orx` against `orx` and match.
+// Un-gated so its tests run on CI's Linux runner; only macOS has a caller.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn is_bundle_exe_launch(exe: &std::path::Path, argv0: Option<&std::ffi::OsStr>) -> bool {
     let in_bundle = exe
         .parent()
