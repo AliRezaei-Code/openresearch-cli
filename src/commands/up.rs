@@ -1548,13 +1548,8 @@ async fn create_run(State(state): State<AppState>, Json(req): Json<CreateRunReq>
     local::apply_compute_default(&mut backend, &mut flavor);
     let args = crate::ExpRunArgs {
         exp_id: req.experiment_id,
-        gpu: None,
-        count: None,
         disk: req.disk,
         provider: req.provider,
-        cpu: None,
-        vcpus: None,
-        sandbox: None,
         backend: Some(backend.unwrap_or_else(|| "local".to_string())),
         flavor,
         org: req.org,

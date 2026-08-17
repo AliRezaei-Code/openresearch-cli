@@ -22,7 +22,6 @@ pub mod artifacts;
 pub mod chart;
 pub mod compute;
 pub mod create_experiment;
-pub mod create_project;
 pub mod delete;
 pub mod env;
 pub mod exp;

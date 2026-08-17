@@ -104,11 +104,7 @@ enum Command {
     /// Render a W&B metric across runs to a PNG.
     Chart(ChartArgs),
 
-    /// Create a project (from a GitHub repo, or a fresh blank repo).
-    #[command(name = "create-project")]
-    CreateProject(CreateProjectArgs),
-
-    /// Add an experiment node (child of a parent, or a baseline root).
+    /// Add an experiment node to a local `orx up` project.
     #[command(name = "create-experiment")]
     CreateExperiment(CreateExperimentArgs),
 
@@ -370,27 +366,8 @@ pub struct ChartArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct CreateProjectArgs {
-    /// Organization id (from `orx projects`).
-    pub org_id: String,
-    /// Project name (required).
-    #[arg(long)]
-    pub name: Option<String>,
-    /// GitHub repo `owner/repo` (or github.com URL) to bind the project to.
-    /// Omit to start the project on a fresh blank repo.
-    #[arg(long)]
-    pub repo: Option<String>,
-    /// Branch of the repo the project binds to (with `--repo`; defaults to the
-    /// repo's default branch). The baseline experiment branches off it.
-    #[arg(long)]
-    pub branch: Option<String>,
-    /// Project description.
-    #[arg(long)]
-    pub description: Option<String>,
-}
-
-#[derive(Args, Debug)]
 pub struct CreateExperimentArgs {
+    /// Local project id from `orx projects`.
     pub project_id: String,
     /// Experiment title (required).
     #[arg(long)]
@@ -399,16 +376,14 @@ pub struct CreateExperimentArgs {
     #[arg(long)]
     pub description: Option<String>,
     /// Parent experiment id -> create a child. Omit on an empty project to
-    /// create the baseline (root); once a root exists, local projects attach
-    /// under the oldest root (server projects create another baseline).
+    /// create the baseline (root); once a root exists, attach under it.
     #[arg(long)]
     pub parent: Option<String>,
     /// Create a new baseline (root) even when the project already has one.
     /// Conflicts with --parent. Projects may hold multiple baselines.
     #[arg(long, conflicts_with = "parent")]
     pub baseline: bool,
-    /// Run command for the node (local projects and server baselines). Omit to
-    /// inherit from the parent / project default.
+    /// Run command for the node. Omit to inherit from the parent/project default.
     #[arg(long = "run-command")]
     pub run_command: Option<String>,
 }
@@ -540,7 +515,7 @@ pub enum ExpCommand {
         stdin: bool,
     },
 
-    /// Launch a run on new (`--gpu`) or existing (`--sandbox`) compute.
+    /// Launch a locally initialized experiment through an orx-supervised backend.
     Run(Box<ExpRunArgs>),
 
     /// Cancel the in-flight run.
@@ -613,33 +588,14 @@ pub enum ReportCommand {
 #[derive(Args, Debug)]
 pub struct ExpRunArgs {
     pub exp_id: String,
-    /// Provision a new instance with this GPU id, e.g. `H100_SXM` — the exact
-    /// id from `orx compute`, not a family name like `H100`.
-    #[arg(long)]
-    pub gpu: Option<String>,
-    /// GPUs per instance (with `--gpu`; default 1).
-    #[arg(long)]
-    pub count: Option<i64>,
-    /// Disk in GB (with `--gpu` or a `--backend openresearch` GPU flavor;
-    /// default 100).
+    /// Disk in GB for a `--backend openresearch` instance (default 100).
     #[arg(long)]
     pub disk: Option<i64>,
-    /// Provider to provision from (with `--gpu` or a `--backend openresearch`
-    /// GPU flavor), e.g. runpod, vast, lambda. Defaults to runpod (`--gpu`) or
-    /// the cheapest offer (`openresearch`) when omitted; validated server-side.
+    /// Provider for a `--backend openresearch` GPU flavor. When omitted, the
+    /// cheapest qualified offer is selected.
     #[arg(long)]
     pub provider: Option<String>,
-    /// Provision a CPU-only instance with this flavor: cpu5c (compute), cpu5g
-    /// (general), or cpu5m (memory-optimized). Mutually exclusive with `--gpu`.
-    #[arg(long)]
-    pub cpu: Option<String>,
-    /// vCPUs for a CPU instance (with `--cpu`): 2, 8, or 32 (default 8).
-    #[arg(long)]
-    pub vcpus: Option<i64>,
-    /// Run on an existing sandbox instead of provisioning. Mutually exclusive with `--gpu`/`--cpu`.
-    #[arg(long)]
-    pub sandbox: Option<String>,
-    /// External executor instead of managed compute: `hf` (Hugging Face Jobs,
+    /// orx-supervised executor: `hf` (Hugging Face Jobs,
     /// billed to your HF account), `modal` (a Modal Sandbox on your own Modal
     /// account, billed per second), `k8s` (a Job on your own Kubernetes
     /// cluster), `ssh` (a detached process on one of your own boxes), `slurm`
@@ -695,8 +651,7 @@ pub struct ExpRunArgs {
     /// Not supported with `--backend ray` (Ray Jobs have no time limit).
     #[arg(long)]
     pub timeout: Option<String>,
-    /// Launch even if the experiment's branch has no changes over its parent
-    /// (bypasses the "did you forget to push?" guard, for a deliberate re-run).
+    /// Launch even when another run is already in flight for this experiment.
     #[arg(long)]
     pub force: bool,
 }
@@ -1003,7 +958,6 @@ fn command_name(command: &Command) -> &'static str {
         Command::Wandb(_) => "wandb",
         Command::Query(_) => "query",
         Command::Chart(_) => "chart",
-        Command::CreateProject(_) => "create-project",
         Command::CreateExperiment(_) => "create-experiment",
         Command::Compute(_) => "compute",
         Command::Instance(_) => "instance",
@@ -1052,7 +1006,6 @@ async fn dispatch(command: Command) -> error::Result<()> {
         Command::Wandb(args) => commands::wandb::run(args).await,
         Command::Query(args) => commands::query::run(args).await,
         Command::Chart(args) => commands::chart::run(args).await,
-        Command::CreateProject(args) => commands::create_project::run(args).await,
         Command::CreateExperiment(args) => commands::create_experiment::run(args).await,
         Command::Compute(args) => commands::compute::run(args).await,
         Command::Instance(args) => commands::instance::run(args).await,
@@ -1098,4 +1051,53 @@ fn command_uses_lifecycle_lock(command: &Command) -> bool {
             | Command::McpGate
             | Command::PublishBranch(_)
     )
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn removed_server_managed_run_flags_are_rejected() {
+        for flag in ["--gpu", "--cpu", "--sandbox"] {
+            let error = Cli::try_parse_from(["orx", "exp", "run", "exp-1", flag, "value"])
+                .expect_err("retired managed-run flag should not parse");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_server_project_create_command_is_rejected() {
+        let error = Cli::try_parse_from(["orx", "create-project", "org-1", "--name", "project"])
+            .expect_err("retired server project creation should not parse");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn openresearch_backend_and_flavor_still_parse() {
+        let cli = Cli::try_parse_from([
+            "orx",
+            "exp",
+            "run",
+            "exp-1",
+            "--backend",
+            "openresearch",
+            "--flavor",
+            "h100_sxm",
+        ])
+        .expect("local OpenResearch launch should parse");
+
+        let Some(Command::Exp(ExpArgs {
+            command: ExpCommand::Run(args),
+        })) = cli.command
+        else {
+            panic!("expected exp run command");
+        };
+        assert_eq!(args.backend.as_deref(), Some("openresearch"));
+        assert_eq!(args.flavor.as_deref(), Some("h100_sxm"));
+    }
 }

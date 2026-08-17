@@ -13,17 +13,13 @@
 //!   `.agents/skills`), so the session's own agent auto-discovers them and never
 //!   sees drift.
 //! * **`orx skill <name>`** resolves a bundled module (with or without the
-//!   `orx-` prefix) from the set matching its context — the Local set inside an
-//!   `orx up` session, the Full set otherwise — and prints it; the no-arg
-//!   overview lists that same set. `orx install-skills --full` writes the Full
-//!   set into an agent's global skills dir (the dedicated cloud box).
+//!   `orx-` prefix) and prints it; the no-arg overview lists the same set.
+//!   `orx install-skills --full` writes the Full set into an agent's global
+//!   skills dir.
 //!
-//! The two sets share the same public skill *names* so docs and references stay
-//! stable; several modules swap their **body** between a local-mode form
-//! (backend-based launches, logs-only evidence, project artifacts, worktree
-//! git flow) and a full/cloud form (managed-SKU compute, artifacts + query +
-//! chart, `orx report` upload). The `orx-` prefix on every dir name makes them
-//! unmistakable in an agent's skill listing.
+//! Every module has one canonical `SKILL.md`. The Local set omits onboarding
+//! because a session already has a project; the Full set includes it. The
+//! `orx-` prefix on every dir name makes modules unmistakable in a skill list.
 
 use std::path::Path;
 
@@ -39,35 +35,25 @@ pub struct AgentSkill {
     pub content: &'static str,
 }
 
-/// Which set of module bodies to serve. The two sets carry the same public skill
-/// names; only a few bodies differ (see the module docs).
+/// Which module set to serve. Both sets use the same canonical module bodies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkillSet {
-    /// `orx up` local mode: logs-only evidence, project artifacts, no `create`.
+    /// Skills installed into an active `orx up` project session.
     Local,
-    /// Full/cloud surface: artifacts + query + chart evidence, `orx report`
-    /// upload, and the project/experiment creation module.
+    /// The complete set, including local project onboarding guidance.
     Full,
 }
 
-// --- Module files (embedded verbatim from the repo `agent-skills/` dir; the
-// `SKILL.local.md` siblings are the local-mode body variants under the same
-// public skill name) ----------------------------------------------------------
+// --- Module files (embedded verbatim from the repo `agent-skills/` dir) ------
 
-const COMPUTE_LOCAL: &str = include_str!("../../agent-skills/orx-compute/SKILL.local.md");
-const COMPUTE_CLOUD: &str = include_str!("../../agent-skills/orx-compute/SKILL.md");
+const COMPUTE: &str = include_str!("../../agent-skills/orx-compute/SKILL.md");
 const COMPUTE_K8S: &str = include_str!("../../agent-skills/orx-compute-k8s/SKILL.md");
-const EXPERIMENT_TREE_LOCAL: &str =
-    include_str!("../../agent-skills/orx-experiment-tree/SKILL.local.md");
-const EXPERIMENT_TREE_CLOUD: &str = include_str!("../../agent-skills/orx-experiment-tree/SKILL.md");
-const GIT_LOCAL: &str = include_str!("../../agent-skills/orx-git/SKILL.local.md");
-const GIT_CLOUD: &str = include_str!("../../agent-skills/orx-git/SKILL.md");
+const EXPERIMENT_TREE: &str = include_str!("../../agent-skills/orx-experiment-tree/SKILL.md");
+const GIT: &str = include_str!("../../agent-skills/orx-git/SKILL.md");
 const LIT: &str = include_str!("../../agent-skills/orx-lit/SKILL.md");
 const CREATE: &str = include_str!("../../agent-skills/orx-create/SKILL.md");
-const REPORTS_LOCAL: &str = include_str!("../../agent-skills/orx-reports/SKILL.local.md");
-const REPORTS_CLOUD: &str = include_str!("../../agent-skills/orx-reports/SKILL.md");
-const EVIDENCE_LOCAL: &str = include_str!("../../agent-skills/orx-evidence/SKILL.local.md");
-const EVIDENCE_CLOUD: &str = include_str!("../../agent-skills/orx-evidence/SKILL.md");
+const REPORTS: &str = include_str!("../../agent-skills/orx-reports/SKILL.md");
+const EVIDENCE: &str = include_str!("../../agent-skills/orx-evidence/SKILL.md");
 
 // Descriptions are the *trigger surface*: what the module covers plus explicit,
 // liberal "Use when …" cues (false positives beat false negatives — an agent
@@ -75,44 +61,28 @@ const EVIDENCE_CLOUD: &str = include_str!("../../agent-skills/orx-evidence/SKILL
 // works blind). Keep each ≤400 chars — Codex's ambient budget is ~8k across
 // the whole set.
 
-const D_COMPUTE_LOCAL: &str = "Launch experiment runs with `orx exp run`: backends (hf, modal, k8s, ssh, slurm, ray, openresearch, local), flavors, timeouts, images, sizing, and choosing `orx exp wait` vs `orx exp wake`. Use before launching or re-launching any run, when choosing or switching a backend or GPU flavor, when a job OOMs, stalls, or times out, or when deciding GPU vs CPU.";
-const D_COMPUTE_CLOUD: &str = "Launch experiment runs with `orx exp run`: backends (hf, modal, k8s, ssh, slurm, ray, openresearch, local), flavors, timeouts, images, sizing, and `orx exp wait`. Use before launching or re-launching any run, when choosing or switching a backend or GPU flavor, when a job OOMs, stalls, or times out, or when deciding GPU vs CPU.";
+const D_COMPUTE: &str = "Launch experiment runs with `orx exp run`: backends (hf, modal, k8s, ssh, slurm, ray, openresearch, local), flavors, timeouts, images, sizing, and choosing `orx exp wait` vs `orx exp wake`. Use before launching or re-launching any run, when choosing or switching a backend or GPU flavor, when a job OOMs, stalls, or times out, or when deciding GPU vs CPU.";
 const D_EXPERIMENT_TREE: &str = "The experiment-tree model and the auto-research loop: shape the tree (stacked bushes), branch/launch/wait/promote, and `orx exp desc` notes. Use before creating, planning, or reorganizing experiments, when deciding what to try next, when a round of runs finishes, or whenever you're unsure how work maps onto the tree.";
 
-const S_COMPUTE_LOCAL: AgentSkill = AgentSkill {
+const S_COMPUTE: AgentSkill = AgentSkill {
     name: "orx-compute",
-    description: D_COMPUTE_LOCAL,
-    content: COMPUTE_LOCAL,
-};
-const S_COMPUTE_CLOUD: AgentSkill = AgentSkill {
-    name: "orx-compute",
-    description: D_COMPUTE_CLOUD,
-    content: COMPUTE_CLOUD,
+    description: D_COMPUTE,
+    content: COMPUTE,
 };
 const S_COMPUTE_K8S: AgentSkill = AgentSkill {
     name: "orx-compute-k8s",
     description: "Run an experiment on your own Kubernetes cluster (`orx exp run --backend k8s`): the single-pod committed-manifest contract orx enforces at submit. Use when the user names k8s, kubernetes, or a cluster, before writing or editing `.orx/k8s.yaml`, or when a k8s submit is rejected.",
     content: COMPUTE_K8S,
 };
-const S_EXPERIMENT_TREE_LOCAL: AgentSkill = AgentSkill {
+const S_EXPERIMENT_TREE: AgentSkill = AgentSkill {
     name: "orx-experiment-tree",
     description: D_EXPERIMENT_TREE,
-    content: EXPERIMENT_TREE_LOCAL,
+    content: EXPERIMENT_TREE,
 };
-const S_EXPERIMENT_TREE_CLOUD: AgentSkill = AgentSkill {
-    name: "orx-experiment-tree",
-    description: D_EXPERIMENT_TREE,
-    content: EXPERIMENT_TREE_CLOUD,
-};
-const S_GIT_LOCAL: AgentSkill = AgentSkill {
+const S_GIT: AgentSkill = AgentSkill {
     name: "orx-git",
     description: "Read, edit, commit, and diff experiment code with local Git. Use whenever you touch an experiment branch, compare nodes, prepare a run, or diagnose stale code.",
-    content: GIT_LOCAL,
-};
-const S_GIT_CLOUD: AgentSkill = AgentSkill {
-    name: "orx-git",
-    description: "Read, edit, commit, and diff experiment code with Git. Use whenever you touch a branch, compare nodes, prepare a run, diagnose stale code, or publish changes.",
-    content: GIT_CLOUD,
+    content: GIT,
 };
 const S_LIT: AgentSkill = AgentSkill {
     name: "orx-lit",
@@ -121,52 +91,41 @@ const S_LIT: AgentSkill = AgentSkill {
 };
 const S_CREATE: AgentSkill = AgentSkill {
     name: "orx-create",
-    description: "Create a project (`orx create-project`), seed an empty baseline from existing code, and add experiment nodes (`orx create-experiment`). Use when starting any new project or experiment, when the tree is empty, or when unsure how to bind a repo or set the run command.",
+    description: "Initialize a local project with `orx up` and add local experiment nodes with `orx create-experiment`. Use when starting a project or experiment, when the local tree is empty, or when choosing a baseline, parent, or run command.",
     content: CREATE,
 };
-const S_REPORTS_LOCAL: AgentSkill = AgentSkill {
+const S_REPORTS: AgentSkill = AgentSkill {
     name: "orx-reports",
     description: "Write durable research outputs into the local project's artifacts directory. Use when a line of work concludes, when the user asks for a write-up, summary, comparison, figures, or exported data, or before ending a long task — findings not written down are lost.",
-    content: REPORTS_LOCAL,
+    content: REPORTS,
 };
-const S_REPORTS_CLOUD: AgentSkill = AgentSkill {
-    name: "orx-reports",
-    description: "Write a research report and publish it with `orx report upload` (list/show/download too) so it appears on the project page. Use when a line of work concludes, when the user asks for a write-up, summary, comparison, or figures, or before ending a long task — findings not written down are lost.",
-    content: REPORTS_CLOUD,
-};
-const S_EVIDENCE_LOCAL: AgentSkill = AgentSkill {
+const S_EVIDENCE: AgentSkill = AgentSkill {
     name: "orx-evidence",
-    description: "Analyze run results in local mode: run logs are the only evidence channel (`orx logs`). Use after any run reaches a terminal state, before declaring a run a success or failure, when metrics are missing from output, or when designing what a run command should print.",
-    content: EVIDENCE_LOCAL,
-};
-const S_EVIDENCE_CLOUD: AgentSkill = AgentSkill {
-    name: "orx-evidence",
-    description: "Analyze run results: `orx logs`, `orx search-logs`, text artifacts, W&B charts (`orx chart wandb`), and the `orx query` evidence DB. Use after any run finishes, when comparing metrics across runs or experiments, when hunting a failure in logs, or when asked for numbers, tables, or charts.",
-    content: EVIDENCE_CLOUD,
+    description: "Analyze run results through `orx logs`. Use after any run reaches a terminal state, before declaring a run a success or failure, when metrics are missing from output, or when designing what a run command should print.",
+    content: EVIDENCE,
 };
 
-/// The modules for a given set, in a stable order. Local and Full share names;
-/// `experiment-tree`/`compute`/`reports`/`evidence` swap bodies, and `create`
-/// is Full-only.
+/// The modules for a given set, in a stable order. Full adds `create`; every
+/// shared module uses the same canonical `SKILL.md`.
 pub fn skills(set: SkillSet) -> Vec<&'static AgentSkill> {
     match set {
         SkillSet::Local => vec![
-            &S_EXPERIMENT_TREE_LOCAL,
-            &S_GIT_LOCAL,
-            &S_COMPUTE_LOCAL,
+            &S_EXPERIMENT_TREE,
+            &S_GIT,
+            &S_COMPUTE,
             &S_COMPUTE_K8S,
-            &S_EVIDENCE_LOCAL,
-            &S_REPORTS_LOCAL,
+            &S_EVIDENCE,
+            &S_REPORTS,
             &S_LIT,
         ],
         SkillSet::Full => vec![
             &S_CREATE,
-            &S_EXPERIMENT_TREE_CLOUD,
-            &S_GIT_CLOUD,
-            &S_COMPUTE_CLOUD,
+            &S_EXPERIMENT_TREE,
+            &S_GIT,
+            &S_COMPUTE,
             &S_COMPUTE_K8S,
-            &S_EVIDENCE_CLOUD,
-            &S_REPORTS_CLOUD,
+            &S_EVIDENCE,
+            &S_REPORTS,
             &S_LIT,
         ],
     }
@@ -174,8 +133,7 @@ pub fn skills(set: SkillSet) -> Vec<&'static AgentSkill> {
 
 /// Resolve a bundled skill by name within `set`, accepting both the public name
 /// (`orx-compute`) and the bare form (`compute`). `None` for an unknown name —
-/// the caller falls back to the live API fetch. Local and cloud share skill
-/// *names* but swap bodies, so pass the set you actually want.
+/// the caller falls back to the live API fetch.
 pub fn find(name: &str, set: SkillSet) -> Option<&'static AgentSkill> {
     let want = name.trim();
     skills(set)
@@ -183,42 +141,18 @@ pub fn find(name: &str, set: SkillSet) -> Option<&'static AgentSkill> {
         .find(|s| s.name == want || s.name.strip_prefix("orx-") == Some(want))
 }
 
-pub fn available_in_session(_skill: &AgentSkill, _github_enabled: bool) -> bool {
-    true
-}
-
-pub fn session_content(skill: &AgentSkill, _github_enabled: bool) -> &'static str {
-    skill.content
-}
-
-pub fn session_description(skill: &AgentSkill, _github_enabled: bool) -> &'static str {
-    skill.description
-}
-
 /// Write the [`SkillSet::Local`] modules as `<worktree>/<skills_dir_rel>/<name>/SKILL.md`,
 /// overwriting every file on every call (same freshness semantics as the
 /// playbook — zero drift). Returns `Err` on the first write failure; the caller
 /// treats it like a playbook-write error.
-pub fn ensure_session_skills(
-    worktree: &Path,
-    skills_dir_rel: &str,
-    github_enabled: bool,
-) -> Result<()> {
+pub fn ensure_session_skills(worktree: &Path, skills_dir_rel: &str) -> Result<()> {
     let base = worktree.join(skills_dir_rel);
     for skill in skills(SkillSet::Local) {
         let dir = base.join(skill.name);
-        if !available_in_session(skill, github_enabled) {
-            if dir.exists() {
-                std::fs::remove_dir_all(&dir)
-                    .map_err(|e| anyhow!("Could not remove {}: {}", dir.display(), e))?;
-            }
-            continue;
-        }
         std::fs::create_dir_all(&dir)
             .map_err(|e| anyhow!("Could not create {}: {}", dir.display(), e))?;
         let path = dir.join("SKILL.md");
-        let content = session_content(skill, github_enabled);
-        std::fs::write(&path, content)
+        std::fs::write(&path, skill.content)
             .map_err(|e| anyhow!("Could not write {}: {}", path.display(), e))?;
     }
     Ok(())
@@ -358,39 +292,20 @@ mod tests {
         assert!(find("orx-create", SkillSet::Local).is_none());
     }
 
-    /// `find` must return the body from the set it was asked for. `orx skill
-    /// <name>` inside an `orx up` session relies on this: the playbook points
-    /// there as the fallback, and a cloud body would name commands local mode
-    /// lacks. Covers every skill whose body swaps between the two sets.
     #[test]
-    fn find_serves_the_requested_variant_body() {
-        // Pinned against the embedded consts, not against `skills()` — the body
-        // a set *should* hold, from a source of truth outside the lookup under
-        // test.
-        let want = [
-            ("evidence", EVIDENCE_LOCAL, EVIDENCE_CLOUD),
-            (
-                "experiment-tree",
-                EXPERIMENT_TREE_LOCAL,
-                EXPERIMENT_TREE_CLOUD,
-            ),
-            ("compute", COMPUTE_LOCAL, COMPUTE_CLOUD),
-            ("reports", REPORTS_LOCAL, REPORTS_CLOUD),
-        ];
-        for (name, local_body, cloud_body) in want {
-            let local = find(name, SkillSet::Local).unwrap_or_else(|| panic!("local {name}"));
-            let cloud = find(name, SkillSet::Full).unwrap_or_else(|| panic!("cloud {name}"));
-            assert_ne!(local_body, cloud_body, "{name} bodies must differ");
-            assert_eq!(local.content, local_body, "{name} served a non-local body");
-            assert_eq!(cloud.content, cloud_body, "{name} served a non-cloud body");
+    fn shared_skills_use_one_canonical_body() {
+        for name in ["experiment-tree", "git", "compute", "evidence", "reports"] {
+            let local = find(name, SkillSet::Local).expect("local skill");
+            let full = find(name, SkillSet::Full).expect("full skill");
+            assert_eq!(local.content, full.content, "{name} body");
         }
     }
 
     #[test]
-    fn local_reports_skill_links_written_artifacts() {
-        assert!(REPORTS_LOCAL.contains("cite every relevant output as raw"));
-        assert!(REPORTS_LOCAL.contains("<file path=\"artifacts/<relative-path>\" />"));
-        assert!(REPORTS_LOCAL.contains("never as a bare or backticked path"));
+    fn reports_skill_links_written_artifacts() {
+        assert!(REPORTS.contains("cite every relevant output as raw"));
+        assert!(REPORTS.contains("<file path=\"artifacts/<relative-path>\" />"));
+        assert!(REPORTS.contains("never as a bare or backticked path"));
     }
 
     #[test]
@@ -401,7 +316,7 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let rel = ".claude/skills";
-        ensure_session_skills(&tmp, rel, true).unwrap();
+        ensure_session_skills(&tmp, rel).unwrap();
 
         let base = tmp.join(rel);
         let expected: HashSet<&str> = skills(SkillSet::Local).iter().map(|s| s.name).collect();
@@ -419,7 +334,7 @@ mod tests {
         }
 
         // Idempotent: a second call overwrites in place and changes nothing.
-        ensure_session_skills(&tmp, rel, true).unwrap();
+        ensure_session_skills(&tmp, rel).unwrap();
         let got2: HashSet<String> = std::fs::read_dir(&base)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -430,15 +345,11 @@ mod tests {
     }
 
     #[test]
-    fn github_disabled_sessions_keep_snapshot_compute_available() {
-        let tmp = std::env::temp_dir().join(format!(
-            "orx-local-only-skills-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+    fn unified_git_and_compute_skills_are_written_to_sessions() {
+        let tmp =
+            std::env::temp_dir().join(format!("orx-unified-skills-test-{}", uuid::Uuid::new_v4()));
         let rel = ".agents/skills";
-        ensure_session_skills(&tmp, rel, true).unwrap();
-        assert!(tmp.join(rel).join("orx-compute-k8s").exists());
-        ensure_session_skills(&tmp, rel, false).unwrap();
+        ensure_session_skills(&tmp, rel).unwrap();
         let git = std::fs::read_to_string(tmp.join(rel).join("orx-git/SKILL.md")).unwrap();
         assert!(git.contains("never part of compute transport"));
         assert!(git.contains("do not push merely to launch compute"));
@@ -453,20 +364,8 @@ mod tests {
     fn bundled_skills_avoid_openresearch_ui_navigation() {
         for set in [SkillSet::Local, SkillSet::Full] {
             for skill in skills(set) {
-                for content in [
-                    skill.content,
-                    session_content(skill, true),
-                    session_content(skill, false),
-                ] {
-                    crate::local::assert_agent_guidance_is_ui_agnostic(skill.name, content);
-                }
-                for description in [
-                    skill.description,
-                    session_description(skill, true),
-                    session_description(skill, false),
-                ] {
-                    crate::local::assert_agent_guidance_is_ui_agnostic(skill.name, description);
-                }
+                crate::local::assert_agent_guidance_is_ui_agnostic(skill.name, skill.content);
+                crate::local::assert_agent_guidance_is_ui_agnostic(skill.name, skill.description);
             }
         }
     }

@@ -109,7 +109,7 @@ pub async fn run(args: crate::ProjectsArgs) -> Result<()> {
             projects.iter().filter(|p| !p.archived).collect()
         };
 
-        // Org id alongside the name — it's what `orx create-project` takes.
+        // Keep the org id visible for org-scoped instance and SSH-key commands.
         println!("\n{}  (org: {})", org.name, org.id);
         if visible.is_empty() {
             println!("  (no projects)");

@@ -5,7 +5,7 @@ description: "The experiment-tree model and the auto-research loop: shape the tr
 
 A project is a **tree of experiment nodes**. The root (**baseline**) holds the
 starting code and a **run command** — the single shell command that trains or
-evaluates the node and writes an `EVAL.md` with its results. Every other node is a
+evaluates the node and prints its results to the run log. Every other node is a
 **child** branched off a parent, inheriting its code and its run command. The two
 rules this depends on — **never edit a node a run has answered** and
 **the run command + env is a fixed contract** — are the cardinal rules;
@@ -73,21 +73,21 @@ resolved, stacked** (one level down per winner kept). A new *round* never hangs 
 the root — it hangs off the previous round's winner. That keeps the tree moving
 **downward** as research progresses, without stringing unrelated nodes into a line.
 
-Re-read `orx experiments` each round and check the shape: a wide row of direct
-children off the root with no grandchildren means you're fanning when you should be
-descending; a long depth-N chain with no branching means you're chaining co-equal
-variants that should have been siblings.
+Re-read the tree each round — `orx project view <projectId>` lists every node
+(id, title, branch; roots marked `[root]`) — and check the shape: a wide row of
+direct children off the root with no grandchildren means you're fanning when you
+should be descending; a long depth-N chain with no branching means you're chaining
+co-equal variants that should have been siblings.
 
 ## The auto-research loop
 
-To drive a project toward a goal (e.g. "best convergence for d=8") with fixed
-GPU capacity, this is the intended flow — do **not** edit a frozen node or rewrite
-the run command:
+To drive a project toward a goal (e.g. "best convergence for d=8"), this is the
+intended flow — do **not** edit a frozen node or rewrite the run command:
 
-1. **Read the baseline's code.** Clone the project's repo into the cache dir and
-   read it with your normal tools (see the `orx-git` skill for the path).
-   See its run command with `orx exp cmd <baseId>` and find where the knobs live
-   (config files, hyperparameters, model defs).
+1. **Read the baseline's code.** You already sit in a private Git worktree of the
+   project's repository. Check out the branch and read it with your normal tools
+   (see `orx-git`). See the node's run command with `orx exp status <expId>` and
+   find where the knobs live (config files, hyperparameters, model definitions).
 2. **Form one round's worth of hypotheses** — the co-equal options of a *single*
    decision (which LR? which schedule? which init?), each a concrete change you can
    make and measure against the others in this round. Don't mix decisions from
@@ -113,35 +113,24 @@ the run command:
    ```
    The child inherits its parent's run command automatically — you don't set it,
    and you never give siblings different commands or env vars (cardinal rule 2).
-4. **Implement each child's change on its git branch** — `orx create-experiment`
-   prints the child's branch (`orx/<slug>`); check the branch out in the
-   project worktree, edit only the files that idea touches, and commit. **Leave the run
-   command alone:**
+4. **Implement each child's change on its Git branch** — `orx create-experiment`
+   prints the child's branch (`orx/<slug>`); in your worktree:
    ```sh
    git checkout orx/<child-slug>
-   #   …edit config.yaml: schedule: constant → cosine …
+   #   …edit only the files that idea touches…
    git commit -am "cosine LR + warmup"
    ```
-   While you're in the code, **make the run emit the evidence you'll need to judge
-   it.** Have it write rollout transcripts, per-sample eval breakdowns, generated
-   text, or summary tables to `.openresearch/artifacts/` (as text — JSONL/CSV/md) —
-   a directory at the **repo root**, where the run command's working dir points, so
-   `.openresearch/artifacts/foo.jsonl` is a plain relative path (if your code `cd`s
-   into a subdir or writes to `/tmp` first, resolve it from the repo root instead).
-   Those files sync to storage and become readable in step 7 via `orx artifacts` /
-   `orx artifact`. A run you can only read the tail-log of is far weaker evidence
-   than one that dumped its rollouts. See the `orx-evidence` skill.
-5. **Fill the available GPU capacity** — launch ready children in parallel until
-   the sum of GPUs requested by in-flight runs reaches the available capacity.
-   Capacity is GPU-weighted, not a raw run-count limit: with 16 available GPUs,
-   one-GPU experiments mean up to 16 concurrent runs, four-GPU experiments mean
-   up to four, and an experiment that requires all 16 runs alone.
-   ```sh
-   orx exp run <childId> --gpu H100_SXM --count 1
-   ```
-6. **Keep GPU capacity saturated — drive a per-completion loop, not a wait-for-all
-   barrier.** You want control back the moment
-   *any one* run finishes so you can analyze the state of experiments and either refill its slot or stop if no experiment further is needed — not after the whole batch
+   **Leave the run command alone.** While you're in the code, make the run print
+   the evidence you'll need to judge it — final metrics, a compact summary block,
+   and the key config it actually used. The run log is the evidence channel; if
+   a result is not printed there, it cannot be inspected later.
+5. **Launch the round's ready children**: `orx exp run <childId> --backend <b>`
+   (or omit `--backend` when a default target is set — see `orx-compute`). Remote
+   backends can run siblings in parallel; `--backend local` shares this machine's
+   CPU, RAM, and GPU.
+6. **Keep the round moving — drive a per-completion loop, not a wait-for-all
+   barrier.** You want control back the moment *any one* run finishes so you can
+   analyze it and either refill its slot or stop — not after the whole batch
    drains. `orx exp wait --project <projectId>` is built for exactly this: it
    returns on the **first** completion. Treat it as one **tick** of a loop, where
    *you* are the loop body:
@@ -175,15 +164,14 @@ the run command:
      exit condition. Don't keep calling it into a timeout.
 7. **Analyze each finish as it lands, then iterate.** Do the per-completion read
    *inside the loop above*, not deferred to the end — when a run finishes,
-   **actually read its results** before deciding: `orx artifact <runId> EVAL.md`,
-   `orx chart wandb …`, `orx query …`. To see exactly what a finished node
-   changed, use the local git diff recipe `orx exp status <expId>` prints (see
-   the `orx-git` skill). Don't infer from status alone. Each
+   **actually read its results** with `orx logs <runId>` (see `orx-evidence`). To
+   see exactly what a finished node changed, diff its branch against its parent's
+   branch (see `orx-git`). Don't infer from status alone. Each
    completion is a decision point with four moves:
    - **Repair** — the run answered nothing: fix this node's branch and
      re-launch the same node (above).
    - **Refill** — result is mediocre or inconclusive: launch the next queued child to
-     keep the GPU capacity saturated (step 5).
+     keep the round moving (step 5).
    - **Promote** — result is a clear win: this node becomes the **parent for the next
      round**. The next batch of children branch off *it*, not the baseline, so the win
      carries forward and the next ideas stack on top of it. This is the move that makes
@@ -194,8 +182,8 @@ the run command:
    down the tree, it never rewrites a node that already measured something.
 
 Stop when the goal is met, or after ~3 consecutive failed or regressed runs.
-When you stop, consider writing up the tree as a local markdown report — see the
-`orx-reports` skill for the folder layout and section structure.
+When you stop, write up the tree as a descriptively named project artifact — see
+the `orx-reports` skill for naming and optional folder guidance.
 
 ## Experiment description / notes — `orx exp desc`
 
@@ -215,5 +203,5 @@ cat notes.md | orx exp desc <expId> --stdin   # overwrite from stdin (long markd
 - **Write** with exactly one of `--set` (inline) or `--stdin` (whole of stdin).
   Passing both is an error. Writing **replaces** the entire description — to
   append, read first, edit, and write back.
-- `<expId>` comes from `orx experiments <projectId>` (the experiment id, not a run
-  or project id).
+- `<expId>` comes from `orx create-experiment` output or `orx project view
+  <projectId>` (the experiment id, not a run or project id).

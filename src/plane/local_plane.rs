@@ -57,10 +57,6 @@ const LOCAL_DEFAULT_BYTES: i64 = 64 * 1024;
 
 #[async_trait(?Send)]
 impl ControlPlane for LocalPlane {
-    fn is_local(&self) -> bool {
-        true
-    }
-
     // --- runs -------------------------------------------------------------
 
     async fn list_runs(&self) -> Result<RunListing> {
@@ -303,6 +299,14 @@ impl ControlPlane for LocalPlane {
         if args.org.is_some() && args.backend.as_deref() != Some("openresearch") {
             return Err(anyhow!("--org only applies with --backend openresearch."));
         }
+        if args.disk.is_some() && args.backend.as_deref() != Some("openresearch") {
+            return Err(anyhow!("--disk only applies with --backend openresearch."));
+        }
+        if args.provider.is_some() && args.backend.as_deref() != Some("openresearch") {
+            return Err(anyhow!(
+                "--provider only applies with --backend openresearch."
+            ));
+        }
         // Coarse backend label for analytics; the backend name is already an
         // enum, never user data. Recorded before the (borrowing) dispatch below.
         let backend_label = args.backend.clone();
@@ -474,8 +478,8 @@ impl ControlPlane for LocalPlane {
             Some(parent_id) => Some(store.get_local_experiment(parent_id)?.ok_or_else(|| {
                 anyhow!(
                     "Parent experiment {} not found in the local store. \
-                     Choose an existing parent experiment in OpenResearch, or omit --parent to branch off the project root.",
-                    parent_id
+                     Choose an existing local experiment from `orx project view {}`, or omit --parent to branch off the project root.",
+                    parent_id, project.id
                 )
             })?),
             None if baseline => None,
