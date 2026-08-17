@@ -46,6 +46,7 @@ import { ClosableTab } from "./components/ClosableTab";
 import { DetailDrawer, type ExperimentView } from "./components/DetailDrawer";
 import { FileViewer, type FileScrollPosition } from "./components/FileViewer";
 import { RailHeader } from "./components/Header";
+import { UpdateBanner } from "./components/UpdateBanner";
 import { Onboarding } from "./components/Onboarding";
 import { NewProjectDialog, ProjectsHome } from "./components/ProjectsHome";
 import { ExperimentsTable } from "./components/ExperimentsTable";
@@ -1193,6 +1194,7 @@ export default function App() {
 
   return (
     <div className="app flex flex-col h-full">
+      <UpdateBanner />
       {homeOpen ? (
         <ProjectsHome
           projects={projects}

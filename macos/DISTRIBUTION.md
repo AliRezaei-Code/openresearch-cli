@@ -29,6 +29,41 @@ the real gate on the certificate** — verify the tag points at trusted code (th
 `main`-only deployment-branch restriction covers the workflow file, not the
 checked-out tag).
 
+## The app updater's contract
+
+Installed apps update themselves from `macos-app.json`, uploaded to the release
+by the same step that uploads the DMG:
+
+```json
+{ "version": "0.1.104", "tag": "v0.1.104", "asset": "OpenResearch.dmg", "sha256": "…" }
+```
+
+Two rules, both load-bearing:
+
+- **Never publish the manifest without its DMG, or ahead of it.** The updater
+  treats the manifest as proof the app build exists; a manifest whose asset is
+  missing points every installed app at a 404, and one that outlives a re-run's
+  new DMG fails every checksum. Hence the upload order in the workflow: delete
+  the old manifest, upload the DMG, then publish the new manifest. A *missing*
+  manifest is fine — the updater reads a 404 as "nothing to update to" and
+  retries later, which is what happens between a release being published and
+  this workflow attaching its DMG.
+- **The app's version comes from this file, not the CLI's `dist-manifest.json`.**
+  The DMG is attached after the release, so the CLI's version can be ahead of the
+  published app build. An app install that read the CLI's manifest would
+  advertise, and endlessly retry, a build that does not exist for it — so
+  `updates::fetch_latest_for_channel` picks the manifest by install channel.
+
+The digest is published here because the release's own `sha256.sum` is generated
+by cargo-dist before this job runs and does not cover the DMG.
+
+Before swapping the bundle, `src/updates/macos_app.rs` checks the digest, then
+requires `codesign` against a Developer ID requirement pinned to team
+`9P69UXUJUK` *and* an `spctl` verdict of `source=Notarized Developer ID`. The
+signature check — not the digest — is what makes an unattended swap safe, so
+**changing the signing identity breaks self-update for every installed app**:
+update `EXPECTED_TEAM_ID` and ship that release before retiring the old cert.
+
 ## Configure signing (CI)
 
 Needs an Apple Developer Program account with a **Developer ID Application**

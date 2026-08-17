@@ -35,6 +35,7 @@ use crate::local::opencode::AgentHost;
 use crate::store::{
     log_path, now_ms, SshHostTest, Store, StoredAgentSelection, StoredChatSession, StoredRun,
 };
+use crate::updates;
 use crate::{browser, UpArgs};
 
 pub async fn run(args: UpArgs) -> Result<()> {
@@ -81,6 +82,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
         state.data_dir_gate.clone(),
     ));
     spawn_claude_auth_monitor(state.chat.clone(), claude.clone(), state.harnesses.clone());
+    spawn_update_checker();
 
     let app = router(state);
     let url = format!("http://127.0.0.1:{port}");
@@ -368,6 +370,10 @@ fn router(state: AppState) -> Router {
             "/api/settings/profile",
             get(profile_settings).post(set_profile_settings),
         )
+        .route("/api/update", get(update_status))
+        .route("/api/update/apply", post(apply_update))
+        .route("/api/update/auto", post(set_auto_update))
+        .route("/api/update/install-cli", post(install_cli))
         .route("/api/settings/ui-state", get(ui_state).post(set_ui_state))
         .route("/api/settings/ssh", get(ssh_settings))
         .route("/api/settings/ssh/preflight", post(ssh_preflight))
@@ -2640,6 +2646,18 @@ async fn set_hf_token(Json(req): Json<SetHfTokenReq>) -> ApiResult {
     Ok(Json(json!(hf_token_status().await)))
 }
 
+/// Keep a long-running dashboard current. `main`'s invocation-time check only
+/// fires once, and `orx up` (and the macOS app it backs) can stay up for days —
+/// long enough to drift several releases behind without this.
+fn spawn_update_checker() {
+    tokio::spawn(async {
+        loop {
+            updates::periodic_update_pass().await;
+            tokio::time::sleep(updates::PERIODIC_CHECK_INTERVAL).await;
+        }
+    });
+}
+
 /// Startup summary of detected coding agents. Never blocks.
 fn spawn_agent_preflight() {
     tokio::spawn(async {
@@ -3351,6 +3369,61 @@ async fn set_telemetry_settings(Json(req): Json<SetTelemetryReq>) -> ApiResult {
     })
     .await
     .map_err(|e| ApiError::from(anyhow!("telemetry task failed: {e}")))?
+}
+
+// --- updates -----------------------------------------------------------------
+
+async fn update_status() -> ApiResult {
+    tokio::task::spawn_blocking(|| Ok(Json(json!(updates::status()))))
+        .await
+        .map_err(|e| ApiError::from(anyhow!("update status task failed: {e}")))?
+}
+
+#[derive(Deserialize)]
+struct SetAutoUpdateReq {
+    enabled: bool,
+}
+
+async fn set_auto_update(Json(req): Json<SetAutoUpdateReq>) -> ApiResult {
+    let enabled = req.enabled;
+    tokio::task::spawn_blocking(move || {
+        crate::config::set_auto_update_enabled(enabled)
+            .map_err(|e| ApiError::from(anyhow!("could not save the auto-update setting: {e}")))?;
+        Ok(Json(json!(updates::status())))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("auto-update task failed: {e}")))?
+}
+
+/// Apply an update now, for the user who doesn't want to wait for the next
+/// periodic pass. Runs the same detached updater, so it can't race one already
+/// in flight — the updater's file lock settles that.
+async fn apply_update() -> ApiResult {
+    updates::apply_now().await?;
+    Ok(Json(json!(updates::status())))
+}
+
+#[derive(Deserialize)]
+struct InstallCliReq {
+    /// Replace an `orx` that is already on PATH. The card only sends this after
+    /// showing the user what it would displace.
+    #[serde(default)]
+    force: bool,
+}
+
+/// Link the app's `orx` onto the user's PATH (Settings → Updates).
+async fn install_cli(Json(req): Json<InstallCliReq>) -> ApiResult {
+    let installed =
+        tokio::task::spawn_blocking(move || crate::commands::install_cli::install(req.force))
+            .await
+            .map_err(|e| ApiError::from(anyhow!("install-cli task failed: {e}")))??;
+    Ok(Json(json!({
+        "link": installed.link.to_string_lossy(),
+        "dir": installed.link.parent().unwrap_or(&installed.link).to_string_lossy(),
+        "target": installed.target.to_string_lossy(),
+        "onPath": installed.on_path,
+        "alreadyCurrent": installed.already_current,
+    })))
 }
 
 fn profile_settings_json() -> Value {
@@ -4645,7 +4718,16 @@ struct EventCursor {
     files: HashMap<String, u64>,
     runs: HashMap<String, (String, i64)>,
     log_offsets: HashMap<String, u64>,
+    /// Last update status sent. Unlike the rest of the cursor this isn't store
+    /// state — the updater is a separate process, so its progress reaches the UI
+    /// through the same diff the store changes do.
+    update: Option<updates::UpdateStatus>,
+    update_sampled_at: Option<std::time::Instant>,
 }
+
+/// How often the event loop re-reads update status. The 500ms store cadence is
+/// there for run logs; nothing about an update needs that resolution.
+const UPDATE_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// 500ms poll loop: diff the store + log files, push named events into the
 /// channel. Ends when the subscriber disconnects (send fails). Same idiom as
@@ -4684,8 +4766,26 @@ fn json_event(name: &str, data: &Value) -> Event {
 /// One diff pass. On the first pass everything is "changed", so a fresh
 /// subscriber gets a full snapshot and needs no separate baseline fetches.
 fn collect_events(cursor: &mut EventCursor, first: bool) -> Result<Vec<Event>> {
-    let store = Store::open()?;
     let mut out = Vec::new();
+
+    // Sampled far below the 2Hz loop — the updater works on the scale of
+    // minutes, and this reads files. `cursor.update` is committed only once the
+    // batch is certain: every `?` below discards it (`event_loop` swallows the
+    // error), and a cursor that had already moved would never re-emit, leaving
+    // the restart banner permanently unshown for that subscriber.
+    let sampled_update = cursor
+        .update_sampled_at
+        .is_none_or(|at| at.elapsed() >= UPDATE_SAMPLE_INTERVAL)
+        .then(|| {
+            cursor.update_sampled_at = Some(std::time::Instant::now());
+            updates::status()
+        })
+        .filter(|update| cursor.update.as_ref() != Some(update));
+    if let Some(update) = &sampled_update {
+        out.push(json_event("update.status", &json!(update)));
+    }
+
+    let store = Store::open()?;
     // Cap log bytes per tick so one pass never materializes a huge batch —
     // remainders (whole-log replays included) stream out on later ticks.
     let mut log_budget: u64 = 2_000_000;
@@ -4739,6 +4839,10 @@ fn collect_events(cursor: &mut EventCursor, first: bool) -> Result<Vec<Event>> {
         }
         // Terminal runs were seeded at EOF above, so this is a no-op for them.
         push_log_delta(&run, cursor, &mut out, &mut log_budget);
+    }
+    // Committed only now that the batch is certain to be returned.
+    if let Some(update) = sampled_update {
+        cursor.update = Some(update);
     }
     Ok(out)
 }

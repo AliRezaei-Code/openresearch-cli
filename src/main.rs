@@ -117,6 +117,9 @@ enum Command {
     /// Update orx to the latest release (installer-script installs only).
     Update(UpdateArgs),
 
+    /// Link the macOS app's `orx` onto your PATH (macOS app installs only).
+    InstallCli(InstallCliArgs),
+
     /// Permanently delete the local database, CLI executable, or both.
     Delete(DeleteArgs),
 
@@ -640,6 +643,17 @@ pub struct UpdateArgs {
     /// (multiple copies, or a `cargo install` overwrote it).
     #[arg(long)]
     pub force: bool,
+    /// Internal: the detached auto-updater. Silent, and records its outcome so
+    /// repeated failures back off.
+    #[arg(long, hide = true)]
+    pub background: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct InstallCliArgs {
+    /// Replace an existing `orx` on your PATH.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args, Debug)]
@@ -784,6 +798,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Paper(_) => "paper",
         Command::Version(_) => "version",
         Command::Update(_) => "update",
+        Command::InstallCli(_) => "install-cli",
         Command::Delete(_) => "delete",
         Command::Serve(_) => "serve",
         Command::Supervise(_) => "supervise",
@@ -826,6 +841,7 @@ async fn dispatch(command: Command) -> error::Result<()> {
         Command::Paper(args) => commands::paper::run(args).await,
         Command::Version(args) => commands::version::run(args).await,
         Command::Update(args) => commands::update::run(args).await,
+        Command::InstallCli(args) => commands::install_cli::run(args).await,
         Command::Delete(args) => commands::delete::run(args).await,
         Command::Serve(args) => commands::serve::run(args).await,
         Command::Supervise(args) => commands::supervise::run(args).await,

@@ -136,8 +136,24 @@ jobs:
           MACOS_NOTARY_PROFILE: orx-notary
         run: bash scripts/package-macos-app.sh
 
-      - name: Upload the DMG to the release
+      # macos-app.json is what the app's self-updater reads; it is the proof that
+      # this release's app build exists, so it must never be published without —
+      # or ahead of — the DMG it describes. On a re-run the old manifest is
+      # deleted first, so no window has a stale digest against the new DMG.
+      # See macos/DISTRIBUTION.md.
+      - name: Upload the DMG and its manifest to the release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.check.outputs.tag }}
-        run: gh release upload "$TAG" dist/OpenResearch.dmg --clobber
+        run: |
+          set -euo pipefail
+          gh release delete-asset "$TAG" macos-app.json --yes 2>/dev/null || true
+          gh release upload "$TAG" dist/OpenResearch.dmg --clobber
+          jq -n \
+            --arg version "${TAG#v}" \
+            --arg tag "$TAG" \
+            --arg asset OpenResearch.dmg \
+            --arg sha256 "$(shasum -a 256 dist/OpenResearch.dmg | cut -d' ' -f1)" \
+            '$ARGS.named' > dist/macos-app.json
+          cat dist/macos-app.json
+          gh release upload "$TAG" dist/macos-app.json --clobber

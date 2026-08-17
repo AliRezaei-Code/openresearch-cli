@@ -6,20 +6,9 @@ import { useEffect, useState } from "react";
 
 import { getLitSources, setLitSources, type LitSourcesSettings } from "../api";
 import { LitSourceLogo, LIT_SOURCE_NAME, type LitSource } from "./LitSourceLogo";
-import { MODEL_ITEM_CLASS_NAME } from "../styleClasses";
+import { MODEL_ITEM_CLASS_NAME, SETTINGS_SWITCH_CLASS_NAME } from "../styleClasses";
 
 const LIT_SOURCES: LitSource[] = ["alphaxiv", "openalex", "biorxiv"];
-
-const SETTINGS_SWITCH_CLASS_NAME = [
-  "settings-switch relative flex-none w-9.5 h-5.5 border border-border rounded-full",
-  "bg-surface transition-[background,border-color] duration-120 ease-standard",
-  "[&_span]:absolute [&_span]:top-[3px] [&_span]:left-[3px] [&_span]:w-3.5 [&_span]:h-3.5",
-  "[&_span]:rounded-full [&_span]:bg-muted [&_span]:transition-[translate,background]",
-  "[&_span]:duration-120 [&_span]:ease-standard [&.on]:border-primary [&.on]:bg-primary",
-  "[&.on_span]:bg-background [&.on_span]:translate-x-4 [&:disabled]:opacity-45",
-  "[&:disabled]:cursor-default [&:focus-visible]:outline-2 [&:focus-visible]:outline-solid",
-  "[&:focus-visible]:outline-text [&:focus-visible]:outline-offset-2",
-].join(" ");
 
 // Remembered across mounts so reopening the panel shows the last values
 // immediately instead of flashing "Loading…" while it revalidates.

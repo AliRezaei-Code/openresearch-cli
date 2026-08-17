@@ -11,6 +11,7 @@ import type {
   Project,
   QueuedMessage,
   Run,
+  UpdateStatus,
 } from "./api";
 
 export interface RunLogEvent {
@@ -104,6 +105,22 @@ export function onDataDirMove(fn: DataDirMoveListener): () => void {
 
 function emitDataDirMove(ev: DataDirMoveEvent) {
   dataDirMoveListeners.forEach((fn) => fn(ev));
+}
+
+// Update status fans out the same way: the restart banner and the Updates
+// settings card both render it, and neither owns the other.
+type UpdateStatusListener = (status: UpdateStatus) => void;
+const updateStatusListeners = new Set<UpdateStatusListener>();
+
+export function onUpdateStatus(fn: UpdateStatusListener): () => void {
+  updateStatusListeners.add(fn);
+  return () => {
+    updateStatusListeners.delete(fn);
+  };
+}
+
+function emitUpdateStatus(status: UpdateStatus) {
+  updateStatusListeners.forEach((fn) => fn(status));
 }
 
 export interface OrxEventHandlers {
@@ -206,6 +223,10 @@ export function useOrxEvents(handlers: OrxEventHandlers) {
     es.addEventListener("datadir.move.error", (e) => {
       const d = parse<{ error: string }>(e as MessageEvent);
       if (d) emitDataDirMove({ type: "error", error: d.error });
+    });
+    es.addEventListener("update.status", (e) => {
+      const d = parse<UpdateStatus>(e as MessageEvent);
+      if (d) emitUpdateStatus(d);
     });
     return () => es.close();
   }, []);
