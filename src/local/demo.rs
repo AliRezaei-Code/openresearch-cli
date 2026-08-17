@@ -15,6 +15,8 @@ use super::chat::{WirePart, WireToolState};
 use super::model::{LocalExperiment, LocalProject};
 
 pub const PROJECT_ID: &str = "demo_nanochat_v1";
+pub const PROJECT_SLUG: &str = "nanochat";
+const FALLBACK_PROJECT_SLUG: &str = "demo_nanochat_v1";
 const EXPERIMENT_ID: &str = "demo_nanochat_cpu_v1";
 const RUN_ID: &str = "demo_nanochat_run_v1";
 const SESSION_ID: &str = "chat_demo_nanochat_v1";
@@ -246,7 +248,8 @@ fn seed_at(
     let bare = data_root.join("demo-repos").join("nanochat.git");
     let commit_sha = install_repository(repo, &bare)?;
 
-    let files = data_root.join("files").join("nanochat");
+    let project_slug = demo_project_slug(store)?;
+    let files = data_root.join("files").join(&project_slug);
     std::fs::create_dir_all(&files)?;
     super::files::ensure_project_brief_contents_at(&files, PROJECT_BRIEF)?;
     std::fs::write(files.join("cpu-apple-silicon-pipeline-results.md"), REPORT)?;
@@ -267,7 +270,7 @@ fn seed_at(
     let project = LocalProject {
         id: PROJECT_ID.into(),
         name: "nanochat (demo)".into(),
-        slug: "nanochat".into(),
+        slug: project_slug,
         github_owner: OWNER.into(),
         github_repo: REPO.into(),
         github_sync_enabled: false,
@@ -448,6 +451,22 @@ fn seed_at(
         ],
     )?;
     validate_snapshot(store, repo, newly_created)
+}
+
+fn demo_project_slug(store: &Store) -> Result<String> {
+    if let Some(project) = store.get_local_project(PROJECT_ID)? {
+        return Ok(project.slug);
+    }
+    if store.get_local_project_by_slug(PROJECT_SLUG)?.is_none() {
+        return Ok(PROJECT_SLUG.into());
+    }
+    let mut candidate = FALLBACK_PROJECT_SLUG.to_string();
+    let mut suffix = 2;
+    while store.get_local_project_by_slug(&candidate)?.is_some() {
+        candidate = format!("{FALLBACK_PROJECT_SLUG}_{suffix}");
+        suffix += 1;
+    }
+    Ok(candidate)
 }
 
 fn validate_snapshot(store: &Store, repo: &Path, newly_created: bool) -> Result<DemoCompletion> {
@@ -1640,6 +1659,60 @@ mod tests {
         assert!(log.contains("The capital of France is Paris"));
         assert!(!log.contains("/Users/"));
         assert!(!log.contains("Traceback"));
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn demo_seed_preserves_legacy_user_artifacts_with_the_nanochat_slug() {
+        let root = std::env::temp_dir().join(format!("orx-demo-test-{}", uuid::Uuid::new_v4()));
+        let data = root.join("data");
+        let repo = root.join("cache/repos").join(OWNER).join(REPO);
+        let store = Store::open_at(data.clone()).unwrap();
+        store
+            .create_local_project(&LocalProject {
+                id: "user-nanochat".into(),
+                name: "nanochat".into(),
+                slug: PROJECT_SLUG.into(),
+                github_owner: String::new(),
+                github_repo: String::new(),
+                github_sync_enabled: false,
+                baseline_branch: "main".into(),
+                repo_path: root.join("user-nanochat").to_string_lossy().into_owned(),
+                run_command: None,
+                paper_id: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        let user_files = data.join("files").join(PROJECT_SLUG);
+        std::fs::create_dir_all(&user_files).unwrap();
+        let user_report = user_files.join("cpu-apple-silicon-pipeline-results.md");
+        std::fs::write(&user_report, "user-owned\n").unwrap();
+
+        let completion = seed_at(
+            &store,
+            &data,
+            &repo,
+            DemoSelection {
+                harness: "codex".into(),
+                model: None,
+                permission_mode: None,
+                reasoning_level: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(completion.project.slug, FALLBACK_PROJECT_SLUG);
+        assert_eq!(
+            std::fs::read_to_string(user_report).unwrap(),
+            "user-owned\n"
+        );
+        assert!(data
+            .join("files")
+            .join(FALLBACK_PROJECT_SLUG)
+            .join("cpu-apple-silicon-pipeline-results.md")
+            .is_file());
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -522,10 +522,8 @@ export default function App() {
     if (previousSessionId) {
       rightPaneStatesRef.current.set(previousSessionId, currentRightPaneStateRef.current);
     }
-    let nextState = nextSessionId
-      ? rightPaneStatesRef.current.get(nextSessionId)
-      : initialRightPaneSessionState();
-    if (!nextState && nextSessionId) {
+    let nextState = nextSessionId ? rightPaneStatesRef.current.get(nextSessionId) : undefined;
+    if (!nextState) {
       const openDemoBrief =
         nextSessionId === DEMO_MAIN_SESSION_ID &&
         tourCompletedRef.current === false &&
@@ -534,7 +532,7 @@ export default function App() {
         demoBriefSeededRef.current = true;
         setDemoBriefLeading(true);
       }
-      nextState = initialRightPaneSessionState(nextSessionId, openDemoBrief);
+      nextState = initialRightPaneSessionState(nextSessionId ?? undefined, openDemoBrief);
     }
     setRightTab(nextState.rightTab);
     tabHistoryRef.current = nextState.tabHistory;

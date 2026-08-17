@@ -20,7 +20,7 @@ fn unique_project_slug(store: &Store, base: &str) -> Result<String> {
         .into_iter()
         .map(|p| p.slug)
         .collect();
-    if !taken.contains(base) {
+    if base != super::demo::PROJECT_SLUG && !taken.contains(base) {
         return Ok(base.to_string());
     }
     let mut n = 2;
@@ -235,6 +235,17 @@ mod tests {
                 "initial",
             ],
         );
+    }
+
+    #[test]
+    fn reserves_the_demo_slug_for_onboarding() {
+        let root = root();
+        let store = Store::open_at(root.join("data")).unwrap();
+        assert_eq!(
+            project_slug_preview(&store, "nanochat").unwrap(),
+            "nanochat-2"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

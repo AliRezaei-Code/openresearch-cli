@@ -200,6 +200,7 @@ function useTextBody(projectId: string, entry: ArtifactEntry, kind: PreviewKind)
   const [truncated, setTruncated] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestSequence = useRef(0);
+  const hasText = useRef(false);
 
   const wantsText = kind === "markdown" || (kind === "text" && entry.size <= FILE_PREVIEW_BYTES);
 
@@ -220,11 +221,14 @@ function useTextBody(projectId: string, entry: ArtifactEntry, kind: PreviewKind)
       .then((body) => {
         if (cancelled || request !== requestSequence.current) return;
         if (body.binary) setBinary(true);
-        else setText(body.content);
+        else {
+          hasText.current = true;
+          setText(body.content);
+        }
         setTruncated(body.truncated);
       })
       .catch((e) => {
-        if (!cancelled && request === requestSequence.current) {
+        if (!cancelled && request === requestSequence.current && !hasText.current) {
           setError(e instanceof Error ? e.message : String(e));
         }
       });
@@ -235,6 +239,7 @@ function useTextBody(projectId: string, entry: ArtifactEntry, kind: PreviewKind)
 
   const replaceText = (value: string) => {
     requestSequence.current += 1;
+    hasText.current = true;
     setText(value);
   };
 
