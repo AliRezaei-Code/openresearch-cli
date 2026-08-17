@@ -33,7 +33,7 @@ pub async fn run(args: DeleteArgs) -> Result<()> {
     let _lifecycle_guard = lifecycle_lock.try_write().map_err(|error| {
         if error.kind() == io::ErrorKind::WouldBlock {
             anyhow!(
-                "Another OpenResearch process is running. Close `orx up`, `orx serve`, and any active runs before trying again."
+                "Another OpenResearch process is running. Quit the OpenResearch app, close `orx up` and `orx serve`, and end any active runs before trying again."
             )
         } else {
             anyhow!("Could not lock OpenResearch for deletion: {error}")

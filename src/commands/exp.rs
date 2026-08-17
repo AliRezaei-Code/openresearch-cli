@@ -160,6 +160,15 @@ pub(crate) fn spawn_detached_supervise(run_id: &str) -> Result<()> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    // The supervisor re-resolves its directories from its own environment, so
+    // without this a run launched from the macOS app is tracked in a different
+    // store than the app is reading.
+    if let Some(path) = crate::local::shell_env::search_path() {
+        cmd.env("PATH", path);
+    }
+    crate::local::shell_env::export_to(|key, value| {
+        cmd.env(key, value);
+    });
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

@@ -90,3 +90,46 @@ and an `/Applications` alias to drag it onto, over a branded background.
   headless shell; if it fails, a functional but unstyled DMG still ships. The
   window/icon constants live at the top of the "styled DMG" block, and the
   matching canvas size lives in `generate-dmg-background.mjs`.
+
+## App-mode runtime environment
+
+Finder launches the bundle through launchd, so the process starts with
+`PATH=/usr/bin:/bin:/usr/sbin:/sbin` and no shell rc ever sourced. Detection
+would then find no `codex` at all, and `claude`/`opencode` only at their default
+installer drop locations — the "works in my terminal, broken in the app" bug.
+
+`commands::app::hydrate_shell_env` therefore probes the user's shell
+(`$SHELL -ilc`, interactive because `.zshrc` is where these exports live) once at
+startup and installs the result via `local::shell_env`, which harness lookup,
+harness children, and directory resolution consult instead of the process
+environment. It is best-effort and capped at 5s; every outcome is logged. To see
+it, run the bundled binary from a terminal:
+
+```bash
+/Applications/OpenResearch.app/Contents/MacOS/OpenResearch
+```
+
+## Coexisting with a CLI install
+
+The app and a `curl`-installed `orx` share one data dir and one config dir, so
+both must be safe to have at once:
+
+- **Ports** — the app binds an ephemeral loopback port rather than `orx up`'s
+  4791.
+- **Store** — SQLite in WAL with a 5s busy timeout; concurrent readers/writers
+  are expected. Run supervisors hold a per-run exclusive lock, so a second
+  server recovering the same active run exits instead of double-driving it.
+- **Lifecycle lock** — app mode takes the same read lock `dispatch` takes for
+  `orx up`, so `orx delete` refuses to wipe the store under a running app.
+- **`orx` on the agent's PATH** — the bundle ships `Contents/MacOS/orx`, a
+  symlink to the executable, and `chat::prepare_env` prepends that directory.
+  Agents shelling out to `orx` therefore get *this* build rather than whatever
+  CLI version happens to be installed, and a DMG-only user needs no CLI at all.
+  Invoked under that name the binary stays a plain CLI — see
+  `launched_as_app_bundle`.
+
+- **Directories** — `ORX_DATA_DIR`, `XDG_DATA_HOME`, and `XDG_CONFIG_HOME` are
+  imported by the same startup probe (`local::shell_env::IMPORTED`), so a rc
+  file that redirects the store moves the app with it. Otherwise the app would
+  read the default database while the CLI read the user's, and the lock above
+  would guard a file neither shares.

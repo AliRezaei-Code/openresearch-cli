@@ -336,13 +336,13 @@ fn precedence(v: &Version) -> (u64, u64, u64, &semver::Prerelease) {
 /// Because orx talks to a versioned backend, a stale client can hit removed or
 /// changed API shapes, so the warning notes the compatibility risk rather than a
 /// neutral "new version available".
-fn warning_for(current: &Version, latest: &Version) -> Option<String> {
+fn warning_for(current: &Version, latest: &Version, orx: &str) -> Option<String> {
     if precedence(latest) <= precedence(current) {
         return None;
     }
     Some(format!(
         "{WARNING_LABEL} orx {current} is outdated (latest {latest}). A newer release is \
-         available; upgrade to stay compatible with the API. Run `orx update` to upgrade."
+         available; upgrade to stay compatible with the API. Run `{orx} update` to upgrade."
     ))
 }
 
@@ -383,7 +383,7 @@ impl UpdateWarning {
         if let Some(message) = cache
             .as_ref()
             .and_then(|c| Version::parse(&c.latest).ok())
-            .and_then(|latest| warning_for(&current, &latest))
+            .and_then(|latest| warning_for(&current, &latest, crate::invocation::orx()))
         {
             // Infallible: a closed/broken stderr (e.g. `2>&-`, or a reader that
             // already exited) must not panic the process before the command even
@@ -517,13 +517,13 @@ mod tests {
     fn no_warning_when_current_or_ahead() {
         let v = |s: &str| Version::parse(s).unwrap();
         // Exactly current.
-        assert!(warning_for(&v("0.1.29"), &v("0.1.29")).is_none());
+        assert!(warning_for(&v("0.1.29"), &v("0.1.29"), "orx").is_none());
         // Local build ahead of the latest release.
-        assert!(warning_for(&v("0.2.0"), &v("0.1.29")).is_none());
+        assert!(warning_for(&v("0.2.0"), &v("0.1.29"), "orx").is_none());
         // Build metadata is ignored by semver ordering, so it's not "outdated".
-        assert!(warning_for(&v("0.1.29"), &v("0.1.29+build.5")).is_none());
+        assert!(warning_for(&v("0.1.29"), &v("0.1.29+build.5"), "orx").is_none());
         // Running ahead of the latest stable on a local pre-release: not outdated.
-        assert!(warning_for(&v("0.3.0-dev.1"), &v("0.2.0")).is_none());
+        assert!(warning_for(&v("0.3.0-dev.1"), &v("0.2.0"), "orx").is_none());
     }
 
     #[test]
@@ -542,7 +542,7 @@ mod tests {
             ("0.2.0-rc.1", "0.2.0"),  // pre-release behind its final release
             ("0.1.29", "0.2.0-rc.1"), // behind the next minor's pre-release
         ] {
-            assert_warns(&warning_for(&v(cur), &v(latest)).unwrap_or_else(|| {
+            assert_warns(&warning_for(&v(cur), &v(latest), "orx").unwrap_or_else(|| {
                 panic!("expected a warning for {cur} -> {latest}");
             }));
         }

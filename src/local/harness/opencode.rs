@@ -200,7 +200,7 @@ impl Harness for OpenCode {
 }
 
 fn opencode_auth_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
+    let base = crate::local::shell_env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")))?;
     Some(base.join("opencode").join("auth.json"))
@@ -245,11 +245,12 @@ async fn opencode_models(bin: &PathBuf) -> Vec<super::ModelInfo> {
 
 /// Run `opencode <args>` in the home dir, returning stdout on success.
 async fn run_models(bin: &PathBuf, args: &[&str]) -> Option<String> {
-    let fut = tokio::process::Command::new(bin)
-        .args(args)
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(args)
         .current_dir(dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
-        .stdin(std::process::Stdio::null())
-        .output();
+        .stdin(std::process::Stdio::null());
+    crate::local::chat::prepare_env(&mut cmd);
+    let fut = cmd.output();
     let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(20), fut).await else {
         return None;
     };

@@ -114,7 +114,7 @@ fn acquire_data_dir_move_lock(path: PathBuf) -> Result<DataDirMoveLock> {
 /// Read an env var as a path, treating unset **and empty** the same (an empty
 /// `export ORX_DATA_DIR=` is a shell footgun that must not resolve to `""`).
 fn env_path(key: &str) -> Option<PathBuf> {
-    std::env::var_os(key)
+    crate::local::shell_env::var(key)
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
 }
