@@ -146,15 +146,12 @@ choice on first run.
 - **Collected:** command name, a random per-install UUID, CLI version, OS/arch,
   the official build channel, a CI flag, coarse install type, and coarse event
   labels (e.g. onboarding completed, project created, chat session started, or
-  a run launched on `modal`). When onboarding is completed, the disclosed
-  research profile is also sent unfiltered: selected research areas, the
-  Other-area description, research background, and representative paper IDs
-  and titles.
+  a run launched on `modal`). For the onboarding research profile, only selected
+  research-area categories and the number of linked papers are collected.
 - **Not automatically added:** code, prompts, file contents or paths, project or
   experiment IDs/names, repo names, tokens, emails, or account identifiers.
-  Anything entered in the onboarding profile is sent exactly as submitted and
-  may contain identifying information. The random install UUID is not tied to
-  your account.
+  Research-profile free text, paper IDs, and paper titles are not sent. The
+  random install UUID is not tied to your account.
 
 ```sh
 orx telemetry off        # persistent, per-machine
@@ -168,3 +165,4 @@ do not create an installation ID. `ORX_TELEMETRY_ENV=off` additionally disables
 analytics in an official binary; it cannot enable analytics in a source build.
 
 Events are fire-and-forget on a background task and never block a command.
+They are sent to OpenResearch's first-party API and stored in Postgres.
