@@ -49,7 +49,7 @@ pub fn unsupported(cmd: &str) -> Error {
     };
     anyhow!(
         "`orx {cmd}` is not supported in local mode yet.\n\
-         Local mode supports: projects, project view/edit, create-experiment, \
+         Local mode supports: projects, project view/edit/brief, create-experiment, \
          exp run/status/cancel/wait/wake/desc, runs, logs.{guidance}"
     )
 }

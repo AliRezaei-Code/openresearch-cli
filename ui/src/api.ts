@@ -1,6 +1,9 @@
 // Typed client for the orx up local HTTP API (/api/*). All wire JSON is camelCase.
 
 export const DEMO_PROJECT_ID = "demo_nanochat_v1";
+export const PROJECT_BRIEF_NAME = "PROJECT.md";
+// Bundled demo snapshots reserve this prefix so future demos inherit demo-only UI.
+export const isDemoProjectId = (id: string) => id.startsWith("demo_");
 export const DEMO_MAIN_SESSION_ID = "chat_demo_nanochat_v1";
 export const DEMO_FIGURE_SESSION_ID = "chat_demo_nanochat_figures_v1";
 export const DEMO_LITERATURE_SESSION_ID = "chat_demo_nanochat_literature_v1";
@@ -796,6 +799,9 @@ export const getArtifactFileText = (
     return r.arrayBuffer().then((bytes) => decodeFileText(bytes, Number.isFinite(total) && total > bytes.byteLength));
   });
 };
+
+export const saveProjectBrief = (projectId: string, content: string) =>
+  put<{ ok: boolean; bytesWritten: number }>(`/api/projects/${projectId}/brief`, { content });
 
 const isFilePresentation = (value: string | null): value is FilePresentation =>
   value === "image" || value === "audio" || value === "video" || value === "pdf" ||

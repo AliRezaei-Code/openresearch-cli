@@ -752,6 +752,21 @@ mod tests {
     }
 
     #[test]
+    fn playbook_makes_project_brief_descriptive_not_authoritative() {
+        let md = sample_playbook();
+        assert!(md.contains("PROJECT.md describes the project; the user directs it"));
+        assert!(md.contains("the user's latest request"));
+        assert!(md.contains("descriptive, never prescriptive"));
+        assert!(
+            md.contains("Never refuse, delay, redirect, or ask for confirmation solely because")
+        );
+        assert!(md.contains("Do not read the brief at session start"));
+        assert!(md.contains("orx project brief update"));
+        assert!(!md.contains("No project summary yet."));
+        assert!(!md.contains("None proposed yet."));
+    }
+
+    #[test]
     fn playbook_requires_clickable_file_references() {
         let md = sample_playbook();
         assert!(md.contains("chip renders as a small pill"));

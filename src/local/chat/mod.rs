@@ -1107,16 +1107,28 @@ fn is_initial_chat_message(transcript_text: Option<&str>, has_messages: bool) ->
     transcript_text.is_none() && !has_messages
 }
 
-fn with_bootstrap_context(
+fn with_turn_context(
     native_session_id: Option<&str>,
     bootstrap_context: Option<&str>,
+    demo_evidence_context: Option<&str>,
     text: String,
 ) -> String {
-    match (native_session_id, bootstrap_context) {
-        (None, Some(context)) => {
-            format!("{context}\n\n<current-user-message>\n{text}\n</current-user-message>")
+    let mut contexts = Vec::new();
+    if native_session_id.is_none() {
+        if let Some(context) = bootstrap_context {
+            contexts.push(context);
         }
-        _ => text,
+    }
+    if let Some(context) = demo_evidence_context {
+        contexts.push(context);
+    }
+    if contexts.is_empty() {
+        text
+    } else {
+        format!(
+            "{}\n\n<current-user-message>\n{text}\n</current-user-message>",
+            contexts.join("\n\n")
+        )
     }
 }
 
@@ -1141,8 +1153,8 @@ fn with_selected_chat_context(text: String, annotations: &[TextAnnotation]) -> S
 #[cfg(test)]
 mod initial_message_tests {
     use super::{
-        contextualize_messages, is_initial_chat_message, with_bootstrap_context,
-        with_selected_chat_context, AnnotatedText, TextAnnotation,
+        contextualize_messages, is_initial_chat_message, with_selected_chat_context,
+        with_turn_context, AnnotatedText, TextAnnotation,
     };
     use serde_json::{json, Value};
 
@@ -1155,16 +1167,42 @@ mod initial_message_tests {
 
     #[test]
     fn bootstrap_context_is_injected_only_before_a_native_session_exists() {
-        let seeded = with_bootstrap_context(None, Some("prior demo"), "continue".into());
+        let seeded = with_turn_context(None, Some("prior demo"), None, "continue".into());
         assert!(seeded.contains("prior demo"));
         assert!(seeded.contains("<current-user-message>\ncontinue"));
         assert_eq!(
-            with_bootstrap_context(Some("native"), Some("prior demo"), "continue".into()),
+            with_turn_context(Some("native"), Some("prior demo"), None, "continue".into()),
             "continue"
         );
         assert_eq!(
-            with_bootstrap_context(None, None, "continue".into()),
+            with_turn_context(None, None, None, "continue".into()),
             "continue"
+        );
+    }
+
+    #[test]
+    fn demo_evidence_context_is_injected_without_rewrapping_the_user_message() {
+        let first = with_turn_context(
+            None,
+            Some("prior demo"),
+            Some("demo evidence"),
+            "first".into(),
+        );
+        let follow_up = with_turn_context(
+            Some("native"),
+            Some("prior demo"),
+            Some("demo evidence"),
+            "follow up".into(),
+        );
+        assert!(first.contains("demo evidence"));
+        assert!(first.contains("prior demo"));
+        assert!(first.contains("<current-user-message>\nfirst"));
+        assert!(follow_up.contains("demo evidence"));
+        assert!(follow_up.contains("<current-user-message>\nfollow up"));
+        assert_eq!(first.matches("<current-user-message>").count(), 1);
+        assert_eq!(
+            with_turn_context(Some("native"), None, None, "ordinary".into()),
+            "ordinary"
         );
     }
 
@@ -2609,9 +2647,11 @@ impl ChatHost {
                 .or_else(|| crate::local::user_skills::expand(text, &project.id))
                 .unwrap_or_else(|| text.to_string())
         });
-        let mut turn_text = with_bootstrap_context(
+        // Demo evidence caveats are not PROJECT.md and never include its contents.
+        let mut turn_text = with_turn_context(
             session.native_session_id.as_deref(),
             session.bootstrap_context.as_deref(),
+            super::demo::turn_context(&project.id),
             turn_text,
         );
         // Harnesses take plain text; attachments ride as on-disk paths every
