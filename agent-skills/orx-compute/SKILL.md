@@ -1,6 +1,6 @@
 ---
 name: orx-compute
-description: "Launch experiment runs with `orx exp run`: backends (hf, modal, k8s, ssh, slurm, ray, openresearch, local), flavors, timeouts, images, sizing, and `orx exp wait`. Use before launching or re-launching any run, when choosing or switching a backend or GPU flavor, when a job OOMs, stalls, or times out, or when deciding GPU vs CPU."
+description: "Launch experiment runs with `orx exp run`: backends (hf, modal, k8s, ssh, slurm, ray, openresearch, local), flavors, timeouts, images, sizing, and choosing `orx exp wait` vs `orx exp wake`. Use before launching or re-launching any run, when choosing or switching a backend or GPU flavor, when a job OOMs, stalls, or times out, or when deciding GPU vs CPU."
 ---
 
 Hosted server projects are read-only execution history. To launch an experiment,
@@ -29,8 +29,8 @@ Rules and notes:
   touch a command is the baseline having none yet.
 - **Set a run command before launching.** Local projects inherit it from the
   project; set it with `orx project edit <projectId> --run-command '<cmd>'`.
-- **Commit your edits before launching.** Every backend runs an immutable source
-  snapshot of the committed branch and never needs a GitHub push.
+- **Commit your edits before launching.** Every backend runs an immutable source snapshot
+  of the committed branch and never needs a GitHub push.
 - **Pick an execution backend.** OpenResearch compute uses `--backend
   openresearch --flavor <shape>`; other supported backends include `hf`,
   `modal`, `k8s`, `ssh`, `slurm`, `ray`, and `local`.
@@ -336,6 +336,13 @@ orx exp wait <expId> --interval 10 --timeout 3600   # tune polling
 - **A failed run is not a new node.** Re-launch the same `<expId>` — a failure
   answered nothing, so the node is still repairable in place
   (`orx-experiment-tree`).
+
+### Going idle instead — `orx exp wake`
+
+After launching a run, use `orx exp wake <expId>` when you want to end the
+current turn and resume after that run succeeds or fails. The wake-up is opt-in,
+fires only for `done` or `failed`, and waits behind any user messages already
+queued for the session. Use either `exp wait` or `exp wake` for a run, not both.
 
 ## Sizing compute
 

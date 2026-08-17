@@ -16,14 +16,14 @@
 //!   `orx-` prefix) from the set matching its context — the Local set inside an
 //!   `orx up` session, the Full set otherwise — and prints it; the no-arg
 //!   overview lists that same set. `orx install-skills --full` writes the Full
-//!   set into an agent's global skills dir (the dedicated cloud box).
+//!   set into an agent's global skills dir.
 //!
 //! The two sets share the same public skill *names* so docs and references stay
-//! stable; several modules swap their **body** between a local-mode form
-//! (backend-based launches, logs-only evidence, project artifacts, worktree
-//! git flow) and a full/cloud form (managed-SKU compute, artifacts + query +
-//! chart, `orx report` upload). The `orx-` prefix on every dir name makes them
-//! unmistakable in an agent's skill listing.
+//! stable; several modules swap their **body** between local-session and Full
+//! forms where the available evidence, reports, and Git workflows differ. The
+//! compute skill is shared because every run now launches from local `orx up`.
+//! The `orx-` prefix on every dir name makes them unmistakable in an agent's
+//! skill listing.
 
 use std::path::Path;
 
@@ -54,8 +54,7 @@ pub enum SkillSet {
 // `SKILL.local.md` siblings are the local-mode body variants under the same
 // public skill name) ----------------------------------------------------------
 
-const COMPUTE_LOCAL: &str = include_str!("../../agent-skills/orx-compute/SKILL.local.md");
-const COMPUTE_CLOUD: &str = include_str!("../../agent-skills/orx-compute/SKILL.md");
+const COMPUTE: &str = include_str!("../../agent-skills/orx-compute/SKILL.md");
 const COMPUTE_K8S: &str = include_str!("../../agent-skills/orx-compute-k8s/SKILL.md");
 const EXPERIMENT_TREE_LOCAL: &str =
     include_str!("../../agent-skills/orx-experiment-tree/SKILL.local.md");
@@ -75,19 +74,13 @@ const EVIDENCE_CLOUD: &str = include_str!("../../agent-skills/orx-evidence/SKILL
 // works blind). Keep each ≤400 chars — Codex's ambient budget is ~8k across
 // the whole set.
 
-const D_COMPUTE_LOCAL: &str = "Launch experiment runs with `orx exp run`: backends (hf, modal, k8s, ssh, slurm, ray, openresearch, local), flavors, timeouts, images, sizing, and choosing `orx exp wait` vs `orx exp wake`. Use before launching or re-launching any run, when choosing or switching a backend or GPU flavor, when a job OOMs, stalls, or times out, or when deciding GPU vs CPU.";
-const D_COMPUTE_CLOUD: &str = "Launch experiment runs with `orx exp run`: backends (hf, modal, k8s, ssh, slurm, ray, openresearch, local), flavors, timeouts, images, sizing, and `orx exp wait`. Use before launching or re-launching any run, when choosing or switching a backend or GPU flavor, when a job OOMs, stalls, or times out, or when deciding GPU vs CPU.";
+const D_COMPUTE: &str = "Launch experiment runs with `orx exp run`: backends (hf, modal, k8s, ssh, slurm, ray, openresearch, local), flavors, timeouts, images, sizing, and choosing `orx exp wait` vs `orx exp wake`. Use before launching or re-launching any run, when choosing or switching a backend or GPU flavor, when a job OOMs, stalls, or times out, or when deciding GPU vs CPU.";
 const D_EXPERIMENT_TREE: &str = "The experiment-tree model and the auto-research loop: shape the tree (stacked bushes), branch/launch/wait/promote, and `orx exp desc` notes. Use before creating, planning, or reorganizing experiments, when deciding what to try next, when a round of runs finishes, or whenever you're unsure how work maps onto the tree.";
 
-const S_COMPUTE_LOCAL: AgentSkill = AgentSkill {
+const S_COMPUTE: AgentSkill = AgentSkill {
     name: "orx-compute",
-    description: D_COMPUTE_LOCAL,
-    content: COMPUTE_LOCAL,
-};
-const S_COMPUTE_CLOUD: AgentSkill = AgentSkill {
-    name: "orx-compute",
-    description: D_COMPUTE_CLOUD,
-    content: COMPUTE_CLOUD,
+    description: D_COMPUTE,
+    content: COMPUTE,
 };
 const S_COMPUTE_K8S: AgentSkill = AgentSkill {
     name: "orx-compute-k8s",
@@ -146,14 +139,14 @@ const S_EVIDENCE_CLOUD: AgentSkill = AgentSkill {
 };
 
 /// The modules for a given set, in a stable order. Local and Full share names;
-/// `experiment-tree`/`compute`/`reports`/`evidence` swap bodies, and `create`
-/// is Full-only.
+/// `experiment-tree`/`git`/`reports`/`evidence` swap bodies, while `compute` is
+/// shared and `create` is Full-only.
 pub fn skills(set: SkillSet) -> Vec<&'static AgentSkill> {
     match set {
         SkillSet::Local => vec![
             &S_EXPERIMENT_TREE_LOCAL,
             &S_GIT_LOCAL,
-            &S_COMPUTE_LOCAL,
+            &S_COMPUTE,
             &S_COMPUTE_K8S,
             &S_EVIDENCE_LOCAL,
             &S_REPORTS_LOCAL,
@@ -163,7 +156,7 @@ pub fn skills(set: SkillSet) -> Vec<&'static AgentSkill> {
             &S_CREATE,
             &S_EXPERIMENT_TREE_CLOUD,
             &S_GIT_CLOUD,
-            &S_COMPUTE_CLOUD,
+            &S_COMPUTE,
             &S_COMPUTE_K8S,
             &S_EVIDENCE_CLOUD,
             &S_REPORTS_CLOUD,
@@ -174,8 +167,8 @@ pub fn skills(set: SkillSet) -> Vec<&'static AgentSkill> {
 
 /// Resolve a bundled skill by name within `set`, accepting both the public name
 /// (`orx-compute`) and the bare form (`compute`). `None` for an unknown name —
-/// the caller falls back to the live API fetch. Local and cloud share skill
-/// *names* but swap bodies, so pass the set you actually want.
+/// the caller falls back to the live API fetch. Some Local and Full skills
+/// share names but swap bodies, so pass the set you actually want.
 pub fn find(name: &str, set: SkillSet) -> Option<&'static AgentSkill> {
     let want = name.trim();
     skills(set)
@@ -360,7 +353,7 @@ mod tests {
 
     /// `find` must return the body from the set it was asked for. `orx skill
     /// <name>` inside an `orx up` session relies on this: the playbook points
-    /// there as the fallback, and a cloud body would name commands local mode
+    /// there as the fallback, and a Full body could name commands local mode
     /// lacks. Covers every skill whose body swaps between the two sets.
     #[test]
     fn find_serves_the_requested_variant_body() {
@@ -374,15 +367,22 @@ mod tests {
                 EXPERIMENT_TREE_LOCAL,
                 EXPERIMENT_TREE_CLOUD,
             ),
-            ("compute", COMPUTE_LOCAL, COMPUTE_CLOUD),
             ("reports", REPORTS_LOCAL, REPORTS_CLOUD),
         ];
-        for (name, local_body, cloud_body) in want {
+        for (name, local_body, full_body) in want {
             let local = find(name, SkillSet::Local).unwrap_or_else(|| panic!("local {name}"));
-            let cloud = find(name, SkillSet::Full).unwrap_or_else(|| panic!("cloud {name}"));
-            assert_ne!(local_body, cloud_body, "{name} bodies must differ");
+            let full = find(name, SkillSet::Full).unwrap_or_else(|| panic!("full {name}"));
+            assert_ne!(local_body, full_body, "{name} bodies must differ");
             assert_eq!(local.content, local_body, "{name} served a non-local body");
-            assert_eq!(cloud.content, cloud_body, "{name} served a non-cloud body");
+            assert_eq!(full.content, full_body, "{name} served a non-Full body");
+        }
+    }
+
+    #[test]
+    fn compute_skill_is_shared_by_both_sets() {
+        for set in [SkillSet::Local, SkillSet::Full] {
+            let compute = find("compute", set).expect("compute skill");
+            assert_eq!(compute.content, COMPUTE);
         }
     }
 
