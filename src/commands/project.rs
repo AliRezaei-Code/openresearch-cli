@@ -31,7 +31,7 @@ async fn run_brief(command: ProjectBriefCommand) -> Result<()> {
             print!("{}", crate::local::files::read_project_brief(&project)?);
             Ok(())
         }
-        ProjectBriefCommand::Update { stdin: _, .. } => {
+        ProjectBriefCommand::Update { .. } => {
             use tokio::io::AsyncReadExt as _;
             let mut content = String::new();
             tokio::io::stdin().read_to_string(&mut content).await?;
