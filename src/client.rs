@@ -24,99 +24,12 @@ use crate::error::{anyhow, Result};
 // Response DTOs
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Org {
     pub id: String,
     pub name: String,
     pub created_by: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Project {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-    pub archived: bool,
-    /// When true, anyone (incl. logged-out visitors) can view the project
-    /// read-only. The `/projects/public` directory only returns these.
-    #[serde(default)]
-    pub is_public: bool,
-    /// GitHub repo the project's experiment branches live on. Clone this to edit
-    /// experiments locally: `git clone https://github.com/<owner>/<repo>.git`.
-    #[serde(default)]
-    pub github_owner: String,
-    #[serde(default)]
-    pub github_repo: String,
-    /// One short, ready-to-send example question derived from the repo README.
-    /// `None` until generated.
-    #[serde(default)]
-    pub example_question: Option<String>,
-    /// arXiv id of the paper this project reproduces, derived from the repo
-    /// README at creation. `None` when the repo names no paper. This is the
-    /// key the publish-to-alphaXiv sweep matches a finished report against.
-    #[serde(default)]
-    pub paper_id: Option<String>,
-    /// Newest run in the project (UUIDv7 encodes the time), or `None` if no runs.
-    #[serde(default)]
-    pub last_activity_run_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Experiment {
-    pub id: String,
-    pub project_id: String,
-    /// `null` for root experiments.
-    pub parent_experiment_id: Option<String>,
-    pub slug: String,
-    /// The experiment's git branch on the project's GitHub repo (`orx/<slug>`).
-    /// This is what you `git checkout` to edit the experiment's code.
-    #[serde(default)]
-    pub branch_name: String,
-    pub title: String,
-    /// Free-form notes / write-up for the experiment; empty string when unset.
-    #[serde(default)]
-    pub description: String,
-    /// Optional analysis write-up; `null` when unset.
-    #[serde(default)]
-    pub analysis: Option<String>,
-    pub run_command: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Run {
-    pub id: String,
-    pub experiment_id: String,
-    pub command: String,
-    pub status: String,
-    pub commit_sha: Option<String>,
-    pub updated_at: String,
-    // The compute the run executed on. Optional so older API deployments (which
-    // omit the field) still deserialize.
-    #[serde(default)]
-    pub sandbox_id: Option<String>,
-    // Object-storage key for the run's logs, once captured. Where to look for the
-    // "why" when a run fails *after* the box is up (e.g. the script exited
-    // non-zero) and `result_markdown` is therefore empty.
-    #[serde(default)]
-    pub log_key: Option<String>,
-    // Human-readable terminal detail. On failure during compute spin-up this
-    // holds the provider error the website shows as a toast (e.g. "Provisioning
-    // failed: RunPod … Out of capacity"); on a successful run it's the run's
-    // EVAL.md. Null for runtime failures after the box came up — see `log_key`.
-    #[serde(default)]
-    pub result_markdown: Option<String>,
-    // Terminal time; only meaningful once `status` is terminal. Optional so
-    // older API deployments (without the field) still deserialize.
-    #[serde(default)]
-    pub ended_at: Option<String>,
-    // Seconds from run creation to end (or to now while still in-flight).
-    #[serde(default)]
-    pub duration_seconds: i64,
 }
 
 /// Disk pricing for an offer. Mirrors the backend `zDisk` discriminated union,
@@ -179,215 +92,6 @@ pub struct ListCpuCatalog {
     pub offers: Vec<CpuOffer>,
 }
 
-/// Response of `GET /experiments/{id}`: the experiment plus its most recent run.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GetExperimentResult {
-    pub experiment: Experiment,
-    /// `null` when the experiment has never been run.
-    pub latest_run: Option<Run>,
-}
-
-/// Mirrors the TS `"degraded" | "ready" | "warming"` union.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum SyncStatus {
-    Degraded,
-    Ready,
-    Warming,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProjectQueryResult {
-    pub columns: Vec<String>,
-    /// Each row is a list of arbitrary JSON cell values (`unknown[][]`).
-    pub rows: Vec<Vec<Value>>,
-    pub row_count: i64,
-    pub total_row_count: i64,
-    pub more_rows_available: bool,
-    pub sync_status: SyncStatus,
-    pub sync_errors: Vec<String>,
-    pub last_synced_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WandbSummary {
-    pub label: String,
-    pub n: i64,
-    pub min: f64,
-    pub max: f64,
-    pub last: f64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WandbFailed {
-    pub label: String,
-    pub error: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WandbChartResult {
-    /// `null` when no run produced any points.
-    pub chart_id: Option<String>,
-    /// Presigned PNG URL, or `null` when nothing was rendered.
-    pub url: Option<String>,
-    pub metric_key: String,
-    pub summaries: Vec<WandbSummary>,
-    pub failed: Vec<WandbFailed>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RunLogExcerpt {
-    pub content: String,
-    pub start_byte: i64,
-    pub end_byte: i64,
-    pub total_bytes: i64,
-    pub source: String,
-    pub truncated_before: bool,
-    pub truncated_after: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LogSearchMatchingLine {
-    pub line_number: i64,
-    pub start_byte: i64,
-    pub end_byte: i64,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LogSearchRunResult {
-    pub run_id: String,
-    pub match_count: i64,
-    pub total_lines: i64,
-    pub source: String,
-    pub matching_lines: Vec<LogSearchMatchingLine>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LogSearchResult {
-    pub capped: bool,
-    pub pattern: String,
-    pub results: Vec<LogSearchRunResult>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ArtifactExcerpt {
-    pub content: String,
-    pub key: String,
-    pub start_byte: i64,
-    pub end_byte: i64,
-    pub total_bytes: i64,
-    pub truncated_before: bool,
-    pub truncated_after: bool,
-}
-
-/// One artifact uploaded during a run (`GET /runs/{id}/artifacts`).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RunArtifact {
-    pub key: String,
-    pub size: i64,
-    /// Presigned download URL.
-    pub url: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ListArtifacts {
-    pub artifacts: Vec<RunArtifact>,
-}
-
-/// One W&B run linked to an OpenResearch run (`GET /runs/{id}/wandb-runs`).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WandbRunLink {
-    pub base_url: String,
-    pub entity: String,
-    pub project: String,
-    pub wandb_run_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ListWandbRuns {
-    pub wandb_runs: Vec<WandbRunLink>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SkillRef {
-    pub name: String,
-    pub description: String,
-    pub path: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ListSkills {
-    pub skills: Vec<SkillRef>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SkillContent {
-    pub content: String,
-}
-
-/// A research report attached to a project (`GET /projects/{id}/reports`).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProjectReport {
-    pub id: String,
-    pub project_id: String,
-    pub title: String,
-    pub slug: String,
-    pub created_at: String,
-    pub created_by: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ListReports {
-    pub reports: Vec<ProjectReport>,
-}
-
-/// Response of `GET /projects/{id}/reports/{reportId}`: a report's metadata plus
-/// its rendered markdown body (`report.md`). `markdown` is empty if the body was
-/// never uploaded.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReportDetail {
-    pub report: ProjectReport,
-    pub markdown: String,
-}
-
-/// One presigned upload slot returned by `POST /projects/{id}/reports`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReportUploadSlot {
-    pub path: String,
-    pub url: String,
-    pub content_type: String,
-}
-
-/// Response of `POST /projects/{id}/reports`: the created report plus the
-/// presigned PUT URLs to upload each of its files directly to storage.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateReportResult {
-    pub report: ProjectReport,
-    pub uploads: Vec<ReportUploadSlot>,
-}
-
 // Thin envelope DTOs for the list endpoints.
 
 #[derive(Debug, Clone, Deserialize)]
@@ -395,121 +99,9 @@ pub struct ListOrgs {
     pub orgs: Vec<Org>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct ListProjects {
-    pub projects: Vec<Project>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ListExperiments {
-    pub experiments: Vec<Experiment>,
-}
-
-/// A single environment variable the project's runs will see. Only the name and
-/// where it's set are returned — values are never exposed over the CLI.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EnvVarName {
-    pub key: String,
-    /// `"org"`, `"project"`, or `"user"`.
-    pub source: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ListEnvVarNames {
-    pub env_vars: Vec<EnvVarName>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ListRuns {
-    pub runs: Vec<Run>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ExperimentEnvelope {
-    pub experiment: Experiment,
-}
-
-/// Response of `PATCH /projects/{id}`: the updated project row.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ProjectEnvelope {
-    pub project: Project,
-}
-
 // ---------------------------------------------------------------------------
 // Request bodies (mirroring the inline TS body shapes)
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WandbRunSpec {
-    pub run_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WandbChartBody {
-    pub metric_key: String,
-    pub runs: Vec<WandbRunSpec>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub smoothing: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateReportBody {
-    pub title: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub slug: Option<String>,
-    /// Report-relative paths to upload, e.g. ["report.md", "images/a.png"].
-    pub files: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SearchLogsBody {
-    pub pattern: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub experiment_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_matching_lines: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct QueryBody<'a> {
-    sql: &'a str,
-}
-
-/// PATCH body for `update_experiment`. Only the fields the CLI sets are
-/// included; every field is optional and omitted when `None`.
-#[derive(Debug, Clone, Serialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateExperimentBody {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub run_command: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-}
-
-/// PATCH body for `update_project`. Only the fields the CLI sets are included;
-/// every field is optional and omitted when `None`.
-#[derive(Debug, Clone, Serialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateProjectBody {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// Project visibility (`isPublic`): `Some(true)` lists it in the public
-    /// directory, `Some(false)` makes it private. `None` leaves it unchanged.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_public: Option<bool>,
-}
 
 /// The `target` of a standalone instance (`POST /sandboxes`). Mirrors
 /// the provider catalog's GPU and CPU variants.
@@ -548,7 +140,7 @@ pub struct CreateSandboxBody {
 }
 
 /// A sandbox as returned by `POST /sandboxes`. Mirrors the API's `zSandbox`;
-/// fields are nullable while a hosted box is still provisioning.
+/// fields are nullable while a box is still provisioning.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Sandbox {
@@ -707,10 +299,6 @@ async fn api_post<T: DeserializeOwned>(creds: &Credentials, path: &str, body: Va
     request(creds, Method::POST, path, Some(body)).await
 }
 
-async fn api_patch<T: DeserializeOwned>(creds: &Credentials, path: &str, body: Value) -> Result<T> {
-    request(creds, Method::PATCH, path, Some(body)).await
-}
-
 // ---------------------------------------------------------------------------
 // Endpoint fns (one per TS export, same path/method/shape)
 // ---------------------------------------------------------------------------
@@ -719,173 +307,12 @@ pub async fn list_orgs(creds: &Credentials) -> Result<ListOrgs> {
     api_get(creds, "/orgs").await
 }
 
-pub async fn list_projects(creds: &Credentials, org_id: &str) -> Result<ListProjects> {
-    api_get(creds, &format!("/orgs/{}/projects", org_id)).await
-}
-
-/// The public project directory — every project flagged `isPublic`, viewable by
-/// anyone. A PAT still works here but doesn't widen the result set.
-pub async fn list_public_projects(creds: &Credentials) -> Result<ListProjects> {
-    api_get(creds, "/projects/public").await
-}
-
-/// Fetch a single project by id (`GET /projects/{id}`). Works for any public
-/// project, or any private one in an org the caller belongs to.
-pub async fn get_project(creds: &Credentials, project_id: &str) -> Result<ProjectEnvelope> {
-    api_get(creds, &format!("/projects/{}", project_id)).await
-}
-
-/// Find a project by id by scanning the caller's orgs. Prefer [`get_project`]
-/// when you only need the row; this stays for callers that need org context.
-pub async fn find_project(creds: &Credentials, project_id: &str) -> Result<Option<Project>> {
-    for org in list_orgs(creds).await?.orgs {
-        let found = list_projects(creds, &org.id)
-            .await?
-            .projects
-            .into_iter()
-            .find(|p| p.id == project_id);
-        if found.is_some() {
-            return Ok(found);
-        }
-    }
-    Ok(None)
-}
-
-pub async fn update_project(
-    creds: &Credentials,
-    project_id: &str,
-    body: &UpdateProjectBody,
-) -> Result<ProjectEnvelope> {
-    let body = serde_json::to_value(body)?;
-    api_patch(creds, &format!("/projects/{}", project_id), body).await
-}
-
-pub async fn list_experiments(creds: &Credentials, project_id: &str) -> Result<ListExperiments> {
-    api_get(creds, &format!("/projects/{}/experiments", project_id)).await
-}
-
-pub async fn list_env_var_names(creds: &Credentials, project_id: &str) -> Result<ListEnvVarNames> {
-    api_get(creds, &format!("/projects/{}/env-var-names", project_id)).await
-}
-
-pub async fn list_runs(creds: &Credentials, project_id: &str) -> Result<ListRuns> {
-    api_get(creds, &format!("/projects/{}/runs", project_id)).await
-}
-
-pub async fn query_project(
-    creds: &Credentials,
-    project_id: &str,
-    sql: &str,
-) -> Result<ProjectQueryResult> {
-    let body = serde_json::to_value(QueryBody { sql })?;
-    api_post(creds, &format!("/projects/{}/query", project_id), body).await
-}
-
-pub async fn render_wandb_chart(
-    creds: &Credentials,
-    project_id: &str,
-    body: &WandbChartBody,
-) -> Result<WandbChartResult> {
-    let body = serde_json::to_value(body)?;
-    api_post(
-        creds,
-        &format!("/projects/{}/charts/wandb", project_id),
-        body,
-    )
-    .await
-}
-
-pub async fn read_run_log(
-    creds: &Credentials,
-    run_id: &str,
-    mode: Option<&str>,
-    max_bytes: Option<i64>,
-    start_byte: Option<i64>,
-    end_byte: Option<i64>,
-) -> Result<RunLogExcerpt> {
-    let mut params: Vec<String> = Vec::new();
-    if let Some(m) = mode {
-        params.push(format!("mode={}", m));
-    }
-    if let Some(v) = max_bytes {
-        params.push(format!("maxBytes={}", v));
-    }
-    if let Some(v) = start_byte {
-        params.push(format!("startByte={}", v));
-    }
-    if let Some(v) = end_byte {
-        params.push(format!("endByte={}", v));
-    }
-    let qs = if params.is_empty() {
-        String::new()
-    } else {
-        format!("?{}", params.join("&"))
-    };
-    api_get(creds, &format!("/runs/{}/log{}", run_id, qs)).await
-}
-
-pub async fn search_logs(
-    creds: &Credentials,
-    project_id: &str,
-    body: &SearchLogsBody,
-) -> Result<LogSearchResult> {
-    let body = serde_json::to_value(body)?;
-    api_post(
-        creds,
-        &format!("/projects/{}/search-logs", project_id),
-        body,
-    )
-    .await
-}
-
-pub async fn read_artifact(
-    creds: &Credentials,
-    run_id: &str,
-    key: &str,
-    mode: Option<&str>,
-    max_bytes: Option<i64>,
-) -> Result<ArtifactExcerpt> {
-    let mut params: Vec<String> = vec![format!("key={}", urlencoding::encode(key))];
-    if let Some(m) = mode {
-        params.push(format!("mode={}", m));
-    }
-    if let Some(v) = max_bytes {
-        params.push(format!("maxBytes={}", v));
-    }
-    api_get(
-        creds,
-        &format!("/runs/{}/artifact?{}", run_id, params.join("&")),
-    )
-    .await
-}
-
-pub async fn list_artifacts(creds: &Credentials, run_id: &str) -> Result<ListArtifacts> {
-    api_get(creds, &format!("/runs/{}/artifacts", run_id)).await
-}
-
-pub async fn list_wandb_runs(creds: &Credentials, run_id: &str) -> Result<ListWandbRuns> {
-    api_get(creds, &format!("/runs/{}/wandb-runs", run_id)).await
-}
-
 pub async fn list_catalog(creds: &Credentials) -> Result<ListCatalog> {
     api_get(creds, "/compute/catalog").await
 }
 
 pub async fn list_cpu_catalog(creds: &Credentials) -> Result<ListCpuCatalog> {
     api_get(creds, "/compute/catalog/cpu").await
-}
-
-pub async fn get_experiment(creds: &Credentials, exp_id: &str) -> Result<GetExperimentResult> {
-    api_get(creds, &format!("/experiments/{}", exp_id)).await
-}
-
-pub async fn update_experiment(
-    creds: &Credentials,
-    exp_id: &str,
-    body: &UpdateExperimentBody,
-) -> Result<ExperimentEnvelope> {
-    let body = serde_json::to_value(body)?;
-    api_patch(creds, &format!("/experiments/{}", exp_id), body).await
 }
 
 /// Spin up a standalone instance in an org (no experiment) — `POST /sandboxes`.
@@ -939,182 +366,6 @@ pub async fn create_ssh_key(
         serde_json::json!({ "name": name, "publicKey": public_key }),
     )
     .await
-}
-
-pub async fn cancel_experiment_run(creds: &Credentials, exp_id: &str) -> Result<()> {
-    request_no_content(
-        creds,
-        Method::POST,
-        &format!("/experiments/{}/cancel", exp_id),
-        Some(serde_json::json!({})),
-    )
-    .await
-}
-
-pub async fn list_reports(creds: &Credentials, project_id: &str) -> Result<ListReports> {
-    api_get(creds, &format!("/projects/{}/reports", project_id)).await
-}
-
-/// Fetch one report's metadata and its rendered markdown body.
-pub async fn get_report(
-    creds: &Credentials,
-    project_id: &str,
-    report_id: &str,
-) -> Result<ReportDetail> {
-    api_get(
-        creds,
-        &format!("/projects/{}/reports/{}", project_id, report_id),
-    )
-    .await
-}
-
-/// Download the raw bytes of one file within a report (e.g. `report.md` or an
-/// image referenced from it). The endpoint 302-redirects to a presigned R2 URL;
-/// `reqwest` follows it (and drops the bearer header on the cross-host hop, which
-/// is correct — the signature in the URL authorizes the read). `path` is a
-/// report-relative POSIX path like `images/loss.png`.
-pub async fn download_report_file(
-    creds: &Credentials,
-    project_id: &str,
-    report_id: &str,
-    path: &str,
-) -> Result<Vec<u8>> {
-    let encoded = urlencoding::encode(path);
-    let res = send_request(
-        creds,
-        Method::GET,
-        &format!(
-            "/projects/{}/reports/{}/file?path={}",
-            project_id, report_id, encoded
-        ),
-        None,
-    )
-    .await?;
-    let bytes = res
-        .bytes()
-        .await
-        .map_err(|e| anyhow!("Could not read {}: {}", path, e))?;
-    Ok(bytes.to_vec())
-}
-
-pub async fn create_report(
-    creds: &Credentials,
-    project_id: &str,
-    body: &CreateReportBody,
-) -> Result<CreateReportResult> {
-    let body = serde_json::to_value(body)?;
-    api_post(creds, &format!("/projects/{}/reports", project_id), body).await
-}
-
-/// Upload raw bytes to a presigned PUT URL (R2). No auth header — the signature
-/// in the URL authorizes the write. `content_type` must match what the server
-/// signed (the value returned alongside the URL).
-pub async fn upload_to_presigned(url: &str, content_type: &str, bytes: Vec<u8>) -> Result<()> {
-    let res = http()
-        .put(url)
-        .header("content-type", content_type)
-        .body(bytes)
-        .send()
-        .await
-        .map_err(|e| anyhow!("Could not upload to storage: {}", e))?;
-    let status = res.status();
-    if !status.is_success() {
-        let reason = status.canonical_reason().unwrap_or("");
-        return Err(anyhow!("Upload failed ({} {})", status.as_u16(), reason));
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// External runs (jobs executed by orx itself — HF Jobs etc.). The api is a
-// mirror: create registers the row, PATCH reports transitions (and returns
-// cancel intent), the log presign hands back a PUT URL for the final log.
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExternalRunLite {
-    pub id: String,
-    pub status: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExternalRunCreated {
-    pub run: ExternalRunLite,
-    pub project_id: String,
-    pub run_command: String,
-    pub branch_name: String,
-    pub github_owner: String,
-    pub github_repo: String,
-    /// Short-lived repo-scoped read token from the org's connected GitHub app,
-    /// for the job's private-repo clone. Null for mint failures.
-    #[serde(default)]
-    pub github_token: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExternalRunPatched {
-    pub cancel_requested: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExternalRunState {
-    pub status: String,
-    pub cancel_requested: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct PresignedUrl {
-    pub url: String,
-}
-
-/// Intentionally retained without a current CLI caller for external-run API compatibility.
-pub async fn create_external_run(
-    creds: &Credentials,
-    exp_id: &str,
-    backend: Value,
-) -> Result<ExternalRunCreated> {
-    api_post(
-        creds,
-        &format!("/experiments/{}/external-run", exp_id),
-        serde_json::json!({ "backend": backend }),
-    )
-    .await
-}
-
-/// Report a transition and/or descriptor update. Fields are all optional; the
-/// response's `cancelRequested` doubles as the supervisor's cancel poll.
-pub async fn update_external_run(
-    creds: &Credentials,
-    run_id: &str,
-    body: Value,
-) -> Result<ExternalRunPatched> {
-    api_patch(creds, &format!("/runs/{}/external", run_id), body).await
-}
-
-pub async fn get_external_run_state(creds: &Credentials, run_id: &str) -> Result<ExternalRunState> {
-    api_get(creds, &format!("/runs/{}/external", run_id)).await
-}
-
-pub async fn presign_external_run_log(creds: &Credentials, run_id: &str) -> Result<PresignedUrl> {
-    api_post(
-        creds,
-        &format!("/runs/{}/external-log", run_id),
-        serde_json::json!({}),
-    )
-    .await
-}
-
-pub async fn list_skills(creds: &Credentials) -> Result<ListSkills> {
-    api_get(creds, "/skills").await
-}
-
-pub async fn read_skill(creds: &Credentials, path: &str) -> Result<SkillContent> {
-    let p = urlencoding::encode(path);
-    api_get(creds, &format!("/skills/read?path={}", p)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1762,6 +1013,32 @@ mod tests {
         LitHit, OpenAlexWork, PaperHit, SandboxEnvelope, SandboxTarget, BIORXIV_SOURCE_ID,
     };
     use serde_json::json;
+
+    #[test]
+    fn openresearch_client_contains_only_account_and_compute_paths() {
+        let source = include_str!("client.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("client source has a production section");
+        for forbidden in ["\"/projects", "\"/experiments", "\"/runs", "\"/skills"] {
+            assert!(
+                !production.contains(forbidden),
+                "research-state endpoint remains in client.rs: {forbidden}"
+            );
+        }
+        for retained in [
+            "\"/orgs\"",
+            "\"/compute/catalog",
+            "\"/sandboxes",
+            "\"/ssh-keys",
+        ] {
+            assert!(
+                production.contains(retained),
+                "missing infrastructure endpoint: {retained}"
+            );
+        }
+    }
 
     /// The GPU catalog wire format carries `disk` as a discriminated union and an
     /// optional `region`, plus `bandwidth*` fields the CLI ignores. Pin that we

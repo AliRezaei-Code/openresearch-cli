@@ -1,6 +1,6 @@
 [package]
 name = "openresearch-cli"
-version = "0.1.105"
+version = "0.1.106"
 edition = "2021"
 description = "OpenResearch CLI (orx) — Rust port"
 repository = "https://github.com/alphaXiv/openresearch-cli"

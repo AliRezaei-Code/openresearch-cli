@@ -1,10 +1,9 @@
 //! Job backends — external compute that orx launches and supervises itself.
 //!
-//! The api never orchestrates these: orx submits natively (HF Jobs, Modal,
-//! Kubernetes, SSH, Slurm, an OpenResearch box, this machine), a detached
-//! `orx supervise` watches the job beside it, and the api receives status/log
-//! mirrors. The run's `backend_json` descriptor is the serialized handle a
-//! later supervisor uses to reattach.
+//! Orx submits natively (HF Jobs, Modal, Kubernetes, SSH, Slurm, an OpenResearch
+//! box, or this machine) and a detached `orx supervise` watches the job beside
+//! it. The run's `backend_json` descriptor is the serialized handle a later
+//! supervisor uses to reattach.
 
 pub mod huggingface;
 pub mod kubernetes;
@@ -39,7 +38,7 @@ pub fn default_unbuffered(env: &HashMap<String, String>) -> HashMap<String, Stri
     env
 }
 
-/// Backend descriptor stored on the run (locally and mirrored to the api).
+/// Backend descriptor stored on the local run.
 /// `kind` discriminates. This is a fixed field list — a key absent here does
 /// NOT survive a parse → to_json round-trip, so anything a backend must keep
 /// needs its own (optional) field.
@@ -221,8 +220,8 @@ impl BackendDescriptor {
     }
 }
 
-/// Map an HF job stage onto the run-status vocabulary the store and the api
-/// share. `UPDATING` appears in the wild as a live state (see huggingface_hub).
+/// Map an HF job stage onto the local run-status vocabulary. `UPDATING` appears
+/// in the wild as a live state (see huggingface_hub).
 pub fn stage_to_run_status(stage: &str) -> &'static str {
     match stage {
         "SCHEDULING" => "starting",

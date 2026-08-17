@@ -84,9 +84,9 @@ Rules and notes:
   flavors, `python:3.12` on cpu flavors). Pick an image with your deps baked
   in when pip-install time dominates the run.
 - Everything downstream is identical: the run appears in the tree, `orx exp
-  wait` / `orx runs` / `orx logs` work unchanged, and cancellation through
-  OpenResearch or `orx exp cancel` reaches the job within a few seconds. A detached
-  `orx supervise` process mirrors status and logs; don't kill it.
+  wait` / `orx runs` / `orx logs` work unchanged, and `orx exp cancel` reaches
+  the job within a few seconds. A detached `orx supervise` process records
+  status and logs locally; don't kill it.
 
 ## Running on Modal — `--backend modal`
 
@@ -122,8 +122,8 @@ Rules and notes:
   flavors, `python:3.12` on cpu). Pick one with your deps baked in when
   pip-install time dominates.
 - Everything downstream is identical (`orx exp wait` / `orx runs` / `orx logs` /
-  `orx exp cancel`). A detached `orx supervise` mirrors status and logs; don't
-  kill it.
+  `orx exp cancel`). A detached `orx supervise` records status and logs locally;
+  don't kill it.
 
 ## Running on your Kubernetes cluster — `--backend k8s`
 
@@ -184,7 +184,7 @@ Rules and notes:
 - `orx` streams the committed source snapshot to the login node before `sbatch`
   starts the fixed command. Everything downstream (`orx exp wait` / `orx runs`
   / `orx logs` / `orx exp cancel`) is
-  identical; a detached `orx supervise` mirrors status and logs — don't kill it.
+  identical; a detached `orx supervise` records status and logs locally — don't kill it.
 
 ## Running on a Ray Jobs cluster — `--backend ray`
 
@@ -212,7 +212,7 @@ Rules and notes:
   runtime env until it finishes; size and bound work in the run command itself.
 - Ray receives the committed snapshot as its `working_dir` package; downstream
   commands stay the same, and a detached
-  `orx supervise` mirrors status and logs — don't kill it.
+  `orx supervise` records status and logs locally — don't kill it.
 
 ## Running on an OpenResearch box — `--backend openresearch`
 
@@ -234,13 +234,13 @@ Rules and notes:
 - **`--flavor` is a GPU id from `orx compute`** (`h100_sxm`, `h100_sxm:2` for a
   count) **or a CPU flavor** (`cpu5c` / `cpu5g` / `cpu5m`, with `:vcpus` like
   `cpu5c:32`). Run `orx compute` to see what's available.
-- Optional: `--org <id>` (when you belong to several), `--disk <GB>`, and
+- Optional: `--org <id>` from `orx orgs` (when you belong to several), `--disk <GB>`, and
   `--provider <P>`. No `--image` — the platform's image is fixed.
 - `--timeout` (default `4h`) applies — the box is deleted when the run ends
   either way, so nothing persists on it; everything you need must be in the log.
 - `orx` streams the committed source snapshot to the provisioned box;
   downstream commands stay the same, and a detached
-  `orx supervise` mirrors status and logs — don't kill it.
+  `orx supervise` records status and logs locally — don't kill it.
 
 ## Running on this machine — `--backend local`
 
@@ -280,7 +280,7 @@ orx instance create <orgId> --gpu H100_SXM --provider runpod        # pin a prov
 orx instance create <orgId> --cpu cpu5g --vcpus 8                    # CPU-only box
 ```
 
-- `<orgId>` comes from `orx projects` (the `org:` line). Choose exactly one of
+- `<orgId>` comes from `orx orgs`. Choose exactly one of
   `--gpu` or `--cpu`; `--count`/`--disk` apply to `--gpu`, `--vcpus` to `--cpu`.
 - Unlike `orx exp run`, omitting `--provider` picks the **cheapest** matching
   offer across all providers; pass `--provider <name>` to pin one.

@@ -64,45 +64,20 @@ enum Command {
     /// Remove the stored token.
     Logout,
 
-    /// List your projects, grouped by organization.
+    /// List projects registered in the local orx store.
     Projects(ProjectsArgs),
 
-    /// Browse the public project directory (no membership needed).
-    Explore(ExploreArgs),
+    /// List organizations available for OpenResearch compute.
+    Orgs(OrgsArgs),
 
-    /// Operate on one project (view it, or edit its name / description).
+    /// Operate on one local project.
     Project(ProjectArgs),
-
-    /// List a project's experiments as a tree.
-    Experiments(ExperimentsArgs),
-
-    /// List the names (not values) of a project's environment variables.
-    Env(EnvArgs),
 
     /// List a project's runs.
     Runs(RunsArgs),
 
     /// Read a run's terminal log (tail by default).
     Logs(LogsArgs),
-
-    /// Grep run logs for a literal pattern.
-    #[command(name = "search-logs")]
-    SearchLogs(SearchLogsArgs),
-
-    /// List the text artifacts a run produced (key + size).
-    Artifacts(ArtifactsArgs),
-
-    /// Read a run's text artifact (also caches it for SQL search).
-    Artifact(ArtifactArgs),
-
-    /// List the W&B runs linked to a run.
-    Wandb(WandbArgs),
-
-    /// Run read-only SQL against the project's evidence.
-    Query(QueryArgs),
-
-    /// Render a W&B metric across runs to a PNG.
-    Chart(ChartArgs),
 
     /// Add an experiment node to a local `orx up` project.
     #[command(name = "create-experiment")]
@@ -118,11 +93,8 @@ enum Command {
     #[command(name = "ssh-key")]
     SshKey(SshKeyArgs),
 
-    /// Operate on one experiment node (status / run command / run / cancel).
+    /// Operate on one local experiment node.
     Exp(ExpArgs),
-
-    /// Upload, list, show, or download a project's research reports.
-    Report(ReportArgs),
 
     /// Print CLI usage for agents, or fetch a skill doc.
     Skill(SkillArgs),
@@ -152,9 +124,8 @@ enum Command {
     /// `opencode serve`); the api tunnels to it on agent boxes.
     Serve(ServeArgs),
 
-    /// Supervise one external run: tail backend logs, mirror status to the
-    /// api, honor cancel intent. Spawned detached by `exp run --backend hf`;
-    /// safe to re-run after a crash or box replacement.
+    /// Supervise one local run: tail backend logs, persist status, and honor
+    /// local cancel intent. Spawned detached by `exp run`.
     Supervise(SuperviseArgs),
 
     /// Start the local autoresearch dashboard on 127.0.0.1: embedded UI,
@@ -199,18 +170,14 @@ pub struct LoginArgs {
 
 #[derive(Args, Debug)]
 pub struct ProjectsArgs {
-    /// Include archived projects.
-    #[arg(long)]
-    pub all: bool,
-    /// Emit raw JSON (id, name, paperId, repo, org) instead of the formatted
-    /// table — for scripts that need each project's `paperId`.
+    /// Emit local project records as JSON.
     #[arg(long)]
     pub json: bool,
 }
 
 #[derive(Args, Debug)]
-pub struct ExploreArgs {
-    /// Emit raw JSON instead of the formatted table.
+pub struct OrgsArgs {
+    /// Emit organization records as JSON.
     #[arg(long)]
     pub json: bool,
 }
@@ -223,32 +190,19 @@ pub struct ProjectArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ProjectCommand {
-    /// Show a project's overview: details, experiment tree, and reports.
+    /// Show a local project's details and experiment tree.
     View { project_id: String },
 
-    /// Edit a project's metadata. Pass at least one of `--name` / `--description`
-    /// / `--public` / `--private` / `--run-command`.
+    /// Edit a local project's name or run command.
     Edit {
         project_id: String,
         /// Rename the project.
         #[arg(long)]
         name: Option<String>,
-        /// Set the project's default run command (local projects only).
+        /// Set the project's default run command.
         /// New experiments inherit it; pass '' to clear.
         #[arg(long = "run-command")]
         run_command: Option<String>,
-        /// Overwrite the project's description with this value.
-        #[arg(long)]
-        description: Option<String>,
-        /// Overwrite the description with the whole of stdin (for long markdown).
-        #[arg(long)]
-        description_stdin: bool,
-        /// Make the project public (listed in the public directory).
-        #[arg(long)]
-        public: bool,
-        /// Make the project private. Mutually exclusive with `--public`.
-        #[arg(long, conflicts_with = "public")]
-        private: bool,
     },
 
     /// Read or update the local project's user-facing PROJECT.md.
@@ -272,16 +226,6 @@ pub enum ProjectBriefCommand {
 }
 
 #[derive(Args, Debug)]
-pub struct ExperimentsArgs {
-    pub project_id: String,
-}
-
-#[derive(Args, Debug)]
-pub struct EnvArgs {
-    pub project_id: String,
-}
-
-#[derive(Args, Debug)]
 pub struct RunsArgs {
     pub project_id: String,
     /// Filter to one experiment.
@@ -301,68 +245,6 @@ pub struct LogsArgs {
     /// Exact byte window `<start>:<end>`.
     #[arg(long)]
     pub range: Option<String>,
-}
-
-#[derive(Args, Debug)]
-pub struct SearchLogsArgs {
-    pub project_id: String,
-    pub pattern: String,
-    /// Scope to a single run.
-    #[arg(long)]
-    pub run: Option<String>,
-    /// Scope to a single experiment.
-    #[arg(long)]
-    pub experiment: Option<String>,
-    /// Cap matching lines.
-    #[arg(long)]
-    pub max: Option<String>,
-}
-
-#[derive(Args, Debug)]
-pub struct ArtifactsArgs {
-    pub run_id: String,
-}
-
-#[derive(Args, Debug)]
-pub struct WandbArgs {
-    pub run_id: String,
-}
-
-#[derive(Args, Debug)]
-pub struct ArtifactArgs {
-    pub run_id: String,
-    pub key: String,
-    /// Read from the start instead of the tail.
-    #[arg(long)]
-    pub head: bool,
-    /// Max bytes to read.
-    #[arg(long)]
-    pub bytes: Option<String>,
-}
-
-#[derive(Args, Debug)]
-pub struct QueryArgs {
-    pub project_id: String,
-    pub sql: String,
-}
-
-#[derive(Args, Debug)]
-pub struct ChartArgs {
-    /// Chart kind. Only `wandb` is supported today.
-    pub kind: String,
-    pub project_id: String,
-    /// W&B history key to plot.
-    #[arg(long)]
-    pub metric: Option<String>,
-    /// Run to overlay (`<id>[:label]`); repeat for multiple runs.
-    #[arg(long = "run")]
-    pub run: Vec<String>,
-    /// EMA smoothing 0–0.99.
-    #[arg(long)]
-    pub smoothing: Option<String>,
-    /// Directory to save the rendered PNG.
-    #[arg(long)]
-    pub out: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -447,7 +329,7 @@ pub enum InstanceCommand {
 
 #[derive(Args, Debug)]
 pub struct InstanceCreateArgs {
-    /// Organization id (from `orx projects`).
+    /// Organization id (from `orx orgs`).
     pub org_id: String,
     /// Provision a GPU instance with this GPU id, e.g. `H100_SXM` — the exact id
     /// from `orx compute`, not a family name like `H100`.
@@ -475,7 +357,7 @@ pub struct InstanceCreateArgs {
 
 #[derive(Args, Debug)]
 pub struct InstanceListArgs {
-    /// Organization id (from `orx projects`).
+    /// Organization id (from `orx orgs`).
     pub org_id: String,
 }
 
@@ -495,14 +377,6 @@ pub struct ExpArgs {
 pub enum ExpCommand {
     /// Show the experiment's status, run command, and latest run.
     Status { exp_id: String },
-
-    /// View the run command, or set it with `--set`.
-    Cmd {
-        exp_id: String,
-        /// Set the run command to this value.
-        #[arg(long)]
-        set: Option<String>,
-    },
 
     /// View the experiment's description/notes, or overwrite it with `--set` / `--stdin`.
     Desc {
@@ -546,46 +420,6 @@ pub enum ExpCommand {
 }
 
 #[derive(Args, Debug)]
-pub struct ReportArgs {
-    #[command(subcommand)]
-    pub command: ReportCommand,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum ReportCommand {
-    /// Upload a report folder (report.md + images/) to a project.
-    Upload {
-        project_id: String,
-        /// Path to the report folder on disk.
-        folder: String,
-        /// Report title (defaults to the folder name).
-        #[arg(long)]
-        title: Option<String>,
-    },
-
-    /// List a project's reports.
-    List { project_id: String },
-
-    /// Print a report's markdown body to stdout. Pass its id or slug.
-    Show {
-        project_id: String,
-        /// Report id (from `orx report list`) or its slug.
-        report: String,
-    },
-
-    /// Download a report folder (report.md + referenced images) to a local
-    /// directory — the inverse of `upload`. Pass the report's id or slug.
-    Download {
-        project_id: String,
-        /// Report id (from `orx report list`) or its slug.
-        report: String,
-        /// Destination directory (created if absent). `report.md` and an
-        /// `images/` subfolder are written under it.
-        dir: String,
-    },
-}
-
-#[derive(Args, Debug)]
 pub struct ExpRunArgs {
     pub exp_id: String,
     /// Disk in GB for a `--backend openresearch` instance (default 100).
@@ -605,7 +439,7 @@ pub struct ExpRunArgs {
     /// `orx login`), or `local` (a detached process on this machine). k8s,
     /// ssh, slurm, ray, openresearch, and local are local
     /// experiments only. orx submits the job and a detached supervisor
-    /// mirrors status/logs back. Omitted on a local experiment: launches on
+    /// records status and logs locally. Omitted on a local experiment: launches on
     /// the configured default compute target, if set.
     #[arg(long)]
     pub backend: Option<String>,
@@ -708,9 +542,8 @@ pub struct InstallSkillsArgs {
 
     /// Also install the full set of modular `orx` skills (~8 always-listed
     /// skills) into the agent's global skills dir, not just the thin shim.
-    /// Intended for dedicated/orx-only environments (e.g. the cloud box) — in a
-    /// general-purpose setup the always-on skills add noise, so the default is
-    /// the shim alone.
+    /// Intended for dedicated/orx-only environments. In a general-purpose setup
+    /// the always-on skills add noise, so the default is the shim alone.
     #[arg(long)]
     pub full: bool,
 }
@@ -729,16 +562,6 @@ pub enum TelemetryCommand {
     On,
     /// Disable anonymous usage analytics on this machine.
     Off,
-    /// Show or set this machine's context tag (e.g. "cloud-agent"), stamped on
-    /// every event as `install_kind` so automated installs are separable from
-    /// humans in analytics. Intended for fleet provisioning, not end users.
-    Context {
-        /// Context value to persist (omit to show the current value).
-        value: Option<String>,
-        /// Clear the persisted context (the machine counts as human again).
-        #[arg(long, conflicts_with = "value")]
-        clear: bool,
-    },
 }
 
 /// Which corpus `orx lit` searches / `orx paper` reads from.
@@ -946,24 +769,15 @@ fn command_name(command: &Command) -> &'static str {
         Command::Login(_) => "login",
         Command::Logout => "logout",
         Command::Projects(_) => "projects",
-        Command::Explore(_) => "explore",
+        Command::Orgs(_) => "orgs",
         Command::Project(_) => "project",
-        Command::Experiments(_) => "experiments",
-        Command::Env(_) => "env",
         Command::Runs(_) => "runs",
         Command::Logs(_) => "logs",
-        Command::SearchLogs(_) => "search-logs",
-        Command::Artifacts(_) => "artifacts",
-        Command::Artifact(_) => "artifact",
-        Command::Wandb(_) => "wandb",
-        Command::Query(_) => "query",
-        Command::Chart(_) => "chart",
         Command::CreateExperiment(_) => "create-experiment",
         Command::Compute(_) => "compute",
         Command::Instance(_) => "instance",
         Command::SshKey(_) => "ssh-key",
         Command::Exp(_) => "exp",
-        Command::Report(_) => "report",
         Command::Skill(_) => "skill",
         Command::InstallSkills(_) => "install-skills",
         Command::Lit(_) => "lit",
@@ -994,18 +808,10 @@ async fn dispatch(command: Command) -> error::Result<()> {
         Command::Login(args) => commands::login::run(args).await,
         Command::Logout => commands::logout::run().await,
         Command::Projects(args) => commands::projects::run(args).await,
-        Command::Explore(args) => commands::explore::run(args).await,
+        Command::Orgs(args) => commands::orgs::run(args).await,
         Command::Project(args) => commands::project::run(args).await,
-        Command::Experiments(args) => commands::experiments::run(args).await,
-        Command::Env(args) => commands::env::run(args).await,
         Command::Runs(args) => commands::runs::run(args).await,
         Command::Logs(args) => commands::logs::run(args).await,
-        Command::SearchLogs(args) => commands::search_logs::run(args).await,
-        Command::Artifacts(args) => commands::artifacts::run(args).await,
-        Command::Artifact(args) => commands::artifact::run(args).await,
-        Command::Wandb(args) => commands::wandb::run(args).await,
-        Command::Query(args) => commands::query::run(args).await,
-        Command::Chart(args) => commands::chart::run(args).await,
         Command::CreateExperiment(args) => commands::create_experiment::run(args).await,
         Command::Compute(args) => commands::compute::run(args).await,
         Command::Instance(args) => commands::instance::run(args).await,
@@ -1014,7 +820,6 @@ async fn dispatch(command: Command) -> error::Result<()> {
             SshKeyCommand::List => commands::ssh_key::list().await,
         },
         Command::Exp(args) => commands::exp::run(args).await,
-        Command::Report(args) => commands::report::run(args).await,
         Command::Skill(args) => commands::skill::run(args).await,
         Command::InstallSkills(args) => commands::install_skills::run(args).await,
         Command::Lit(args) => commands::lit::run(args).await,
@@ -1058,10 +863,10 @@ mod cli_tests {
     use super::*;
 
     #[test]
-    fn removed_server_managed_run_flags_are_rejected() {
+    fn run_accepts_only_supervised_backend_flags() {
         for flag in ["--gpu", "--cpu", "--sandbox"] {
             let error = Cli::try_parse_from(["orx", "exp", "run", "exp-1", flag, "value"])
-                .expect_err("retired managed-run flag should not parse");
+                .expect_err("unsupported run flag should not parse");
             assert_eq!(
                 error.kind(),
                 clap::error::ErrorKind::UnknownArgument,
@@ -1071,10 +876,33 @@ mod cli_tests {
     }
 
     #[test]
-    fn retired_server_project_create_command_is_rejected() {
-        let error = Cli::try_parse_from(["orx", "create-project", "org-1", "--name", "project"])
-            .expect_err("retired server project creation should not parse");
+    fn research_state_commands_are_local_only() {
+        for command in [
+            "explore",
+            "experiments",
+            "env",
+            "search-logs",
+            "artifacts",
+            "artifact",
+            "wandb",
+            "query",
+            "chart",
+            "report",
+        ] {
+            let error = Cli::try_parse_from(["orx", command])
+                .expect_err("removed research command should not parse");
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+        }
+
+        let error = Cli::try_parse_from(["orx", "exp", "cmd", "exp-1"])
+            .expect_err("per-experiment run command should not parse");
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+
+        let error = Cli::try_parse_from(["orx", "projects", "--all"])
+            .expect_err("local projects have no archived state");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+
+        Cli::try_parse_from(["orx", "orgs", "--json"]).expect("orgs should parse");
     }
 
     #[test]

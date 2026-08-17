@@ -11,7 +11,7 @@ and edit code (see `orx-git`).
 
 This overview is deliberately short: it carries the cardinal rules and a command
 quick-reference, then points at focused **modules** for everything else. Load a
-module with `orx skill <name>` (the live index is printed at the end of `orx
+module with `orx skill <name>` (the bundled index is printed at the end of `orx
 skill` output).
 
 ## Cardinal rules — read before doing anything else
@@ -74,7 +74,8 @@ group below has a module (`orx skill <name>`) with the full flags and rules.
 ### Discover (project- and experiment-scoped)
 | Command | What it does |
 |---|---|
-| `orx projects [--json]` | List local `orx up` projects and, when logged in, organization ids used for OpenResearch compute. |
+| `orx projects [--json]` | List projects in the local `orx` store. |
+| `orx orgs [--json]` | List organization ids available for OpenResearch compute (login required). |
 | `orx project view <projectId>` | Show a local project's details and experiment tree. **Experiment ids come from here.** |
 | `orx runs <projectId> [--experiment <id>]` | List runs as a table, newest first. **Run ids come from here.** |
 
@@ -107,11 +108,11 @@ Use before any web search for academic/research queries (paper, author, blog, mo
 ### Meta
 | Command | What it does |
 |---|---|
-| `orx skill [name]` | Print this overview + the live module index (no args), or print one module / fetch a deeper reference doc by name. |
+| `orx skill [name]` | Print this overview + the bundled module index (no args), or print one bundled module by name. |
 
 ## Modules
 
-The detail lives in focused modules — load one with `orx skill <name>` (the live
+The detail lives in focused modules — load one with `orx skill <name>` (the bundled
 list, with one-line descriptions, is printed at the end of `orx skill` output):
 
 - **orx-experiment-tree** — the experiment-tree model, the auto-research loop, and `orx exp desc`.

@@ -100,11 +100,8 @@ fn opencode_config_json(model: Option<&str>, instructions: &str) -> String {
     serde_json::to_string_pretty(&cfg).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// The local-mode autoresearch playbook: project context + cardinal rules +
-/// the v1 local command surface. Ported from the cloud agent's
-/// `autoresearchMd()`/`projectContextMd()` prompts, adapted for `orx up`
-/// (external backends via `--backend`, analysis via `orx logs`, no
-/// artifacts/query/chart).
+/// The local research playbook: project context, cardinal rules, and the local
+/// command surface used by `orx up`.
 /// The playbook template — a literal, GitHub-readable markdown file. Rendered
 /// by [`playbook_md`]: the leading HTML comment is stripped and `{token}`
 /// placeholders are substituted (project facts, the compute default, and the

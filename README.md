@@ -84,7 +84,7 @@ Run `orx --help` (or `orx <command> --help`) for full usage. The highlights:
 | Area | Commands |
 |---|---|
 | Dashboard | `up` |
-| Auth | `login`, `logout` |
+| Auth & organizations | `login`, `logout`, `orgs` |
 | Projects | `projects`, `project` |
 | Experiments | `create-experiment`, `exp status/run/cancel/wait/wake` |
 | Runs & evidence | `runs`, `logs` |
@@ -131,11 +131,14 @@ Run the tests with `cargo test`.
 
 ## Configuration
 
-- **API URL** — defaults to production (`https://api.openresearch.sh`);
-  override with `--api-url` or `OPENRESEARCH_API_URL`.
+- **OpenResearch service URL** — used only for login, organizations, managed
+  compute, sandboxes, and SSH keys. It defaults to production
+  (`https://api.openresearch.sh`); override it with `--api-url` or
+  `OPENRESEARCH_API_URL`.
 - **Credentials** — `orx login` opens your browser, mints a personal access
   token, and stores it at `${XDG_CONFIG_HOME:-~/.config}/openresearch/credentials.json`
-  (mode `0600`). Sent as `Authorization: Bearer …` on every request.
+  (mode `0600`). Local projects, experiments, runs, logs, and files never use
+  these credentials or sync to the service.
 
 ## Usage analytics
 

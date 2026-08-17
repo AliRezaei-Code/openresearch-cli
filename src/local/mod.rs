@@ -4,10 +4,8 @@
 //! except `openresearch`, whose *compute* is a platform box by definition
 //! (the run rows still live only in the local store).
 //!
-//! Detection rule: an experiment/run is "local" iff its experiment id exists
-//! in `local_experiments`. CLI commands check the local store FIRST and only
-//! require credentials on the server path — dispatch on it via
-//! `resolve::{resolve_project, resolve_experiment, resolve_run}`, never by hand.
+//! Experiment and run identifiers resolve only when their records belong to a
+//! project registered in the local store.
 
 pub mod agent_skills;
 pub mod chat;
@@ -37,30 +35,15 @@ pub mod ssh;
 pub mod ssh_identity;
 pub mod user_skills;
 
-use crate::error::{anyhow, Error, Result};
+use crate::error::{anyhow, Result};
 use crate::store::{now_ms, Store, StoredRun};
-
-/// Graceful error for commands outside the local-mode v1 surface.
-pub fn unsupported(cmd: &str) -> Error {
-    let guidance = if cmd == "exp cmd" {
-        "\nSet the local project run command instead: `orx project edit <projectId> --run-command '<cmd>'`."
-    } else {
-        ""
-    };
-    anyhow!(
-        "`orx {cmd}` is not supported in local mode yet.\n\
-         Local mode supports: projects, project view/edit/brief, create-experiment, \
-         exp run/status/cancel/wait/wake/desc, runs, logs.{guidance}"
-    )
-}
 
 /// Terminal run states — the run is finished and won't change further.
 pub fn is_terminal(status: &str) -> bool {
     matches!(status, "done" | "failed" | "cancelled")
 }
 
-/// The stored run, but only when it belongs to a local experiment. Server-mode
-/// HF runs also live in the runs table, so membership there is not enough.
+/// The stored run, but only when it belongs to a registered local experiment.
 pub fn local_run(store: &Store, run_id: &str) -> Result<Option<StoredRun>> {
     match store.get_run(run_id)? {
         Some(run) => Ok(store.get_local_experiment(&run.experiment_id)?.map(|_| run)),
