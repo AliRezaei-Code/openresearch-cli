@@ -104,11 +104,7 @@ enum Command {
     /// Render a W&B metric across runs to a PNG.
     Chart(ChartArgs),
 
-    /// Create a project (from a GitHub repo, or a fresh blank repo).
-    #[command(name = "create-project")]
-    CreateProject(CreateProjectArgs),
-
-    /// Add an experiment node (child of a parent, or a baseline root).
+    /// Add an experiment node to a local `orx up` project.
     #[command(name = "create-experiment")]
     CreateExperiment(CreateExperimentArgs),
 
@@ -351,27 +347,8 @@ pub struct ChartArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct CreateProjectArgs {
-    /// Organization id (from `orx projects`).
-    pub org_id: String,
-    /// Project name (required).
-    #[arg(long)]
-    pub name: Option<String>,
-    /// GitHub repo `owner/repo` (or github.com URL) to bind the project to.
-    /// Omit to start the project on a fresh blank repo.
-    #[arg(long)]
-    pub repo: Option<String>,
-    /// Branch of the repo the project binds to (with `--repo`; defaults to the
-    /// repo's default branch). The baseline experiment branches off it.
-    #[arg(long)]
-    pub branch: Option<String>,
-    /// Project description.
-    #[arg(long)]
-    pub description: Option<String>,
-}
-
-#[derive(Args, Debug)]
 pub struct CreateExperimentArgs {
+    /// Local project id from `orx projects`.
     pub project_id: String,
     /// Experiment title (required).
     #[arg(long)]
@@ -380,16 +357,14 @@ pub struct CreateExperimentArgs {
     #[arg(long)]
     pub description: Option<String>,
     /// Parent experiment id -> create a child. Omit on an empty project to
-    /// create the baseline (root); once a root exists, local projects attach
-    /// under the oldest root (server projects create another baseline).
+    /// create the baseline (root); once a root exists, attach under it.
     #[arg(long)]
     pub parent: Option<String>,
     /// Create a new baseline (root) even when the project already has one.
     /// Conflicts with --parent. Projects may hold multiple baselines.
     #[arg(long, conflicts_with = "parent")]
     pub baseline: bool,
-    /// Run command for the node (local projects and server baselines). Omit to
-    /// inherit from the parent / project default.
+    /// Run command for the node. Omit to inherit from the parent/project default.
     #[arg(long = "run-command")]
     pub run_command: Option<String>,
 }
@@ -657,8 +632,7 @@ pub struct ExpRunArgs {
     /// Not supported with `--backend ray` (Ray Jobs have no time limit).
     #[arg(long)]
     pub timeout: Option<String>,
-    /// Launch even if the experiment's branch has no changes over its parent
-    /// (bypasses the "did you forget to push?" guard, for a deliberate re-run).
+    /// Launch even when another run is already in flight for this experiment.
     #[arg(long)]
     pub force: bool,
 }
@@ -965,7 +939,6 @@ fn command_name(command: &Command) -> &'static str {
         Command::Wandb(_) => "wandb",
         Command::Query(_) => "query",
         Command::Chart(_) => "chart",
-        Command::CreateProject(_) => "create-project",
         Command::CreateExperiment(_) => "create-experiment",
         Command::Compute(_) => "compute",
         Command::Instance(_) => "instance",
@@ -1014,7 +987,6 @@ async fn dispatch(command: Command) -> error::Result<()> {
         Command::Wandb(args) => commands::wandb::run(args).await,
         Command::Query(args) => commands::query::run(args).await,
         Command::Chart(args) => commands::chart::run(args).await,
-        Command::CreateProject(args) => commands::create_project::run(args).await,
         Command::CreateExperiment(args) => commands::create_experiment::run(args).await,
         Command::Compute(args) => commands::compute::run(args).await,
         Command::Instance(args) => commands::instance::run(args).await,
@@ -1077,6 +1049,13 @@ mod cli_tests {
                 "{flag}"
             );
         }
+    }
+
+    #[test]
+    fn retired_server_project_create_command_is_rejected() {
+        let error = Cli::try_parse_from(["orx", "create-project", "org-1", "--name", "project"])
+            .expect_err("retired server project creation should not parse");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 
     #[test]

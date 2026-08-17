@@ -1,18 +1,15 @@
 ---
 name: openresearch-cli
-description: Use the `orx` CLI to drive OpenResearch projects from a terminal — browse the experiment tree, runs, logs, artifacts, and the evidence DB; create experiments; launch, wait on, and cancel runs on GPU compute; and chart W&B metrics. Each experiment is a git branch in a local cache-dir clone — reading, diffing, and editing code all happen there with plain git. Read this before driving `orx` programmatically.
+description: Use the `orx` CLI to run local OpenResearch projects from a terminal — create experiment branches, launch and supervise compute, inspect logs and evidence, and read legacy API records. Experiment code and execution are owned by the local `orx up` project. Read this before driving `orx` programmatically.
 ---
 
 # OpenResearch CLI (`orx`)
 
-`orx` is a command-line client over the OpenResearch API. It authenticates with a
-personal access token and exposes both **read views** of a project (experiment
-tree, runs, logs, artifacts, evidence database) and **write actions**
-(create experiments, launch/cancel runs on GPU compute). Code is the one thing
-`orx` does not serve: every experiment is a git branch on the project's GitHub
-repo, and the **local clone in `~/.cache/openresearch/repos/<owner>/<repo>` is
-the standard way to read, diff, and edit it** (see the `orx-git` module). Use
-`orx` when you need to inspect or drive project state from a shell.
+`orx up` owns new projects, experiment branches, and execution in a local Git
+repository and local database. The CLI also reads retained project, experiment,
+run, and report records from the OpenResearch API. Those legacy API records do
+not support project creation, experiment creation, or hosted execution. Use the
+local session worktree to read, diff, and edit code (see `orx-git`).
 
 This overview is deliberately short: it carries the cardinal rules and a command
 quick-reference, then points at focused **modules** for everything else. Load a
@@ -36,8 +33,8 @@ expands on the why; these are the non-negotiables.
    alone. Do **not** give nodes different start commands, and do **not** vary
    behavior through environment variables or env-prefixed commands
    (`LR=3e-4 python …`). The *only* thing that may differ between nodes is the
-   **committed code/config** on the node's git branch. `orx exp cmd --set` is
-   legitimate exactly once: to set the baseline's command when it has none.
+   **committed code/config** on the node's git branch. Set the local project's
+   command once with `orx project edit <projectId> --run-command '<cmd>'`.
 3. **Vary code, not knobs-in-the-command.** Encode hyperparameters in the
    code/config files and branch a child per variant — never sweep them by editing
    the run command or passing env vars. Every node runs the *same* command over
@@ -60,7 +57,8 @@ orx logout         # remove the stored token
 
 - The API base URL resolves from `--api-url` → `OPENRESEARCH_API_URL` → a built-in
   default. Set `OPENRESEARCH_API_URL` for non-local use.
-- Every command except `login`, `lit`, and `paper` needs a token; if you see `Not logged in`, run `orx login`. (`lit` and `paper` hit public alphaXiv / OpenAlex / bioRxiv hosts and work without one.)
+- Local `orx up` project and run commands do not require a token. API-backed
+  reads, reports, instance provisioning, and account settings require `orx login`.
 
 ## Command quick-reference
 
@@ -78,12 +76,12 @@ group below has a module (`orx skill <name>`) with the full flags and rules.
 ### Discover (project- and experiment-scoped)
 | Command | What it does |
 |---|---|
-| `orx projects [--all] [--json]` | List your projects (id + name + GitHub `owner/repo`), grouped by org. `--all` includes archived; `--json` emits a flat array (incl. each project's `paperId`) for scripts. **Project ids, org ids, and the repo to clone come from here.** |
-| `orx explore [--json]` | List the **public** project directory (id + name + repo) — projects anyone can view. Drill in with `orx project view` / `orx experiments` / `orx runs`. |
+| `orx projects [--all] [--json]` | List local `orx up` projects plus retained API project records. Local rows include their working directory; API rows remain readable history. |
+| `orx explore [--json]` | List public API project records (id + name + repo). Drill in with `orx project view` / `orx experiments` / `orx runs`. |
 | `orx project view <projectId>` | Overview of one project: details, its experiment tree, and its reports. Works on any public project or any private one in your orgs. |
 | `orx experiments <projectId>` | Print the project's experiments as an indented tree. **Experiment ids come from here.** |
 | `orx runs <projectId> [--experiment <id>]` | List runs as a table, newest first. **Run ids come from here.** |
-| `orx env <projectId>` | List the **names** of the env vars a run will see (merged org + project + per-user), each tagged with its source. **Names only — values never returned.** |
+| `orx env <projectId>` | For an API project record, list environment-variable names and their source. Values are never returned. |
 
 ### Run evidence (run-scoped) — module `orx-evidence`
 | Command | What it does |
@@ -98,18 +96,17 @@ group below has a module (`orx skill <name>`) with the full flags and rules.
 ### Create and run experiments (write) — modules `orx-create`, `orx-compute`, `orx-git`
 | Command | What it does |
 |---|---|
-| `orx create-project <orgId> --name "<n>" [--repo <owner/repo>]` | Create a project bound to a GitHub repo (or a fresh blank repo). |
-| `orx project edit <projectId> [--name "<n>"] [--description "<text>" \| --description-stdin]` | Edit a project's name and/or description (pass at least one); `--description-stdin` overwrites the description from stdin (long markdown). |
-| `orx create-experiment <projectId> --title "<t>" [...]` | Add an experiment node; prints its git branch. |
-| `orx compute [--gpu <id>] [--count <n>] [--provider <name>] \| --cpu]` | List the GPU/CPU compute catalog. |
+| `orx up` | Open the local dashboard to import or create a local project. |
+| `orx project edit <localProjectId> [--name "<n>"] [--run-command "<cmd>"]` | Edit a local project's name or fixed run command. |
+| `orx create-experiment <localProjectId> --title "<t>" [...]` | Add a local experiment node; prints its Git branch. |
+| `orx compute [--gpu <id>] [--count <n>] [--provider <name>]` / `orx compute --cpu` | List the GPU/CPU compute catalog. |
 | `orx instance create <orgId> (--gpu <id> … \| --cpu <flavor> …)` | Spin up a standalone instance in an org. |
-| `orx exp status/cmd/run/cancel/wait <expId>` | Inspect, run, cancel, and wait on a single experiment node. |
+| `orx exp status/run/cancel/wait/wake <localExpId>` | Inspect, run, cancel, wait on, or register a wake-up for a local experiment node. |
 | `orx exp desc <expId> [--set "<text>" \| --stdin]` | Read or overwrite the experiment's description. |
 | `orx report upload/list/show/download <projectId> …` | Publish and read project reports (module `orx-reports`). |
 
-To **read or edit** a node's code — including diffing what a run changed — use
-plain git in the cache-dir clone; there is no `orx` code command. See the
-`orx-git` module.
+To **read or edit** a node's code—including diffing what a run changed—use plain
+Git in the local session worktree. See the `orx-git` module.
 
 ### Literature & papers — alphaXiv / OpenAlex / bioRxiv (no login required) — module `orx-lit`
 Use before any web search for academic/research queries (paper, author, blog, model release).
@@ -129,7 +126,7 @@ The detail lives in focused modules — load one with `orx skill <name>` (the li
 list, with one-line descriptions, is printed at the end of `orx skill` output):
 
 - **orx-experiment-tree** — the experiment-tree model, the auto-research loop, and `orx exp desc`.
-- **orx-create** — create a project, seed an empty baseline, add experiment nodes.
+- **orx-create** — initialize a local project and add local experiment nodes.
 - **orx-compute** / **orx-compute-k8s** — launch runs on compute; the k8s manifest contract.
 - **orx-git** — read, edit, and diff a node's code with plain git.
 - **orx-evidence** — logs, search-logs, artifacts, W&B charts, and the `orx query` evidence DB.

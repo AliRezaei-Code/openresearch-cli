@@ -494,8 +494,7 @@ mod tests {
         for c in [
             "orx exp run e-1 --backend hf",
             "orx instance create --gpu a100",
-            "orx create-project --repo x/y",
-            "orx create-experiment --parent e-1",
+            "orx create-experiment p-1 --title x --parent e-1",
             "orx login",
             "orx logout",
             "orx install-skills",
@@ -533,7 +532,9 @@ mod tests {
         // smuggle a second command through.
         assert!(!allowed("orx runs; orx exp run e-1")); // write segment
         assert!(!allowed("orx runs && rm -rf /")); // non-orx segment
-        assert!(!allowed("orx runs; echo hi; orx create-project --repo x/y")); // write in a batch
+        assert!(!allowed(
+            "orx runs; echo hi; orx create-experiment p-1 --title x"
+        )); // write in a batch
         assert!(!allowed("orx runs | tee /etc/passwd")); // pipe into a writer
         assert!(!allowed("orx logs r-1 > /tmp/x")); // redirection
         assert!(!allowed("orx query \"$(rm -rf /)\"")); // command substitution

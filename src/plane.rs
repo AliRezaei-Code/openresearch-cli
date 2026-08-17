@@ -1,7 +1,7 @@
 //! The control-plane abstraction — one `ControlPlane` trait with two
 //! implementors, `ServerPlane` (the cloud api, `client.rs`) and `LocalPlane`
-//! (the local store + `src/local`). The six dual-mode commands
-//! (`exp`/`runs`/`logs`/`project`/`report`/`create_experiment`) resolve an id to
+//! (the local store + `src/local`). The five dual-mode commands
+//! (`exp`/`runs`/`logs`/`project`/`report`) resolve an id to
 //! a `Box<dyn ControlPlane>` once and then call verbs, instead of each branching
 //! on `resolve_project`/`resolve_run` and inlining a local body and a server body.
 //!
@@ -221,9 +221,9 @@ impl DescInput {
 /// the two planes print differently (status lines, launch recaps, the logs
 /// footer): merging that printing would risk drift, so it stays in the impl and
 /// the command keeps only shared arg parsing / usage errors / shared table code.
-/// Verbs that are server-only today (`set_experiment_command`, all `report_*`,
-/// `create_child`) return the SAME `local::unsupported`/guidance error on
-/// `LocalPlane` that the command returns today — byte-identical.
+/// Server-only verbs (`set_experiment_command`, reports) return local guidance;
+/// hosted launch and experiment creation invert that pattern and return
+/// retirement guidance from the server placeholder.
 ///
 /// `?Send`: `LocalPlane` owns a `rusqlite`-backed `Store` (which is `!Sync`), so
 /// its verb futures can't be `Send`. That's fine — a plane is built and driven to
@@ -233,11 +233,6 @@ impl DescInput {
 /// nothing shares a `ControlPlane` between tasks.
 #[async_trait(?Send)]
 pub trait ControlPlane {
-    /// Whether this is the local store plane. Only for the create-experiment
-    /// telemetry flag (`capture_experiment_started(_, is_local, _)`), which the
-    /// command fires after the verb returns Ok.
-    fn is_local(&self) -> bool;
-
     // --- project ----------------------------------------------------------
 
     /// `orx project view <id>` — print the project overview.
@@ -287,10 +282,10 @@ pub trait ControlPlane {
     /// project ref.
     async fn wait_project(&self, interval: Duration, deadline: Instant) -> Result<()>;
 
-    // --- create-experiment ------------------------------------------------
+    // --- local experiment creation ---------------------------------------
 
-    /// `orx create-experiment <projectId> …` — create a child or baseline node.
-    /// The command owns the USAGE guard and fires telemetry after Ok.
+    /// `orx create-experiment <projectId> …` — create a local child or baseline.
+    /// Server implementations return retirement guidance without an API write.
     async fn create_experiment(&self, spec: CreateExperimentSpec) -> Result<()>;
 
     // --- reports (server only; local returns guidance) --------------------

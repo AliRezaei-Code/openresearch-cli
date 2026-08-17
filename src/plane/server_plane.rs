@@ -3,7 +3,7 @@
 //! Constructed only on the server arm of a resolved command, so it fetches
 //! credentials up front (`ServerPlane::connect` → `require_credentials`) exactly
 //! as the old server bodies did on entry. The verb bodies below are the former
-//! `commands::{runs,logs,project,exp,create_experiment,report}` server fns moved
+//! `commands::{runs,logs,project,exp,report}` server fns moved
 //! here almost verbatim; only signatures/`self` were adapted.
 
 use std::collections::HashMap;
@@ -17,10 +17,9 @@ use super::{
     ControlPlane, CreateExperimentSpec, DescInput, LogRequest, ProjectEdit, Run, RunListing, RunLog,
 };
 use crate::client::{
-    cancel_experiment_run, create_baseline_experiment, create_child_experiment, create_report,
-    download_report_file, find_project, get_experiment, get_project, get_report, list_experiments,
-    list_reports, list_runs, read_run_log, update_experiment, update_project, upload_to_presigned,
-    CreateBaselineExperimentBody, CreateChildBody, CreateReportBody, UpdateExperimentBody,
+    cancel_experiment_run, create_report, download_report_file, find_project, get_experiment,
+    get_project, get_report, list_experiments, list_reports, list_runs, read_run_log,
+    update_experiment, update_project, upload_to_presigned, CreateReportBody, UpdateExperimentBody,
     UpdateProjectBody,
 };
 use crate::commands::experiments::print_tree;
@@ -54,23 +53,23 @@ fn retired_launch_error() -> anyhow::Error {
     )
 }
 
+fn retired_create_experiment_error() -> anyhow::Error {
+    anyhow!(
+        "Server experiment creation has been retired. Open or import the repository in `orx up`, \
+         then run `orx create-experiment <localProjectId> --title '<title>'`."
+    )
+}
+
 /// A not-yet-connected server plane. The resolvers are sync (and must run their
-/// login-independent guards — e.g. the `--run-command`-on-server-child refusal —
-/// BEFORE any `require_credentials`, matching the old arm ordering), so they box
-/// this. The real `ServerPlane` is built by connecting (fetching credentials) on
-/// the verb call, which is exactly where the old server bodies called
-/// `require_credentials`. This keeps `require_credentials` off the local path and
-/// off command entry, and preserves the guard-before-login order.
+/// login-independent guards before any `require_credentials`), so they box this.
+/// The real `ServerPlane` is built by connecting on the verb call. This keeps
+/// `require_credentials` off the local path and off command entry.
 pub struct ServerPlaceholder {
     pub(super) id: String,
 }
 
 #[async_trait(?Send)]
 impl ControlPlane for ServerPlaceholder {
-    fn is_local(&self) -> bool {
-        false
-    }
-
     async fn view_project(&self) -> Result<()> {
         ServerPlane::connect(self.id.clone())
             .await
@@ -122,6 +121,7 @@ impl ControlPlane for ServerPlaceholder {
             .await
     }
     async fn launch(&self, _args: ExpRunArgs) -> Result<()> {
+        // Retired writes short-circuit before authentication or API access.
         Err(retired_launch_error())
     }
     async fn cancel(&self) -> Result<()> {
@@ -139,21 +139,9 @@ impl ControlPlane for ServerPlaceholder {
             .wait_project(interval, deadline)
             .await
     }
-    async fn create_experiment(&self, spec: CreateExperimentSpec) -> Result<()> {
-        // The server child-create API carries no run command field — refuse
-        // rather than silently drop it. (The baseline create does accept one.)
-        // Refuse before asking for credentials, matching the old server body.
-        if spec.run_command.is_some() && spec.parent.is_some() {
-            return Err(anyhow!(
-                "--run-command is supported for local projects and server baselines \
-                 only. For server child experiments, set it after creation with \
-                 `orx exp cmd <expId> --set '<cmd>'`."
-            ));
-        }
-        ServerPlane::connect(self.id.clone())
-            .await
-            .create_experiment(spec)
-            .await
+    async fn create_experiment(&self, _spec: CreateExperimentSpec) -> Result<()> {
+        // Retired writes short-circuit before authentication or API access.
+        Err(retired_create_experiment_error())
     }
     async fn report(&self, cmd: ReportCommand) -> Result<()> {
         ServerPlane::connect(self.id.clone())
@@ -165,10 +153,6 @@ impl ControlPlane for ServerPlaceholder {
 
 #[async_trait(?Send)]
 impl ControlPlane for ServerPlane {
-    fn is_local(&self) -> bool {
-        false
-    }
-
     // --- runs -------------------------------------------------------------
 
     async fn list_runs(&self) -> Result<RunListing> {
@@ -498,6 +482,7 @@ impl ControlPlane for ServerPlane {
     }
 
     async fn launch(&self, _args: ExpRunArgs) -> Result<()> {
+        // Defensive invariant if a future internal path bypasses the placeholder.
         Err(retired_launch_error())
     }
 
@@ -596,69 +581,9 @@ impl ControlPlane for ServerPlane {
         }
     }
 
-    // --- create-experiment ------------------------------------------------
-
-    async fn create_experiment(&self, spec: CreateExperimentSpec) -> Result<()> {
-        let creds = &self.creds;
-        let project_id = &self.id;
-        let CreateExperimentSpec {
-            title,
-            parent,
-            description,
-            run_command,
-            baseline: _,
-        } = spec;
-
-        let experiment: crate::client::Experiment;
-        let kind: String;
-        if let Some(parent) = parent {
-            let envelope = create_child_experiment(
-                creds,
-                project_id,
-                &CreateChildBody {
-                    title,
-                    description,
-                    parent_experiment_id: parent,
-                },
-            )
-            .await?;
-            experiment = envelope.experiment;
-            kind = "child".to_string();
-        } else {
-            // Baseline on the project's already-bound GitHub repo. The server
-            // branches `orx/<slug>` off the branch picked at project creation
-            // (the repo's default unless one was chosen).
-            let envelope = create_baseline_experiment(
-                creds,
-                project_id,
-                &CreateBaselineExperimentBody {
-                    title: Some(title),
-                    description,
-                    run_command,
-                },
-            )
-            .await?;
-            experiment = envelope.experiment;
-            kind = "baseline".to_string();
-        }
-
-        println!("\u{2713} Created {} experiment", kind);
-        println!("  id:     {}", experiment.id);
-        println!("  title:  {}", experiment.title);
-        println!("  slug:   {}", experiment.slug);
-        println!("  branch: {}", experiment.branch_name);
-        println!();
-        println!("To edit it, check out the branch in your local clone of the project's repo:");
-        println!(
-            "  git fetch origin && git checkout {}",
-            experiment.branch_name
-        );
-        println!("  # …edit, then…");
-        println!(
-            "  git commit -am \"<msg>\" && git push -u origin {}",
-            experiment.branch_name
-        );
-        Ok(())
+    async fn create_experiment(&self, _spec: CreateExperimentSpec) -> Result<()> {
+        // Defensive invariant if a future internal path bypasses the placeholder.
+        Err(retired_create_experiment_error())
     }
 
     // --- reports ----------------------------------------------------------
@@ -946,4 +871,49 @@ fn collect_files(base: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retired_server_writes_return_guidance_without_connecting() {
+        let plane = ServerPlaceholder {
+            id: "legacy-id".to_string(),
+        };
+        let create_error = plane
+            .create_experiment(CreateExperimentSpec {
+                title: "test".to_string(),
+                parent: None,
+                baseline: false,
+                description: None,
+                run_command: None,
+            })
+            .await
+            .expect_err("server experiment creation must be retired");
+        assert!(create_error
+            .to_string()
+            .contains("Server experiment creation has been retired"));
+
+        let launch_error = plane
+            .launch(ExpRunArgs {
+                exp_id: "legacy-id".to_string(),
+                disk: None,
+                provider: None,
+                backend: None,
+                flavor: None,
+                org: None,
+                host: None,
+                manifest: None,
+                image: None,
+                timeout: None,
+                force: false,
+            })
+            .await
+            .expect_err("server experiment launch must be retired");
+        assert!(launch_error
+            .to_string()
+            .contains("Hosted experiment execution has been retired"));
+    }
 }

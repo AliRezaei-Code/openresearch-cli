@@ -84,10 +84,11 @@ To drive a project toward a goal (e.g. "best convergence for d=8") with fixed
 GPU capacity, this is the intended flow — do **not** edit a frozen node or rewrite
 the run command:
 
-1. **Read the baseline's code.** Clone the project's repo into the cache dir and
-   read it with your normal tools (see the `orx-git` skill for the path).
-   See its run command with `orx exp cmd <baseId>` and find where the knobs live
-   (config files, hyperparameters, model defs).
+1. **Read the baseline's code.** For a legacy API record, clone its repository
+   normally and import it in `orx up`; otherwise open its local session worktree.
+   Read it with your normal tools (see `orx-git`). See the run command with
+   `orx exp status <baseId>` and find where the knobs live (config files,
+   hyperparameters, model definitions).
 2. **Form one round's worth of hypotheses** — the co-equal options of a *single*
    decision (which LR? which schedule? which init?), each a concrete change you can
    make and measure against the others in this round. Don't mix decisions from
@@ -134,7 +135,8 @@ the run command:
 5. **Fill the available GPU capacity** — launch ready children in parallel until
    the sum of GPUs requested by in-flight runs reaches the available capacity.
    Launching requires a local project initialized from the cloned repository
-   with `orx up`; hosted project records cannot launch runs. See `orx-compute`.
+   with `orx up`; legacy API project records cannot launch runs. See
+   `orx-compute`.
    Capacity is GPU-weighted, not a raw run-count limit: with 16 available GPUs,
    one-GPU experiments mean up to 16 concurrent runs, four-GPU experiments mean
    up to four, and an experiment that requires all 16 runs alone.

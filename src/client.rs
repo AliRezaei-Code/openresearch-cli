@@ -431,14 +431,6 @@ pub struct ExperimentEnvelope {
     pub experiment: Experiment,
 }
 
-/// Response of `POST /orgs/{orgId}/projects`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateProjectResult {
-    pub is_first_project: bool,
-    pub project: Project,
-}
-
 /// Response of `PATCH /projects/{id}`: the updated project row.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectEnvelope {
@@ -464,45 +456,6 @@ pub struct WandbChartBody {
     pub runs: Vec<WandbRunSpec>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub smoothing: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateChildBody {
-    pub title: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub parent_experiment_id: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateBaselineExperimentBody {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// Run command seeded onto the baseline so it's launchable immediately.
-    /// Omit to set it later (`orx exp cmd`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub run_command: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateProjectBody {
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// `owner/repo` (or github.com URL) to bind the project to — the user's own
-    /// repo, or a readable source it gets copied from. Omit to start the
-    /// project on a fresh blank repo (a stub root commit on `main`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub repo_full_name: Option<String>,
-    /// Branch of the repo the project binds to (only with `repo_full_name`) —
-    /// the baseline experiment branches off it. Omit for the repo's default.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -798,15 +751,6 @@ pub async fn find_project(creds: &Credentials, project_id: &str) -> Result<Optio
     Ok(None)
 }
 
-pub async fn create_project(
-    creds: &Credentials,
-    org_id: &str,
-    body: &CreateProjectBody,
-) -> Result<CreateProjectResult> {
-    let body = serde_json::to_value(body)?;
-    api_post(creds, &format!("/orgs/{}/projects", org_id), body).await
-}
-
 pub async fn update_project(
     creds: &Credentials,
     project_id: &str,
@@ -847,38 +791,6 @@ pub async fn render_wandb_chart(
         creds,
         &format!("/projects/{}/charts/wandb", project_id),
         body,
-    )
-    .await
-}
-
-pub async fn create_child_experiment(
-    creds: &Credentials,
-    project_id: &str,
-    body: &CreateChildBody,
-) -> Result<ExperimentEnvelope> {
-    let body = serde_json::to_value(body)?;
-    api_post(
-        creds,
-        &format!("/projects/{}/experiments", project_id),
-        body,
-    )
-    .await
-}
-
-pub async fn create_baseline_experiment(
-    creds: &Credentials,
-    project_id: &str,
-    body: &CreateBaselineExperimentBody,
-) -> Result<ExperimentEnvelope> {
-    // Repo is bound at project creation; this materializes a baseline (root
-    // node) on it. `None` fields are omitted so the server applies its
-    // defaults. Repeat calls create additional roots — projects may hold
-    // multiple baselines.
-    let json = serde_json::to_value(body)?;
-    api_post(
-        creds,
-        &format!("/projects/{}/baseline-experiment", project_id),
-        json,
     )
     .await
 }
@@ -1159,6 +1071,7 @@ pub struct PresignedUrl {
     pub url: String,
 }
 
+/// Intentionally retained without a current CLI caller for external-run API compatibility.
 pub async fn create_external_run(
     creds: &Credentials,
     exp_id: &str,

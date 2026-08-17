@@ -21,9 +21,9 @@
 //! The two sets share the same public skill *names* so docs and references stay
 //! stable; several modules swap their **body** between local-session and Full
 //! forms where the available evidence, reports, and Git workflows differ. The
-//! compute skill is shared because every run now launches from local `orx up`.
-//! The `orx-` prefix on every dir name makes them unmistakable in an agent's
-//! skill listing.
+//! compute and Git skills are shared because every run now launches from local
+//! `orx up`. The `orx-` prefix on every dir name makes them unmistakable in an
+//! agent's skill listing.
 
 use std::path::Path;
 
@@ -45,22 +45,21 @@ pub struct AgentSkill {
 pub enum SkillSet {
     /// `orx up` local mode: logs-only evidence, project artifacts, no `create`.
     Local,
-    /// Full/cloud surface: artifacts + query + chart evidence, `orx report`
-    /// upload, and the project/experiment creation module.
+    /// Full surface: artifacts + query + chart evidence, `orx report` upload,
+    /// and local project/experiment onboarding guidance.
     Full,
 }
 
 // --- Module files (embedded verbatim from the repo `agent-skills/` dir; the
-// `SKILL.local.md` siblings are the local-mode body variants under the same
-// public skill name) ----------------------------------------------------------
+// `SKILL.local.md` siblings, where present, are local-mode body variants under
+// the same public skill name) -------------------------------------------------
 
 const COMPUTE: &str = include_str!("../../agent-skills/orx-compute/SKILL.md");
 const COMPUTE_K8S: &str = include_str!("../../agent-skills/orx-compute-k8s/SKILL.md");
 const EXPERIMENT_TREE_LOCAL: &str =
     include_str!("../../agent-skills/orx-experiment-tree/SKILL.local.md");
 const EXPERIMENT_TREE_CLOUD: &str = include_str!("../../agent-skills/orx-experiment-tree/SKILL.md");
-const GIT_LOCAL: &str = include_str!("../../agent-skills/orx-git/SKILL.local.md");
-const GIT_CLOUD: &str = include_str!("../../agent-skills/orx-git/SKILL.md");
+const GIT: &str = include_str!("../../agent-skills/orx-git/SKILL.md");
 const LIT: &str = include_str!("../../agent-skills/orx-lit/SKILL.md");
 const CREATE: &str = include_str!("../../agent-skills/orx-create/SKILL.md");
 const REPORTS_LOCAL: &str = include_str!("../../agent-skills/orx-reports/SKILL.local.md");
@@ -97,15 +96,10 @@ const S_EXPERIMENT_TREE_CLOUD: AgentSkill = AgentSkill {
     description: D_EXPERIMENT_TREE,
     content: EXPERIMENT_TREE_CLOUD,
 };
-const S_GIT_LOCAL: AgentSkill = AgentSkill {
+const S_GIT: AgentSkill = AgentSkill {
     name: "orx-git",
     description: "Read, edit, commit, and diff experiment code with local Git. Use whenever you touch an experiment branch, compare nodes, prepare a run, or diagnose stale code.",
-    content: GIT_LOCAL,
-};
-const S_GIT_CLOUD: AgentSkill = AgentSkill {
-    name: "orx-git",
-    description: "Read, edit, commit, and diff experiment code with Git. Use whenever you touch a branch, compare nodes, prepare a run, diagnose stale code, or publish changes.",
-    content: GIT_CLOUD,
+    content: GIT,
 };
 const S_LIT: AgentSkill = AgentSkill {
     name: "orx-lit",
@@ -114,7 +108,7 @@ const S_LIT: AgentSkill = AgentSkill {
 };
 const S_CREATE: AgentSkill = AgentSkill {
     name: "orx-create",
-    description: "Create a project (`orx create-project`), seed an empty baseline from existing code, and add experiment nodes (`orx create-experiment`). Use when starting any new project or experiment, when the tree is empty, or when unsure how to bind a repo or set the run command.",
+    description: "Initialize a local project with `orx up` and add local experiment nodes with `orx create-experiment`. Use when starting a project or experiment, when the local tree is empty, or when choosing a baseline, parent, or run command.",
     content: CREATE,
 };
 const S_REPORTS_LOCAL: AgentSkill = AgentSkill {
@@ -139,13 +133,13 @@ const S_EVIDENCE_CLOUD: AgentSkill = AgentSkill {
 };
 
 /// The modules for a given set, in a stable order. Local and Full share names;
-/// `experiment-tree`/`git`/`reports`/`evidence` swap bodies, while `compute` is
-/// shared and `create` is Full-only.
+/// `experiment-tree`/`reports`/`evidence` swap bodies, `git` and `compute` are
+/// shared, and `create` is Full-only.
 pub fn skills(set: SkillSet) -> Vec<&'static AgentSkill> {
     match set {
         SkillSet::Local => vec![
             &S_EXPERIMENT_TREE_LOCAL,
-            &S_GIT_LOCAL,
+            &S_GIT,
             &S_COMPUTE,
             &S_COMPUTE_K8S,
             &S_EVIDENCE_LOCAL,
@@ -155,7 +149,7 @@ pub fn skills(set: SkillSet) -> Vec<&'static AgentSkill> {
         SkillSet::Full => vec![
             &S_CREATE,
             &S_EXPERIMENT_TREE_CLOUD,
-            &S_GIT_CLOUD,
+            &S_GIT,
             &S_COMPUTE,
             &S_COMPUTE_K8S,
             &S_EVIDENCE_CLOUD,
@@ -387,6 +381,14 @@ mod tests {
     }
 
     #[test]
+    fn git_skill_is_shared_by_both_sets() {
+        for set in [SkillSet::Local, SkillSet::Full] {
+            let git = find("git", set).expect("git skill");
+            assert_eq!(git.content, GIT);
+        }
+    }
+
+    #[test]
     fn local_reports_skill_links_written_artifacts() {
         assert!(REPORTS_LOCAL.contains("cite every relevant output as raw"));
         assert!(REPORTS_LOCAL.contains("<file path=\"artifacts/<relative-path>\" />"));
@@ -430,14 +432,10 @@ mod tests {
     }
 
     #[test]
-    fn github_disabled_sessions_keep_snapshot_compute_available() {
-        let tmp = std::env::temp_dir().join(format!(
-            "orx-local-only-skills-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+    fn unified_git_and_compute_skills_are_written_to_sessions() {
+        let tmp =
+            std::env::temp_dir().join(format!("orx-unified-skills-test-{}", uuid::Uuid::new_v4()));
         let rel = ".agents/skills";
-        ensure_session_skills(&tmp, rel, true).unwrap();
-        assert!(tmp.join(rel).join("orx-compute-k8s").exists());
         ensure_session_skills(&tmp, rel, false).unwrap();
         let git = std::fs::read_to_string(tmp.join(rel).join("orx-git/SKILL.md")).unwrap();
         assert!(git.contains("never part of compute transport"));

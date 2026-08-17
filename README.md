@@ -85,8 +85,8 @@ Run `orx --help` (or `orx <command> --help`) for full usage. The highlights:
 |---|---|
 | Dashboard | `up` |
 | Auth | `login`, `logout` |
-| Projects | `projects`, `explore`, `project`, `create-project`, `env` |
-| Experiments | `experiments`, `create-experiment`, `exp status/cmd/run/cancel` |
+| Projects | `projects`, `explore`, `project`, `env` |
+| Experiments | `experiments` (API records), `create-experiment`, `exp status/run/cancel/wait/wake` |
 | Runs & evidence | `runs`, `logs`, `search-logs`, `artifacts`, `artifact`, `wandb`, `query`, `chart`, `report` |
 | Compute | `compute`, `instance create` |
 | Literature | `lit`, `paper` (full-text search across alphaXiv, OpenAlex, bioRxiv — no login required) |
