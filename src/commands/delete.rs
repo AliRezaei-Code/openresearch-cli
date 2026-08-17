@@ -116,6 +116,24 @@ impl DeleteTargets {
             .then(std::env::current_exe)
             .transpose()?
             .map(|path| path.canonicalize().unwrap_or(path));
+        // Canonicalizing means `orx delete --cli` run through the app's PATH
+        // link (see `orx install-cli`) resolves to the bundle's executable —
+        // deleting it would gut the app the user is running, from a command
+        // they think removes a CLI.
+        if let Some(executable) = &executable {
+            if let Ok(crate::updates::InstallChannel::AppBundle(root)) =
+                crate::updates::detect_channel(executable)
+            {
+                return Err(anyhow!(
+                    "This `orx` is the OpenResearch app's binary ({}).\n\
+                     Deleting it would break the app, so `orx delete` won't.\n\
+                     To remove the app, drag {} to the Trash. `orx delete database` \
+                     still works.",
+                    executable.display(),
+                    root.display()
+                ));
+            }
+        }
         let receipt = match &executable {
             Some(executable) => match crate::updates::load_receipt() {
                 Ok(receipt) => receipt.and_then(|receipt| {

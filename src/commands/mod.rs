@@ -28,6 +28,7 @@ pub mod exp;
 pub mod experiments;
 pub mod explore;
 mod file_serve;
+pub mod install_cli;
 pub mod install_skills;
 pub mod instance;
 pub mod lit;

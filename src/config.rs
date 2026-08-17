@@ -178,6 +178,18 @@ pub fn set_github_for_new_projects(enabled: bool) -> Result<()> {
     Ok(())
 }
 
+/// Whether orx may install updates on its own (Settings → Updates). Lives in
+/// the telemetry-owned `settings.json` for the same single-writer reason as the
+/// data dir above. Read by `updates::auto_update_eligible`.
+pub fn auto_update_enabled() -> bool {
+    crate::telemetry::auto_update_enabled()
+}
+
+pub fn set_auto_update_enabled(enabled: bool) -> Result<()> {
+    crate::telemetry::set_auto_update_enabled(enabled)?;
+    Ok(())
+}
+
 pub fn github_default_prompt_seen() -> bool {
     crate::telemetry::github_default_prompt_seen()
 }

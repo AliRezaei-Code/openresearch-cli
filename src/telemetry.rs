@@ -159,6 +159,11 @@ pub(crate) struct Settings {
     /// source added later defaults to enabled. Enforced by `orx lit`/`orx paper`.
     #[serde(default)]
     pub disabled_lit_sources: Vec<String>,
+    /// Whether orx may install updates on its own (Settings → Updates). Absent =
+    /// enabled. Turning it off still leaves the outdated-version warning in
+    /// place; only the silent apply stops.
+    #[serde(default)]
+    pub auto_update: Option<bool>,
 }
 
 /// A paper the user linked to their researcher profile.
@@ -274,6 +279,18 @@ pub(crate) fn github_for_new_projects() -> bool {
 
 pub(crate) fn set_github_for_new_projects(enabled: bool) -> std::io::Result<()> {
     mutate_settings(|settings| settings.github_for_new_projects = Some(enabled))
+}
+
+/// Whether orx may apply updates on its own. Defaults to enabled — the whole
+/// point is that an install nobody tends stays current.
+pub(crate) fn auto_update_enabled() -> bool {
+    load_settings()
+        .and_then(|settings| settings.auto_update)
+        .unwrap_or(true)
+}
+
+pub(crate) fn set_auto_update_enabled(enabled: bool) -> std::io::Result<()> {
+    mutate_settings(|settings| settings.auto_update = Some(enabled))
 }
 
 pub(crate) fn github_default_prompt_seen() -> bool {

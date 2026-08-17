@@ -106,9 +106,31 @@ x86_64 and arm64) and is the same as:
 curl -LsSf https://github.com/alphaXiv/openresearch-cli/releases/latest/download/openresearch-cli-installer.sh | sh
 ```
 
-`orx update` keeps script-installed binaries current; interactive terminals
-also get a once-a-day background check with a one-line stderr notice (silence
-it with `ORX_NO_UPDATE_CHECK=1`).
+### Staying up to date
+
+Script-installed CLIs and the macOS app both update themselves. When a check
+finds a newer release, a detached updater installs it in the background: the
+CLI's *next* invocation is on the new version, and the app picks it up on its
+next launch (the dashboard shows a "restart to finish updating" notice in the
+meantime). Nothing blocks the command you actually ran, and a failing update
+backs off rather than retrying on every invocation.
+
+The macOS app verifies each download's checksum *and* requires a notarized
+Developer ID signature from alphaXiv before replacing itself, so an unattended
+swap can't install anything we didn't publish.
+
+- `orx version --json` reports `channel` and whether `autoUpdate` is in effect.
+- `orx update` updates now; `--dry-run` only reports.
+- Settings → Updates shows the same state, with a toggle for automatic installs
+  and, in the macOS app, **Install the `orx` command** — it links the app's
+  binary onto your PATH so the CLI and the app are always the same build (also
+  `orx install-cli`).
+- Turn automatic installs off in Settings → Updates, or silence updates
+  entirely with `ORX_NO_UPDATE_CHECK=1`.
+
+Installs orx doesn't own — `cargo install`, Homebrew, Nix — are never modified.
+They still get the outdated notice, and `orx update` then names the command to
+run for that package manager.
 
 ### From source
 

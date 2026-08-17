@@ -409,6 +409,48 @@ export const getHfSettings = () => get<HfSettings>("/api/settings/hf");
 
 export const saveHfToken = (token: string) => post<HfSettings>("/api/settings/hf", { token });
 
+// --- updates ------------------------------------------------------------------
+
+/** How orx was installed. Only `installer` and `app-bundle` update themselves. */
+export type InstallChannel = "installer" | "app-bundle" | "cargo" | "homebrew" | "nix" | "unknown";
+
+export interface UpdateStatus {
+  current: string;
+  /** Latest release this install can actually move to — the macOS app and the
+   *  CLI read different manifests, and the app's can lag. */
+  latest: string | null;
+  channel: InstallChannel;
+  /** Whether this install is one orx can replace at all. */
+  selfUpdates: boolean;
+  autoUpdate: boolean;
+  /** `autoUpdate` is off because of the environment, not the user's setting. */
+  envDisabled: boolean;
+  updateAvailable: boolean;
+  /** The newer version already on disk. Distinct from `latest`: a release can
+   *  land between the install and the restart. */
+  installedVersion: string | null;
+  restartRequired: boolean;
+}
+
+export interface InstalledCli {
+  link: string;
+  /** The link's directory — what to add to PATH when `onPath` is false. */
+  dir: string;
+  target: string;
+  onPath: boolean;
+  alreadyCurrent: boolean;
+}
+
+export const getUpdateStatus = () => get<UpdateStatus>("/api/update");
+
+export const applyUpdate = () => post<UpdateStatus>("/api/update/apply");
+
+export const setAutoUpdate = (enabled: boolean) =>
+  post<UpdateStatus>("/api/update/auto", { enabled });
+
+export const installCli = (force = false) =>
+  post<InstalledCli>("/api/update/install-cli", { force });
+
 // --- settings: kubernetes -----------------------------------------------------
 
 export interface K8sPreflight {
