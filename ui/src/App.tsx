@@ -19,12 +19,15 @@ import {
   cancelRun,
   DEMO_FIGURE_SESSION_ID,
   DEMO_LITERATURE_SESSION_ID,
+  DEMO_MAIN_SESSION_ID,
   getArtifacts,
   getUiState,
+  isDemoProjectId,
   listExperiments,
   listProjects,
   listRuns,
   openProject,
+  PROJECT_BRIEF_NAME,
   updateUiState,
   type AgentSelection,
   type Experiment,
@@ -49,7 +52,7 @@ import { ExperimentsTable } from "./components/ExperimentsTable";
 import { Md } from "./components/Md";
 import { usePopover } from "./components/ModelPicker";
 import { SettingsView, type SettingsTab } from "./components/SettingsPage";
-import { Tour } from "./components/Tour";
+import { DemoWelcomeModal } from "./components/Tour";
 import { clearReadDemoSessions } from "./demoSessionState";
 import { TreeView } from "./components/TreeView";
 import { useOrxEvents } from "./events";
@@ -195,7 +198,10 @@ interface RightPaneSessionState {
   panelMax: boolean;
 }
 
-function initialRightPaneSessionState(sessionId?: string): RightPaneSessionState {
+function initialRightPaneSessionState(
+  sessionId?: string,
+  openDemoBrief = false,
+): RightPaneSessionState {
   const initial: RightPaneSessionState = {
     rightTab: "experiments",
     tabHistory: ["experiments"],
@@ -214,6 +220,18 @@ function initialRightPaneSessionState(sessionId?: string): RightPaneSessionState
     panelOpen: true,
     panelMax: false,
   };
+  if (sessionId === DEMO_MAIN_SESSION_ID && openDemoBrief) {
+    const projectBriefTab: FileViewDef = {
+      path: PROJECT_BRIEF_NAME,
+      source: "artifacts",
+    };
+    return {
+      ...initial,
+      rightTab: projectBriefTab,
+      tabHistory: ["experiments", projectBriefTab],
+      fileTabs: [projectBriefTab],
+    };
+  }
   if (sessionId === DEMO_FIGURE_SESSION_ID) {
     const fileTabs: FileViewDef[] = [
       { path: "nanochat-base-training-curves.svg", source: "artifacts" },
@@ -336,6 +354,8 @@ const LAYOUT_CHROME = RAIL_WIDTH + 14 * 4;
 // Once a drag pushes the panel past its usable max by this much, it snaps to
 // fullscreen — a bit of resistance you have to overcome deliberately.
 const FULLSCREEN_SNAP_SLOP = 80;
+// Inward drag needed before snapping back to the last non-fullscreen width.
+const FULLSCREEN_RESTORE_DRAG = 48;
 
 /** The widest the floating panel can be while leaving the rail + chat usable. */
 function panelMaxWidth(): number {
@@ -372,6 +392,9 @@ function useStableStringMap(next: Map<string, string>): Map<string, string> {
 export default function App() {
   const [projects, setProjects] = useState<Project[] | null>(null);
   const [uiState, setUiState] = useState<UiState | null>(null);
+  const tourCompletedRef = useRef<boolean | undefined>(undefined);
+  tourCompletedRef.current = uiState?.tourCompleted;
+  const demoBriefSeededRef = useRef(false);
   const [startupError, setStartupError] = useState<string | null>(null);
   const persistedPreferredAgent = useRef<AgentSelection | null>(null);
   const [projectId, setProjectId] = useState<string | null>(null);
@@ -393,6 +416,7 @@ export default function App() {
   const { open: scopeMenuOpen, setOpen: setScopeMenuOpen, ref: scopeMenuRef } =
     usePopover(scopeTriggerRef);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [demoBriefLeading, setDemoBriefLeading] = useState(false);
   const allExperimentsAttributed = experiments.every((experiment) => experiment.chatSessionId);
   const effectiveScope = activeSessionId && allExperimentsAttributed ? scope : "project";
   const scopedExperiments = useMemo(() => {
@@ -498,10 +522,18 @@ export default function App() {
     if (previousSessionId) {
       rightPaneStatesRef.current.set(previousSessionId, currentRightPaneStateRef.current);
     }
-    const nextState = nextSessionId
-      ? (rightPaneStatesRef.current.get(nextSessionId) ??
-        initialRightPaneSessionState(nextSessionId))
-      : initialRightPaneSessionState();
+    let nextState = nextSessionId ? rightPaneStatesRef.current.get(nextSessionId) : undefined;
+    if (!nextState) {
+      const openDemoBrief =
+        nextSessionId === DEMO_MAIN_SESSION_ID &&
+        tourCompletedRef.current === false &&
+        !demoBriefSeededRef.current;
+      if (openDemoBrief) {
+        demoBriefSeededRef.current = true;
+        setDemoBriefLeading(true);
+      }
+      nextState = initialRightPaneSessionState(nextSessionId ?? undefined, openDemoBrief);
+    }
     setRightTab(nextState.rightTab);
     tabHistoryRef.current = nextState.tabHistory;
     setTabHistory(nextState.tabHistory);
@@ -523,33 +555,25 @@ export default function App() {
     setActiveSessionId(nextSessionId);
   }, []);
   const onboarded = uiState?.onboardingCompleted ?? false;
-  // The spotlight tour of the workspace (Tour.tsx). Starting it normalizes
-  // the layout so every tour target exists; those are the defaults, so
-  // nothing needs restoring on finish/skip.
-  const [tourOpen, setTourOpen] = useState(false);
-  const startTour = useCallback(() => {
-    setMainView("chat");
-    setRailOpen(true);
-    setExperimentsTabOpen(true);
-    selectRightTab("experiments");
-    setPanelOpen(true);
-    setPanelMax(false);
-    setTourOpen(true);
-  }, [selectRightTab]);
-  const closeTour = useCallback(async () => {
+  const [demoWelcomeOpen, setDemoWelcomeOpen] = useState(false);
+  const openDemoWelcome = useCallback(() => setDemoWelcomeOpen(true), []);
+  const closeDemoWelcome = useCallback(async () => {
     const saved = await updateUiState({ tourCompleted: true });
     setUiState((current) => current && { ...current, tourCompleted: saved.tourCompleted });
-    setTourOpen(false);
+    setDemoWelcomeOpen(false);
   }, []);
+  const createProjectFromDemoWelcome = useCallback(async () => {
+    await closeDemoWelcome();
+    setNewProjectOpen(true);
+  }, [closeDemoWelcome]);
 
-  // Auto-start the tour the first time the workspace is actually on screen:
-  // first-run walkthrough done, a project open, projects home closed. With
-  // zero projects this waits until the first one is created and opened.
+  // Show the welcome once the bundled demo is first visible. User projects
+  // never open it automatically.
   useEffect(() => {
-    if (!projectId || homeOpen || !onboarded) return;
+    if (!projectId || !isDemoProjectId(projectId) || homeOpen || !onboarded) return;
     if (uiState?.tourCompleted) return;
-    startTour();
-  }, [projectId, homeOpen, onboarded, startTour, uiState?.tourCompleted]);
+    openDemoWelcome();
+  }, [projectId, homeOpen, onboarded, openDemoWelcome, uiState?.tourCompleted]);
 
   const projectIdRef = useRef(projectId);
   projectIdRef.current = projectId;
@@ -636,6 +660,7 @@ export default function App() {
     setSelectedRunId(null);
     setExpTabs([]);
     setFileTabs([]);
+    setDemoBriefLeading(false);
     setPlanTabs([]);
     setSubagentTabs([]);
     setCodeTabs([]);
@@ -765,6 +790,22 @@ export default function App() {
     [expTabs, forgetRightTab, rightTab],
   );
 
+  const openResolvedFileTab = useCallback(
+    (tab: FileViewDef) => {
+      const persistentTab = persistentFileTab(tab);
+      setFileTabs((prev) => {
+        const idx = prev.findIndex((item) => sameFileTab(item, tab));
+        if (idx === -1) return [...prev, persistentTab];
+        const next = prev.slice();
+        next[idx] = persistentTab;
+        return next;
+      });
+      selectRightTab(tab);
+      setPanelOpen(true);
+    },
+    [selectRightTab],
+  );
+
   // Open a project file as a right-panel tab. `contextSessionId` is the chat
   // session (or viewed file's session) the click came from — see
   // parseFilePath for how it resolves against the reported path.
@@ -807,18 +848,14 @@ export default function App() {
       // Line is not part of tab identity: reopening a file at a new line reuses
       // the tab but makes the new (line-carrying) def the active one so the
       // viewer re-scrolls.
-      const persistentTab = persistentFileTab(tab);
-      setFileTabs((prev) => {
-        const idx = prev.findIndex((item) => sameFileTab(item, tab));
-        if (idx === -1) return [...prev, persistentTab];
-        const next = prev.slice();
-        next[idx] = persistentTab;
-        return next;
-      });
-      selectRightTab(tab);
-      setPanelOpen(true);
+      openResolvedFileTab(tab);
     },
-    [projects, projectId, selectRightTab],
+    [projects, projectId, openResolvedFileTab],
+  );
+
+  const openArtifactFileTab = useCallback(
+    (path: string) => openResolvedFileTab({ path, source: "artifacts" }),
+    [openResolvedFileTab],
   );
 
   // Chat file chips may carry a target line, cited experiment, or an exact Git
@@ -836,6 +873,12 @@ export default function App() {
       setFileTabs((prev) => prev.filter((_, i) => i !== idx));
       if (projectId) {
         fileScrollPositionsRef.current.delete(fileScrollKey(projectId, activeSessionId, tab));
+      }
+      if (
+        activeSessionId === DEMO_MAIN_SESSION_ID &&
+        sameFileTab(tab, { path: PROJECT_BRIEF_NAME, source: "artifacts" })
+      ) {
+        setDemoBriefLeading(false);
       }
       forgetRightTab(tab, rightTabKey(rightTab) === rightTabKey(tab));
     },
@@ -968,10 +1011,39 @@ export default function App() {
     e.preventDefault();
     // Capture the pointer so the terminal/diff views under the cursor don't
     // steal the drag, and suppress text selection for its duration.
-    e.currentTarget.setPointerCapture(e.pointerId);
+    const handle = e.currentTarget;
+    handle.setPointerCapture(e.pointerId);
     const prevUserSelect = document.body.style.userSelect;
     document.body.style.userSelect = "none";
-    const onMove = (ev: PointerEvent) => {
+    const startedMaximized = panelMax;
+    const startX = e.clientX;
+    const startWidth = panelWidth;
+    let restoredFromMax = false;
+    function stop() {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
+      document.body.style.userSelect = prevUserSelect;
+    }
+    function onMove(ev: PointerEvent) {
+      if (startedMaximized) {
+        const distance = ev.clientX - startX;
+        if (restoredFromMax || distance < FULLSCREEN_RESTORE_DRAG) return;
+        restoredFromMax = true;
+        setPanelMax(false);
+        const width = Math.min(
+          Math.max(startWidth, PANEL_MIN_WIDTH),
+          panelMaxWidth(),
+        );
+        setPanelWidth(width);
+        try {
+          localStorage.setItem(PANEL_WIDTH_KEY, String(width));
+        } catch {
+          // best-effort persistence
+        }
+        window.removeEventListener("pointermove", onMove);
+        return;
+      }
       const w = Math.round(window.innerWidth - ev.clientX - PANEL_MARGIN);
       const max = panelMaxWidth();
       // Drag past the usable max by the slop threshold → snap to fullscreen.
@@ -988,13 +1060,7 @@ export default function App() {
       } catch {
         // best-effort persistence
       }
-    };
-    const stop = () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", stop);
-      window.removeEventListener("pointercancel", stop);
-      document.body.style.userSelect = prevUserSelect;
-    };
+    }
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", stop);
     window.addEventListener("pointercancel", stop);
@@ -1018,6 +1084,21 @@ export default function App() {
   const expTab =
     typeof rightTab === "object" && "id" in rightTab ? rightTab : null;
   const fileTab = typeof rightTab === "object" && "path" in rightTab ? rightTab : null;
+  const onboardingProjectBriefTab =
+    activeSessionId === DEMO_MAIN_SESSION_ID && demoBriefLeading
+      ? fileTabs.find(
+          (tab) =>
+            sameFileTab(tab, {
+              path: PROJECT_BRIEF_NAME,
+              source: "artifacts",
+            }),
+        )
+      : undefined;
+  // The demo brief leads the home tabs; every other file keeps the normal slot.
+  const leadingFileTabs = onboardingProjectBriefTab ? [onboardingProjectBriefTab] : [];
+  const trailingFileTabs = onboardingProjectBriefTab
+    ? fileTabs.filter((tab) => !sameFileTab(tab, onboardingProjectBriefTab))
+    : fileTabs;
   // PlanViewDef and SubagentViewDef both carry `kind`; discriminate on its value.
   const planTab =
     typeof rightTab === "object" && "kind" in rightTab && rightTab.kind === "plan"
@@ -1032,6 +1113,16 @@ export default function App() {
   const codeTab = requestedCodeTab
     ? (codeTabs.find((tab) => sameCodeTab(tab, requestedCodeTab)) ?? null)
     : null;
+  const renderFileTab = (tab: FileViewDef) => (
+    <ClosableTab
+      key={`file:${fileTabKey(tab)}`}
+      active={fileTab !== null && sameFileTab(fileTab, tab)}
+      label={tab.path.split("/").pop() || tab.path}
+      icon={<FileCode size={12} style={{ flexShrink: 0 }} />}
+      onSelect={() => selectRightTab(tab)}
+      onClose={() => closeFileTab(tab)}
+    />
+  );
   const activeProject = projects?.find((p) => p.id === projectId) ?? null;
   const tabExperiment = expTab ? (experiments.find((e) => e.id === expTab.id) ?? null) : null;
   const codeExperiment = codeTab
@@ -1139,7 +1230,9 @@ export default function App() {
             onOpenPlan={openPlanTab}
             onOpenSubagent={openSubagentTab}
             onOpenWorktree={openWorktreeTab}
-            onStartTour={startTour}
+            onOpenDemoWelcome={
+              activeProject && isDemoProjectId(activeProject.id) ? openDemoWelcome : undefined
+            }
             onActiveSessionChange={onActiveSessionChange}
             preferredAgent={uiState.preferredAgent}
             onPreferredAgentChange={persistPreferredAgent}
@@ -1170,9 +1263,14 @@ export default function App() {
           style={panelMax ? undefined : { width: panelWidth }}
           data-onboarding="experiments"
         >
-          {!panelMax && <div className="panel-resizer absolute left-0 top-0 bottom-0 w-1.5 cursor-col-resize z-30 [&:hover]:bg-[color-mix(in_oklab,_var(--text)_12%,_transparent)] [&:active]:bg-[color-mix(in_oklab,_var(--text)_12%,_transparent)]" onPointerDown={resizePanel} />}
+          <div
+            className={`panel-resizer absolute left-0 top-0 bottom-0 w-1.5 z-30 [&:hover]:bg-[color-mix(in_oklab,_var(--text)_12%,_transparent)] [&:active]:bg-[color-mix(in_oklab,_var(--text)_12%,_transparent)] ${panelMax ? "cursor-e-resize" : "cursor-col-resize"}`}
+            title={panelMax ? "Drag right to restore panel" : "Drag to resize panel"}
+            onPointerDown={resizePanel}
+          />
           <div className="tabs flex items-end gap-0 pt-1 pr-1.5 pb-0 pl-2 h-10 border-b border-b-border bg-background shrink-0">
             <div className="tab-strip flex items-end gap-0.5 flex-1 min-w-0 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+              {leadingFileTabs.map(renderFileTab)}
               {artifactsTabOpen && (
                 <ClosableTab
                   active={rightTab === "artifacts"}
@@ -1219,16 +1317,7 @@ export default function App() {
                   />
                 );
               })}
-              {fileTabs.map((t) => (
-                <ClosableTab
-                  key={`file:${fileTabKey(t)}`}
-                  active={fileTab !== null && sameFileTab(fileTab, t)}
-                  label={t.path.split("/").pop() || t.path}
-                  icon={<FileCode size={12} style={{ flexShrink: 0 }} />}
-                  onSelect={() => selectRightTab(t)}
-                  onClose={() => closeFileTab(t)}
-                />
-              ))}
+              {trailingFileTabs.map(renderFileTab)}
               {planTabs.map((t) => (
                 <ClosableTab
                   key={`plan:${t.promptId}`}
@@ -1293,6 +1382,7 @@ export default function App() {
                   project={activeProject}
                   artifacts={artifacts}
                   onChanged={refreshArtifacts}
+                  onOpenFile={openArtifactFileTab}
                   onOpenStorage={() => setMainView("storage")}
                 />
               )}
@@ -1546,7 +1636,12 @@ export default function App() {
           }}
         />
       )}
-      {tourOpen && !homeOpen && projectId && <Tour onClose={closeTour} />}
+      {demoWelcomeOpen && !homeOpen && activeProject && isDemoProjectId(activeProject.id) && (
+        <DemoWelcomeModal
+          onClose={closeDemoWelcome}
+          onCreateProject={createProjectFromDemoWelcome}
+        />
+      )}
     </div>
   );
 }

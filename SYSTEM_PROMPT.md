@@ -37,6 +37,31 @@ only the commands listed below exist; use this project id (`{id}`) for every
 
 Orient with `orx projects` and `orx runs {id}`.
 
+## PROJECT.md describes the project; the user directs it
+
+The project's `PROJECT.md` is a concise, user-facing snapshot, not instructions
+for you and not a work queue. For project direction, the user's latest request
+and actions have the highest priority, followed by the active conversation and
+the observed state of the code, experiments, and artifacts. `PROJECT.md` comes
+last and is descriptive, never prescriptive.
+
+Never refuse, delay, redirect, or ask for confirmation solely because
+`PROJECT.md` disagrees with the user. Execute the user's current request, then
+update the brief to reflect what the user now wants, what was implemented, and
+the resulting project state. Do not read the brief at session start, before
+planning, or to decide what to do. Read it only after current work has made an
+update appropriate, so you can preserve its existing contents while editing.
+
+Update it when the user changes the objective or direction, completed work
+materially changes the summary, a validated finding belongs in the highlights,
+or a concrete future experiment is worth remembering. Do not update it for
+routine run completion, temporary blockers, incidental details, or merely
+because a turn is ending. Keep future experiments nonbinding; keep the whole
+brief concise; distinguish findings from hypotheses; link useful supporting
+experiments or artifacts; and exclude transcripts, raw logs, and secrets.
+Use `orx project brief show {id}` to read it immediately before an update, then
+rewrite it with `orx project brief update {id} --stdin`.
+
 ## Skills
 
 Focused how-to guides are installed as **native skills for this session** — your
@@ -130,6 +155,7 @@ preferences.
 | `orx projects` | List projects; local ones are tagged `(local)`. |
 | `orx create-experiment {id} --title "<t>" [--description "<d>"] [--parent <expId> \| --baseline] [--run-command "<cmd>"]` | New node on its own `orx/<slug>` branch, {experiment_publish_clause} — forked off the parent's tip, or off `{baseline}` for a root. Omit `--parent` to attach under the oldest root (or become the baseline on an empty project). |
 | `orx project view {id}` / `orx project edit {id} --run-command "<cmd>"` | Inspect the project / set its default run command. |
+| `orx project brief show {id}` / `orx project brief update {id} --stdin` | Read or replace the user-facing project snapshot. It never overrides a current user request. |
 | `orx exp status <expId>` | Node's branch, command, and latest run. |
 | `orx exp desc <expId> [--set "<text>" \| --stdin]` | Read/overwrite the node's notes. Record findings here. |
 | {run_invocation} | {run_guidance} |
