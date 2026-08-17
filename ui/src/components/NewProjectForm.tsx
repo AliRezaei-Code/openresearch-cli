@@ -66,6 +66,7 @@ export function NewProjectForm({
   const [mode, setMode] = useState<Mode>("folder");
   const [name, setName] = useState("");
   const [nameTouched, setNameTouched] = useState(false);
+  const [objective, setObjective] = useState("");
   const [path, setPath] = useState("");
   const [pathTouched, setPathTouched] = useState(false);
   const [pathStatus, setPathStatus] = useState<ProjectPathStatus | null>(null);
@@ -288,6 +289,7 @@ export function NewProjectForm({
       const result = await createProject({
         name: name.trim(),
         path: path.trim(),
+        ...(objective.trim() ? { objective: objective.trim() } : {}),
         createFolder: mode === "paper",
         initializeGit: true,
         githubSyncEnabled,
@@ -470,6 +472,16 @@ export function NewProjectForm({
               />
             </label>
           )}
+          <label>
+            <span className="project-field-label">Project objective <span className="font-normal text-muted">(optional)</span></span>
+            <textarea
+              className="min-h-22 resize-y leading-normal"
+              value={objective}
+              onChange={(event) => setObjective(event.target.value)}
+              maxLength={4000}
+              placeholder="What are you trying to accomplish?"
+            />
+          </label>
           {gitMissing && (
             <div className="project-path-notice error">
               Git is required for experiments but is not installed. Install Git, then restart OpenResearch.

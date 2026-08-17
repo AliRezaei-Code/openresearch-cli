@@ -7,8 +7,10 @@ import {
   FileText,
   MousePointerClick,
   Package,
+  Pencil,
   Settings2,
   Trash2,
+  X,
 } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
@@ -21,6 +23,8 @@ import {
   FILE_PREVIEW_BYTES,
   fmtBytes,
   getArtifactFileText,
+  PROJECT_BRIEF_NAME,
+  saveProjectBrief,
   type ArtifactEntry,
   type Project,
   type ProjectArtifacts,
@@ -30,7 +34,7 @@ import { FileTypeIcon, isMarkdownFile } from "./FileTypeIcon";
 import { MediaPreview, mediaPreviewKind, type MediaPreviewKind } from "./MediaPreview";
 import { normalizeMarkdownForRendering } from "../markdownNormalization";
 import { mdCodeComponents, remarkMathOptions } from "./Md";
-import { ICON_BUTTON_BASE_CLASS_NAME, ICON_BUTTON_CLASS_NAME, SETTINGS_LOADING_CLASS_NAME, SPINNER_CLASS_NAME } from "../styleClasses";
+import { ICON_BUTTON_BASE_CLASS_NAME, ICON_BUTTON_CLASS_NAME, SETTINGS_LOADING_CLASS_NAME, SMALL_BUTTON_CLASS_NAME, SMALL_PRIMARY_BUTTON_CLASS_NAME, SPINNER_CLASS_NAME } from "../styleClasses";
 
 const TOOLTIP_ICON_BUTTON_CLASS_NAME = `${ICON_BUTTON_CLASS_NAME} tip-up [&[data-tip]::after]:top-auto [&[data-tip]::after]:bottom-[calc(100%_+_6px)]`;
 
@@ -184,45 +188,56 @@ function previewKind(entry: ArtifactEntry): PreviewKind {
     (entry.presentation === "text" || entry.presentation === "unknown" ? "text" : "download");
 }
 
+function isProjectBriefPath(path: string): boolean {
+  return path.toLowerCase() === PROJECT_BRIEF_NAME.toLowerCase();
+}
+
 /** Fetched body for kinds that need text: markdown or raw text. */
 function useTextBody(projectId: string, entry: ArtifactEntry, kind: PreviewKind) {
   const [text, setText] = useState<string | null>(null);
   const [binary, setBinary] = useState(false);
   const [truncated, setTruncated] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const requestSequence = useRef(0);
 
   const wantsText = kind === "markdown" || (kind === "text" && entry.size <= FILE_PREVIEW_BYTES);
 
   useEffect(() => {
-    // Reset before the wantsText guard: a refire on the same mounted entry
-    // (modifiedAt changed — file rewritten on disk) must not leave the
-    // previous body or binary/error flags behind.
-    setText(null);
+    // Keep the previous body visible while a same-path rewrite is refetched.
+    // The preview component remounts when the selected path changes.
     setBinary(false);
     setTruncated(false);
     setError(null);
     if (!wantsText) return;
     let cancelled = false;
+    const request = ++requestSequence.current;
     const load = getArtifactFileText(projectId, entry.path).then((body) => {
       if (!body) throw new Error("Artifact not found");
       return body;
     });
     load
       .then((body) => {
-        if (cancelled) return;
+        if (cancelled || request !== requestSequence.current) return;
         if (body.binary) setBinary(true);
         else setText(body.content);
         setTruncated(body.truncated);
       })
       .catch((e) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+        if (!cancelled && request === requestSequence.current) {
+          setError(e instanceof Error ? e.message : String(e));
+        }
       });
     return () => {
       cancelled = true;
     };
   }, [projectId, entry.path, entry.modifiedAt, kind, wantsText]);
 
-  return { text, binary, truncated, error, wantsText };
+  const replaceText = (value: string) => {
+    requestSequence.current += 1;
+    setText(value);
+  };
+
+  return { text, replaceText, binary, truncated, error, wantsText };
 }
 
 /** Right pane: the selected artifact rendered inline — markdown as a document,
@@ -231,20 +246,55 @@ function PreviewPane({
   projectId,
   entry,
   onDelete,
+  onChanged,
 }: {
   projectId: string;
   entry: ArtifactEntry;
   onDelete: (path: string) => void;
+  onChanged: () => void;
 }) {
   const kind = previewKind(entry);
-  const { text, binary, truncated, error, wantsText } = useTextBody(projectId, entry, kind);
+  const { text, replaceText, binary, truncated, error, wantsText } = useTextBody(projectId, entry, kind);
   const [showSource, setShowSource] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const isDoc = kind === "markdown";
+  const isProjectBrief = isProjectBriefPath(entry.path);
   const mdFolder = entry.path.split("/").slice(0, -1).join("/");
   const rawUrl = `${artifactUrl(projectId, entry.path)}&v=${entry.modifiedAt}`;
 
+  const saveBrief = async () => {
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await saveProjectBrief(projectId, draft);
+      replaceText(draft);
+      setEditing(false);
+      setShowSource(false);
+      onChanged();
+    } catch (saveFailure) {
+      setSaveError(saveFailure instanceof Error ? saveFailure.message : String(saveFailure));
+    } finally {
+      setSaving(false);
+    }
+  };
+
   let body: ReactNode;
-  if (kind === "image" || kind === "audio" || kind === "video" || kind === "pdf") {
+  if (editing) {
+    body = (
+      <div className="flex h-full min-h-0 flex-col gap-2 p-4">
+        <textarea
+          className="min-h-0 flex-1 resize-none font-mono text-sm leading-relaxed"
+          aria-label="Edit project brief"
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+        />
+        {saveError && <div className="text-sm text-accent-red">Could not save: {saveError}</div>}
+      </div>
+    );
+  } else if (kind === "image" || kind === "audio" || kind === "video" || kind === "pdf") {
     body = <MediaPreview kind={kind} url={rawUrl} name={entry.name} />;
   } else if (kind === "download" || !wantsText || binary) {
     body = (
@@ -294,7 +344,49 @@ function PreviewPane({
         {(kind === "text" || kind === "download") && (
           <span className="fpreview-size text-xs text-muted whitespace-nowrap shrink-0">{fmtBytes(entry.size)}</span>
         )}
-        {isDoc && (
+        {isProjectBrief && !editing && text !== null && !truncated && (
+          <button
+            className={SMALL_BUTTON_CLASS_NAME}
+            data-tip="Edit project brief"
+            data-tip-align="end"
+            aria-label="Edit project brief"
+            onClick={() => {
+              setDraft(text);
+              setSaveError(null);
+              setEditing(true);
+            }}
+          >
+            <Pencil size={13} /> Edit
+          </button>
+        )}
+        {isProjectBrief && editing && (
+          <>
+            <button
+              className={SMALL_BUTTON_CLASS_NAME}
+              data-tip="Cancel editing"
+              data-tip-align="end"
+              aria-label="Cancel editing"
+              disabled={saving}
+              onClick={() => {
+                setEditing(false);
+                setSaveError(null);
+              }}
+            >
+              <X size={13} /> Cancel
+            </button>
+            <button
+              className={SMALL_PRIMARY_BUTTON_CLASS_NAME}
+              data-tip={saving ? "Saving…" : "Save project brief"}
+              data-tip-align="end"
+              aria-label={saving ? "Saving project brief" : "Save project brief"}
+              disabled={saving}
+              onClick={() => void saveBrief()}
+            >
+              <Check size={13} /> {saving ? "Saving…" : "Save"}
+            </button>
+          </>
+        )}
+        {isDoc && !editing && (
           <button
             className={`${ICON_BUTTON_CLASS_NAME} ${showSource ? "active" : ""}`}
             data-tip={showSource ? "Rendered view" : "View source"}
@@ -316,20 +408,22 @@ function PreviewPane({
         >
           <ExternalLink size={13} />
         </a>
-        <button
-          className={ICON_BUTTON_CLASS_NAME}
-          data-tip="Delete artifact"
-          data-tip-align="end"
-          aria-label="Delete artifact"
-          onClick={() => {
-            if (window.confirm(`Delete "${entry.path}" from the artifacts directory?`))
-              onDelete(entry.path);
-          }}
-        >
-          <Trash2 size={13} />
-        </button>
+        {!isProjectBrief && (
+          <button
+            className={ICON_BUTTON_CLASS_NAME}
+            data-tip="Delete artifact"
+            data-tip-align="end"
+            aria-label="Delete artifact"
+            onClick={() => {
+              if (window.confirm(`Delete "${entry.path}" from the artifacts directory?`))
+                onDelete(entry.path);
+            }}
+          >
+            <Trash2 size={13} />
+          </button>
+        )}
       </div>
-      <div className={`fpreview-body flex-1 min-h-0 overflow-auto [&.doc]:pt-4.5 [&.doc]:px-7 [&.doc]:pb-12 [&.doc_.artifact-md]:max-w-readable [&.doc_.artifact-md]:my-0 [&.doc_.artifact-md]:mx-auto ${isDoc && !showSource ? "doc" : ""}`}>
+      <div className={`fpreview-body flex-1 min-h-0 overflow-auto [&.doc]:pt-4.5 [&.doc]:px-7 [&.doc]:pb-12 [&.doc_.artifact-md]:max-w-readable [&.doc_.artifact-md]:my-0 [&.doc_.artifact-md]:mx-auto ${isDoc && !showSource && !editing ? "doc" : ""}`}>
         {body}
         {truncated && (
           <div className="file-view-note py-2.5 px-4 text-sm text-muted">
@@ -478,6 +572,12 @@ export function ArtifactsTab({
   const [collapsed, setCollapsed] = useState<Set<string>>(() => initialCollapsed(project.id));
   const [treeWidth, setTreeWidth] = useState(initialTreeWidth);
   const treeRef = useRef<HTMLDivElement>(null);
+  const projectBriefPath =
+    artifacts?.entries.find((entry) => !entry.isDir && isProjectBriefPath(entry.path))?.path ?? null;
+
+  useEffect(() => {
+    if (!selected && projectBriefPath) setSelected(projectBriefPath);
+  }, [selected, projectBriefPath]);
 
   useEffect(() => {
     try {
@@ -601,6 +701,7 @@ export function ArtifactsTab({
           projectId={project.id}
           entry={selectedEntry}
           onDelete={remove}
+          onChanged={onChanged}
         />
       ) : (
         <div className="fpreview flex-1 min-w-0 flex flex-col min-h-0 bg-background fpreview-none items-center justify-center gap-2 text-md text-muted">

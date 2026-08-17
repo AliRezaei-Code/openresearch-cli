@@ -19,6 +19,7 @@ import {
 } from "../api";
 import { renderNote } from "./agentNote";
 import { HarnessLogo } from "./HarnessLogo";
+import { LIT_SOURCE_NAME, LitSourceLogo, type LitSource } from "./LitSourceLogo";
 import { onHarnessAuth } from "../events";
 import { GHOST_BUTTON_CLASS_NAME, MONO_CLASS_NAME, PAPER_TITLE_CLASS_NAME, PRIMARY_BUTTON_CLASS_NAME, SPINNER_CLASS_NAME, STATUS_BADGE_CLASS_NAME } from "../styleClasses";
 
@@ -65,7 +66,7 @@ export function Onboarding({
   onDone: (project: Project, selection: AgentSelection) => void;
   preferredAgent: AgentSelection | null;
 }) {
-  const [step, setStep] = useState<0 | 1>(0);
+  const [step, setStep] = useState<0 | 1 | 2>(0);
   const [harnesses, setHarnesses] = useState<Harness[] | null>(null);
   const [gitVersion, setGitVersion] = useState<string | null>();
   const [finishing, setFinishing] = useState(false);
@@ -226,15 +227,85 @@ export function Onboarding({
   };
 
   return (
-    <div className="home flex-1 min-h-0 overflow-y-auto [scrollbar-gutter:stable_both-edges] bg-canvas onboarding [&_.home-inner]:max-w-140 [&_.home-inner]:pt-24">
-      <div className="home-inner max-w-155 my-0 mx-auto pt-12 px-6 pb-16">
+    <div
+      className={`home flex-1 min-h-0 overflow-y-auto [scrollbar-gutter:stable_both-edges] bg-canvas onboarding ${
+        step === 0
+          ? "[&_.home-inner]:max-w-300 [&_.home-inner]:pt-0 [&_.home-inner]:pb-0"
+          : "[&_.home-inner]:max-w-140 [&_.home-inner]:pt-24"
+      }`}
+    >
+      <div
+        className={`home-inner max-w-155 my-0 mx-auto ${
+          step === 0 ? "px-8 sm:px-12" : "pt-12 px-6 pb-16"
+        }`}
+      >
         {step === 0 ? (
+          <div className="onb-intro relative flex min-h-dvh flex-col justify-center gap-4 py-12 min-[1120px]:grid min-[1120px]:grid-cols-[minmax(0,_1.1fr)_minmax(28rem,_1fr)] min-[1120px]:grid-rows-[auto_auto] min-[1120px]:content-center min-[1120px]:gap-x-20 min-[1120px]:gap-y-10">
+            <div className="onb-intro-copy relative z-10 min-[1120px]:col-start-1 min-[1120px]:row-start-1 min-[1120px]:self-start">
+              <div className="onb-intro-brand text-[4.25rem] leading-none font-semibold tracking-[-0.035em] mb-10">
+                <Wordmark />
+              </div>
+              <h2 className="onb-title mt-0 mx-0 text-[3.25rem] leading-[1.08] tracking-[-0.035em]">
+                A workspace for your research agents
+              </h2>
+            </div>
+            <div className="onb-intro-features relative min-[1120px]:col-start-2 min-[1120px]:row-start-1 min-[1120px]:self-end">
+              <div
+                aria-hidden="true"
+                className="absolute -inset-14 rounded-full bg-primary-subtle opacity-70 blur-3xl"
+              />
+              <ul className="onb-intro-list relative flex flex-col gap-4 m-0 p-0 list-none">
+                <li className="rounded-2xl border border-border bg-background p-6 shadow-[0_14px_36px_color-mix(in_oklab,_var(--text)_6%,_transparent)]">
+                  <span>
+                    <strong className="mb-1.5 block text-2xl tracking-[-0.015em]">
+                      Consolidate your research.
+                    </strong>
+                    <span className="block text-lg leading-[1.55] text-text">
+                      Track experiments, artifacts, compute, skills, and code all in one place.
+                    </span>
+                  </span>
+                </li>
+                <li className="rounded-2xl border border-border bg-background p-6 shadow-[0_14px_36px_color-mix(in_oklab,_var(--text)_6%,_transparent)]">
+                  <span>
+                    <strong className="mb-1.5 block text-2xl tracking-[-0.015em]">
+                      Ground your agents:
+                    </strong>
+                    <span className="block text-lg leading-[1.55] text-text">
+                      Connected to <InlineLitSource source="alphaxiv" />,{" "}
+                      <InlineLitSource source="biorxiv" />, and{" "}
+                      <InlineLitSource source="openalex" />{" "}
+                      to ground your agents in the latest research.
+                    </span>
+                  </span>
+                </li>
+                <li className="rounded-2xl border border-border bg-background p-6 shadow-[0_14px_36px_color-mix(in_oklab,_var(--text)_6%,_transparent)]">
+                  <span>
+                    <strong className="mb-1.5 block text-2xl tracking-[-0.015em]">
+                      Everything stays local:
+                    </strong>
+                    <span className="block text-lg leading-[1.55] text-text">
+                      Your code, data, and experiment history stay on your machine.
+                    </span>
+                  </span>
+                </li>
+              </ul>
+            </div>
+            <div className="onb-intro-actions relative z-10 mt-8 flex justify-end min-[1120px]:col-start-2 min-[1120px]:row-start-2 min-[1120px]:mt-0 min-[1120px]:self-start">
+              <button
+                className={`${PRIMARY_BUTTON_CLASS_NAME} !py-3.5 !px-7 !text-xl !rounded-lg`}
+                onClick={() => setStep(1)}
+              >
+                Continue <ArrowRight size={20} />
+              </button>
+            </div>
+          </div>
+        ) : step === 1 ? (
           <>
             <div className="onb-eyebrow text-xl font-semibold text-muted mb-4.5">
               <Wordmark /> · Step 1 of 2
             </div>
             <h2 className="onb-title mt-0 mx-0 mb-1.5 text-3xl tracking-[-0.01em]">Choose a coding agent</h2>
-            <p className="onb-sub text-text text-base leading-[1.55] mt-0 mx-0 mb-5.5 max-w-120">OpenResearch uses an agent already signed in on this machine.</p>
+            <p className="onb-sub text-text text-base leading-[1.55] mt-0 mx-0 mb-5.5 max-w-120">OpenResearch uses a coding agent already installed on this machine.</p>
             {harnesses !== null && !anyAgentReady && (
               <p className={ONB_GATE_HINT_CLASS_NAME}>
                 Sign in to at least one agent to continue.
@@ -277,6 +348,9 @@ export function Onboarding({
               </div>
             )}
             <div className="onb-actions flex items-center gap-2.5 mt-5.5">
+              <button className={GHOST_BUTTON_CLASS_NAME} onClick={() => setStep(0)}>
+                <ArrowLeft size={12} /> Back
+              </button>
               {(harnessError ||
                 gitError ||
                 gitVersion === null ||
@@ -288,7 +362,7 @@ export function Onboarding({
               <div style={{ flex: 1 }} />
               <button
                 className={PRIMARY_BUTTON_CLASS_NAME}
-                onClick={() => setStep(1)}
+                onClick={() => setStep(2)}
                 disabled={checking || !anyAgentReady || preferredHarness === null || !gitReady}
                 title={
                   checking
@@ -418,7 +492,7 @@ export function Onboarding({
               </p>
             )}
             <div className="onb-actions flex items-center gap-2.5 mt-5.5">
-              <button className={GHOST_BUTTON_CLASS_NAME} onClick={() => setStep(0)} disabled={finishing}>
+              <button className={GHOST_BUTTON_CLASS_NAME} onClick={() => setStep(1)} disabled={finishing}>
                 <ArrowLeft size={12} /> Back
               </button>
               <div style={{ flex: 1 }} />
@@ -448,6 +522,20 @@ export function Onboarding({
         )}
       </div>
     </div>
+  );
+}
+
+function InlineLitSource({ source }: { source: LitSource }) {
+  return (
+    <span className="whitespace-nowrap">
+      <LitSourceLogo
+        source={source}
+        size={18}
+        decorative
+        className="mr-1 inline-flex align-[-0.15em] !rounded-none !bg-transparent !p-0 !shadow-none"
+      />
+      {LIT_SOURCE_NAME[source]}
+    </span>
   );
 }
 

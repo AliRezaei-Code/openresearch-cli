@@ -20,7 +20,7 @@ use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::Engine as _;
 use futures::Stream;
@@ -36,6 +36,8 @@ use crate::store::{
     log_path, now_ms, SshHostTest, Store, StoredAgentSelection, StoredChatSession, StoredRun,
 };
 use crate::{browser, UpArgs};
+
+const MAX_PROJECT_OBJECTIVE_BYTES: usize = 16 * 1024;
 
 pub async fn run(args: UpArgs) -> Result<()> {
     let port = args.port;
@@ -317,6 +319,12 @@ fn router(state: AppState) -> Router {
             get(list_artifacts).delete(delete_artifact),
         )
         .route("/api/projects/{id}/files/file", get(serve_artifact))
+        .route(
+            "/api/projects/{id}/brief",
+            put(write_project_brief).layer(DefaultBodyLimit::max(
+                local::files::MAX_PROJECT_BRIEF_BYTES * 6 + 1024,
+            )),
+        )
         .route("/api/events", get(events))
         .route("/api/settings/hf", get(hf_settings).post(set_hf_token))
         .route(
@@ -935,6 +943,7 @@ async fn resolve_paper_api(Query(q): Query<PaperResolveQ>) -> ApiResult {
 struct CreateProjectReq {
     name: String,
     path: String,
+    objective: Option<String>,
     run_command: Option<String>,
     paper_id: Option<String>,
     clone_url: Option<String>,
@@ -959,6 +968,15 @@ async fn create_project(
     if name.is_empty() {
         return Err(bad_request("name is required"));
     }
+    if req
+        .objective
+        .as_ref()
+        .is_some_and(|objective| objective.len() > MAX_PROJECT_OBJECTIVE_BYTES)
+    {
+        return Err(bad_request(
+            "project objective is too large; keep it under 16 KiB",
+        ));
+    }
     let path = req.path;
     let create_folder = req.create_folder;
     let initialize_git = req.initialize_git;
@@ -978,9 +996,10 @@ async fn create_project(
     };
     let shallow_clone = local::github::should_shallow_clone(repo_size_kb);
     let run_command = req.run_command;
-    let result = tokio::task::spawn_blocking(move || {
+    let objective = req.objective;
+    let result = tokio::task::spawn_blocking(move || -> Result<local::model::LocalProject> {
         let store = Store::open()?;
-        local::projects::create_project(
+        let project = local::projects::create_project(
             &store,
             &name,
             &path,
@@ -992,7 +1011,12 @@ async fn create_project(
                 run_command,
                 paper_id,
             },
-        )
+        )?;
+        if let Err(error) = local::files::ensure_project_brief(&project, objective.as_deref()) {
+            store.delete_local_project(&project.id)?;
+            return Err(error);
+        }
+        Ok(project)
     })
     .await
     .map_err(|e| anyhow!("project task failed: {e}"))?;
@@ -2462,6 +2486,11 @@ async fn delete_artifact(
     Query(q): Query<ArtifactPathQuery>,
 ) -> ApiResult {
     reject_if_moving(&state)?;
+    if local::files::is_project_brief_path(&q.path) {
+        return Err(bad_request(
+            "PROJECT.md is part of the project and cannot be deleted",
+        ));
+    }
     blocking_api(move || {
         let store = Store::open()?;
         let project = store
@@ -2469,6 +2498,36 @@ async fn delete_artifact(
             .ok_or_else(|| not_found("project"))?;
         local::files::delete_entry(&project, &q.path)?;
         Ok(Json(json!({ "ok": true })))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct ProjectBriefWriteReq {
+    content: String,
+}
+
+async fn write_project_brief(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ProjectBriefWriteReq>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    if req.content.len() > local::files::MAX_PROJECT_BRIEF_BYTES {
+        return Err(bad_request(
+            "PROJECT.md is too large; keep the project brief under 256 KiB",
+        ));
+    }
+    blocking_api(move || {
+        let store = Store::open()?;
+        let project = store
+            .get_local_project(&id)?
+            .ok_or_else(|| not_found("project"))?;
+        local::files::write_project_brief(&project, &req.content)?;
+        Ok(Json(json!({
+            "ok": true,
+            "bytesWritten": req.content.len(),
+        })))
     })
     .await
 }

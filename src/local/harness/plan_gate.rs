@@ -289,7 +289,11 @@ fn is_readonly_orx(tokens: &[&str], stage: &str) -> bool {
 
     match verb {
         // Verbs with a write subcommand: allow only the read-only subcommand(s).
-        "project" => matches!(subcommand(&mut rest), Some("view")),
+        "project" => match subcommand(&mut rest) {
+            Some("view") => true,
+            Some("brief") => matches!(subcommand(&mut rest), Some("show")),
+            _ => false,
+        },
         "exp" => match subcommand(&mut rest) {
             // Pure reads.
             Some("status" | "wait") => true,
@@ -466,6 +470,7 @@ mod tests {
     #[test]
     fn read_only_subcommands_are_allowed() {
         assert!(allowed("orx project view p-1"));
+        assert!(allowed("orx project brief show p-1"));
         assert!(allowed("orx exp status e-1"));
         // The playbook's core orientation reads (view form).
         assert!(allowed("orx exp desc e-1"));
@@ -480,6 +485,9 @@ mod tests {
     fn write_subcommands_are_gated() {
         // Same verb, write subcommand → not allowed (plan mode gates it).
         assert!(!allowed("orx project edit p-1 --name x"));
+        assert!(!allowed("orx project brief update p-1 --stdin"));
+        assert!(!allowed("orx project brief --stdin update p-1"));
+        assert!(!allowed("orx project --stdin brief update p-1"));
         assert!(!allowed("orx exp run e-1"));
         assert!(!allowed("orx exp cancel e-1"));
         assert!(!allowed("orx report upload r-1 --file x.md"));

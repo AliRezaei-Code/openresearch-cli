@@ -4,7 +4,7 @@ import { GitHubMark } from "./BackendLogos";
 import { useEffect, useRef, useState } from "react";
 import { deleteProject, timeAgo, type Project } from "../api";
 import { NewProjectForm } from "./NewProjectForm";
-import { MONO_CLASS_NAME, SMALL_BUTTON_CLASS_NAME } from "../styleClasses";
+import { BUTTON_CLASS_NAME, MONO_CLASS_NAME } from "../styleClasses";
 
 export function NewProjectDialog({
   onClose,
@@ -71,14 +71,14 @@ export function NewProjectDialog({
 
   return (
     <div
-      className="modal-backdrop fixed inset-0 bg-[rgba(29,_27,_26,_0.4)] flex items-start justify-center pt-[var(--modal-top)] px-4 pb-6 overflow-y-auto z-100"
+      className="modal-backdrop fixed inset-0 bg-[rgba(29,_27,_26,_0.42)] flex items-center justify-center p-5 overflow-y-auto z-100"
       onClick={(event) => {
         if (event.target === event.currentTarget) onClose();
       }}
     >
       <div
         ref={dialogRef}
-        className="modal w-120 max-w-[94vw] max-h-[calc(100vh_-_var(--modal-top)_-_48px)] overflow-y-auto bg-background border border-border rounded-xl shadow-[0_24px_60px_rgba(0,_0,_0,_0.22)] p-6 [&_h2]:mt-0 [&_h2]:mx-0 [&_h2]:mb-3.5 [&_h2]:text-xl"
+        className="modal w-120 max-w-full max-h-[calc(100vh_-_40px)] overflow-y-auto bg-background border border-border rounded-xl shadow-[0_24px_60px_rgba(0,_0,_0,_0.22)] p-6 [&_h2]:mt-0 [&_h2]:mx-0 [&_h2]:mb-3.5 [&_h2]:text-xl"
         role="dialog"
         aria-modal="true"
         aria-labelledby="new-project-dialog-title"
@@ -131,8 +131,11 @@ export function ProjectsHome({
         </div>
         <div className="home-head flex items-center justify-between gap-3 mb-4.5 [&_h2]:m-0 [&_h2]:text-2xl [&_h2]:tracking-[-0.01em]">
           <h2>Projects</h2>
-          <button className={SMALL_BUTTON_CLASS_NAME} onClick={() => setModalOpen(true)}>
-            <Plus size={13} /> New project
+          <button
+            className={BUTTON_CLASS_NAME}
+            onClick={() => setModalOpen(true)}
+          >
+            <Plus size={15} /> New project
           </button>
         </div>
         <div className="home-list flex flex-col gap-2.5">

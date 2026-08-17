@@ -3487,7 +3487,7 @@ export function ChatPanel({
   onOpenPlan,
   onOpenSubagent,
   onOpenWorktree,
-  onStartTour,
+  onOpenDemoWelcome,
   onActiveSessionChange,
   preferredAgent,
   onPreferredAgentChange,
@@ -3531,8 +3531,8 @@ export function ChatPanel({
   onOpenSubagent?: (sessionId: string, spawnPartId: string) => void;
   /** Open the pinned Files home for the active session. */
   onOpenWorktree: () => void;
-  /** Replay the onboarding tour (chat header help button). */
-  onStartTour?: () => void;
+  /** Reopen the demo welcome modal from the chat header. */
+  onOpenDemoWelcome?: () => void;
   /** The open chat session, surfaced so the shell can scope panes to it. */
   onActiveSessionChange?: (sessionId: string | null) => void;
   /** Database-backed selection used to seed new chat sessions. */
@@ -4922,12 +4922,12 @@ export function ChatPanel({
             "New session"
           )}
         </div>
-        {onStartTour && (
+        {onOpenDemoWelcome && (
           <button
             className={ICON_BUTTON_CLASS_NAME}
-            data-tip="Replay tour"
-            aria-label="Replay tour"
-            onClick={onStartTour}
+            data-tip="About this demo"
+            aria-label="About this demo"
+            onClick={onOpenDemoWelcome}
           >
             <HelpCircle size={15} />
           </button>

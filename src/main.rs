@@ -253,6 +253,25 @@ pub enum ProjectCommand {
         #[arg(long, conflicts_with = "public")]
         private: bool,
     },
+
+    /// Read or update the local project's user-facing PROJECT.md.
+    Brief {
+        #[command(subcommand)]
+        command: ProjectBriefCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ProjectBriefCommand {
+    /// Print the current project brief, or the default template if missing.
+    Show { project_id: String },
+
+    /// Replace the project brief with Markdown read from stdin.
+    Update {
+        project_id: String,
+        #[arg(long, required = true)]
+        stdin: bool,
+    },
 }
 
 #[derive(Args, Debug)]

@@ -21,6 +21,7 @@ import {
   DEMO_LITERATURE_SESSION_ID,
   getArtifacts,
   getUiState,
+  isDemoProjectId,
   listExperiments,
   listProjects,
   listRuns,
@@ -49,7 +50,7 @@ import { ExperimentsTable } from "./components/ExperimentsTable";
 import { Md } from "./components/Md";
 import { usePopover } from "./components/ModelPicker";
 import { SettingsView, type SettingsTab } from "./components/SettingsPage";
-import { Tour } from "./components/Tour";
+import { DemoWelcomeModal } from "./components/Tour";
 import { clearReadDemoSessions } from "./demoSessionState";
 import { TreeView } from "./components/TreeView";
 import { useOrxEvents } from "./events";
@@ -523,33 +524,25 @@ export default function App() {
     setActiveSessionId(nextSessionId);
   }, []);
   const onboarded = uiState?.onboardingCompleted ?? false;
-  // The spotlight tour of the workspace (Tour.tsx). Starting it normalizes
-  // the layout so every tour target exists; those are the defaults, so
-  // nothing needs restoring on finish/skip.
-  const [tourOpen, setTourOpen] = useState(false);
-  const startTour = useCallback(() => {
-    setMainView("chat");
-    setRailOpen(true);
-    setExperimentsTabOpen(true);
-    selectRightTab("experiments");
-    setPanelOpen(true);
-    setPanelMax(false);
-    setTourOpen(true);
-  }, [selectRightTab]);
-  const closeTour = useCallback(async () => {
+  const [demoWelcomeOpen, setDemoWelcomeOpen] = useState(false);
+  const openDemoWelcome = useCallback(() => setDemoWelcomeOpen(true), []);
+  const closeDemoWelcome = useCallback(async () => {
     const saved = await updateUiState({ tourCompleted: true });
     setUiState((current) => current && { ...current, tourCompleted: saved.tourCompleted });
-    setTourOpen(false);
+    setDemoWelcomeOpen(false);
   }, []);
+  const createProjectFromDemoWelcome = useCallback(async () => {
+    await closeDemoWelcome();
+    setNewProjectOpen(true);
+  }, [closeDemoWelcome]);
 
-  // Auto-start the tour the first time the workspace is actually on screen:
-  // first-run walkthrough done, a project open, projects home closed. With
-  // zero projects this waits until the first one is created and opened.
+  // Show the welcome once the bundled demo is first visible. User projects
+  // never open it automatically.
   useEffect(() => {
-    if (!projectId || homeOpen || !onboarded) return;
+    if (!projectId || !isDemoProjectId(projectId) || homeOpen || !onboarded) return;
     if (uiState?.tourCompleted) return;
-    startTour();
-  }, [projectId, homeOpen, onboarded, startTour, uiState?.tourCompleted]);
+    openDemoWelcome();
+  }, [projectId, homeOpen, onboarded, openDemoWelcome, uiState?.tourCompleted]);
 
   const projectIdRef = useRef(projectId);
   projectIdRef.current = projectId;
@@ -1139,7 +1132,9 @@ export default function App() {
             onOpenPlan={openPlanTab}
             onOpenSubagent={openSubagentTab}
             onOpenWorktree={openWorktreeTab}
-            onStartTour={startTour}
+            onOpenDemoWelcome={
+              activeProject && isDemoProjectId(activeProject.id) ? openDemoWelcome : undefined
+            }
             onActiveSessionChange={onActiveSessionChange}
             preferredAgent={uiState.preferredAgent}
             onPreferredAgentChange={persistPreferredAgent}
@@ -1546,7 +1541,12 @@ export default function App() {
           }}
         />
       )}
-      {tourOpen && !homeOpen && projectId && <Tour onClose={closeTour} />}
+      {demoWelcomeOpen && !homeOpen && activeProject && isDemoProjectId(activeProject.id) && (
+        <DemoWelcomeModal
+          onClose={closeDemoWelcome}
+          onCreateProject={createProjectFromDemoWelcome}
+        />
+      )}
     </div>
   );
 }
