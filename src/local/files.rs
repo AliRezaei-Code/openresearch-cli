@@ -76,16 +76,6 @@ pub fn ensure_dir(project: &LocalProject) -> Result<PathBuf> {
     Ok(dir)
 }
 
-fn project_brief_contents(objective: Option<&str>) -> String {
-    let objective = objective
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("Not defined yet.");
-    format!(
-        "# Objective\n\n{objective}\n\n# Current Project Summary\n\nNo project summary yet.\n\n# Important Highlights\n\n- None yet.\n\n# Future Experiments\n\n- None proposed yet.\n"
-    )
-}
-
 pub(crate) fn ensure_project_brief_contents_at(dir: &Path, contents: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)
         .map_err(|e| anyhow!("Could not create {}: {}", dir.display(), e))?;
@@ -110,12 +100,12 @@ pub(crate) fn ensure_project_brief_contents_at(dir: &Path, contents: &str) -> Re
     Ok(path)
 }
 
-fn ensure_project_brief_at(dir: &Path, objective: Option<&str>) -> Result<PathBuf> {
-    ensure_project_brief_contents_at(dir, &project_brief_contents(objective))
+fn ensure_project_brief_at(dir: &Path) -> Result<PathBuf> {
+    ensure_project_brief_contents_at(dir, PROJECT_BRIEF_TEMPLATE)
 }
 
-pub fn ensure_project_brief(project: &LocalProject, objective: Option<&str>) -> Result<PathBuf> {
-    ensure_project_brief_at(&files_dir(project), objective)
+pub fn ensure_project_brief(project: &LocalProject) -> Result<PathBuf> {
+    ensure_project_brief_at(&files_dir(project))
 }
 
 fn read_project_brief_at(dir: &Path) -> Result<String> {
@@ -529,7 +519,7 @@ fn collect_tree(
 /// Scan the artifacts dir (creating it if missing) into a plain file tree.
 pub fn list(project: &LocalProject) -> Result<ArtifactsListing> {
     let dir = ensure_dir(project)?;
-    ensure_project_brief_at(&dir, None)?;
+    ensure_project_brief_at(&dir)?;
     let canonical = dir
         .canonicalize()
         .map_err(|e| anyhow!("Could not resolve {}: {}", dir.display(), e))?;
@@ -759,27 +749,15 @@ mod tests {
     #[test]
     fn project_brief_creation_preserves_existing_content() {
         let (root, base, _) = scratch();
-        let path = ensure_project_brief_at(&base, Some("Reproduce the paper")).unwrap();
+        let path = ensure_project_brief_at(&base).unwrap();
         let initial = std::fs::read_to_string(&path).unwrap();
-        assert!(initial.contains("# Objective\n\nReproduce the paper"));
-        assert!(initial.contains("# Future Experiments"));
+        assert_eq!(initial, PROJECT_BRIEF_TEMPLATE);
 
         std::fs::write(&path, "# My custom brief\n").unwrap();
-        ensure_project_brief_at(&base, Some("Ignored replacement")).unwrap();
+        ensure_project_brief_at(&base).unwrap();
         assert_eq!(
             std::fs::read_to_string(path).unwrap(),
             "# My custom brief\n"
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn empty_objective_uses_the_default_template() {
-        let (root, base, _) = scratch();
-        let path = ensure_project_brief_at(&base, Some("   ")).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(path).unwrap(),
-            PROJECT_BRIEF_TEMPLATE
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -805,7 +783,7 @@ mod tests {
     #[test]
     fn project_brief_writes_replace_the_complete_file() {
         let (root, base, _) = scratch();
-        ensure_project_brief_at(&base, None).unwrap();
+        ensure_project_brief_at(&base).unwrap();
         let path = write_project_brief_at(&base, "# Updated\n\nCurrent state.\n").unwrap();
         assert_eq!(
             std::fs::read_to_string(path).unwrap(),

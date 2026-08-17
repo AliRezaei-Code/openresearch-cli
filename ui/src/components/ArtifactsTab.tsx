@@ -87,6 +87,7 @@ const TREE_WIDTH_KEY = "orx:files-tree-width";
 const COLLAPSED_DIRS_KEY_PREFIX = "orx:artifacts-collapsed:";
 const TREE_MIN_WIDTH = 180;
 const TREE_MAX_WIDTH = 560;
+const TREE_MAX_INDENT_DEPTH = 8;
 const TREE_DEFAULT_WIDTH = 280;
 
 function initialTreeWidth(): number {
@@ -442,6 +443,7 @@ function TreeRows({
   selected,
   onToggle,
   onSelect,
+  onOpenFile,
   onDelete,
 }: {
   entries: ArtifactEntry[];
@@ -450,17 +452,18 @@ function TreeRows({
   selected: string | null;
   onToggle: (path: string) => void;
   onSelect: (path: string) => void;
+  onOpenFile: (path: string) => void;
   onDelete: (path: string) => void;
 }) {
   return (
-    <>
+    <div className="flex w-full max-w-full min-w-0 flex-col items-stretch">
       {entries.map((e) => {
-        const indent = { paddingLeft: 8 + depth * 14 };
+        const indent = { paddingLeft: 8 + Math.min(depth, TREE_MAX_INDENT_DEPTH) * 14 };
         if (e.isDir) {
           const open = !collapsed.has(e.path);
           return (
-            <div key={e.path}>
-              <div className="file-tree-row flex items-center gap-1.5 w-full py-[3px] px-2.5 border-0 bg-transparent text-text text-left cursor-pointer font-[inherit] text-[length:inherit] [&:hover]:bg-panel [&_>_svg]:shrink-0 [&_>_svg]:text-subtext [&_>_svg.file-tree-chevron]:text-muted artifact-tree-row [&.selected]:bg-panel [&.selected:hover]:bg-panel [&:hover_.ft-row-delete]:opacity-100" style={indent} onClick={() => onToggle(e.path)}>
+            <div key={e.path} className="min-w-0 max-w-full">
+              <div className="file-tree-row flex w-full min-w-0 items-center gap-1.5 py-[3px] px-2.5 border-0 bg-transparent text-text text-left cursor-pointer font-[inherit] text-[length:inherit] [&:hover]:bg-panel [&_>_svg]:shrink-0 [&_>_svg]:text-subtext [&_>_svg.file-tree-chevron]:text-muted artifact-tree-row [&.selected]:bg-panel [&.selected:hover]:bg-panel [&:hover_.ft-row-delete]:opacity-100" style={indent} onClick={() => onToggle(e.path)}>
                 <button
                   className="file-tree-chevron text-muted shrink-0 [button&]:inline-flex [button&]:items-center [button&]:justify-center [button&]:w-[13px] [button&]:h-[13px] [button&]:p-0 [button&]:border-0 [button&]:bg-transparent [button&_>_svg]:transition-transform [button&_>_svg]:duration-120 [button&_>_svg]:ease-standard [button&_>_svg.open]:rotate-90"
                   aria-label={open ? `Collapse ${e.name}` : `Expand ${e.name}`}
@@ -494,6 +497,7 @@ function TreeRows({
                   selected={selected}
                   onToggle={onToggle}
                   onSelect={onSelect}
+                  onOpenFile={onOpenFile}
                   onDelete={onDelete}
                 />
               )}
@@ -505,18 +509,27 @@ function TreeRows({
           <button
             key={e.path}
             type="button"
-            className={`file-tree-row flex items-center gap-1.5 w-full py-[3px] px-2.5 border-0 bg-transparent text-text text-left cursor-pointer font-[inherit] text-[length:inherit] [&:hover]:bg-panel [&_>_svg]:shrink-0 [&_>_svg]:text-subtext [&_>_svg.file-tree-chevron]:text-muted artifact-tree-row [&.selected]:bg-panel [&.selected:hover]:bg-panel [&:hover_.ft-row-delete]:opacity-100 ${selected === e.path ? "selected" : ""}`}
+            className={`file-tree-row flex w-full min-w-0 items-center gap-1.5 py-[3px] px-2.5 border-0 bg-transparent text-text text-left cursor-pointer font-[inherit] text-[length:inherit] [&:hover]:bg-panel [&_>_svg]:shrink-0 [&_>_svg]:text-subtext [&_>_svg.file-tree-chevron]:text-muted artifact-tree-row [&.selected]:bg-panel [&.selected:hover]:bg-panel [&:hover_.ft-row-delete]:opacity-100 ${selected === e.path ? "selected" : ""}`}
             style={indent}
-            title={e.path}
+            title={`${e.path} — double-click or Command/Ctrl+Enter to open in a tab`}
+            aria-keyshortcuts="Meta+Enter Control+Enter"
             aria-pressed={selected === e.path}
             onClick={() => onSelect(e.path)}
+            onDoubleClick={() => onOpenFile(e.path)}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter" || (!event.metaKey && !event.ctrlKey)) return;
+              event.preventDefault();
+              event.stopPropagation();
+              onSelect(e.path);
+              onOpenFile(e.path);
+            }}
           >
             <FileTypeIcon name={e.name} />
             <span className="file-tree-name flex-1 min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">{e.name}</span>
           </button>
         );
       })}
-    </>
+    </div>
   );
 }
 
@@ -558,11 +571,13 @@ export function ArtifactsTab({
   project,
   artifacts,
   onChanged,
+  onOpenFile,
   onOpenStorage,
 }: {
   project: Project;
   artifacts: ProjectArtifacts | null;
   onChanged: () => void;
+  onOpenFile: (path: string) => void;
   /** Navigate to Settings → Storage (where the data dir can be changed). */
   onOpenStorage: () => void;
 }) {
@@ -660,6 +675,7 @@ export function ArtifactsTab({
       selected={selected}
       onToggle={toggle}
       onSelect={setSelected}
+      onOpenFile={onOpenFile}
       onDelete={remove}
     />
   );

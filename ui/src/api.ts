@@ -160,7 +160,6 @@ export const pickProjectFolder = () =>
 export interface NewProject {
   name: string;
   path: string;
-  objective?: string;
   runCommand?: string;
   paperId?: string;
   cloneUrl?: string;

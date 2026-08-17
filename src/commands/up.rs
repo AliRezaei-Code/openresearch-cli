@@ -37,8 +37,6 @@ use crate::store::{
 };
 use crate::{browser, UpArgs};
 
-const MAX_PROJECT_OBJECTIVE_BYTES: usize = 16 * 1024;
-
 pub async fn run(args: UpArgs) -> Result<()> {
     let port = args.port;
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
@@ -948,7 +946,6 @@ async fn resolve_paper_api(Query(q): Query<PaperResolveQ>) -> ApiResult {
 struct CreateProjectReq {
     name: String,
     path: String,
-    objective: Option<String>,
     run_command: Option<String>,
     paper_id: Option<String>,
     clone_url: Option<String>,
@@ -973,15 +970,6 @@ async fn create_project(
     if name.is_empty() {
         return Err(bad_request("name is required"));
     }
-    if req
-        .objective
-        .as_ref()
-        .is_some_and(|objective| objective.len() > MAX_PROJECT_OBJECTIVE_BYTES)
-    {
-        return Err(bad_request(
-            "project objective is too large; keep it under 16 KiB",
-        ));
-    }
     let path = req.path;
     let create_folder = req.create_folder;
     let initialize_git = req.initialize_git;
@@ -1001,7 +989,6 @@ async fn create_project(
     };
     let shallow_clone = local::github::should_shallow_clone(repo_size_kb);
     let run_command = req.run_command;
-    let objective = req.objective;
     let creation_guard = state.project_creation_lock.lock().await;
     let result = tokio::task::spawn_blocking(move || -> Result<local::model::LocalProject> {
         let store = Store::open()?;
@@ -1018,7 +1005,7 @@ async fn create_project(
                 paper_id,
             },
         )?;
-        if let Err(error) = local::files::ensure_project_brief(&project, objective.as_deref()) {
+        if let Err(error) = local::files::ensure_project_brief(&project) {
             store.delete_local_project(&project.id)?;
             return Err(error);
         }

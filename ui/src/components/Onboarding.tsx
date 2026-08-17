@@ -242,10 +242,10 @@ export function Onboarding({
         {step === 0 ? (
           <div className="onb-intro relative flex min-h-dvh flex-col justify-center gap-4 py-12 min-[1120px]:grid min-[1120px]:grid-cols-[minmax(0,_1.1fr)_minmax(28rem,_1fr)] min-[1120px]:grid-rows-[auto_auto] min-[1120px]:content-center min-[1120px]:gap-x-20 min-[1120px]:gap-y-10">
             <div className="onb-intro-copy relative z-10 min-[1120px]:col-start-1 min-[1120px]:row-start-1 min-[1120px]:self-start">
-              <div className="onb-intro-brand text-[4.25rem] leading-none font-semibold tracking-[-0.035em] mb-10">
+              <div className="onb-intro-brand text-[4rem] leading-none font-semibold tracking-[-0.035em] mb-10">
                 <Wordmark />
               </div>
-              <h2 className="onb-title mt-0 mx-0 text-[3.25rem] leading-[1.08] tracking-[-0.035em]">
+              <h2 className="onb-title mt-0 mx-0 text-[2.5rem] leading-[1.08] tracking-[-0.035em]">
                 A workspace for your research agents
               </h2>
             </div>
@@ -258,7 +258,7 @@ export function Onboarding({
                 <li className="rounded-2xl border border-border bg-background p-6 shadow-[0_14px_36px_color-mix(in_oklab,_var(--text)_6%,_transparent)]">
                   <span>
                     <strong className="mb-1.5 block text-2xl tracking-[-0.015em]">
-                      Consolidate your research.
+                      Consolidate your research
                     </strong>
                     <span className="block text-lg leading-[1.55] text-text">
                       Track experiments, artifacts, compute, skills, and code all in one place.
@@ -268,7 +268,7 @@ export function Onboarding({
                 <li className="rounded-2xl border border-border bg-background p-6 shadow-[0_14px_36px_color-mix(in_oklab,_var(--text)_6%,_transparent)]">
                   <span>
                     <strong className="mb-1.5 block text-2xl tracking-[-0.015em]">
-                      Ground your agents:
+                      Ground your agents
                     </strong>
                     <span className="block text-lg leading-[1.55] text-text">
                       Connected to <InlineLitSource source="alphaxiv" />,{" "}
@@ -281,7 +281,7 @@ export function Onboarding({
                 <li className="rounded-2xl border border-border bg-background p-6 shadow-[0_14px_36px_color-mix(in_oklab,_var(--text)_6%,_transparent)]">
                   <span>
                     <strong className="mb-1.5 block text-2xl tracking-[-0.015em]">
-                      Everything stays local:
+                      Everything stays local
                     </strong>
                     <span className="block text-lg leading-[1.55] text-text">
                       Your code, data, and experiment history stay on your machine.

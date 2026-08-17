@@ -5313,8 +5313,8 @@ export function ChatPanel({
               }}
             />
           </div>
-          <div className="composer-actions flex justify-end items-center gap-2 pt-1.5 px-2 pb-2">
-            <div className="option-picker relative inline-flex" ref={dataSources.ref}>
+          <div className="composer-actions flex min-w-0 justify-end items-center gap-2 pt-1.5 px-2 pb-2">
+            <div className="option-picker relative inline-flex shrink-0" ref={dataSources.ref}>
               <button
                 type="button"
                 className="composer-bare inline-flex items-center justify-center rounded-sm p-1.5 text-text transition-[background] duration-150 ease-standard hover:bg-surface"
@@ -5346,7 +5346,7 @@ export function ChatPanel({
             />
             <button
               type="button"
-              className="composer-attach inline-flex items-center justify-center w-7.5 h-7.5 rounded-sm text-text cursor-pointer transition-[background] duration-150 ease-standard [&:hover]:bg-surface"
+              className="composer-attach inline-flex shrink-0 items-center justify-center w-7.5 h-7.5 rounded-sm text-text cursor-pointer transition-[background] duration-150 ease-standard [&:hover]:bg-surface"
               title="Attach a PDF or image"
               aria-label="Attach a PDF or image"
               onClick={() => fileInputRef.current?.click()}
@@ -5356,7 +5356,7 @@ export function ChatPanel({
             {planActive && (
               <button
                 type="button"
-                className="plan-indicator group inline-flex h-7.5 items-center gap-1.5 rounded-sm bg-surface px-2 text-sm text-muted transition-colors hover:text-text focus-visible:text-text"
+                className="plan-indicator group inline-flex h-7.5 shrink-0 items-center gap-1.5 rounded-sm bg-surface px-2 text-sm text-muted transition-colors hover:text-text focus-visible:text-text"
                 title="Exit Plan mode"
                 aria-label="Exit Plan mode"
                 onClick={() => void exitPlanMode()}
@@ -5368,7 +5368,7 @@ export function ChatPanel({
                 <span>Plan</span>
               </button>
             )}
-            <div style={{ flex: 1 }} />
+            <div className="min-w-0 flex-1" />
             {/* The model picker reflects the open session (harness locked once it
                 exists); the global default only applies before the first
                 message. */}
@@ -5391,12 +5391,12 @@ export function ChatPanel({
               // (their cards are the affordance; send() can't service them).
               // Send stays only when it actually works: idle, or a held
               // QUESTION card that owns typed text.
-              <button className="send-btn inline-flex items-center justify-center w-8 h-8 rounded-md bg-primary text-background transition-[background,opacity] duration-100 ease-standard [&:hover:not(:disabled)]:bg-[color-mix(in_oklab,_var(--primary)_88%,_var(--text))] [&:disabled]:opacity-40 [&:disabled]:cursor-default [&.stop]:bg-surface [&.stop]:text-text [&.stop:hover:not(:disabled)]:bg-[color-mix(in_oklab,_var(--surface)_88%,_var(--text))] stop" title="Stop" aria-label="Stop" onClick={stop}>
+              <button className="send-btn inline-flex shrink-0 items-center justify-center w-8 h-8 rounded-md bg-primary text-background transition-[background,opacity] duration-100 ease-standard [&:hover:not(:disabled)]:bg-[color-mix(in_oklab,_var(--primary)_88%,_var(--text))] [&:disabled]:opacity-40 [&:disabled]:cursor-default [&.stop]:bg-surface [&.stop]:text-text [&.stop:hover:not(:disabled)]:bg-[color-mix(in_oklab,_var(--surface)_88%,_var(--text))] stop" title="Stop" aria-label="Stop" onClick={stop}>
                 <X size={16} />
               </button>
             ) : (
               <button
-                className="send-btn inline-flex items-center justify-center w-8 h-8 rounded-md bg-primary text-background transition-[background,opacity] duration-100 ease-standard [&:hover:not(:disabled)]:bg-[color-mix(in_oklab,_var(--primary)_88%,_var(--text))] [&:disabled]:opacity-40 [&:disabled]:cursor-default [&.stop]:bg-surface [&.stop]:text-text [&.stop:hover:not(:disabled)]:bg-[color-mix(in_oklab,_var(--surface)_88%,_var(--text))]"
+                className="send-btn inline-flex shrink-0 items-center justify-center w-8 h-8 rounded-md bg-primary text-background transition-[background,opacity] duration-100 ease-standard [&:hover:not(:disabled)]:bg-[color-mix(in_oklab,_var(--primary)_88%,_var(--text))] [&:disabled]:opacity-40 [&:disabled]:cursor-default [&.stop]:bg-surface [&.stop]:text-text [&.stop:hover:not(:disabled)]:bg-[color-mix(in_oklab,_var(--surface)_88%,_var(--text))]"
                 title="Send"
                 aria-label="Send"
                 onClick={() => void send()}
