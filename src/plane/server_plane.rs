@@ -19,9 +19,9 @@ use super::{
 use crate::client::{
     cancel_experiment_run, create_baseline_experiment, create_child_experiment, create_report,
     download_report_file, find_project, get_experiment, get_project, get_report, list_experiments,
-    list_reports, list_runs, read_run_log, start_experiment_run, update_experiment, update_project,
-    upload_to_presigned, CreateBaselineExperimentBody, CreateChildBody, CreateReportBody,
-    RunTarget, UpdateExperimentBody, UpdateProjectBody,
+    list_reports, list_runs, read_run_log, update_experiment, update_project, upload_to_presigned,
+    CreateBaselineExperimentBody, CreateChildBody, CreateReportBody, UpdateExperimentBody,
+    UpdateProjectBody,
 };
 use crate::commands::experiments::print_tree;
 use crate::config::Credentials;
@@ -44,6 +44,14 @@ impl ServerPlane {
         let creds = require_credentials().await;
         ServerPlane { id, creds }
     }
+}
+
+fn retired_launch_error() -> anyhow::Error {
+    anyhow!(
+        "Hosted experiment execution has been retired. Clone the project's GitHub repository \
+         (see `orx projects`), initialize it with `orx up`, and run the local experiment with \
+         `orx exp run --backend <backend>`. Use `orx compute` to browse OpenResearch shapes."
+    )
 }
 
 /// A not-yet-connected server plane. The resolvers are sync (and must run their
@@ -113,11 +121,8 @@ impl ControlPlane for ServerPlaceholder {
             .set_experiment_command(command)
             .await
     }
-    async fn launch(&self, args: ExpRunArgs) -> Result<()> {
-        ServerPlane::connect(self.id.clone())
-            .await
-            .launch(args)
-            .await
+    async fn launch(&self, _args: ExpRunArgs) -> Result<()> {
+        Err(retired_launch_error())
     }
     async fn cancel(&self) -> Result<()> {
         ServerPlane::connect(self.id.clone()).await.cancel().await
@@ -351,17 +356,13 @@ impl ControlPlane for ServerPlane {
             None => None,
         };
 
-        println!("{}  ({})", exp.title, exp.agent_status);
+        println!("{}", exp.title);
         println!("  id:       {}", exp.id);
         println!("  branch:   {}", exp.branch_name);
         match (&exp.parent_experiment_id, &parent_branch) {
             (Some(id), Some(branch)) => println!("  parent:   {} (branch {})", id, branch),
             (Some(id), None) => println!("  parent:   {}", id),
             (None, _) => println!("  parent:   — (root experiment)"),
-        }
-        match &exp.sandbox_id {
-            Some(sb) => println!("  sandbox:  {}", sb),
-            None => println!("  sandbox:  — (none linked)"),
         }
         if exp.run_command.is_empty() {
             println!(
@@ -496,8 +497,8 @@ impl ControlPlane for ServerPlane {
         Ok(())
     }
 
-    async fn launch(&self, args: ExpRunArgs) -> Result<()> {
-        self.launch_impl(args).await
+    async fn launch(&self, _args: ExpRunArgs) -> Result<()> {
+        Err(retired_launch_error())
     }
 
     async fn cancel(&self) -> Result<()> {
@@ -618,7 +619,6 @@ impl ControlPlane for ServerPlane {
                     title,
                     description,
                     parent_experiment_id: parent,
-                    chat_session_id: crate::local::chat::launching_chat_session(),
                 },
             )
             .await?;
@@ -635,7 +635,6 @@ impl ControlPlane for ServerPlane {
                     title: Some(title),
                     description,
                     run_command,
-                    chat_session_id: crate::local::chat::launching_chat_session(),
                 },
             )
             .await?;
@@ -682,150 +681,6 @@ impl ControlPlane for ServerPlane {
 }
 
 impl ServerPlane {
-    /// The managed/external launch dispatcher — the former `exp::launch`.
-    async fn launch_impl(&self, args: ExpRunArgs) -> Result<()> {
-        let creds = &self.creds;
-        // External backends: orx submits and supervises the job itself; the api
-        // only mirrors. Everything below this branch is the managed path.
-        if args.manifest.is_some() && args.backend.as_deref() != Some("k8s") {
-            return Err(anyhow!("--manifest only applies with --backend k8s."));
-        }
-        if args.host.is_some() && !matches!(args.backend.as_deref(), Some("ssh") | Some("slurm")) {
-            return Err(anyhow!("--host only applies with --backend ssh or slurm."));
-        }
-        if args.org.is_some() {
-            return Err(anyhow!(
-                "--org only applies with --backend openresearch (local experiments); server \
-                 experiments bill the project's own org."
-            ));
-        }
-        match args.backend.as_deref() {
-            Some("hf" | "modal") => {
-                return Err(anyhow!(
-                    "--backend {} requires a local experiment (`orx up`) so orx can stage its \
-                     immutable source snapshot directly. Server experiments run through managed \
-                     OpenResearch compute with --gpu/--cpu/--sandbox.",
-                    args.backend.as_deref().unwrap_or_default()
-                ));
-            }
-            Some("k8s") => {
-                return Err(anyhow!(
-                    "--backend k8s is supported for local experiments (`orx up`) only for now."
-                ));
-            }
-            Some("ssh") => {
-                return Err(anyhow!(
-                    "--backend ssh is supported for local experiments (`orx up`) only for now."
-                ));
-            }
-            Some("slurm") => {
-                return Err(anyhow!(
-                    "--backend slurm is supported for local experiments (`orx up`) only for now."
-                ));
-            }
-            Some("ray") => {
-                return Err(anyhow!(
-                    "--backend ray is supported for local experiments (`orx up`) only for now."
-                ));
-            }
-            Some("openresearch") => {
-                return Err(anyhow!(
-                    "--backend openresearch is for local experiments (`orx up`) only. Server \
-                     experiments already run on OpenResearch compute — pass --gpu/--cpu/--sandbox."
-                ));
-            }
-            Some("local") => {
-                return Err(anyhow!(
-                    "--backend local is supported for local experiments (`orx up`) only."
-                ));
-            }
-            Some(other) => {
-                return Err(anyhow!(
-                    "Unknown --backend '{}'. External backends are available for local \
-                     experiments (`orx up`) only.",
-                    other
-                ));
-            }
-            None => {}
-        }
-        if args.flavor.is_some() || args.image.is_some() || args.timeout.is_some() {
-            return Err(anyhow!(
-                "--flavor/--image/--timeout only apply with an external --backend."
-            ));
-        }
-        if args.manifest.is_some() {
-            return Err(anyhow!("--manifest only applies with --backend k8s."));
-        }
-        // Resolve the target: exactly one of --sandbox, --gpu, or --cpu.
-        let selectors = [
-            args.sandbox.is_some(),
-            args.gpu.is_some(),
-            args.cpu.is_some(),
-        ];
-        let chosen = selectors.iter().filter(|x| **x).count();
-        if chosen > 1 {
-            return Err(anyhow!("Pass exactly one of --sandbox, --gpu, or --cpu."));
-        }
-        if args.provider.is_some() && args.gpu.is_none() {
-            return Err(anyhow!(
-                "--provider only applies with --gpu (it selects among new GPU offers)."
-            ));
-        }
-        let target = if let Some(sandbox_id) = &args.sandbox {
-            RunTarget::Existing {
-                sandbox_id: sandbox_id.clone(),
-            }
-        } else if let Some(gpu) = &args.gpu {
-            RunTarget::New {
-                gpu: gpu.clone(),
-                gpu_count: args.count.unwrap_or(1),
-                disk_gb: args.disk.unwrap_or(100),
-                // Omitted = server default (RunPod). The server validates the
-                // name and 400s on an unknown provider, so no client-side check.
-                provider: args.provider.clone(),
-            }
-        } else if let Some(cpu_flavor) = &args.cpu {
-            RunTarget::NewCpu {
-                cpu_flavor: cpu_flavor.clone(),
-                vcpu_count: args.vcpus.unwrap_or(8),
-            }
-        } else {
-            return Err(anyhow!(
-                "Choose compute: --gpu <id> [--count N] [--disk GB], \
-                 --cpu <cpu5c|cpu5g|cpu5m> [--vcpus 2|8|32], or --sandbox <id>. \
-                 See `orx compute` for available GPUs."
-            ));
-        };
-
-        // Friendlier than the raw API "No run command set": tell them how to fix.
-        let current = get_experiment(creds, &args.exp_id).await?;
-        if current.experiment.run_command.is_empty() {
-            return Err(anyhow!(
-                "No run command set for this experiment. Set one first with \
-                 `orx exp cmd {} --set \"…\"`.",
-                args.exp_id
-            ));
-        }
-
-        // Coarse target label for analytics — NOT the sandbox id / gpu / flavor.
-        let target_kind = match &target {
-            RunTarget::Existing { .. } => "existing",
-            RunTarget::New { .. } => "gpu",
-            RunTarget::NewCpu { .. } => "cpu",
-        };
-        start_experiment_run(creds, &args.exp_id, target, args.force).await?;
-
-        // Key event, fired only on success. Server run (not local mode here).
-        crate::telemetry::capture_experiment_started("run", false, Some(target_kind));
-
-        println!("\u{2713} Run queued.");
-        println!(
-            "  Follow it with `orx runs {}` and `orx logs <runId>`.",
-            current.experiment.project_id
-        );
-        Ok(())
-    }
-
     // --- report subcommands (former commands::report server fns) ----------
 
     async fn report_show(&self, project_id: &str, report: &str) -> Result<()> {

@@ -272,7 +272,7 @@ pub trait ControlPlane {
     async fn set_experiment_command(&self, command: Option<String>) -> Result<()>;
 
     /// `orx exp run <expId> …` — launch a run. The command passes the parsed
-    /// `ExpRunArgs`; each plane validates and dispatches its own backends.
+    /// `ExpRunArgs`; the local plane validates and dispatches its backends.
     async fn launch(&self, args: crate::ExpRunArgs) -> Result<()>;
 
     /// `orx exp cancel <expId>` — cancel the in-flight run(s).

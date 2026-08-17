@@ -57,12 +57,6 @@ pub async fn submit_local_k8s_with_source(
     source: SourceSnapshot,
     run_id: String,
 ) -> Result<StoredRun> {
-    if args.sandbox.is_some() || args.gpu.is_some() || args.cpu.is_some() {
-        return Err(anyhow!(
-            "--backend k8s runs from a manifest committed on the experiment branch; \
-             drop --gpu/--cpu/--sandbox (resources live in the manifest)."
-        ));
-    }
     if args.flavor.is_some() {
         return Err(anyhow!(
             "--backend k8s has no flavors — the manifest on the experiment branch \
@@ -101,7 +95,6 @@ pub async fn submit_local_k8s_with_source(
         .or_else(|| project.run_command.clone().filter(|c| !c.trim().is_empty()))
         .ok_or_else(|| anyhow!("{}", crate::invocation::no_run_command(&project.id)))?;
 
-    // One run in flight per experiment unless deliberately forced.
     let manifest = {
         let repo_path = project.repo_path.clone();
         let revision = source.revision.clone();

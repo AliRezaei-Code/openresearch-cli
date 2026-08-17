@@ -28,7 +28,7 @@ pub fn run_dir(run_id: &str) -> String {
 /// Parse `--flavor` into a `POST /sandboxes` target: `<gpu_id>[:count]`
 /// (e.g. `h100_sxm:2`) or a CPU flavor `cpu…[:vcpus]` (e.g. `cpu5c:8`).
 /// Ids are validated server-side against the live catalog (400 on unknown),
-/// same as the managed `--gpu` path — see `orx compute` for what exists.
+/// See `orx compute` for the provider catalog.
 pub fn parse_flavor(flavor: &str, disk_gb: i64, provider: Option<String>) -> Result<SandboxTarget> {
     let flavor = flavor.trim();
     let (base, count) = match flavor.split_once(':') {

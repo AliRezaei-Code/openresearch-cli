@@ -521,7 +521,7 @@ pub enum ExpCommand {
         stdin: bool,
     },
 
-    /// Launch a run on new (`--gpu`) or existing (`--sandbox`) compute.
+    /// Launch a locally initialized experiment through an orx-supervised backend.
     Run(Box<ExpRunArgs>),
 
     /// Cancel the in-flight run.
@@ -594,33 +594,14 @@ pub enum ReportCommand {
 #[derive(Args, Debug)]
 pub struct ExpRunArgs {
     pub exp_id: String,
-    /// Provision a new instance with this GPU id, e.g. `H100_SXM` — the exact
-    /// id from `orx compute`, not a family name like `H100`.
-    #[arg(long)]
-    pub gpu: Option<String>,
-    /// GPUs per instance (with `--gpu`; default 1).
-    #[arg(long)]
-    pub count: Option<i64>,
-    /// Disk in GB (with `--gpu` or a `--backend openresearch` GPU flavor;
-    /// default 100).
+    /// Disk in GB for a `--backend openresearch` instance (default 100).
     #[arg(long)]
     pub disk: Option<i64>,
-    /// Provider to provision from (with `--gpu` or a `--backend openresearch`
-    /// GPU flavor), e.g. runpod, vast, lambda. Defaults to runpod (`--gpu`) or
-    /// the cheapest offer (`openresearch`) when omitted; validated server-side.
+    /// Provider for a `--backend openresearch` GPU flavor. When omitted, the
+    /// cheapest qualified offer is selected.
     #[arg(long)]
     pub provider: Option<String>,
-    /// Provision a CPU-only instance with this flavor: cpu5c (compute), cpu5g
-    /// (general), or cpu5m (memory-optimized). Mutually exclusive with `--gpu`.
-    #[arg(long)]
-    pub cpu: Option<String>,
-    /// vCPUs for a CPU instance (with `--cpu`): 2, 8, or 32 (default 8).
-    #[arg(long)]
-    pub vcpus: Option<i64>,
-    /// Run on an existing sandbox instead of provisioning. Mutually exclusive with `--gpu`/`--cpu`.
-    #[arg(long)]
-    pub sandbox: Option<String>,
-    /// External executor instead of managed compute: `hf` (Hugging Face Jobs,
+    /// orx-supervised executor: `hf` (Hugging Face Jobs,
     /// billed to your HF account), `modal` (a Modal Sandbox on your own Modal
     /// account, billed per second), `k8s` (a Job on your own Kubernetes
     /// cluster), `ssh` (a detached process on one of your own boxes), `slurm`
@@ -1079,4 +1060,46 @@ fn command_uses_lifecycle_lock(command: &Command) -> bool {
             | Command::McpGate
             | Command::PublishBranch(_)
     )
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn removed_server_managed_run_flags_are_rejected() {
+        for flag in ["--gpu", "--cpu", "--sandbox"] {
+            let error = Cli::try_parse_from(["orx", "exp", "run", "exp-1", flag, "value"])
+                .expect_err("retired managed-run flag should not parse");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn openresearch_backend_and_flavor_still_parse() {
+        let cli = Cli::try_parse_from([
+            "orx",
+            "exp",
+            "run",
+            "exp-1",
+            "--backend",
+            "openresearch",
+            "--flavor",
+            "h100_sxm",
+        ])
+        .expect("local OpenResearch launch should parse");
+
+        let Some(Command::Exp(ExpArgs {
+            command: ExpCommand::Run(args),
+        })) = cli.command
+        else {
+            panic!("expected exp run command");
+        };
+        assert_eq!(args.backend.as_deref(), Some("openresearch"));
+        assert_eq!(args.flavor.as_deref(), Some("h100_sxm"));
+    }
 }

@@ -3,24 +3,20 @@ name: orx-compute
 description: "Launch experiment runs with `orx exp run`: backends (hf, modal, k8s, ssh, slurm, ray, openresearch, local), flavors, timeouts, images, sizing, and `orx exp wait`. Use before launching or re-launching any run, when choosing or switching a backend or GPU flavor, when a job OOMs, stalls, or times out, or when deciding GPU vs CPU."
 ---
 
-Each experiment node has a **run command** (the shell command that trains/evaluates
-it) and is launched on **compute** you choose at run time. Compute is *not* stored
-on the node — you pick a GPU, a CPU-only instance, or an existing sandbox each time
-you launch (local projects may instead carry a default target — see "The default
-compute target" below).
+Hosted server projects are read-only execution history. To launch an experiment,
+clone its repository, initialize it with `orx up`, and choose a local execution
+backend. The backend is explicit on each launch or comes from the machine-wide
+default target.
 
 ```sh
 orx exp status <expId>                 # status, branch, parent, run command, latest run + commit, local diff recipe
-orx exp cmd <expId>                    # print the current run command
-orx exp cmd <baseId> --set "bash run.sh"   # set it ONCE on the baseline; children inherit it
 orx compute                            # browse GPU offers across all providers (price-sorted)
 orx compute --gpu H100_SXM --count 1   # filter by gpu / count
 orx compute --provider vast            # filter by provider
 orx compute --cpu                      # browse CPU-only offers (price-sorted)
-orx exp run <expId> --gpu H100_SXM --count 1 [--disk 100]     # launch on a NEW GPU instance (RunPod)
-orx exp run <expId> --gpu H100_SXM --provider vast       # launch on another provider's GPU
-orx exp run <expId> --cpu cpu5c --vcpus 8                 # launch on a NEW CPU-only instance
-orx exp run <expId> --sandbox <sandboxId>                 # launch on an EXISTING node
+orx up                                        # initialize the cloned repository
+orx exp run <expId> --backend openresearch --flavor h100_sxm
+orx exp run <expId> --backend openresearch --flavor cpu5c:8
 orx exp cancel <expId>                 # cancel the in-flight run
 ```
 
@@ -31,28 +27,13 @@ Rules and notes:
   it — vary the **code/config** on a child's git branch instead, so every variant
   runs the same command and their `EVAL.md`s stay comparable. The normal reason to
   touch a command is the baseline having none yet.
-- **Set a run command before launching.** `orx exp run` fails with a pointer to
-  `orx exp cmd --set` if the node has none.
-- **Commit your edits before launching.** Local projects run an immutable source
-  snapshot of the committed branch and never need a GitHub push. Managed server
-  projects still run their recorded remote revision. As a safety net, `orx exp
-  run` refuses a child whose branch has no changes over its parent; commit a
-  meaningful change and retry, or pass `--force` deliberately.
-- **Pick compute with exactly one of `--gpu`, `--cpu`, or `--sandbox`.** With
-  `--gpu`, `--count` defaults to `1` and `--disk` to `100` (GB). A new GPU
-  instance defaults to **RunPod** (the cheapest matching RunPod offer for the
-  chosen gpu/count); pass `--provider <name>` to launch from another provider
-  shown in `orx compute` (e.g. `vast`, `lambda`). New CPU instances are
-  RunPod-only. Browse valid gpu ids, providers, and prices with `orx compute`.
-- **GPU ids are exact enum strings, not family names.** `--gpu H100` is invalid —
-  the variant suffix is part of the id (`H100_SXM`, `H100_PCIE`, `A100_SXM_80GB`,
-  `RTX_4090`, …). Use the exact `GPU` column value from `orx compute`; run it
-  first if unsure.
-- **Use `--cpu` for GPU-less work** (data prep, eval harnesses, CPU-bound papers).
-  The flavor is one of `cpu5c` (compute), `cpu5g` (general), or `cpu5m` (memory);
-  `--vcpus` is one of `2`, `8`, `32` (default `8`). Browse offers with
-  `orx compute --cpu`. CPU instances size their disk from the vCPU count, so there
-  is no `--disk` knob.
+- **Set a run command before launching.** Local projects inherit it from the
+  project; set it with `orx project edit <projectId> --run-command '<cmd>'`.
+- **Commit your edits before launching.** Every backend runs an immutable source
+  snapshot of the committed branch and never needs a GitHub push.
+- **Pick an execution backend.** OpenResearch compute uses `--backend
+  openresearch --flavor <shape>`; other supported backends include `hf`,
+  `modal`, `k8s`, `ssh`, `slurm`, `ray`, and `local`.
 - `orx exp run` **queues** the run and returns immediately — it does not wait.
   Follow progress with `orx runs <projectId>` and `orx logs <runId>`, or block
   with `orx exp wait` (below).
@@ -66,18 +47,17 @@ set, `orx exp run <expId>` with no
 `--backend` launches there with the saved default flavor — omitting the flag is
 how you use it (flavor-required backends still need `--flavor` if no default
 flavor is saved). When none is set, ask the user to choose an explicit backend.
-Server projects are unaffected: managed compute (`--gpu`/`--cpu`/`--sandbox`)
-stays their default.
+Hosted server projects cannot launch runs; initialize the repository with
+`orx up` first.
 
 ## Running on Hugging Face Jobs — `--backend hf`
 
-**Managed compute (`--gpu`/`--cpu`/`--sandbox`) is the default for server
-projects. `--backend hf` requires a local project (`orx up`); use it ONLY when
+**`--backend hf` requires a local project (`orx up`); use it ONLY when
 the user explicitly asks for Hugging Face Jobs**
 (e.g. "run this on HF", "use my huggingface account"), it is the configured
 default target, or the project context says to
 prefer it. A connected HF token by itself is NOT a signal to switch — it just
-means the option exists. When in doubt, launch on managed compute.
+means the option exists. When in doubt, ask which backend to use.
 
 With `--backend hf`, the job runs on the user's own HF account (requires
 `HF_TOKEN` in the environment — orgs that connect their HF account in compute
@@ -91,11 +71,10 @@ orx exp run <expId> --backend hf --flavor cpu-upgrade --image python:3.12
 ```
 
 Rules and notes:
-- **`--flavor` is required** and replaces `--gpu`/`--cpu`/`--sandbox`. Common
+- **`--flavor` is required.** Common
   flavors: `t4-small`, `a10g-small`, `a10g-large`, `l4x1`, `l40sx1`,
-  `a100-large`, `h200` (and `x2/x4/x8` multiples); CPU: `cpu-basic`,
-  `cpu-upgrade`. Prefer the smallest flavor that fits — same sizing discipline
-  as managed GPUs.
+  `a100-large`, `h100`, `h200` (and `x2/x4/x8` multiples); CPU: `cpu-basic`,
+  `cpu-upgrade`. Prefer the smallest flavor that fits.
 - **Set `--timeout` to cover the whole run** (default `4h`). HF kills the job
   at the timeout; a killed job reads as a failed run.
 - For a local project, `orx` uploads the committed source snapshot into a
@@ -131,7 +110,7 @@ orx exp run <expId> --backend modal --flavor cpu --image python:3.12
 ```
 
 Rules and notes:
-- **`--flavor` is required** and replaces `--gpu`/`--cpu`/`--sandbox`. It's a
+- **`--flavor` is required.** It's a
   Modal GPU: `t4`, `l4`, `a10g`, `a100`, `a100-80gb`, `l40s`, `h100`, `h200`
   (append `:N` for a count, e.g. `h100:2`); or `cpu` / `cpu-large` for CPU-only.
   Prefer the smallest flavor that fits.
@@ -237,12 +216,13 @@ Rules and notes:
 
 ## Running on an OpenResearch box — `--backend openresearch`
 
-**Same rule: use `--backend openresearch` ONLY when the user explicitly asks
-for it** ("use an openresearch box", "bill it to the org") or it is the
-configured default target. It provisions an **ephemeral OpenResearch machine
+**Requires a local project initialized with `orx up`. Use `--backend
+openresearch` ONLY when the user explicitly asks for it** ("use an openresearch
+box", "bill it to the org") or it is the configured default target. It
+provisions an **ephemeral OpenResearch machine
 billed to the user's org** — created for this run and deleted when it ends —
-with a fixed CUDA + PyTorch + uv image. Needs `orx login` and a registered SSH
-key.
+from the provider's pinned CUDA base with pinned `uv`. Project dependencies come
+from the experiment lockfile. Needs `orx login` and a registered SSH key.
 
 ```sh
 orx exp run <expId> --backend openresearch --flavor h100_sxm:2 --timeout 4h
@@ -299,9 +279,8 @@ orx instance create <orgId> --gpu H100_SXM --provider runpod        # pin a prov
 orx instance create <orgId> --cpu cpu5g --vcpus 8                    # CPU-only box
 ```
 
-- `<orgId>` comes from `orx projects` (the `org:` line). The flags mirror
-  `orx exp run`: exactly one of `--gpu` or `--cpu`; `--count`/`--disk` apply to
-  `--gpu`, `--vcpus` to `--cpu`.
+- `<orgId>` comes from `orx projects` (the `org:` line). Choose exactly one of
+  `--gpu` or `--cpu`; `--count`/`--disk` apply to `--gpu`, `--vcpus` to `--cpu`.
 - Unlike `orx exp run`, omitting `--provider` picks the **cheapest** matching
   offer across all providers; pass `--provider <name>` to pin one.
 - The box provisions asynchronously — the command prints its id and current

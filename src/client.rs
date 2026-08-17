@@ -83,12 +83,6 @@ pub struct Experiment {
     #[serde(default)]
     pub analysis: Option<String>,
     pub run_command: String,
-    /// `null` until the experiment has been linked to a sandbox.
-    #[serde(default)]
-    pub sandbox_id: Option<String>,
-    /// The experiment agent's state, e.g. `"idle"` or `"implementing"`.
-    #[serde(default)]
-    pub agent_status: String,
     pub updated_at: String,
 }
 
@@ -479,9 +473,6 @@ pub struct CreateChildBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub parent_experiment_id: String,
-    /// Populated from `launching_chat_session()`; None outside a chat session.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chat_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -495,9 +486,6 @@ pub struct CreateBaselineExperimentBody {
     /// Omit to set it later (`orx exp cmd`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_command: Option<String>,
-    /// Populated from `launching_chat_session()`; None outside a chat session.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chat_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -570,51 +558,8 @@ pub struct UpdateProjectBody {
     pub is_public: Option<bool>,
 }
 
-/// The `target` of a run launch (`POST /experiments/{id}/run`). Internally
-/// tagged by `type`, with camelCase fields to match the API.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum RunTarget {
-    /// Reuse an already-provisioned sandbox.
-    Existing {
-        #[serde(rename = "sandboxId")]
-        sandbox_id: String,
-    },
-    /// Provision a fresh instance for the chosen GPU.
-    New {
-        gpu: String,
-        #[serde(rename = "gpuCount")]
-        gpu_count: i64,
-        #[serde(rename = "diskGb")]
-        disk_gb: i64,
-        /// Single lowercase word — same under camelCase, so no rename needed.
-        /// Omitted from the payload when `None`.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        provider: Option<String>,
-    },
-    /// Provision a fresh CPU-only instance.
-    #[serde(rename = "new-cpu")]
-    NewCpu {
-        #[serde(rename = "cpuFlavor")]
-        cpu_flavor: String,
-        #[serde(rename = "vcpuCount")]
-        vcpu_count: i64,
-    },
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct RunBody {
-    target: RunTarget,
-    /// Bypass the server's "branch unchanged vs parent" guard. Omitted when false.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    force: bool,
-}
-
 /// The `target` of a standalone instance (`POST /sandboxes`). Mirrors
-/// `RunTarget`'s `New`/`NewCpu` variants, minus `Existing` — a standalone box is
-/// always freshly provisioned, never an existing-sandbox reuse. Kept separate
-/// from `RunTarget` because the two hit different endpoints whose contracts may
-/// diverge.
+/// the provider catalog's GPU and CPU variants.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SandboxTarget {
@@ -1029,16 +974,6 @@ pub async fn update_experiment(
 ) -> Result<ExperimentEnvelope> {
     let body = serde_json::to_value(body)?;
     api_patch(creds, &format!("/experiments/{}", exp_id), body).await
-}
-
-pub async fn start_experiment_run(
-    creds: &Credentials,
-    exp_id: &str,
-    target: RunTarget,
-    force: bool,
-) -> Result<ExperimentEnvelope> {
-    let body = serde_json::to_value(RunBody { target, force })?;
-    api_post(creds, &format!("/experiments/{}/run", exp_id), body).await
 }
 
 /// Spin up a standalone instance in an org (no experiment) — `POST /sandboxes`.
@@ -1910,9 +1845,8 @@ pub async fn fetch_biorxiv(doi: &str) -> Result<Option<BiorxivDetail>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        openalex_selector, reconstruct_abstract, CreateBaselineExperimentBody, CreateChildBody,
-        CreateSandboxBody, ListCatalog, ListCpuCatalog, LitHit, OpenAlexWork, PaperHit, RunBody,
-        RunTarget, SandboxEnvelope, SandboxTarget, BIORXIV_SOURCE_ID,
+        openalex_selector, reconstruct_abstract, CreateSandboxBody, ListCatalog, ListCpuCatalog,
+        LitHit, OpenAlexWork, PaperHit, SandboxEnvelope, SandboxTarget, BIORXIV_SOURCE_ID,
     };
     use serde_json::json;
 
@@ -1990,64 +1924,6 @@ mod tests {
         assert_eq!(parsed.offers.len(), 1);
         assert!(parsed.offers[0].disk.sizable);
         assert_eq!(parsed.offers[0].disk.per_gb_hour, Some(0.0001));
-    }
-
-    /// The `new` GPU run target serializes with the discriminant and camelCase
-    /// keys the API expects, including `provider` when set.
-    #[test]
-    fn serializes_run_target_new_with_provider() {
-        let target = RunTarget::New {
-            gpu: "H100_SXM".into(),
-            gpu_count: 1,
-            disk_gb: 100,
-            provider: Some("runpod".into()),
-        };
-        assert_eq!(
-            serde_json::to_value(&target).unwrap(),
-            json!({"type": "new", "gpu": "H100_SXM", "gpuCount": 1, "diskGb": 100, "provider": "runpod"}),
-        );
-    }
-
-    /// A `None` provider must be omitted from the payload entirely (so the server
-    /// falls back to its own default), not sent as `null`.
-    #[test]
-    fn serializes_run_target_new_without_provider() {
-        let target = RunTarget::New {
-            gpu: "H100_SXM".into(),
-            gpu_count: 2,
-            disk_gb: 200,
-            provider: None,
-        };
-        let value = serde_json::to_value(&target).unwrap();
-        assert_eq!(
-            value,
-            json!({"type": "new", "gpu": "H100_SXM", "gpuCount": 2, "diskGb": 200}),
-        );
-        assert!(value.get("provider").is_none());
-    }
-
-    /// `force` is omitted when false and present when true.
-    #[test]
-    fn serializes_run_body_force_flag() {
-        let target = RunTarget::New {
-            gpu: "H100_SXM".into(),
-            gpu_count: 1,
-            disk_gb: 100,
-            provider: Some("vast".into()),
-        };
-        let with_force = serde_json::to_value(RunBody {
-            target: target.clone(),
-            force: true,
-        })
-        .unwrap();
-        assert_eq!(with_force.get("force"), Some(&json!(true)));
-
-        let without_force = serde_json::to_value(RunBody {
-            target,
-            force: false,
-        })
-        .unwrap();
-        assert!(without_force.get("force").is_none());
     }
 
     /// The standalone GPU sandbox target mirrors the run target's wire shape.
@@ -2228,48 +2104,6 @@ mod tests {
             Some("No capacity is available.")
         );
         assert_eq!(sandbox.failed_at.as_deref(), Some("2026-06-18T00:05:00Z"));
-    }
-
-    /// The api declares `chatSessionId` optional: a lost `rename_all` would send
-    /// `chat_session_id` and a lost `skip_serializing_if` would send `null`,
-    /// either of which silently drops the row's attribution.
-    #[test]
-    fn serializes_experiment_chat_session_id() {
-        let child = serde_json::to_value(CreateChildBody {
-            title: "Child".into(),
-            description: None,
-            parent_experiment_id: "exp_parent".into(),
-            chat_session_id: Some("ses_abc123".into()),
-        })
-        .unwrap();
-        assert_eq!(child.get("chatSessionId"), Some(&json!("ses_abc123")));
-
-        let child_without = serde_json::to_value(CreateChildBody {
-            title: "Child".into(),
-            description: None,
-            parent_experiment_id: "exp_parent".into(),
-            chat_session_id: None,
-        })
-        .unwrap();
-        assert!(child_without.get("chatSessionId").is_none());
-
-        let baseline = serde_json::to_value(CreateBaselineExperimentBody {
-            title: Some("Baseline".into()),
-            description: None,
-            run_command: None,
-            chat_session_id: Some("ses_abc123".into()),
-        })
-        .unwrap();
-        assert_eq!(baseline.get("chatSessionId"), Some(&json!("ses_abc123")));
-
-        let baseline_without = serde_json::to_value(CreateBaselineExperimentBody {
-            title: Some("Baseline".into()),
-            description: None,
-            run_command: None,
-            chat_session_id: None,
-        })
-        .unwrap();
-        assert!(baseline_without.get("chatSessionId").is_none());
     }
 
     /// The inverted index maps token → positions; reconstruction must restore the

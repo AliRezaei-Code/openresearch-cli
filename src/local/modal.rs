@@ -46,12 +46,6 @@ pub async fn submit_local_modal_with_source(
     source: SourceSnapshot,
     run_id: String,
 ) -> Result<StoredRun> {
-    if args.sandbox.is_some() || args.gpu.is_some() || args.cpu.is_some() {
-        return Err(anyhow!(
-            "--backend modal runs on Modal serverless GPUs; drop --gpu/--cpu/--sandbox \
-             and pass --flavor instead (e.g. --flavor a10g, --flavor a100-80gb, --flavor cpu)."
-        ));
-    }
     let flavor_name = args.flavor.clone().ok_or_else(|| {
         anyhow!(
             "--backend modal requires --flavor: a Modal GPU (t4, l4, a10g, a100, \
@@ -83,7 +77,6 @@ pub async fn submit_local_modal_with_source(
         .or_else(|| project.run_command.clone().filter(|c| !c.trim().is_empty()))
         .ok_or_else(|| anyhow!("{}", crate::invocation::no_run_command(&project.id)))?;
 
-    // One run in flight per experiment unless deliberately forced.
     let image = args
         .image
         .clone()

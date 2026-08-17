@@ -9,10 +9,10 @@ depends on the project type:
 - For a local project, work in its session worktree, check out the branch, edit,
   and commit. Every compute backend receives an immutable snapshot of that local
   commit. A GitHub push is optional publication and is never required to run.
-- For a managed server project, GitHub remains the source of record. Use the
-  cache-dir clone flow below and push the branch before running.
+- For a hosted server project, GitHub remains the source of record. Clone the
+  repository, initialize it with `orx up`, and launch from that local project.
 
-**For managed server projects, clone into the openresearch cache dir, not your cwd.** The canonical location,
+**For hosted server projects, clone into the OpenResearch cache dir, not your cwd.** The canonical location,
 keyed by repo so the same clone is reused across all of a project's experiments:
 
 ```
@@ -23,12 +23,11 @@ keyed by repo so the same clone is reused across all of a project's experiments:
 directory or the user's project folders — clones accreting in `~/projects` is the
 failure mode this avoids.
 
-For a managed server project, this is how you **realize a child's hypothesis**: after `create-experiment
---parent`, check out the child's branch and make the specific code/config edits
-its description calls for — then commit, push, and run. Edit only the files that
-idea touches, and **don't touch the run command** (it's inherited; see the
-`orx-experiment-tree` skill). A node a run has already answered is frozen —
-branch a child instead.
+For a hosted server project, check out the experiment branch and make the
+specific code/config edits its description calls for. Commit and push for
+collaboration, then initialize the repository with `orx up` to launch it locally.
+Edit only the files that idea touches. A node a run has already answered is
+frozen — branch a child instead.
 
 The sync recipe is **idempotent** — run it verbatim whether or not the clone
 already exists from a previous session. Always fetch + fast-forward before
@@ -47,7 +46,7 @@ git -C "$DIR" merge --ff-only origin/orx/<slug>   # fails loudly rather than dis
 
 #   …edit files under "$DIR" with your normal tools…
 git -C "$DIR" commit -am "tune lr"     # one or more commits — your call
-git -C "$DIR" push                     # push so runs and the tree see the change
+git -C "$DIR" push                     # optional publication/collaboration
 ```
 
 Rules and notes:
@@ -61,9 +60,8 @@ Rules and notes:
   already has — the repo lives under your account or your org, so access is the
   same as any of your repos. If a clone or push fails on auth, authenticate git
   for github.com (e.g. `gh auth login` or an SSH key) and retry.
-- **Push before managed server runs.** Local projects run committed snapshots
-  directly and do not require a push. Managed server projects launch from the
-  pushed GitHub tip, so commit and push those branches first.
+- **Push for collaboration, not execution.** Local projects run committed
+  snapshots directly and do not require a push.
 - **Never merge or rebase a branch once its node is frozen** (cardinal rule):
   its history is the code those results came from. Bring changes in on a
   **child** instead. On a *provisional* node a plain `git merge
@@ -96,7 +94,7 @@ git -C "$DIR" diff origin/<parent-branch>...<full-commit-sha>
 
 A node whose run answered nothing is provisional: fix it on **its own branch** and
 re-run the same `<expId>` — don't create a child (`orx-experiment-tree`). Sync
-as above, then commit, push, `orx exp run`.
+as above, then commit and run `orx exp run`. Push only for collaboration.
 
 If the checkout fails with "already checked out at …", read the path: your own
 worktree means you already hold it. Another session's means that agent owns the

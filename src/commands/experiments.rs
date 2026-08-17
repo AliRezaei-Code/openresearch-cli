@@ -67,10 +67,7 @@ fn print_node(
     let indent = "  ".repeat(depth);
     // Id first (like `orx projects`) so it's easy to copy into experiment-scoped
     // commands (`orx exp …`, `orx create-experiment --parent …`).
-    println!(
-        "{indent}\u{25b8} {}  {}  ({})",
-        exp.id, exp.title, exp.agent_status
-    );
+    println!("{indent}\u{25b8} {}  {}", exp.id, exp.title);
     if let Some(children) = children_of.get(&Some(exp.id.clone())) {
         for &child in children {
             print_node(experiments, children_of, child, depth + 1);

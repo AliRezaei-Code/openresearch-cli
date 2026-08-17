@@ -876,15 +876,12 @@ impl TelemetrySession {
 /// The motivating key event. Fire only on success.
 ///
 /// - `kind`: `"create"` (a node was created) or `"run"` (a run was launched).
-/// - `local`: `true` when dispatched via the local `orx up` store path,
-///   `false` for a hosted server experiment. NB this is a dispatch axis, not a
-///   "runs on this machine" axis — e.g. `local=true, target="openresearch"` is
-///   an ephemeral OpenResearch box provisioned for a local-mode run, and
-///   `local=true, target="hf"` drives the user's own HF account from local mode.
+/// - `local`: `true` when dispatched via the local `orx up` store path.
+///   This is a dispatch axis, not a "runs on this machine" axis — for example,
+///   `target="openresearch"` provisions an ephemeral OpenResearch box.
 /// - `target`: for a run, a COARSE compute label — the backend/provider name
 ///   (`"hf"`, `"modal"`, `"k8s"`, `"ssh"`, `"slurm"`, `"ray"`, `"openresearch"`,
-///   `"local"`) for local-mode runs, or the managed compute shape (`"gpu"`,
-///   `"cpu"`, `"existing"`) for server runs. `None` for `create` (no compute).
+///   `"local"`) for local-mode runs. `None` for `create` (no compute).
 ///   Always a fixed enum label, never an id, name, or path.
 ///
 /// One vocabulary axis per property: `target` is always "what compute", `local`

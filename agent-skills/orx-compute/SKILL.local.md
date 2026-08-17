@@ -9,9 +9,9 @@ repository clone, GitHub token, or public repository is required.
 
 In local mode (`orx up`) every run launches with `orx exp run <expId>` onto a
 **backend**: `hf`, `modal`, `k8s`, `ssh`, `slurm`, `ray`, `openresearch`, or `local`.
-There is no managed-SKU compute here (`--gpu`/`--cpu`/`--sandbox` are
-server-project flags) — the backend comes from an explicit `--backend`, or from
-the machine-wide default target configured by the user.
+The backend comes from an explicit `--backend`, or from the machine-wide default
+target configured by the user. Hosted server projects are read-only execution
+history; clone the repository and initialize it with `orx up` before launching.
 
 ```sh
 orx exp status <expId>                     # status, branch, run command, latest run
@@ -154,8 +154,9 @@ orx exp run <expId> --backend ray --flavor cpu:2,mem:8GiB
 ## An OpenResearch box — `--backend openresearch`
 
 Provisions an **ephemeral OpenResearch machine billed to the user's org** —
-created for this run and deleted when it ends — with a fixed CUDA + PyTorch +
-uv image. Needs `orx login` and an SSH key registered from *this* computer —
+created for this run and deleted when it ends — from the provider's pinned CUDA
+base with pinned `uv`. Project dependencies come from the experiment lockfile.
+Needs `orx login` and an SSH key registered from *this* computer —
 without one the box comes online but refuses the connection.
 
 `orx ssh-key list` marks which registered keys are usable here. If none are,

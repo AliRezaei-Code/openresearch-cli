@@ -133,11 +133,13 @@ the run command:
    than one that dumped its rollouts. See the `orx-evidence` skill.
 5. **Fill the available GPU capacity** — launch ready children in parallel until
    the sum of GPUs requested by in-flight runs reaches the available capacity.
+   Launching requires a local project initialized from the cloned repository
+   with `orx up`; hosted project records cannot launch runs. See `orx-compute`.
    Capacity is GPU-weighted, not a raw run-count limit: with 16 available GPUs,
    one-GPU experiments mean up to 16 concurrent runs, four-GPU experiments mean
    up to four, and an experiment that requires all 16 runs alone.
    ```sh
-   orx exp run <childId> --gpu H100_SXM --count 1
+   orx exp run <childId> --backend openresearch --flavor h100_sxm
    ```
 6. **Keep GPU capacity saturated — drive a per-completion loop, not a wait-for-all
    barrier.** You want control back the moment

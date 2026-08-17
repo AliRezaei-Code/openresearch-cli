@@ -303,6 +303,14 @@ impl ControlPlane for LocalPlane {
         if args.org.is_some() && args.backend.as_deref() != Some("openresearch") {
             return Err(anyhow!("--org only applies with --backend openresearch."));
         }
+        if args.disk.is_some() && args.backend.as_deref() != Some("openresearch") {
+            return Err(anyhow!("--disk only applies with --backend openresearch."));
+        }
+        if args.provider.is_some() && args.backend.as_deref() != Some("openresearch") {
+            return Err(anyhow!(
+                "--provider only applies with --backend openresearch."
+            ));
+        }
         // Coarse backend label for analytics; the backend name is already an
         // enum, never user data. Recorded before the (borrowing) dispatch below.
         let backend_label = args.backend.clone();
