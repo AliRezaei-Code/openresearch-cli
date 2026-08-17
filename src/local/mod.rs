@@ -42,10 +42,15 @@ use crate::store::{now_ms, Store, StoredRun};
 
 /// Graceful error for commands outside the local-mode v1 surface.
 pub fn unsupported(cmd: &str) -> Error {
+    let guidance = if cmd == "exp cmd" {
+        "\nSet the local project run command instead: `orx project edit <projectId> --run-command '<cmd>'`."
+    } else {
+        ""
+    };
     anyhow!(
         "`orx {cmd}` is not supported in local mode yet.\n\
          Local mode supports: projects, project view/edit, create-experiment, \
-         exp run/status/cancel/wait/desc, runs, logs."
+         exp run/status/cancel/wait/wake/desc, runs, logs.{guidance}"
     )
 }
 

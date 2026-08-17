@@ -39,12 +39,6 @@ pub async fn submit_local_ray_with_source(
     source: SourceSnapshot,
     run_id: String,
 ) -> Result<StoredRun> {
-    if args.sandbox.is_some() || args.gpu.is_some() || args.cpu.is_some() {
-        return Err(anyhow!(
-            "--backend ray submits to your Ray cluster; drop --gpu/--cpu/--sandbox and \
-             ask for resources with --flavor (e.g. --flavor gpu:1)."
-        ));
-    }
     if args.image.is_some() {
         return Err(anyhow!(
             "--image doesn't apply to --backend ray — the job runs in the cluster's \

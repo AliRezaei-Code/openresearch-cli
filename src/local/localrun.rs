@@ -38,12 +38,6 @@ pub async fn submit_local_run_with_source(
     source: SourceSnapshot,
     run_id: String,
 ) -> Result<StoredRun> {
-    if args.sandbox.is_some() || args.gpu.is_some() || args.cpu.is_some() {
-        return Err(anyhow!(
-            "--backend local runs on this machine; drop --gpu/--cpu/--sandbox — \
-             there is nothing to provision."
-        ));
-    }
     if args.flavor.is_some() {
         return Err(anyhow!(
             "--backend local has no flavors — the hardware is whatever this machine has."
@@ -71,7 +65,6 @@ pub async fn submit_local_run_with_source(
         .or_else(|| project.run_command.clone().filter(|c| !c.trim().is_empty()))
         .ok_or_else(|| anyhow!("{}", crate::invocation::no_run_command(&project.id)))?;
 
-    // One run in flight per experiment unless deliberately forced.
     let script = crate::compute::snapshot_script(&source.path.to_string_lossy(), &run_command);
 
     // The run's env: everything the user synced (API keys), plus the tokens

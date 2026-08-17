@@ -2,7 +2,7 @@
 //!
 //!   orx exp status <expId>            inspect status, run command, latest run
 //!   orx exp cmd    <expId> [--set …]  view or set the run command
-//!   orx exp run    <expId> …          launch a run on new or existing compute
+//!   orx exp run    <expId> …          launch a local orx-supervised run
 //!   orx exp cancel <expId>            cancel the in-flight run
 //!   orx exp wake   <expId>            resume this agent when the run succeeds or fails
 //!

@@ -57,7 +57,7 @@ JSON/SSE API over a local SQLite store. From there you get:
   measured against it, so lineage stays explicit.
 - **Runs** — every backend receives the same immutable archive of the recorded
   Git commit. Modal, Hugging Face Jobs, Kubernetes, Slurm, SSH, Ray,
-  OpenResearch, and local runs do not require a hosted repository or push.
+  OpenResearch, and local runs do not require publishing the repository.
 - **Autoresearch** — describe a goal and let the agent run autonomously toward
   it: proposing, launching, and analyzing experiments.
 
@@ -85,9 +85,9 @@ Run `orx --help` (or `orx <command> --help`) for full usage. The highlights:
 |---|---|
 | Dashboard | `up` |
 | Auth | `login`, `logout` |
-| Projects | `projects`, `explore`, `project`, `create-project`, `env` |
-| Experiments | `experiments`, `create-experiment`, `exp status/cmd/run/cancel` |
-| Runs & evidence | `runs`, `logs`, `search-logs`, `artifacts`, `artifact`, `wandb`, `query`, `chart`, `report` |
+| Projects | `projects`, `project` |
+| Experiments | `create-experiment`, `exp status/run/cancel/wait/wake` |
+| Runs & evidence | `runs`, `logs` |
 | Compute | `compute`, `instance create` |
 | Literature | `lit`, `paper` (full-text search across alphaXiv, OpenAlex, bioRxiv — no login required) |
 | Agent integration | `install-skills`, `skill` |
