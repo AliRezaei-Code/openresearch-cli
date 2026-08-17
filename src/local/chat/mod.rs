@@ -4357,8 +4357,8 @@ pub fn set_chat_session_env(cmd: &mut tokio::process::Command, session_id: &str)
 }
 
 /// The chat session that launched this run, read from the env the harness child
-/// exported (see [`set_chat_session_env`]). `None` for CLI-launched or server
-/// runs — those intentionally poke no chat session on completion.
+/// exported (see [`set_chat_session_env`]). `None` for runs launched outside
+/// chat — those intentionally poke no chat session on completion.
 pub fn launching_chat_session() -> Option<String> {
     std::env::var(CHAT_SESSION_ENV)
         .ok()
@@ -4368,9 +4368,8 @@ pub fn launching_chat_session() -> Option<String> {
 /// Whether this process is running inside a local `orx up` session.
 /// [`LOCAL_SESSION_ENV`] is exported only by [`set_chat_session_env`] onto
 /// `orx up` harness children, so its presence means this process is one (or a
-/// subprocess of one). Commands that take a project or run id should prefer
-/// `…is_local()` on the resolved entity; this is for the ones that take
-/// neither (e.g. `orx skill <name>`).
+/// subprocess of one). Project, experiment, and run commands resolve their ids
+/// through `local::resolve`; this is for commands that take no such id.
 pub fn in_local_session() -> bool {
     std::env::var(LOCAL_SESSION_ENV).is_ok_and(|v| !v.is_empty())
 }

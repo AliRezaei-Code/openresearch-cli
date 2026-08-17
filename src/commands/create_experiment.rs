@@ -22,7 +22,6 @@ pub async fn run(mut args: crate::CreateExperimentArgs) -> Result<()> {
         }
     };
 
-    // The server plane rejects this verb without making an API request.
     let store = Store::open()?;
     let plane = resolve_project(store, &args.project_id)?;
     plane
@@ -34,7 +33,6 @@ pub async fn run(mut args: crate::CreateExperimentArgs) -> Result<()> {
             run_command: args.run_command,
         })
         .await?;
-    // Success is local-only because the server plane always returns above.
-    crate::telemetry::capture_experiment_started("create", true, None);
+    crate::telemetry::capture_experiment_started("create", None);
     Ok(())
 }

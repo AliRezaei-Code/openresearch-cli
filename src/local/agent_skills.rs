@@ -132,8 +132,8 @@ pub fn skills(set: SkillSet) -> Vec<&'static AgentSkill> {
 }
 
 /// Resolve a bundled skill by name within `set`, accepting both the public name
-/// (`orx-compute`) and the bare form (`compute`). `None` for an unknown name —
-/// the caller falls back to the live API fetch.
+/// (`orx-compute`) and the bare form (`compute`). Returns `None` for an unknown
+/// bundled name.
 pub fn find(name: &str, set: SkillSet) -> Option<&'static AgentSkill> {
     let want = name.trim();
     skills(set)

@@ -112,14 +112,6 @@ pub(crate) struct Settings {
     /// Set by `orx telemetry off`. `Some(true)` = user opted out persistently.
     #[serde(default)]
     pub telemetry_disabled: Option<bool>,
-    /// Machine context tag (e.g. `"cloud-agent"` on OpenResearch cloud boxes),
-    /// set once by `orx telemetry context <value>` during box provisioning.
-    /// Stamped on every event as the `install_kind` property so first-party
-    /// automation can be excluded from human usage metrics centrally (the
-    /// analytics projections) instead of per-dashboard filters. Absent = a
-    /// human install (`install_kind: "human"`).
-    #[serde(default)]
-    pub machine_context: Option<String>,
     /// User-chosen data directory (Storage settings). Absent = fall back to the
     /// env/XDG/default chain in `store::data_dir()`. Persisted here — in the one
     /// `settings.json` — so a write can't clobber `install_id`/`telemetry_disabled`
@@ -536,39 +528,6 @@ pub(crate) fn set_persisted_disabled(disabled: bool) -> std::io::Result<()> {
     })
 }
 
-/// The effective machine context: the `ORX_TELEMETRY_CONTEXT` env var when set
-/// and non-empty (so a fleet can re-tag per-process without touching disk),
-/// else the persisted `machine_context`. `None` = a human install.
-pub(crate) fn machine_context() -> Option<String> {
-    if let Ok(v) = std::env::var("ORX_TELEMETRY_CONTEXT") {
-        let v = v.trim();
-        if !v.is_empty() {
-            return Some(v.to_string());
-        }
-    }
-    load_settings()
-        .and_then(|s| s.machine_context)
-        .filter(|v| !v.is_empty())
-}
-
-/// Persist (or clear, with `None`) the machine context, preserving every other
-/// settings field via the locked RMW. Used by `orx telemetry context`.
-pub(crate) fn set_machine_context(context: Option<String>) -> std::io::Result<()> {
-    mutate_settings(|s| {
-        s.machine_context = context
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-    })
-}
-
-/// The value stamped as every event's `install_kind` property: the machine
-/// context when one is set, else `"human"`. This is the delineation axis for
-/// "installs by humans" vs first-party automation (cloud agent boxes) — kept
-/// separate from `ci`, which flags *third-party* automation (a user's own CI).
-fn install_kind() -> String {
-    machine_context().unwrap_or_else(|| "human".to_string())
-}
-
 /// Process-global capture of the `--no-telemetry` flag, set once in `main`
 /// before any command runs. Command modules fire events without having to
 /// thread the global flag through their `run(args)` signatures — they read it
@@ -615,7 +574,6 @@ fn build_payload_with_id(
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
             "ci": is_ci(),
-            "installKind": install_kind(),
         },
         "events": [{
             "eventId": event_id.to_string(),
@@ -802,8 +760,8 @@ pub(crate) fn capture_onboarding_research_profile(profile: &ResearchProfile) {
     );
 }
 
-pub(crate) fn capture_project_created(local: bool) {
-    capture("project_created", json!({ "local": local }));
+pub(crate) fn capture_project_created() {
+    capture("project_created", json!({}));
 }
 
 pub(crate) fn capture_chat_session_started(harness: &str) {
@@ -867,21 +825,15 @@ impl TelemetrySession {
 /// The motivating key event. Fire only on success.
 ///
 /// - `kind`: `"create"` (a node was created) or `"run"` (a run was launched).
-/// - `local`: `true` when dispatched via the local `orx up` store path.
-///   This is a dispatch axis, not a "runs on this machine" axis — for example,
-///   `target="openresearch"` provisions an ephemeral OpenResearch box.
 /// - `target`: for a run, a COARSE compute label — the backend/provider name
 ///   (`"hf"`, `"modal"`, `"k8s"`, `"ssh"`, `"slurm"`, `"ray"`, `"openresearch"`,
-///   `"local"`) for local-mode runs. `None` for `create` (no compute).
+///   `"local"`). `None` for `create` (no compute).
 ///   Always a fixed enum label, never an id, name, or path.
-///
-/// One vocabulary axis per property: `target` is always "what compute", `local`
-/// is always "which dispatch path". `kind`+`local` tell you how to read `target`.
 ///
 /// Non-blocking: the send is spawned and registered for the exit-time flush, so
 /// this returns immediately and never delays the command's own success output.
-pub(crate) fn capture_experiment_started(kind: &str, local: bool, target: Option<&str>) {
-    let mut extra = json!({ "kind": kind, "local": local });
+pub(crate) fn capture_experiment_started(kind: &str, target: Option<&str>) {
+    let mut extra = json!({ "kind": kind });
     if let (Some(obj), Some(t)) = (extra.as_object_mut(), target) {
         obj.insert("computeTarget".to_string(), json!(t));
     }
@@ -934,12 +886,7 @@ mod tests {
         }
     }
 
-    const OPT_VARS: &[&str] = &[
-        "XDG_CONFIG_HOME",
-        "ORX_TELEMETRY_CONTEXT",
-        "ORX_TELEMETRY_ENV",
-        "ORX_TELEMETRY_HOST",
-    ];
+    const OPT_VARS: &[&str] = &["XDG_CONFIG_HOME", "ORX_TELEMETRY_ENV", "ORX_TELEMETRY_HOST"];
 
     #[test]
     fn environment_policy_is_fail_closed_and_downgrade_only() {
@@ -1245,14 +1192,13 @@ mod tests {
 
     #[test]
     fn standard_payload_shape_excludes_sensitive_fields() {
-        // build_payload reads the machine context (env + settings), so isolate.
         let _g = EnvGuard::new(OPT_VARS);
         let dir = std::env::temp_dir().join(format!("orx-tel-shape-{}", uuid::Uuid::new_v4()));
         std::env::set_var("XDG_CONFIG_HOME", &dir);
         let payload = build_payload(
             "experiment_started",
             "test-distinct-id",
-            json!({ "kind": "run", "local": false, "computeTarget": "modal" }),
+            json!({ "kind": "run", "computeTarget": "modal" }),
         );
 
         assert_eq!(payload["schemaVersion"], 1);
@@ -1266,8 +1212,6 @@ mod tests {
         assert!(context["os"].is_string());
         assert!(context["arch"].is_string());
         assert!(context["ci"].is_boolean());
-        // No context configured → a human install.
-        assert_eq!(context["installKind"], "human");
         let props = &payload["events"][0]["properties"];
         // Event-specific coarse props.
         assert_eq!(props["kind"], "run");
@@ -1300,7 +1244,6 @@ mod tests {
                 "source": "EVIL",
                 "buildChannel": "EVIL",
                 "ci": "EVIL",
-                "installKind": "EVIL",
                 "command": "login"
             }),
         );
@@ -1311,50 +1254,8 @@ mod tests {
             "embedded build channel must win"
         );
         assert!(context["ci"].is_boolean(), "base ci must win");
-        assert_eq!(
-            context["installKind"], "human",
-            "base install kind must win"
-        );
         // Non-colliding extra keys still land.
         assert_eq!(payload["events"][0]["properties"]["command"], "login");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn install_kind_resolution_env_over_persisted_over_default() {
-        let _g = EnvGuard::new(OPT_VARS);
-        let dir = std::env::temp_dir().join(format!("orx-tel-kind-{}", uuid::Uuid::new_v4()));
-        std::env::set_var("XDG_CONFIG_HOME", &dir);
-
-        // Nothing configured → human.
-        assert_eq!(install_kind(), "human");
-
-        // Persisted context wins over the default and survives sibling writes.
-        set_machine_context(Some("cloud-agent".into())).unwrap();
-        assert_eq!(install_kind(), "cloud-agent");
-        set_persisted_disabled(true).unwrap();
-        let s = load_settings().expect("settings present");
-        assert_eq!(
-            s.machine_context.as_deref(),
-            Some("cloud-agent"),
-            "context survived a sibling mutation"
-        );
-        assert_eq!(s.telemetry_disabled, Some(true));
-        set_persisted_disabled(false).unwrap();
-
-        // Env var wins over the persisted value; whitespace-only is ignored.
-        std::env::set_var("ORX_TELEMETRY_CONTEXT", "ci-fleet");
-        assert_eq!(install_kind(), "ci-fleet");
-        std::env::set_var("ORX_TELEMETRY_CONTEXT", "   ");
-        assert_eq!(install_kind(), "cloud-agent");
-        std::env::remove_var("ORX_TELEMETRY_CONTEXT");
-
-        // Clearing restores the default; empty string means clear.
-        set_machine_context(None).unwrap();
-        assert_eq!(install_kind(), "human");
-        set_machine_context(Some("  ".into())).unwrap();
-        assert!(load_settings().unwrap().machine_context.is_none());
-
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1541,10 +1442,9 @@ mod tests {
             assert!(!profile_text.contains(forbidden));
         }
 
-        let project = build_payload("project_created", "did", json!({ "local": true }));
+        let project = build_payload("project_created", "did", json!({}));
         assert_eq!(project["events"][0]["name"], "cli_project_created");
-        assert_eq!(project["events"][0]["properties"]["local"], true);
-        assert_eq!(property_keys(&project), vec!["local"]);
+        assert!(property_keys(&project).is_empty());
 
         let chat = build_payload("chat_session_started", "did", json!({ "harness": "codex" }));
         assert_eq!(chat["events"][0]["name"], "cli_chat_session_started");
@@ -1598,9 +1498,9 @@ mod tests {
         let session = TelemetrySession::start("up");
         capture_onboarding_completed();
         capture_onboarding_research_profile(&ResearchProfile::default());
-        capture_project_created(true);
+        capture_project_created();
         capture_chat_session_started("codex");
-        capture_experiment_started("run", true, Some("local"));
+        capture_experiment_started("run", Some("local"));
 
         assert!(pending().lock().unwrap().is_empty());
         session.finish(true).await;

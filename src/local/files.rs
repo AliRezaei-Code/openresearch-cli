@@ -61,7 +61,7 @@ pub fn files_dir(project: &LocalProject) -> PathBuf {
 /// The artifacts dir as the UI sees it, for recognizing artifact paths in chat
 /// links. Deliberately NOT canonicalized: the absolute path the agent inlines
 /// into the transcript comes from the un-canonicalized `files_dir` (the
-/// `{artifacts}` playbook token in `opencode.rs` and the `orx report` guidance),
+/// `{artifacts}` playbook token in `opencode.rs` and report-writing guidance),
 /// so the surfaced string must match it byte-for-byte or the UI's prefix match
 /// misses on symlinked data dirs (e.g. `/tmp` → `/private/tmp`).
 pub fn files_dir_display(project: &LocalProject) -> String {

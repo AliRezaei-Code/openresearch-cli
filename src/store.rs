@@ -1,14 +1,12 @@
 //! Local run store — orx's own truth for externally-executed runs.
 //!
 //! Mirrors the opencode model: state lives in a SQLite db beside the work
-//! (`orx.db` under the data dir), `orx serve` exposes it over loopback
-//! HTTP/SSE, and the api snapshots the whole dir to R2 per project. Run logs
-//! are plain append-only files under `run-logs/<runId>.log` so tailing (serve)
-//! and appending (supervise) never contend on the db.
+//! (`orx.db` under the data dir), and `orx serve` exposes it over loopback
+//! HTTP/SSE. Run logs are plain append-only files under `run-logs/<runId>.log`
+//! so tailing (serve) and appending (supervise) never contend on the db.
 //!
 //! Data dir: `$ORX_DATA_DIR`, else `$XDG_DATA_HOME/openresearch`, else
-//! `~/.local/share/openresearch` — the exact path the api's snapshot/restore
-//! tars on agent boxes.
+//! `~/.local/share/openresearch`.
 
 use std::path::PathBuf;
 
@@ -188,8 +186,7 @@ pub fn human_bytes(n: u64) -> String {
 }
 
 pub fn log_path(run_id: &str) -> PathBuf {
-    // Run ids are server-issued UUIDs; sanitize anyway so a hostile id can't
-    // escape the log dir.
+    // Sanitize the id so malformed local data cannot escape the log directory.
     let safe: String = run_id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
@@ -197,9 +194,8 @@ pub fn log_path(run_id: &str) -> PathBuf {
     data_dir().join("run-logs").join(format!("{safe}.log"))
 }
 
-/// A locally-tracked external run. `status` uses the server vocabulary
-/// (starting/running/done/failed/cancelled); `backend_json` is the opaque
-/// descriptor (kind, namespace, jobId, flavor…) shared with the api mirror.
+/// A locally tracked run. `backend_json` stores the backend descriptor used by
+/// the detached supervisor.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoredRun {
@@ -216,11 +212,11 @@ pub struct StoredRun {
     pub exit_code: Option<i64>,
     pub commit_sha: Option<String>,
     pub result_markdown: Option<String>,
-    /// Local-mode cancel intent (the supervisor polls it; server runs ignore it).
+    /// Cancel intent polled by the detached supervisor.
     pub cancel_requested: bool,
     /// The `orx up` chat session that launched this run, when it was started by
     /// an agent harness child (which exports `ORX_CHAT_SESSION_ID`). `None` for
-    /// CLI-launched or server runs. This records attribution; wake-ups are
+    /// CLI-launched runs. This records attribution; wake-ups are
     /// separately and explicitly registered in `chat_run_wakeups`.
     pub chat_session_id: Option<String>,
 }

@@ -4,7 +4,7 @@
 //! tools (file reads, `grep`, …) but treats an arbitrary `Bash(orx …)` as a
 //! write it must gate — and headless `--print` can't answer that prompt, so the
 //! call just fails. That breaks planning, because the agent plans by
-//! *inspecting* prior runs, logs, and the evidence DB via read-only `orx`
+//! *inspecting* prior runs and logs via read-only `orx`
 //! subcommands — and by reading experiment code that often lives only on git
 //! branches (`git show <ref>:<file>`, `git ls-tree`), typically piped through
 //! `head`/`grep` with a `2>&1`.
@@ -33,23 +33,7 @@ use serde_json::{json, Value};
 /// turn them into a write). Kept in lockstep with `main.rs`'s `Command` enum;
 /// `readonly_verbs_are_real_commands` guards against a rename.
 const WHOLE_VERB_READS: &[&str] = &[
-    "projects",
-    "explore",
-    "experiments",
-    "env",
-    "runs",
-    "logs",
-    "search-logs",
-    "artifacts",
-    "artifact",
-    "wandb",
-    "query",
-    "chart",
-    "compute",
-    "lit",
-    "paper",
-    "skill",
-    "version",
+    "projects", "orgs", "runs", "logs", "compute", "lit", "paper", "skill", "version",
 ];
 
 /// Shell no-ops allowed as glue between read-only segments in a batch —
@@ -167,7 +151,7 @@ pub fn decide(payload: &Value) -> Option<Value> {
 /// `cmd 2>&1 | head` and the merge itself has no side effect.
 ///
 /// The split is not quote-aware, so a separator *inside* a quoted argument
-/// (e.g. `orx query "select … where a && b"`) is still treated as a separator
+/// (e.g. `orx logs "name && status"`) is still treated as a separator
 /// and gates the line. This over-gates rather than under-allows — it fails
 /// safe — so such a command just falls back to plan mode's normal gate; run it
 /// outside a batch to have it auto-allowed.
@@ -271,7 +255,7 @@ fn is_pure_consumer(tokens: &[&str]) -> bool {
 
 /// True iff a tokenized `orx …` invocation is read-only. `stage` is the raw
 /// stage text, kept for the `--set`/`--stdin` substring scan (those flags only
-/// ever appear on the write forms of `exp desc`/`exp cmd`, so a whole-stage
+/// appear on the write form of `exp desc`, so a whole-stage
 /// scan is a sound discriminator).
 fn is_readonly_orx(tokens: &[&str], stage: &str) -> bool {
     let mut rest = tokens.iter().skip(1).copied();
@@ -297,12 +281,11 @@ fn is_readonly_orx(tokens: &[&str], stage: &str) -> bool {
         "exp" => match subcommand(&mut rest) {
             // Pure reads.
             Some("status" | "wait") => true,
-            // `desc`/`cmd` view the node's notes / run command, but *write*
-            // them with `--set`/`--stdin`. Allow only the read (view) form.
-            Some("desc" | "cmd") => !stage.contains("--set") && !stage.contains("--stdin"),
+            // `desc` views the node's notes, but writes them with
+            // `--set`/`--stdin`. Allow only the read form.
+            Some("desc") => !stage.contains("--set") && !stage.contains("--stdin"),
             _ => false,
         },
-        "report" => matches!(subcommand(&mut rest), Some("list" | "show" | "download")),
 
         // Everything else — create-*, instance, login/logout, install-skills,
         // update, serve, supervise, up, and any unrecognized future verb — is
@@ -449,13 +432,8 @@ mod tests {
         for c in [
             "orx runs",
             "orx logs r-123 --tail 200",
-            "orx query \"select 1\"",
-            "orx experiments",
-            "orx artifacts r-9",
-            "orx search-logs foo",
-            "orx wandb r-1",
-            "orx chart loss",
             "orx compute",
+            "orx orgs",
             "orx lit transformers",
             "orx paper 2301.00001",
             "orx skill",
@@ -474,11 +452,7 @@ mod tests {
         assert!(allowed("orx exp status e-1"));
         // The playbook's core orientation reads (view form).
         assert!(allowed("orx exp desc e-1"));
-        assert!(allowed("orx exp cmd e-1"));
         assert!(allowed("orx exp wait e-1"));
-        assert!(allowed("orx report list"));
-        assert!(allowed("orx report show r-1"));
-        assert!(allowed("orx report download r-1 --out x.md"));
     }
 
     #[test]
@@ -490,11 +464,9 @@ mod tests {
         assert!(!allowed("orx project --stdin brief update p-1"));
         assert!(!allowed("orx exp run e-1"));
         assert!(!allowed("orx exp cancel e-1"));
-        assert!(!allowed("orx report upload r-1 --file x.md"));
-        // `desc`/`cmd` become writes with --set/--stdin → gated.
+        // `desc` becomes a write with --set/--stdin → gated.
         assert!(!allowed("orx exp desc e-1 --set \"found X\""));
         assert!(!allowed("orx exp desc e-1 --stdin"));
-        assert!(!allowed("orx exp cmd e-1 --set \"python train.py\""));
     }
 
     #[test]
@@ -545,7 +517,7 @@ mod tests {
         )); // write in a batch
         assert!(!allowed("orx runs | tee /etc/passwd")); // pipe into a writer
         assert!(!allowed("orx logs r-1 > /tmp/x")); // redirection
-        assert!(!allowed("orx query \"$(rm -rf /)\"")); // command substitution
+        assert!(!allowed("orx logs \"$(rm -rf /)\"")); // command substitution
         assert!(!allowed("orx runs `whoami`")); // backtick substitution
         assert!(!allowed("orx runs &")); // background execution
         assert!(!allowed("orx runs & rm -rf /")); // single-& chaining
@@ -559,7 +531,7 @@ mod tests {
         // line is allowed.
         assert!(allowed("orx exp desc e-1; echo ====; orx exp desc e-2"));
         assert!(allowed("orx runs && orx logs r-1"));
-        assert!(allowed("orx exp desc e-1 && orx exp cmd e-1"));
+        assert!(allowed("orx exp desc e-1 && orx project view p-1"));
         // Mixed `&&` and `;` in one line exercises the two-level split.
         assert!(allowed("orx runs && orx logs r-1; echo done"));
         // Harmless glue on its own, and shell-tolerated trailing/empty segments.
@@ -733,7 +705,7 @@ mod tests {
             );
         }
         // The verbs with mixed read/write subcommands must also be real.
-        for verb in ["project", "exp", "report"] {
+        for verb in ["project", "exp"] {
             assert!(real.contains(verb), "`{verb}` is not a real orx command");
         }
     }

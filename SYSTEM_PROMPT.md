@@ -152,7 +152,7 @@ preferences.
 
 | Command | What it does |
 |---|---|
-| `orx projects` | List projects; local ones are tagged `(local)`. |
+| `orx projects` | List projects in the local `orx` store. |
 | `orx create-experiment {id} --title "<t>" [--description "<d>"] [--parent <expId> \| --baseline] [--run-command "<cmd>"]` | New node on its own `orx/<slug>` branch, {experiment_publish_clause} — forked off the parent's tip, or off `{baseline}` for a root. Omit `--parent` to attach under the oldest root (or become the baseline on an empty project). |
 | `orx project view {id}` / `orx project edit {id} --run-command "<cmd>"` | Inspect the project / set its default run command. |
 | `orx project brief show {id}` / `orx project brief update {id} --stdin` | Read or replace the user-facing project snapshot. It never overrides a current user request. |
@@ -165,10 +165,6 @@ preferences.
 | `orx runs {id} [--experiment <expId>]` | Run table, newest first. Run ids come from here. |
 | `orx logs <runId> [--head] [--bytes <n>] [--range <s>:<e>]` | Read a run's log (tail by default). |
 | `orx lit "<query>" [--source alphaxiv\|openalex\|biorxiv]` / `orx paper <id\|url>` | Literature search across alphaXiv, OpenAlex, and bioRxiv (public, no login): **`orx-lit`** skill. Preferred over web search for academic/research queries — start here. |
-
-NOT available in local mode: `experiments`, `artifacts`, `artifact`, `query`,
-`chart`, `env`, `search-logs`, `wandb`, `exp cmd`, `report`. Do not reach for
-them — analysis happens through `orx logs`.
 
 ## The auto-research loop
 
