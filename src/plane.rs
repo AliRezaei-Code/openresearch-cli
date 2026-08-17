@@ -221,9 +221,8 @@ impl DescInput {
 /// the two planes print differently (status lines, launch recaps, the logs
 /// footer): merging that printing would risk drift, so it stays in the impl and
 /// the command keeps only shared arg parsing / usage errors / shared table code.
-/// Server-only verbs (`set_experiment_command`, reports) return local guidance;
-/// hosted launch and experiment creation invert that pattern and return
-/// retirement guidance from the server placeholder.
+/// `set_experiment_command` and reports are server-only and return local
+/// guidance. Launch and experiment creation are local-only.
 ///
 /// `?Send`: `LocalPlane` owns a `rusqlite`-backed `Store` (which is `!Sync`), so
 /// its verb futures can't be `Send`. That's fine — a plane is built and driven to

@@ -61,7 +61,8 @@ pub async fn submit_local_openresearch_with_source(
     if args.image.is_some() {
         return Err(anyhow!(
             "--image doesn't apply to --backend openresearch — provider base images are fixed \
-             by OpenResearch and project dependencies come from the experiment lockfile."
+             by OpenResearch; install project dependencies from the project's lockfile in the \
+             run command."
         ));
     }
     let flavor = args.flavor.clone().ok_or_else(|| {

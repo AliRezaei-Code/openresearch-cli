@@ -3,16 +3,12 @@ name: orx-create
 description: "Initialize a local project with `orx up` and add local experiment nodes with `orx create-experiment`. Use when starting a project or experiment, when the local tree is empty, or when choosing a baseline, parent, or run command."
 ---
 
-OpenResearch project and experiment creation is local. The CLI no longer creates
-project or experiment records on `openresearch.sh`.
-
 ## Start a local project
 
 Run `orx up`, then use the dashboard to import an existing local Git repository
-or create a new local project. The project record and experiment tree live in
-the local `orx` database. Optional GitHub publication is for collaboration; it
-is not required for compute and does not create an OpenResearch API project
-record.
+or create a new local project. The project and experiment tree live in the
+local `orx` database. Optional GitHub publication is for collaboration and is
+not required for compute.
 
 For an existing GitHub repository, clone it normally before importing it:
 
@@ -55,4 +51,4 @@ orx create-experiment <localProjectId> --title "Alternative baseline" --baseline
 - `--description` should state the concrete change and measurement the node
   owes.
 - Commit the node's branch before launching. Runs use an immutable archive of
-  that local commit, not a hosted checkout or a GitHub branch.
+  that local commit.

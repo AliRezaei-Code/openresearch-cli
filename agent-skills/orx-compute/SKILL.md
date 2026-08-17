@@ -3,10 +3,9 @@ name: orx-compute
 description: "Launch experiment runs with `orx exp run`: backends (hf, modal, k8s, ssh, slurm, ray, openresearch, local), flavors, timeouts, images, sizing, and choosing `orx exp wait` vs `orx exp wake`. Use before launching or re-launching any run, when choosing or switching a backend or GPU flavor, when a job OOMs, stalls, or times out, or when deciding GPU vs CPU."
 ---
 
-Legacy project records returned by the OpenResearch API are read-only history.
-New projects and experiments are created locally through `orx up`. To continue
-work from a legacy record, clone its repository, use the `orx up` dashboard to
-import it, and choose a local execution backend.
+Projects and experiments are created locally through `orx up`. Each run uses an
+immutable snapshot of the experiment branch's recorded commit and sends it to
+the selected execution backend.
 
 ```sh
 orx up                                 # open the dashboard and import the cloned repository
@@ -24,8 +23,8 @@ Rules and notes:
 - **The run command is a fixed contract — set it once on the baseline, then leave
   it alone.** Children inherit it (see the `orx-experiment-tree` skill). Do not
   give a child a different command or bake swept hyperparameters into it — vary
-  the **code/config** on a child's git branch instead, so every variant
-  runs the same command and their `EVAL.md`s stay comparable. If the baseline has
+  the **code/config** on a child's Git branch instead, so every variant
+  runs the same command and their logged results stay comparable. If the baseline has
   no command, set the local project default with
   `orx project edit <projectId> --run-command '<cmd>'`.
 - **Set a run command before launching.** Local projects inherit it from the
@@ -50,8 +49,6 @@ set, `orx exp run <expId>` with no
 `--backend` launches there with the saved default flavor — omitting the flag is
 how you use it (flavor-required backends still need `--flavor` if no default
 flavor is saved). When none is set, ask the user to choose an explicit backend.
-Legacy API project records cannot launch runs; use the `orx up` dashboard to
-import the repository first.
 
 ## Running on Hugging Face Jobs — `--backend hf`
 
@@ -224,8 +221,9 @@ openresearch` ONLY when the user explicitly asks for it** ("use an openresearch
 box", "bill it to the org") or it is the configured default target. It
 provisions an **ephemeral OpenResearch machine
 billed to the user's org** — created for this run and deleted when it ends —
-from the provider's pinned CUDA base with pinned `uv`. Project dependencies come
-from the experiment lockfile. Needs `orx login` and a registered SSH key.
+from the provider's pinned CUDA base with pinned `uv`. The run command installs
+project dependencies from the project's lockfile. Needs `orx login` and a
+registered SSH key.
 
 ```sh
 orx exp run <expId> --backend openresearch --flavor h100_sxm:2 --timeout 4h
