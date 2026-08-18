@@ -3110,6 +3110,17 @@ function renderParts(
           {part.text}
         </details>,
       );
+    else if (part.type === "steer")
+      // A message the user sent into this turn while it ran — the same bubble a
+      // user message gets, sitting where the agent received it.
+      rendered.push(
+        <div
+          key={part.id}
+          className="msg-steer my-2 ml-auto w-fit max-w-[88%] bg-surface rounded-[16px] py-2.5 px-[15px] text-base whitespace-pre-wrap wrap-anywhere"
+        >
+          {part.text}
+        </div>,
+      );
     else if (part.type === "prompt" && part.prompt)
       rendered.push(
         <PromptCard
@@ -4423,6 +4434,13 @@ export function ChatPanel({
   activeLeafRef.current = activeLeafId;
   const messages = useMemo(() => activePath(allMessages, activeLeafId), [allMessages, activeLeafId]);
   const busy = activeId ? state.busySessions.has(activeId) : false;
+  // Enter hands the message to the running turn; attachments still park, since
+  // only a full turn builds their on-disk preamble.
+  const steering =
+    busy &&
+    !!activeHarness?.supportsSteering &&
+    attachments.length === 0 &&
+    annotations.length === 0;
   const canFork = !busy && !!activeHarness?.agentReady;
   const hasPendingTailTool = busy && streamTailTool(messages) != null;
   // Messages the user parked behind the running turn (oldest first). Populated
@@ -4614,7 +4632,8 @@ export function ChatPanel({
     return () => ro.disconnect();
   }, [threadMounted]);
 
-  async function send() {
+  /** `queue` (Cmd/Alt+Enter) parks the message even on a harness that steers. */
+  async function send({ queue = false }: { queue?: boolean } = {}) {
     const args = draft.trim();
     // Reassemble the picked skill chip into the plain `/name args` wire form —
     // the backend's slash expansion and the transcript both see only text.
@@ -4709,10 +4728,11 @@ export function ChatPanel({
       return;
     }
     if (busy) {
-      // A turn is already running: park this message (Claude-desktop steering)
-      // so it runs when the turn ends, instead of dropping it. The server
-      // enqueues it and echoes chat.queued to render the chip — no optimistic
-      // transcript bubble, since it hasn't run yet.
+      // A turn is already running. Steering hands the message to it now, and
+      // the delivered text comes back inline on the assistant message. Parking
+      // (no steering support, or Cmd/Alt+Enter) instead runs it when the turn
+      // ends: the server enqueues it and echoes chat.queued to render the chip
+      // — no optimistic transcript bubble, since it hasn't run yet.
       if (!activeId || !activeHarness?.agentReady) {
         clearFailedPlanCommand();
         return;
@@ -4738,17 +4758,20 @@ export function ChatPanel({
         name: a.name,
       }));
       try {
-        const sendQueued = () =>
+        const sendBusy = () =>
           sendChatMessage(
             sid,
             text,
             turnOpts,
             images.length ? images : undefined,
             wireAnnotations,
+            steering && !queue && pending.length === 0 && pendingAnnotations.length === 0
+              ? "steer"
+              : undefined,
           );
-        await queueSessionMutation(sendQueued);
+        await queueSessionMutation(sendBusy);
       } catch {
-        // Never reached the queue — restore the composer so a retry is one keypress.
+        // Never reached the turn — restore the composer so a retry is one keypress.
         clearFailedPlanCommand();
         restoreComposer();
       }
@@ -5045,6 +5068,7 @@ export function ChatPanel({
   const newTaskShortcut = /Mac|iPhone|iPad/.test(navigator.platform)
     ? "⌘ ⇧ Enter"
     : "Ctrl + Shift + Enter";
+  const queueChord = /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘ Enter" : "Alt + Enter";
   const startNewTask = useCallback(() => {
     setSessionFilter("active");
     setActiveId(null);
@@ -5510,6 +5534,9 @@ export function ChatPanel({
               onScroll={syncChipScroll}
               placeholder={
                 // A pending question card owns typed text (see send()); say so.
+                // While a steerable turn runs, Enter goes to that turn, so name
+                // the gesture (and its Cmd/Alt+Enter escape hatch) here — the
+                // send button is a Stop button for the whole busy stretch.
                 // With a chip active, the skill's arg hint says what to type. For
                 // the paper-reproduction skills with a paper attached, both parts
                 // are optional — paper defaults to it, compute to the configured
@@ -5518,6 +5545,8 @@ export function ChatPanel({
                 // picker for a new session and the open session once one exists.
                 pendingQuestion
                   ? "Type a custom answer…"
+                  : steering && activeHarness
+                    ? `Steer ${HARNESS_LABELS[activeHarness.id]} mid-task… (${queueChord} to queue)`
                   : pickedSkill
                     ? ["reproduce-paper", "paper-to-marimo"].includes(pickedSkill.name) &&
                       paperId
@@ -5611,7 +5640,7 @@ export function ChatPanel({
                 }
                 if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                   e.preventDefault();
-                  void send();
+                  void send({ queue: e.metaKey || e.altKey });
                 }
               }}
             />

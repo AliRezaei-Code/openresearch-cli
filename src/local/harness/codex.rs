@@ -44,12 +44,14 @@ use super::options::{
     resolve_reasoning, HarnessOptions, OptionChoice, PermissionMode, PlanActivation,
     REASONING_DEFAULT_ID,
 };
-use super::{should_synthesize_plan, synthesize_resume, Harness, ResumeAction, TURN_WATCHDOG};
+use super::{
+    should_synthesize_plan, synthesize_resume, Harness, ResumeAction, Waited, TURN_WATCHDOG,
+};
 use crate::error::{anyhow, Result};
 use crate::local::chat::{
     find_part_mut, prepare_env, set_chat_session_env, upsert_preserving_children, ContextUsage,
-    PromptAnswer, ResumeCtx, TurnCtx, WireMessage, WirePart, WirePrompt, WireQuestionOption,
-    WireToolState,
+    PromptAnswer, ResumeCtx, SteerMessage, TurnCtx, WireMessage, WirePart, WirePrompt,
+    WireQuestionOption, WireToolState,
 };
 use crate::local::codex::{CodexClient, ServerReqKind, TurnEvent};
 use crate::local::opencode::ensure_playbook;
@@ -424,6 +426,11 @@ impl Harness for Codex {
     }
 
     fn supports_chat(&self) -> bool {
+        true
+    }
+
+    /// The app-server takes `turn/steer` against the active turn.
+    fn supports_steering(&self) -> bool {
         true
     }
 
@@ -1943,22 +1950,39 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
         // Suspended while a card is pending — user think-time is unbounded by
         // design (question think-time too); codex's own ~5-minute approval
         // deadline still applies server-side.
-        let event = if open_requests.is_empty() {
-            match tokio::time::timeout(TURN_WATCHDOG, rx.recv()).await {
-                Ok(event) => event,
-                Err(_) => {
-                    client.interrupt_active_turn().await;
-                    ctx.push_error(format!(
-                        "codex produced no output for {} minutes — turn interrupted",
-                        TURN_WATCHDOG.as_secs() / 60
-                    ));
-                    settle_running_subagents(&mut ctx.assistant.parts);
-                    let _ = ctx.flush();
-                    return Ok(());
+        // The steer arm sits beside the event wait so a message the user sends
+        // mid-turn reaches `turn/steer` while the turn is still running,
+        // instead of waiting out the turn.
+        let waited = {
+            let steering = &mut ctx.steering;
+            if open_requests.is_empty() {
+                tokio::select! {
+                    event = tokio::time::timeout(TURN_WATCHDOG, rx.recv()) => Waited::Event(event),
+                    steer = super::next_steer(steering) => Waited::Steer(steer),
+                }
+            } else {
+                tokio::select! {
+                    event = rx.recv() => Waited::Event(Ok(event)),
+                    steer = super::next_steer(steering) => Waited::Steer(steer),
                 }
             }
-        } else {
-            rx.recv().await
+        };
+        let event = match waited {
+            Waited::Steer(steer) => {
+                steer_turn(ctx, &client, &thread_id, turn_id.as_deref(), steer).await;
+                continue;
+            }
+            Waited::Event(Ok(event)) => event,
+            Waited::Event(Err(_)) => {
+                client.interrupt_active_turn().await;
+                ctx.push_error(format!(
+                    "codex produced no output for {} minutes — turn interrupted",
+                    TURN_WATCHDOG.as_secs() / 60
+                ));
+                settle_running_subagents(&mut ctx.assistant.parts);
+                let _ = ctx.flush();
+                return Ok(());
+            }
         };
         let Some(event) = event else {
             settle_running_subagents(&mut ctx.assistant.parts);
@@ -2404,6 +2428,37 @@ fn has_error_part(ctx: &TurnCtx, message: &str) -> bool {
             .as_ref()
             .is_some_and(|s| s.status == "error" && s.error.as_deref() == Some(message))
     })
+}
+
+/// Hand one steer to the turn already running. `turn/steer` is rejected on
+/// review and compaction turns and missing from older app-servers, so any
+/// failure parks the message for the next turn instead of dropping it.
+async fn steer_turn(
+    ctx: &mut TurnCtx,
+    client: &CodexClient,
+    thread_id: &str,
+    turn_id: Option<&str>,
+    steer: SteerMessage,
+) {
+    let delivered = match turn_id {
+        Some(turn_id) => client
+            .try_request(
+                "turn/steer",
+                serde_json::json!({
+                    "threadId": thread_id,
+                    "input": [{ "type": "text", "text": steer.text }],
+                    "expectedTurnId": turn_id,
+                }),
+            )
+            .await
+            .is_ok_and(|result| result.is_ok()),
+        None => false,
+    };
+    if delivered {
+        ctx.record_steer(&steer.display);
+    } else {
+        ctx.host.park_steer(&ctx.session_id, steer);
+    }
 }
 
 /// `thread/start` and record the new thread id as the session's native id.

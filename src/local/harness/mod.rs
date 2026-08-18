@@ -32,7 +32,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::error::{anyhow, Result};
-use crate::local::chat::{PromptAnswer, ResumeCtx, TurnCtx, WirePrompt};
+use crate::local::chat::{
+    PromptAnswer, ResumeCtx, SteerMessage, SteerReceiver, TurnCtx, WirePrompt,
+};
 
 pub(crate) use claude::{question_prompt, should_synthesize_plan, synthesize_resume};
 pub use detect::{HarnessAuthState, HarnessInfo, ModelInfo};
@@ -113,6 +115,12 @@ pub trait Harness: Send + Sync {
     /// parts onto `ctx`. Default is "not a chat harness".
     async fn run_turn(&self, _ctx: &mut TurnCtx) -> Result<()> {
         Err(anyhow!("{} cannot run chat turns", self.id()))
+    }
+
+    /// Whether a running turn can take further user input (steering). Default
+    /// is no: the composer then parks the message until the turn ends.
+    fn supports_steering(&self) -> bool {
+        false
     }
 
     /// The permission-mode / reasoning-level vocabulary this harness supports,
@@ -235,6 +243,30 @@ pub fn effective_permission_id(harness_id: &str, stored: Option<&str>) -> Option
     options.default_permission_mode.map(str::to_string)
 }
 
+/// One wait in a harness's turn loop: the harness's own next event, or a
+/// message the user steered into the turn meanwhile.
+pub(crate) enum Waited<T> {
+    Event(T),
+    Steer(SteerMessage),
+}
+
+/// The next message the user steers into a running turn. A turn without a
+/// steering sink parks here forever, which is what makes this a safe
+/// `select!` arm next to a harness's own event wait.
+pub(crate) async fn next_steer(steering: &mut Option<SteerReceiver>) -> SteerMessage {
+    match steering {
+        Some(rx) => match rx.recv().await {
+            Some(message) => message,
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
+    }
+}
+
+pub fn supports_steering(harness_id: &str) -> bool {
+    chat_harness(harness_id).is_some_and(|harness| harness.supports_steering())
+}
+
 pub fn supports_command_plan(harness_id: &str) -> bool {
     chat_harness(harness_id).and_then(|harness| harness.options().plan_activation)
         == Some(options::PlanActivation::Command)
@@ -284,6 +316,7 @@ async fn detect_one(harness: &dyn Harness) -> Option<HarnessInfo> {
             };
         }
         info.options = harness.options();
+        info.supports_steering = harness.supports_steering();
         info
     })
 }

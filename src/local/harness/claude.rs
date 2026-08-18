@@ -36,7 +36,7 @@ use super::detect::{
 use super::options::{
     HarnessOptions, OptionChoice, PermissionMode, PlanActivation, REASONING_DEFAULT_ID,
 };
-use super::{Harness, ResumeAction};
+use super::{Harness, ResumeAction, Waited};
 use crate::error::{anyhow, Result};
 use crate::local::chat::{
     find_part_mut, prepare_env, ContextUsage, PromptAnswer, ResumeCtx, TurnCtx, WirePart,
@@ -432,6 +432,12 @@ impl Harness for ClaudeCode {
     }
 
     fn supports_chat(&self) -> bool {
+        true
+    }
+
+    /// The resident child holds stdin open, so a second stream-json user
+    /// message reaches the turn already running.
+    fn supports_steering(&self) -> bool {
         true
     }
 
@@ -1596,10 +1602,29 @@ async fn run_attempt(ctx: &mut TurnCtx, spec: SpawnSpec) -> Result<(TurnState, u
         } else {
             FIRST_EVENT_TIMEOUT
         };
-        let event = match tokio::time::timeout(deadline, rx.recv()).await {
-            Ok(event) => event,
-            Err(_) if ctx.host.has_pending_permission(&ctx.session_id) => continue,
-            Err(_) => {
+        // The steer arm sits beside the event wait so a message the user sends
+        // mid-turn reaches the child's stdin while it is still working, rather
+        // than waiting out the turn.
+        let waited = {
+            let steering = &mut ctx.steering;
+            tokio::select! {
+                event = tokio::time::timeout(deadline, rx.recv()) => Waited::Event(event),
+                steer = super::next_steer(steering) => Waited::Steer(steer),
+            }
+        };
+        let event = match waited {
+            Waited::Steer(steer) => {
+                // A failed write means the child is gone and this turn is about
+                // to error out — park the text so it survives into the next one.
+                match client.send_user_message(&steer.text).await {
+                    Ok(()) => ctx.record_steer(&steer.display),
+                    Err(_) => ctx.host.park_steer(&ctx.session_id, steer),
+                }
+                continue;
+            }
+            Waited::Event(Ok(event)) => event,
+            Waited::Event(Err(_)) if ctx.host.has_pending_permission(&ctx.session_id) => continue,
+            Waited::Event(Err(_)) => {
                 commit_attempt_session(ctx, &state);
                 ctx.host.claude.kill_session(&ctx.session_id).await;
                 let _ = ctx.flush();
