@@ -2461,11 +2461,13 @@ struct AbsoluteFileQuery {
     path: String,
 }
 
-/// Validate an absolute-path request: a non-empty, bounded, absolute path.
-/// Returns the trimmed display string and its `PathBuf` so both come from one
-/// normalization. The bind is loopback-only and the server runs as the user, so
-/// any file the user could read is fair game — this only rejects malformed
-/// input, not location.
+/// Validate an absolute-path request and resolve a leading `~`/`~/` to the home
+/// dir (the shell never expands it for us, and agents inline `~/…` paths). The
+/// display string stays as typed — it's what the tab shows and what the agent
+/// wrote; only the returned `PathBuf` is home-expanded. `~otheruser` is left
+/// alone and simply fails the absolute check. The bind is loopback-only and the
+/// server runs as the user, so any file the user could read is fair game — this
+/// only rejects malformed input, not location.
 fn validated_absolute_file_path(
     path: &str,
 ) -> std::result::Result<(String, std::path::PathBuf), ApiError> {
@@ -2473,11 +2475,16 @@ fn validated_absolute_file_path(
     if trimmed.is_empty() || trimmed.len() > 4096 {
         return Err(bad_request("invalid path"));
     }
-    let abs = std::path::PathBuf::from(trimmed);
-    if !abs.is_absolute() {
+    let resolved = match trimmed.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => dirs::home_dir()
+            .ok_or_else(|| bad_request("no home directory"))?
+            .join(rest.trim_start_matches('/')),
+        _ => std::path::PathBuf::from(trimmed),
+    };
+    if !resolved.is_absolute() {
         return Err(bad_request("path must be absolute"));
     }
-    Ok((trimmed.to_string(), abs))
+    Ok((trimmed.to_string(), resolved))
 }
 
 /// One file by absolute path, for the UI file viewer — the escape hatch for a
@@ -5383,21 +5390,37 @@ mod tests {
         }
     }
 
+    // ApiError has no Debug, so `.unwrap()` on the Err path won't compile; drop
+    // the error to its message string to make the Result assertion-friendly.
+    fn abs_path(path: &str) -> std::result::Result<(String, std::path::PathBuf), String> {
+        validated_absolute_file_path(path).map_err(|error| error.1)
+    }
+
     #[test]
     fn absolute_file_paths_require_an_absolute_path() {
         assert_eq!(
-            validated_absolute_file_path("  /etc/hosts  ")
-                .map_err(|error| error.1)
-                .unwrap()
-                .0,
-            "/etc/hosts",
+            abs_path("  /etc/hosts  "),
+            Ok((
+                "/etc/hosts".to_string(),
+                std::path::PathBuf::from("/etc/hosts")
+            )),
         );
         for path in ["", "   ", "relative/path", "../secret", &"/x".repeat(3000)] {
-            assert!(
-                validated_absolute_file_path(path).is_err(),
-                "accepted {path:?}"
-            );
+            assert!(abs_path(path).is_err(), "accepted {path:?}");
         }
+    }
+
+    #[test]
+    fn absolute_file_paths_expand_a_leading_tilde() {
+        let home = dirs::home_dir().expect("home dir");
+        // `~/x` and bare `~` resolve under home; the display stays as typed.
+        assert_eq!(
+            abs_path("~/.ssh/config"),
+            Ok(("~/.ssh/config".to_string(), home.join(".ssh/config"))),
+        );
+        assert_eq!(abs_path("~").map(|(_, p)| p), Ok(home));
+        // `~otheruser` isn't expanded, so it stays relative and is rejected.
+        assert!(abs_path("~otheruser/x").is_err());
     }
 
     fn no_key(path: Option<&str>) -> SshReadiness {

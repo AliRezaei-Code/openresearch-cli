@@ -293,6 +293,9 @@ function parseFilePath(
     path = path.slice("artifacts/".length);
     return path ? { path, source: "artifacts" } : null;
   }
+  // A home-anchored path (`~` or `~/…`) is disk, never a repo file — the backend
+  // expands the `~`, so hand it over verbatim.
+  if (path === "~" || path.startsWith("~/")) return { path, source: "abs" };
   // `path` relative to `base` (`""` when equal), else null. macOS symlinks
   // `/tmp`→`/private/tmp` and `/var`→`/private/var`, so an agent-inlined path
   // and the stored dir can differ only by that prefix — strip it on both sides.
