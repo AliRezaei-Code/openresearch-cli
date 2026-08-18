@@ -7,13 +7,16 @@
 import { Code, ExternalLink, FileText, GitBranch, RotateCw } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
+  absoluteFileUrl,
   artifactUrl,
+  getAbsoluteFile,
   getArtifactFileMetadata,
   getArtifactFileText,
   getProjectFile,
   openFileInEditor,
   projectFileUrl,
   saveProjectFile,
+  type AbsoluteFile,
   type CheckoutRoot,
   type ProjectFile,
 } from "../api";
@@ -28,7 +31,8 @@ import { ICON_BUTTON_CLASS_NAME, SPINNER_CLASS_NAME } from "../styleClasses";
 type ArtifactPreviewFile = Omit<ProjectFile, "root">;
 type LoadedFile =
   | { source: "checkout"; file: ProjectFile }
-  | { source: "artifact"; file: ArtifactPreviewFile; checkoutRoot?: CheckoutRoot };
+  | { source: "artifact"; file: ArtifactPreviewFile; checkoutRoot?: CheckoutRoot }
+  | { source: "absolute"; file: AbsoluteFile };
 
 export interface FileScrollPosition {
   top: number;
@@ -52,10 +56,11 @@ export function FileViewer({
   projectId: string;
   path: string;
   /** Which backend serves this file. "artifacts" reads the project's durable
-   * output directory, else the repo/worktree checkout. */
-  source?: "repo" | "artifacts";
+   * output directory; "abs" reads an absolute path off disk (a file outside
+   * the checkout and artifacts); else the repo/worktree checkout. */
+  source?: "repo" | "artifacts" | "abs";
   /** Chat session whose worktree holds the file (absent → hub clone).
-   * Never set for tabs opened with source:"artifacts". */
+   * Never set for tabs opened with source:"artifacts" or "abs". */
   sessionId?: string;
   /** Branch whose committed copy to show — overrides the live checkout.
    * (Named gitRef because `ref` is reserved on React components.) */
@@ -77,9 +82,12 @@ export function FileViewer({
   const [loading, setLoading] = useState(true);
   const [nonce, setNonce] = useState(0);
   const isArtifacts = source === "artifacts";
+  const isAbsolute = source === "abs";
   // Markdown renders by default; the header toggle shows the raw source.
   const isMarkdown = isMarkdownFile(path);
-  const artifactsFolder = path.split("/").slice(0, -1).join("/");
+  // This file's parent dir: the artifact report folder for image resolution,
+  // and the anchor for a relative link inside an abs file.
+  const parentFolder = path.split("/").slice(0, -1).join("/");
   const [showSource, setShowSource] = useState(false);
   // Live edit buffer for the code file. It IS the view for editable files (no
   // edit mode); it tracks the loaded content and diverges as the user types.
@@ -164,9 +172,11 @@ export function FileViewer({
       setOpeningEditor(false);
     }
   };
-  const rawUrlBase = artifactsMode
-    ? artifactUrl(projectId, path)
-    : projectFileUrl(projectId, path, { sessionId, ref: gitRef });
+  const rawUrlBase = isAbsolute
+    ? absoluteFileUrl(path)
+    : artifactsMode
+      ? artifactUrl(projectId, path)
+      : projectFileUrl(projectId, path, { sessionId, ref: gitRef });
   const rawUrl = `${rawUrlBase}&v=${nonce}`;
 
   useEffect(() => {
@@ -198,7 +208,9 @@ export function FileViewer({
     // A checkout path the /file endpoint doesn't have may still name an
     // artifact, so try that directory before declaring it missing. Branch tabs
     // do not fall back because a ref names a committed tree.
-    const load: Promise<LoadedFile> = isArtifacts
+    const load: Promise<LoadedFile> = isAbsolute
+      ? getAbsoluteFile(path).then((file) => ({ source: "absolute", file }))
+      : isArtifacts
       ? fromArtifacts().then((file) => ({ source: "artifact", file }))
       : getProjectFile(projectId, path, { sessionId, ref: gitRef }).then((d) =>
           d.notFound && !gitRef
@@ -235,6 +247,7 @@ export function FileViewer({
   }, [data]);
 
   const notFoundCopy = (d: LoadedFile) => {
+    if (d.source === "absolute") return "File not found on disk.";
     if (isArtifacts) return "Artifact not found in the project.";
     if (gitRef) return `File not found on branch ${gitRef}.`;
     if (sessionId && d.source === "checkout" && d.file.root === "clone")
@@ -351,13 +364,24 @@ export function FileViewer({
             {artifactsMode ? (
               <ArtifactMarkdown
                 projectId={projectId}
-                folder={artifactsFolder}
+                folder={parentFolder}
                 markdown={data.content}
               />
             ) : (
               <Md
                 text={data.content}
-                onOpenFile={onOpenFile && ((p) => onOpenFile(p, sessionId, gitRef))}
+                onOpenFile={
+                  onOpenFile &&
+                  ((p) =>
+                    // A relative link inside an abs file names a sibling on disk,
+                    // not a repo-relative path — anchor it to this file's dir so
+                    // it re-enters the abs branch instead of hitting the clone.
+                    onOpenFile(
+                      isAbsolute && !p.startsWith("/") ? `${parentFolder}/${p}` : p,
+                      sessionId,
+                      gitRef,
+                    ))
+                }
               />
             )}
           </div>

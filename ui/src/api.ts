@@ -312,6 +312,22 @@ export const getProjectFile = (projectId: string, path: string, opts: CheckoutRe
 export const projectFileUrl = (projectId: string, path: string, opts: CheckoutRef = {}) =>
   `/api/projects/${projectId}/file/raw?${checkoutQuery(opts, new URLSearchParams({ path }))}`;
 
+/** A file read by absolute path, outside the project's checkout and artifacts
+ * (e.g. `/Users/me/.ssh/config`). Same capped/decoded body as `ProjectFile`;
+ * the wire `root` is always `"abs"`, so it's dropped here rather than widening
+ * `CheckoutRoot` — nothing reads it, and it isn't part of any git tree. */
+export type AbsoluteFile = Omit<ProjectFile, "root">;
+
+/** One file by absolute path — the escape hatch for a file an agent references
+ * that lives outside the checkout and artifacts. Server-side capped (~512 KB);
+ * loopback-only, so it reads whatever the user running `orx up` can read. */
+export const getAbsoluteFile = (path: string) =>
+  get<AbsoluteFile>(`/api/files/abs?path=${encodeURIComponent(path)}`);
+
+/** Byte-exact absolute-path file for browser-native media rendering or download. */
+export const absoluteFileUrl = (path: string) =>
+  `/api/files/abs/raw?path=${encodeURIComponent(path)}`;
+
 /** Overwrite a text file in the project's live checkout (worktree when
  * `sessionId` is given, else the hub clone). Committed branch trees are
  * read-only, so pass no `ref`. */
