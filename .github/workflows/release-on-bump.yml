@@ -49,6 +49,7 @@ on:
 permissions:
   contents: read
   actions: write # github.token fallback path dispatches release.yml
+  statuses: write # to set the version-bump commit status chip
 
 jobs:
   dispatch:
@@ -100,6 +101,15 @@ jobs:
             echo "Tag ${tag} already exists — nothing to release."
             echo "(If you meant to cut a release, bump the version in Cargo.toml.)"
             exit 0
+          fi
+
+          # Chip on the bump commit showing which version it shipped. Best-effort:
+          # a status API hiccup must never block the release dispatch below.
+          if ! GH_TOKEN="$FALLBACK_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            -f state=success \
+            -f context="version" \
+            -f description="Bumped to ${tag}" >/dev/null; then
+            echo "::warning::Failed to set version status chip for ${GITHUB_SHA}"
           fi
 
           echo "Dispatching release.yml with tag=${tag} (version is unreleased)."
