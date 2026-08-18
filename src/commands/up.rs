@@ -418,6 +418,8 @@ fn router(state: AppState) -> Router {
         .route("/api/chat/sessions/{id}/messages", get(chat_messages))
         .route("/api/chat/sessions/{id}/worktree", get(session_worktree))
         .route("/api/chat/sessions/{id}/message", post(send_chat_message))
+        .route("/api/chat/sessions/{id}/fork", post(fork_chat_turn))
+        .route("/api/chat/sessions/{id}/branch", post(select_chat_branch))
         .route("/api/chat/sessions/{id}/interrupt", post(interrupt_chat))
         .route(
             "/api/chat/sessions/{id}/queue/{itemId}",
@@ -4563,6 +4565,7 @@ async fn create_chat_session(
         archived: false,
         context_usage_json: None,
         bootstrap_context: None,
+        active_leaf_id: None,
         created_at: now_ms(),
         updated_at: now_ms(),
     };
@@ -4631,14 +4634,21 @@ async fn update_chat_session(
 }
 
 async fn chat_messages(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
-    Store::open()?
+    // Messages first: these are two connections, so a turn writing between them
+    // can only leave the leaf *ahead* of the list, which the client falls back on
+    // safely — the other order hides a reply that is already in the list.
+    let messages = local::chat::list_messages(&id)?;
+    let session = Store::open()?
         .get_chat_session(&id)?
         .ok_or_else(|| not_found("chat session"))?;
-    let messages = local::chat::list_messages(&id)?;
     // Parked messages are in-memory, so a reload mid-turn recovers them here
     // rather than from the store.
     let queued = state.chat.queued_items(&id);
-    Ok(Json(json!({ "messages": messages, "queued": queued })))
+    Ok(Json(json!({
+        "messages": messages,
+        "queued": queued,
+        "activeLeafId": session.active_leaf_id,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -4682,6 +4692,58 @@ async fn send_chat_message(
     state
         .chat
         .send_message(&id, text, overrides, req.images, annotations)
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForkChatReq {
+    /// The message being re-sampled: an assistant reply to retry, or a user
+    /// message to re-ask with `text`.
+    message_id: String,
+    /// Edited prompt. Absent re-sends the original message unchanged.
+    text: Option<String>,
+}
+
+async fn fork_chat_turn(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ForkChatReq>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    let kind = match req.text {
+        Some(text) if !text.trim().is_empty() => local::chat::ForkKind::Edit(text),
+        Some(_) => return Err(bad_request("text is required")),
+        None => local::chat::ForkKind::Retry,
+    };
+    // A fork re-samples under the session's current settings, so it takes no
+    // overrides — the turn runs in the background and streams over /api/events.
+    state
+        .chat
+        .fork_turn(&id, &req.message_id, kind)
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectBranchReq {
+    /// The fork to show. Its whole branch comes with it.
+    leaf_id: String,
+}
+
+async fn select_chat_branch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<SelectBranchReq>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    state
+        .chat
+        .select_branch(&id, &req.leaf_id)
         .await
         .map_err(bad_request)?;
     Ok(Json(json!({ "ok": true })))
