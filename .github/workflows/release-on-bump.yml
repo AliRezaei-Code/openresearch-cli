@@ -49,6 +49,8 @@ on:
 permissions:
   contents: read
   actions: write # github.token fallback path dispatches release.yml
+  issues: write # to create/apply the version label on the bump's PR
+  pull-requests: read # to resolve the bump commit to its squash-merged PR
 
 jobs:
   dispatch:
@@ -100,6 +102,28 @@ jobs:
             echo "Tag ${tag} already exists — nothing to release."
             echo "(If you meant to cut a release, bump the version in Cargo.toml.)"
             exit 0
+          fi
+
+          # Mark the bump's PR with a shared "version-bump" label so releases
+          # are visible from the PR list (one reused label, not one per
+          # version). Best-effort: a labeling hiccup must never block the
+          # release dispatch below.
+          if pr=$(GH_TOKEN="$FALLBACK_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+            --jq '.[0].number // empty' 2>/dev/null); then
+            if [ -n "${pr}" ]; then
+              # Create the label first (422 if it already exists — ignored) so
+              # the add below never depends on auto-creation behavior.
+              GH_TOKEN="$FALLBACK_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/labels" \
+                -f name="version-bump" -f color="0e8a16" \
+                -f description="Bumps the CLI version; merging cuts a release" >/dev/null 2>&1 || true
+              GH_TOKEN="$FALLBACK_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/issues/${pr}/labels" \
+                -f "labels[]=version-bump" >/dev/null \
+                || echo "::warning::Failed to label PR #${pr} with version-bump"
+            else
+              echo "No PR associated with ${GITHUB_SHA} — skipping the version-bump label."
+            fi
+          else
+            echo "::warning::Could not look up the PR for ${GITHUB_SHA} — skipping the version-bump label."
           fi
 
           echo "Dispatching release.yml with tag=${tag} (version is unreleased)."
