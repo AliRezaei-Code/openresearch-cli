@@ -57,7 +57,7 @@ JSON/SSE API over a local SQLite store. From there you get:
   measured against it, so lineage stays explicit.
 - **Runs** — every backend receives the same immutable archive of the recorded
   Git commit. Modal, Hugging Face Jobs, Kubernetes, Slurm, SSH, Ray,
-  OpenResearch, and local runs do not require a hosted repository or push.
+  OpenResearch, and local runs do not require publishing the repository.
 - **Autoresearch** — describe a goal and let the agent run autonomously toward
   it: proposing, launching, and analyzing experiments.
 
@@ -84,10 +84,10 @@ Run `orx --help` (or `orx <command> --help`) for full usage. The highlights:
 | Area | Commands |
 |---|---|
 | Dashboard | `up` |
-| Auth | `login`, `logout` |
-| Projects | `projects`, `explore`, `project`, `create-project`, `env` |
-| Experiments | `experiments`, `create-experiment`, `exp status/cmd/run/cancel` |
-| Runs & evidence | `runs`, `logs`, `search-logs`, `artifacts`, `artifact`, `wandb`, `query`, `chart`, `report` |
+| Auth & organizations | `login`, `logout`, `orgs` |
+| Projects | `projects`, `project` |
+| Experiments | `create-experiment`, `exp status/run/cancel/wait/wake` |
+| Runs & evidence | `runs`, `logs` |
 | Compute | `compute`, `instance create` |
 | Literature | `lit`, `paper` (full-text search across alphaXiv, OpenAlex, bioRxiv — no login required) |
 | Agent integration | `install-skills`, `skill` |
@@ -106,9 +106,31 @@ x86_64 and arm64) and is the same as:
 curl -LsSf https://github.com/alphaXiv/openresearch-cli/releases/latest/download/openresearch-cli-installer.sh | sh
 ```
 
-`orx update` keeps script-installed binaries current; interactive terminals
-also get a once-a-day background check with a one-line stderr notice (silence
-it with `ORX_NO_UPDATE_CHECK=1`).
+### Staying up to date
+
+Script-installed CLIs and the macOS app both update themselves. When a check
+finds a newer release, a detached updater installs it in the background: the
+CLI's *next* invocation is on the new version, and the app picks it up on its
+next launch (the dashboard shows a "restart to finish updating" notice in the
+meantime). Nothing blocks the command you actually ran, and a failing update
+backs off rather than retrying on every invocation.
+
+The macOS app verifies each download's checksum *and* requires a notarized
+Developer ID signature from alphaXiv before replacing itself, so an unattended
+swap can't install anything we didn't publish.
+
+- `orx version --json` reports `channel` and whether `autoUpdate` is in effect.
+- `orx update` updates now; `--dry-run` only reports.
+- Settings → Updates shows the same state, with a toggle for automatic installs
+  and, in the macOS app, **Install the `orx` command** — it links the app's
+  binary onto your PATH so the CLI and the app are always the same build (also
+  `orx install-cli`).
+- Turn automatic installs off in Settings → Updates, or silence updates
+  entirely with `ORX_NO_UPDATE_CHECK=1`.
+
+Installs orx doesn't own — `cargo install`, Homebrew, Nix — are never modified.
+They still get the outdated notice, and `orx update` then names the command to
+run for that package manager.
 
 ### From source
 
@@ -131,11 +153,14 @@ Run the tests with `cargo test`.
 
 ## Configuration
 
-- **API URL** — defaults to production (`https://api.openresearch.sh`);
-  override with `--api-url` or `OPENRESEARCH_API_URL`.
+- **OpenResearch service URL** — used only for login, organizations, managed
+  compute, sandboxes, and SSH keys. It defaults to production
+  (`https://api.openresearch.sh`); override it with `--api-url` or
+  `OPENRESEARCH_API_URL`.
 - **Credentials** — `orx login` opens your browser, mints a personal access
   token, and stores it at `${XDG_CONFIG_HOME:-~/.config}/openresearch/credentials.json`
-  (mode `0600`). Sent as `Authorization: Bearer …` on every request.
+  (mode `0600`). Local projects, experiments, runs, logs, and files never use
+  these credentials or sync to the service.
 
 ## Usage analytics
 
@@ -146,15 +171,12 @@ choice on first run.
 - **Collected:** command name, a random per-install UUID, CLI version, OS/arch,
   the official build channel, a CI flag, coarse install type, and coarse event
   labels (e.g. onboarding completed, project created, chat session started, or
-  a run launched on `modal`). When onboarding is completed, the disclosed
-  research profile is also sent unfiltered: selected research areas, the
-  Other-area description, research background, and representative paper IDs
-  and titles.
+  a run launched on `modal`). For the onboarding research profile, only selected
+  research-area categories and the number of linked papers are collected.
 - **Not automatically added:** code, prompts, file contents or paths, project or
   experiment IDs/names, repo names, tokens, emails, or account identifiers.
-  Anything entered in the onboarding profile is sent exactly as submitted and
-  may contain identifying information. The random install UUID is not tied to
-  your account.
+  Research-profile free text, paper IDs, and paper titles are not sent. The
+  random install UUID is not tied to your account.
 
 ```sh
 orx telemetry off        # persistent, per-machine
@@ -168,3 +190,4 @@ do not create an installation ID. `ORX_TELEMETRY_ENV=off` additionally disables
 analytics in an official binary; it cannot enable analytics in a source build.
 
 Events are fire-and-forget on a background task and never block a command.
+They are sent to OpenResearch's first-party API and stored in Postgres.

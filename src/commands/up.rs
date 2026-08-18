@@ -20,7 +20,7 @@ use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::Engine as _;
 use futures::Stream;
@@ -35,6 +35,7 @@ use crate::local::opencode::AgentHost;
 use crate::store::{
     log_path, now_ms, SshHostTest, Store, StoredAgentSelection, StoredChatSession, StoredRun,
 };
+use crate::updates;
 use crate::{browser, UpArgs};
 
 pub async fn run(args: UpArgs) -> Result<()> {
@@ -66,6 +67,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
         claude: claude.clone(),
         harnesses: Arc::new(tokio::sync::Mutex::new(None)),
         project_lifecycle: Arc::new(ProjectLifecycle::default()),
+        project_creation_lock: Arc::new(tokio::sync::Mutex::new(())),
         publication_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         data_dir_move_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         data_dir_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -95,6 +97,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
         state.data_dir_gate.clone(),
     ));
     spawn_claude_auth_monitor(state.chat.clone(), claude.clone(), state.harnesses.clone());
+    spawn_update_checker();
 
     let app = router(state);
     let url = format!("http://127.0.0.1:{port}");
@@ -167,6 +170,7 @@ struct AppState {
     /// limited to once per TTL unless the UI asks for a refresh.
     harnesses: Arc<tokio::sync::Mutex<Option<(std::time::Instant, Value)>>>,
     project_lifecycle: Arc<ProjectLifecycle>,
+    project_creation_lock: Arc<tokio::sync::Mutex<()>>,
     publication_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Set while a data-dir move is running. New chat turns and run launches
     /// check it and refuse (409) so nothing starts writing the store mid-move —
@@ -321,13 +325,23 @@ fn router(state: AppState) -> Router {
         )
         .route("/api/projects/{id}/working-tree", get(project_working_tree))
         .route("/api/projects/{id}/code-tree", get(project_code_tree))
-        .route("/api/projects/{id}/file", get(project_file))
+        .route(
+            "/api/projects/{id}/file",
+            get(project_file).put(write_project_file),
+        )
         .route("/api/projects/{id}/file/raw", get(project_raw_file))
+        .route("/api/projects/{id}/file/open", post(open_project_file))
         .route(
             "/api/projects/{id}/files",
             get(list_artifacts).delete(delete_artifact),
         )
         .route("/api/projects/{id}/files/file", get(serve_artifact))
+        .route(
+            "/api/projects/{id}/brief",
+            put(write_project_brief).layer(DefaultBodyLimit::max(
+                local::files::MAX_PROJECT_BRIEF_BYTES * 6 + 1024,
+            )),
+        )
         .route("/api/events", get(events))
         .route("/api/settings/hf", get(hf_settings).post(set_hf_token))
         .route(
@@ -371,6 +385,10 @@ fn router(state: AppState) -> Router {
             "/api/settings/profile",
             get(profile_settings).post(set_profile_settings),
         )
+        .route("/api/update", get(update_status))
+        .route("/api/update/apply", post(apply_update))
+        .route("/api/update/auto", post(set_auto_update))
+        .route("/api/update/install-cli", post(install_cli))
         .route("/api/settings/ui-state", get(ui_state).post(set_ui_state))
         .route("/api/settings/ssh", get(ssh_settings))
         .route("/api/settings/ssh/preflight", post(ssh_preflight))
@@ -870,6 +888,7 @@ async fn project_path_status(Query(q): Query<ProjectPathStatusQ>) -> ApiResult {
                 "directory": null,
                 "empty": null,
                 "initialized": null,
+                "gitState": null,
             })));
         };
         let resolved = local::projects::expand_path(&path)?;
@@ -880,8 +899,9 @@ async fn project_path_status(Query(q): Query<ProjectPathStatusQ>) -> ApiResult {
         } else {
             None
         };
-        let initialized =
-            git_version.is_some() && directory && local::git::is_repository(&resolved);
+        let git_state =
+            (git_version.is_some() && directory).then(|| local::git::repository_state(&resolved));
+        let initialized = git_state.is_some_and(local::git::RepositoryState::is_initialized);
         let github_publication = initialized
             .then(|| local::git::github_publication(&resolved))
             .flatten();
@@ -892,6 +912,7 @@ async fn project_path_status(Query(q): Query<ProjectPathStatusQ>) -> ApiResult {
             "directory": directory,
             "empty": empty,
             "initialized": initialized,
+            "gitState": git_state.map(local::git::RepositoryState::as_str),
             "githubOwner": github_publication.as_ref().map(|(owner, _)| owner),
             "githubRepo": github_publication.as_ref().map(|(_, repo)| repo),
         })))
@@ -993,9 +1014,10 @@ async fn create_project(
     };
     let shallow_clone = local::github::should_shallow_clone(repo_size_kb);
     let run_command = req.run_command;
-    let result = tokio::task::spawn_blocking(move || {
+    let creation_guard = state.project_creation_lock.lock().await;
+    let result = tokio::task::spawn_blocking(move || -> Result<local::model::LocalProject> {
         let store = Store::open()?;
-        local::projects::create_project(
+        let project = local::projects::create_project(
             &store,
             &name,
             &path,
@@ -1007,11 +1029,17 @@ async fn create_project(
                 run_command,
                 paper_id,
             },
-        )
+        )?;
+        if let Err(error) = local::files::ensure_project_brief(&project) {
+            store.delete_local_project(&project.id)?;
+            return Err(error);
+        }
+        Ok(project)
     })
     .await
     .map_err(|e| anyhow!("project task failed: {e}"))?;
     let project = result.map_err(bad_request)?;
+    drop(creation_guard);
     let _project_admission = state
         .project_lifecycle
         .admit(&project.id)
@@ -1030,7 +1058,7 @@ async fn create_project(
     } else {
         (project, None)
     };
-    crate::telemetry::capture_project_created(true);
+    crate::telemetry::capture_project_created();
     Ok(Json(json!({
         "project": project_json(&project),
         "githubPublicationError": github_publication_error,
@@ -1133,15 +1161,14 @@ async fn initialize_project_git(
         .ok_or_else(|| bad_request("project deletion is in progress"))?;
     reject_if_moving(&state)?;
     let _lock = project_publication_lock(&state, &id).await;
+    let _creation_guard = state.project_creation_lock.lock().await;
     tokio::task::spawn_blocking(move || {
         let store = Store::open()?;
         let mut project = store
             .get_local_project(&id)?
             .ok_or_else(|| anyhow!("project not found"))?;
         let path = std::path::Path::new(&project.repo_path);
-        if !local::git::is_repository(path) {
-            local::git::initialize_repository(path)?;
-        }
+        local::git::initialize_repository(path)?;
         local::git::validate_project_repository(path)?;
         project.baseline_branch = local::git::require_current_branch(path)?;
         store.update_local_project(&project)?;
@@ -1546,13 +1573,8 @@ async fn create_run(State(state): State<AppState>, Json(req): Json<CreateRunReq>
     local::apply_compute_default(&mut backend, &mut flavor);
     let args = crate::ExpRunArgs {
         exp_id: req.experiment_id,
-        gpu: None,
-        count: None,
         disk: req.disk,
         provider: req.provider,
-        cpu: None,
-        vcpus: None,
-        sandbox: None,
         backend: Some(backend.unwrap_or_else(|| "local".to_string())),
         flavor,
         org: req.org,
@@ -2236,6 +2258,128 @@ async fn project_file(
     .map_err(|e| ApiError::from(anyhow!("file task failed: {e}")))?
 }
 
+/// Upper bound on a single save — generous room to grow past the read cap while
+/// still bounding one write.
+const FILE_WRITE_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// True when a repo-relative path steps into the `.git` metadata dir — writing
+/// there (`config`, `hooks/*`) is an arbitrary-command vector. Case-insensitive
+/// so `.GIT` can't slip past on macOS/Windows.
+fn touches_git_dir(rel_path: &std::path::Path) -> bool {
+    rel_path.components().any(
+        |c| matches!(c, std::path::Component::Normal(name) if name.eq_ignore_ascii_case(".git")),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WriteProjectFileReq {
+    path: String,
+    content: String,
+    /// Chat session whose worktree owns the file; absent writes the hub clone.
+    session_id: Option<String>,
+}
+
+/// Overwrite an existing text file in the project's live checkout with edited
+/// content. Only the worktree/clone is writable — committed branch trees have no
+/// `ref` path here and stay read-only. Traversal and symlink escapes are
+/// rejected by canonicalizing the target and confirming it stays under the root.
+async fn write_project_file(
+    Path(id): Path<String>,
+    Json(req): Json<WriteProjectFileReq>,
+) -> ApiResult {
+    blocking_api(move || {
+        let (rel, rel_path) = validated_project_file_path(&req.path)?;
+        if touches_git_dir(&rel_path) {
+            return Err(bad_request("cannot edit files under .git"));
+        }
+        if req.content.len() as u64 > FILE_WRITE_LIMIT {
+            return Err(bad_request("file too large to save"));
+        }
+        if !matches!(
+            local::files::presentation_for_path(&rel),
+            local::files::FilePresentation::Text | local::files::FilePresentation::Unknown
+        ) {
+            return Err(bad_request("not an editable text file"));
+        }
+        let store = Store::open()?;
+        let project = store
+            .get_local_project(&id)?
+            .ok_or_else(|| not_found("project"))?;
+        let (root, root_kind) = resolve_checkout_root(&store, &project, req.session_id.as_deref())?;
+        // A session write that fell back to the clone means the worktree was
+        // pruned mid-edit — refuse rather than silently write another checkout.
+        if req.session_id.is_some() && root_kind == "clone" {
+            return Err(bad_request(
+                "this session's worktree is no longer available — reload the file",
+            ));
+        }
+        // Canonicalize the existing target so a symlinked path can't escape the
+        // checkout; a missing file means the editor's copy is stale.
+        let full = match std::fs::canonicalize(root.join(&rel_path)) {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(not_found("file")),
+            Err(e) => return Err(ApiError::from(anyhow!("save failed: {e}"))),
+        };
+        if !full.starts_with(&root) {
+            return Err(bad_request("path escapes repository"));
+        }
+        if full.is_dir() {
+            return Err(bad_request("path is a directory"));
+        }
+        std::fs::write(&full, req.content.as_bytes())
+            .map_err(|e| ApiError::from(anyhow!("save failed: {e}")))?;
+        Ok(Json(json!({
+            "ok": true,
+            "root": root_kind,
+            "bytesWritten": req.content.len(),
+        })))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenProjectFileReq {
+    path: String,
+    session_id: Option<String>,
+}
+
+/// Open a checkout file in the machine's default app for its type (the user's
+/// editor for source files). Resolves the same worktree/clone the reader uses
+/// and confirms the file is inside it before handing the path to the OS opener.
+async fn open_project_file(
+    Path(id): Path<String>,
+    Json(req): Json<OpenProjectFileReq>,
+) -> ApiResult {
+    blocking_api(move || {
+        let (_, rel_path) = validated_project_file_path(&req.path)?;
+        if touches_git_dir(&rel_path) {
+            return Err(bad_request("cannot open files under .git"));
+        }
+        let store = Store::open()?;
+        let project = store
+            .get_local_project(&id)?
+            .ok_or_else(|| not_found("project"))?;
+        let (root, _) = resolve_checkout_root(&store, &project, req.session_id.as_deref())?;
+        let full = match std::fs::canonicalize(root.join(&rel_path)) {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(not_found("file")),
+            Err(e) => return Err(ApiError::from(anyhow!("open failed: {e}"))),
+        };
+        if !full.starts_with(&root) {
+            return Err(bad_request("path escapes repository"));
+        }
+        if full.is_dir() {
+            return Err(bad_request("path is a directory"));
+        }
+        crate::editors::open_in_default_app(&full)
+            .map_err(|e| ApiError::from(anyhow!("could not open file: {e}")))?;
+        Ok(Json(json!({ "ok": true })))
+    })
+    .await
+}
+
 enum RawProjectFileSource {
     Disk(std::fs::File),
     Git {
@@ -2355,6 +2499,11 @@ async fn delete_artifact(
     Query(q): Query<ArtifactPathQuery>,
 ) -> ApiResult {
     reject_if_moving(&state)?;
+    if local::files::is_project_brief_path(&q.path) {
+        return Err(bad_request(
+            "PROJECT.md is part of the project and cannot be deleted",
+        ));
+    }
     blocking_api(move || {
         let store = Store::open()?;
         let project = store
@@ -2362,6 +2511,36 @@ async fn delete_artifact(
             .ok_or_else(|| not_found("project"))?;
         local::files::delete_entry(&project, &q.path)?;
         Ok(Json(json!({ "ok": true })))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct ProjectBriefWriteReq {
+    content: String,
+}
+
+async fn write_project_brief(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ProjectBriefWriteReq>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    if req.content.len() > local::files::MAX_PROJECT_BRIEF_BYTES {
+        return Err(bad_request(
+            "PROJECT.md is too large; keep the project brief under 256 KiB",
+        ));
+    }
+    blocking_api(move || {
+        let store = Store::open()?;
+        let project = store
+            .get_local_project(&id)?
+            .ok_or_else(|| not_found("project"))?;
+        local::files::write_project_brief(&project, &req.content)?;
+        Ok(Json(json!({
+            "ok": true,
+            "bytesWritten": req.content.len(),
+        })))
     })
     .await
 }
@@ -2484,6 +2663,18 @@ async fn set_hf_token(Json(req): Json<SetHfTokenReq>) -> ApiResult {
     // Freshly re-resolved: if HF_TOKEN is set in this process env, env still
     // wins over the file — source says "env" and the UI explains it.
     Ok(Json(json!(hf_token_status().await)))
+}
+
+/// Keep a long-running dashboard current. `main`'s invocation-time check only
+/// fires once, and `orx up` (and the macOS app it backs) can stay up for days —
+/// long enough to drift several releases behind without this.
+fn spawn_update_checker() {
+    tokio::spawn(async {
+        loop {
+            updates::periodic_update_pass().await;
+            tokio::time::sleep(updates::PERIODIC_CHECK_INTERVAL).await;
+        }
+    });
 }
 
 /// Startup summary of detected coding agents. Never blocks.
@@ -3197,6 +3388,61 @@ async fn set_telemetry_settings(Json(req): Json<SetTelemetryReq>) -> ApiResult {
     })
     .await
     .map_err(|e| ApiError::from(anyhow!("telemetry task failed: {e}")))?
+}
+
+// --- updates -----------------------------------------------------------------
+
+async fn update_status() -> ApiResult {
+    tokio::task::spawn_blocking(|| Ok(Json(json!(updates::status()))))
+        .await
+        .map_err(|e| ApiError::from(anyhow!("update status task failed: {e}")))?
+}
+
+#[derive(Deserialize)]
+struct SetAutoUpdateReq {
+    enabled: bool,
+}
+
+async fn set_auto_update(Json(req): Json<SetAutoUpdateReq>) -> ApiResult {
+    let enabled = req.enabled;
+    tokio::task::spawn_blocking(move || {
+        crate::config::set_auto_update_enabled(enabled)
+            .map_err(|e| ApiError::from(anyhow!("could not save the auto-update setting: {e}")))?;
+        Ok(Json(json!(updates::status())))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("auto-update task failed: {e}")))?
+}
+
+/// Apply an update now, for the user who doesn't want to wait for the next
+/// periodic pass. Runs the same detached updater, so it can't race one already
+/// in flight — the updater's file lock settles that.
+async fn apply_update() -> ApiResult {
+    updates::apply_now().await?;
+    Ok(Json(json!(updates::status())))
+}
+
+#[derive(Deserialize)]
+struct InstallCliReq {
+    /// Replace an `orx` that is already on PATH. The card only sends this after
+    /// showing the user what it would displace.
+    #[serde(default)]
+    force: bool,
+}
+
+/// Link the app's `orx` onto the user's PATH (Settings → Updates).
+async fn install_cli(Json(req): Json<InstallCliReq>) -> ApiResult {
+    let installed =
+        tokio::task::spawn_blocking(move || crate::commands::install_cli::install(req.force))
+            .await
+            .map_err(|e| ApiError::from(anyhow!("install-cli task failed: {e}")))??;
+    Ok(Json(json!({
+        "link": installed.link.to_string_lossy(),
+        "dir": installed.link.parent().unwrap_or(&installed.link).to_string_lossy(),
+        "target": installed.target.to_string_lossy(),
+        "onPath": installed.on_path,
+        "alreadyCurrent": installed.already_current,
+    })))
 }
 
 fn profile_settings_json() -> Value {
@@ -4541,7 +4787,16 @@ struct EventCursor {
     files: HashMap<String, u64>,
     runs: HashMap<String, (String, i64)>,
     log_offsets: HashMap<String, u64>,
+    /// Last update status sent. Unlike the rest of the cursor this isn't store
+    /// state — the updater is a separate process, so its progress reaches the UI
+    /// through the same diff the store changes do.
+    update: Option<updates::UpdateStatus>,
+    update_sampled_at: Option<std::time::Instant>,
 }
+
+/// How often the event loop re-reads update status. The 500ms store cadence is
+/// there for run logs; nothing about an update needs that resolution.
+const UPDATE_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// 500ms poll loop: diff the store + log files, push named events into the
 /// channel. Ends when the subscriber disconnects (send fails). Same idiom as
@@ -4580,8 +4835,26 @@ fn json_event(name: &str, data: &Value) -> Event {
 /// One diff pass. On the first pass everything is "changed", so a fresh
 /// subscriber gets a full snapshot and needs no separate baseline fetches.
 fn collect_events(cursor: &mut EventCursor, first: bool) -> Result<Vec<Event>> {
-    let store = Store::open()?;
     let mut out = Vec::new();
+
+    // Sampled far below the 2Hz loop — the updater works on the scale of
+    // minutes, and this reads files. `cursor.update` is committed only once the
+    // batch is certain: every `?` below discards it (`event_loop` swallows the
+    // error), and a cursor that had already moved would never re-emit, leaving
+    // the restart banner permanently unshown for that subscriber.
+    let sampled_update = cursor
+        .update_sampled_at
+        .is_none_or(|at| at.elapsed() >= UPDATE_SAMPLE_INTERVAL)
+        .then(|| {
+            cursor.update_sampled_at = Some(std::time::Instant::now());
+            updates::status()
+        })
+        .filter(|update| cursor.update.as_ref() != Some(update));
+    if let Some(update) = &sampled_update {
+        out.push(json_event("update.status", &json!(update)));
+    }
+
+    let store = Store::open()?;
     // Cap log bytes per tick so one pass never materializes a huge batch —
     // remainders (whole-log replays included) stream out on later ticks.
     let mut log_budget: u64 = 2_000_000;
@@ -4635,6 +4908,10 @@ fn collect_events(cursor: &mut EventCursor, first: bool) -> Result<Vec<Event>> {
         }
         // Terminal runs were seeded at EOF above, so this is a no-op for them.
         push_log_delta(&run, cursor, &mut out, &mut log_budget);
+    }
+    // Committed only now that the batch is certain to be returned.
+    if let Some(update) = sampled_update {
+        cursor.update = Some(update);
     }
     Ok(out)
 }
@@ -4773,6 +5050,32 @@ async fn spa(uri: Uri) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn project_path_status_reports_an_unborn_repository_as_importable() {
+        let path =
+            std::env::temp_dir().join(format!("orx-project-path-status-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).unwrap();
+        let status = std::process::Command::new("git")
+            .current_dir(&path)
+            .args(["init", "-q", "-b", "main"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let response = project_path_status(Query(ProjectPathStatusQ {
+            path: Some(path.to_string_lossy().into_owned()),
+        }))
+        .await;
+        let Json(body) = match response {
+            Ok(body) => body,
+            Err(error) => panic!("unexpected path status error: {}", error.1),
+        };
+
+        assert_eq!(body["gitState"], "unborn");
+        assert_eq!(body["initialized"], true);
+        std::fs::remove_dir_all(path).unwrap();
+    }
 
     #[test]
     fn plan_never_becomes_the_preferred_mode_for_new_sessions() {

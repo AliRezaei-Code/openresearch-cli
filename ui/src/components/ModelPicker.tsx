@@ -283,12 +283,12 @@ export function ModelPicker({
   );
 
   return (
-    <div className="model-picker relative inline-flex" data-onboarding="model-picker" ref={rootRef}>
+    <div className="model-picker relative inline-flex min-w-0" data-onboarding="model-picker" ref={rootRef}>
       <button
         ref={triggerRef}
         type="button"
-        className="composer-pill inline-flex items-center gap-[5px] text-md text-text py-[5px] px-2 rounded-sm whitespace-nowrap transition-[background] duration-150 ease-standard [&:hover]:bg-surface"
-        title="Harness + model for this chat"
+        className="composer-pill inline-flex min-w-0 max-w-full items-center gap-[5px] text-md text-text py-[5px] px-2 rounded-sm whitespace-nowrap transition-[background] duration-150 ease-standard [&:hover]:bg-surface"
+        title={`Harness + model for this chat: ${label}${reasoningLabel ? ` · ${reasoningLabel}` : ""}`}
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => {
@@ -300,9 +300,11 @@ export function ModelPicker({
         }}
       >
         {value?.harness && <HarnessLogo harness={value.harness} size={14} />}
-        {label}
-        {reasoningLabel && <span className="model-picker-reasoning ml-0.5 text-muted">{reasoningLabel}</span>}
-        <ChevronDown size={14} className="text-muted" />
+        <span className="model-picker-label min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">
+          {label}
+          {reasoningLabel && <span className="model-picker-reasoning ml-1 text-muted">{reasoningLabel}</span>}
+        </span>
+        <ChevronDown size={14} className="shrink-0 text-muted" />
       </button>
       {open && (
         <div className="model-menu absolute bottom-[calc(100%_+_8px)] left-0 max-h-100 flex flex-col bg-background border border-border rounded-md shadow-[0_10px_26px_rgba(0,_0,_0,_0.16)] z-50 overflow-hidden w-72 [&.align-right]:left-auto [&.align-right]:right-0 [&_input]:rounded-none [&_input]:border-0 [&_input]:border-b [&_input]:border-b-border-variant [&_input]:bg-none [&_input]:bg-transparent [&_input]:py-2 [&_input]:px-2.5 [&_input]:text-sm [&_input]:outline-none align-right">

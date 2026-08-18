@@ -31,8 +31,8 @@ pub async fn launch_local_openresearch(args: &crate::ExpRunArgs) -> Result<()> {
     println!("  run     {}", run.id);
     println!("  The box is provisioning; the supervisor launches the run once it's online.");
     println!(
-        "  Follow it with `orx exp wait {}` or `orx logs {}`.",
-        run.experiment_id, run.id
+        "{}",
+        crate::invocation::follow_up(&run.experiment_id, &run.id)
     );
     Ok(())
 }
@@ -49,13 +49,6 @@ pub async fn submit_local_openresearch_with_source(
     source: SourceSnapshot,
     run_id: String,
 ) -> Result<StoredRun> {
-    if args.sandbox.is_some() || args.gpu.is_some() || args.cpu.is_some() {
-        return Err(anyhow!(
-            "--gpu/--cpu/--sandbox are the managed server-experiment flags; with \
-             --backend openresearch pass the shape as --flavor (e.g. --flavor h100_sxm \
-             or --flavor cpu5c)."
-        ));
-    }
     if args.host.is_some() {
         return Err(anyhow!(
             "--host doesn't apply to --backend openresearch — the box is provisioned \
@@ -67,8 +60,9 @@ pub async fn submit_local_openresearch_with_source(
     }
     if args.image.is_some() {
         return Err(anyhow!(
-            "--image doesn't apply to --backend openresearch — boxes run the platform's \
-             fixed image (CUDA + PyTorch + uv preinstalled)."
+            "--image doesn't apply to --backend openresearch — provider base images are fixed \
+             by OpenResearch; install project dependencies from the project's lockfile in the \
+             run command."
         ));
     }
     let flavor = args.flavor.clone().ok_or_else(|| {
@@ -155,16 +149,8 @@ pub async fn submit_local_openresearch_with_source(
     let run_command = Some(exp.run_command.clone())
         .filter(|c| !c.trim().is_empty())
         .or_else(|| project.run_command.clone().filter(|c| !c.trim().is_empty()))
-        .ok_or_else(|| {
-            anyhow!(
-                "No run command set for this experiment or its project. Set the project \
-                 default with `orx project edit {} --run-command '<cmd>'`, or pass \
-                 `--run-command '<cmd>'` to `orx create-experiment` — then relaunch.",
-                project.id
-            )
-        })?;
+        .ok_or_else(|| anyhow!("{}", crate::invocation::no_run_command(&project.id)))?;
 
-    // One run in flight per experiment unless deliberately forced.
     let sandbox = create_sandbox(
         &creds,
         &CreateSandboxBody {

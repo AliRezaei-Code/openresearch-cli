@@ -1111,16 +1111,28 @@ fn is_initial_chat_message(transcript_text: Option<&str>, has_messages: bool) ->
     transcript_text.is_none() && !has_messages
 }
 
-fn with_bootstrap_context(
+fn with_turn_context(
     native_session_id: Option<&str>,
     bootstrap_context: Option<&str>,
+    demo_evidence_context: Option<&str>,
     text: String,
 ) -> String {
-    match (native_session_id, bootstrap_context) {
-        (None, Some(context)) => {
-            format!("{context}\n\n<current-user-message>\n{text}\n</current-user-message>")
+    let mut contexts = Vec::new();
+    if native_session_id.is_none() {
+        if let Some(context) = bootstrap_context {
+            contexts.push(context);
         }
-        _ => text,
+    }
+    if let Some(context) = demo_evidence_context {
+        contexts.push(context);
+    }
+    if contexts.is_empty() {
+        text
+    } else {
+        format!(
+            "{}\n\n<current-user-message>\n{text}\n</current-user-message>",
+            contexts.join("\n\n")
+        )
     }
 }
 
@@ -1145,8 +1157,8 @@ fn with_selected_chat_context(text: String, annotations: &[TextAnnotation]) -> S
 #[cfg(test)]
 mod initial_message_tests {
     use super::{
-        contextualize_messages, is_initial_chat_message, with_bootstrap_context,
-        with_selected_chat_context, AnnotatedText, TextAnnotation,
+        contextualize_messages, is_initial_chat_message, with_selected_chat_context,
+        with_turn_context, AnnotatedText, TextAnnotation,
     };
     use serde_json::{json, Value};
 
@@ -1159,16 +1171,42 @@ mod initial_message_tests {
 
     #[test]
     fn bootstrap_context_is_injected_only_before_a_native_session_exists() {
-        let seeded = with_bootstrap_context(None, Some("prior demo"), "continue".into());
+        let seeded = with_turn_context(None, Some("prior demo"), None, "continue".into());
         assert!(seeded.contains("prior demo"));
         assert!(seeded.contains("<current-user-message>\ncontinue"));
         assert_eq!(
-            with_bootstrap_context(Some("native"), Some("prior demo"), "continue".into()),
+            with_turn_context(Some("native"), Some("prior demo"), None, "continue".into()),
             "continue"
         );
         assert_eq!(
-            with_bootstrap_context(None, None, "continue".into()),
+            with_turn_context(None, None, None, "continue".into()),
             "continue"
+        );
+    }
+
+    #[test]
+    fn demo_evidence_context_is_injected_without_rewrapping_the_user_message() {
+        let first = with_turn_context(
+            None,
+            Some("prior demo"),
+            Some("demo evidence"),
+            "first".into(),
+        );
+        let follow_up = with_turn_context(
+            Some("native"),
+            Some("prior demo"),
+            Some("demo evidence"),
+            "follow up".into(),
+        );
+        assert!(first.contains("demo evidence"));
+        assert!(first.contains("prior demo"));
+        assert!(first.contains("<current-user-message>\nfirst"));
+        assert!(follow_up.contains("demo evidence"));
+        assert!(follow_up.contains("<current-user-message>\nfollow up"));
+        assert_eq!(first.matches("<current-user-message>").count(), 1);
+        assert_eq!(
+            with_turn_context(Some("native"), None, None, "ordinary".into()),
+            "ordinary"
         );
     }
 
@@ -3382,9 +3420,10 @@ impl ChatHost {
                     .or_else(|| crate::local::user_skills::expand(text, &project.id))
                     .unwrap_or_else(|| text.to_string())
             });
-            with_bootstrap_context(
+            with_turn_context(
                 session.native_session_id.as_deref(),
                 session.bootstrap_context.as_deref(),
+                super::demo::turn_context(&project.id),
                 expanded,
             )
         });
@@ -5465,20 +5504,27 @@ pub async fn watch_runs(
 }
 
 /// Env prep shared by the CLI adapters: this orx first on PATH (agents shell
-/// out to `orx`) and the dashboard-managed env vars, real env winning.
+/// out to `orx`), the shell environment app mode imported, and the
+/// dashboard-managed env vars, real env winning.
 pub fn prepare_env(cmd: &mut tokio::process::Command) {
     if let Ok(exe) = std::env::current_exe().and_then(|p| p.canonicalize()) {
         if let Some(dir) = exe.parent() {
             let mut path = std::ffi::OsString::from(dir);
-            if let Some(existing) = std::env::var_os("PATH").filter(|p| !p.is_empty()) {
+            if let Some(existing) = crate::local::shell_env::search_path().filter(|p| !p.is_empty())
+            {
                 path.push(":");
                 path.push(existing);
             }
             cmd.env("PATH", path);
         }
     }
+    // So an agent's `orx exp run` resolves the same store the dashboard is
+    // showing it, rather than re-resolving to the default.
+    crate::local::shell_env::export_to(|key, value| {
+        cmd.env(key, value);
+    });
     for (key, value) in crate::config::list_synced_env() {
-        if std::env::var_os(&key).is_none() {
+        if crate::local::shell_env::var(&key).is_none() {
             cmd.env(key, value);
         }
     }
@@ -5607,8 +5653,8 @@ pub fn set_chat_session_env(cmd: &mut tokio::process::Command, session_id: &str)
 }
 
 /// The chat session that launched this run, read from the env the harness child
-/// exported (see [`set_chat_session_env`]). `None` for CLI-launched or server
-/// runs — those intentionally poke no chat session on completion.
+/// exported (see [`set_chat_session_env`]). `None` for runs launched outside
+/// chat — those intentionally poke no chat session on completion.
 pub fn launching_chat_session() -> Option<String> {
     std::env::var(CHAT_SESSION_ENV)
         .ok()
@@ -5618,9 +5664,8 @@ pub fn launching_chat_session() -> Option<String> {
 /// Whether this process is running inside a local `orx up` session.
 /// [`LOCAL_SESSION_ENV`] is exported only by [`set_chat_session_env`] onto
 /// `orx up` harness children, so its presence means this process is one (or a
-/// subprocess of one). Commands that take a project or run id should prefer
-/// `…is_local()` on the resolved entity; this is for the ones that take
-/// neither (e.g. `orx skill <name>`).
+/// subprocess of one). Project, experiment, and run commands resolve their ids
+/// through `local::resolve`; this is for commands that take no such id.
 pub fn in_local_session() -> bool {
     std::env::var(LOCAL_SESSION_ENV).is_ok_and(|v| !v.is_empty())
 }

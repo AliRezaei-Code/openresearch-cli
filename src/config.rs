@@ -62,7 +62,7 @@ pub struct Credentials {
 }
 
 pub(crate) fn config_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+    let base = crate::local::shell_env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             dirs::home_dir()
@@ -175,6 +175,18 @@ pub fn github_for_new_projects() -> bool {
 
 pub fn set_github_for_new_projects(enabled: bool) -> Result<()> {
     crate::telemetry::set_github_for_new_projects(enabled)?;
+    Ok(())
+}
+
+/// Whether orx may install updates on its own (Settings → Updates). Lives in
+/// the telemetry-owned `settings.json` for the same single-writer reason as the
+/// data dir above. Read by `updates::auto_update_eligible`.
+pub fn auto_update_enabled() -> bool {
+    crate::telemetry::auto_update_enabled()
+}
+
+pub fn set_auto_update_enabled(enabled: bool) -> Result<()> {
+    crate::telemetry::set_auto_update_enabled(enabled)?;
     Ok(())
 }
 

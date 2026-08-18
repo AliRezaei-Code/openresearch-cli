@@ -1,6 +1,9 @@
 // Typed client for the orx up local HTTP API (/api/*). All wire JSON is camelCase.
 
 export const DEMO_PROJECT_ID = "demo_nanochat_v1";
+export const PROJECT_BRIEF_NAME = "PROJECT.md";
+// Bundled demo snapshots reserve this prefix so future demos inherit demo-only UI.
+export const isDemoProjectId = (id: string) => id.startsWith("demo_");
 export const DEMO_MAIN_SESSION_ID = "chat_demo_nanochat_v1";
 export const DEMO_FIGURE_SESSION_ID = "chat_demo_nanochat_figures_v1";
 export const DEMO_LITERATURE_SESSION_ID = "chat_demo_nanochat_literature_v1";
@@ -96,6 +99,12 @@ const patch = <T>(url: string, body: unknown) =>
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   }).then((r) => json<T>(r));
+const put = <T>(url: string, body: unknown) =>
+  fetch(url, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  }).then((r) => json<T>(r));
 
 export const listProjects = () =>
   get<{ projects: Project[] }>("/api/projects").then((r) => r.projects);
@@ -135,6 +144,7 @@ export interface ProjectPathStatus {
   directory: boolean | null;
   empty: boolean | null;
   initialized: boolean | null;
+  gitState?: "notRepository" | "unborn" | "ready" | "detached" | "invalid" | null;
   githubOwner?: string | null;
   githubRepo?: string | null;
 }
@@ -302,6 +312,32 @@ export const getProjectFile = (projectId: string, path: string, opts: CheckoutRe
 export const projectFileUrl = (projectId: string, path: string, opts: CheckoutRef = {}) =>
   `/api/projects/${projectId}/file/raw?${checkoutQuery(opts, new URLSearchParams({ path }))}`;
 
+/** Overwrite a text file in the project's live checkout (worktree when
+ * `sessionId` is given, else the hub clone). Committed branch trees are
+ * read-only, so pass no `ref`. */
+export const saveProjectFile = (
+  projectId: string,
+  path: string,
+  content: string,
+  opts: { sessionId?: string } = {},
+) =>
+  put<{ ok: boolean; root: CheckoutRoot; bytesWritten: number }>(
+    `/api/projects/${projectId}/file`,
+    { path, content, sessionId: opts.sessionId },
+  );
+
+/** Open a checkout file on the machine running `orx up`, in the OS default app
+ * for its type (the user's editor for source files). */
+export const openFileInEditor = (
+  projectId: string,
+  path: string,
+  opts: { sessionId?: string } = {},
+) =>
+  post<{ ok: boolean }>(`/api/projects/${projectId}/file/open`, {
+    path,
+    sessionId: opts.sessionId,
+  });
+
 export interface CodeTree {
   root: CheckoutRoot;
   /** The listed branch (`ref` mode), else the checked-out branch, else null
@@ -375,6 +411,48 @@ export interface HfSettings {
 export const getHfSettings = () => get<HfSettings>("/api/settings/hf");
 
 export const saveHfToken = (token: string) => post<HfSettings>("/api/settings/hf", { token });
+
+// --- updates ------------------------------------------------------------------
+
+/** How orx was installed. Only `installer` and `app-bundle` update themselves. */
+export type InstallChannel = "installer" | "app-bundle" | "cargo" | "homebrew" | "nix" | "unknown";
+
+export interface UpdateStatus {
+  current: string;
+  /** Latest release this install can actually move to — the macOS app and the
+   *  CLI read different manifests, and the app's can lag. */
+  latest: string | null;
+  channel: InstallChannel;
+  /** Whether this install is one orx can replace at all. */
+  selfUpdates: boolean;
+  autoUpdate: boolean;
+  /** `autoUpdate` is off because of the environment, not the user's setting. */
+  envDisabled: boolean;
+  updateAvailable: boolean;
+  /** The newer version already on disk. Distinct from `latest`: a release can
+   *  land between the install and the restart. */
+  installedVersion: string | null;
+  restartRequired: boolean;
+}
+
+export interface InstalledCli {
+  link: string;
+  /** The link's directory — what to add to PATH when `onPath` is false. */
+  dir: string;
+  target: string;
+  onPath: boolean;
+  alreadyCurrent: boolean;
+}
+
+export const getUpdateStatus = () => get<UpdateStatus>("/api/update");
+
+export const applyUpdate = () => post<UpdateStatus>("/api/update/apply");
+
+export const setAutoUpdate = (enabled: boolean) =>
+  post<UpdateStatus>("/api/update/auto", { enabled });
+
+export const installCli = (force = false) =>
+  post<InstalledCli>("/api/update/install-cli", { force });
 
 // --- settings: kubernetes -----------------------------------------------------
 
@@ -721,6 +799,9 @@ export const getArtifactFileText = (
     return r.arrayBuffer().then((bytes) => decodeFileText(bytes, Number.isFinite(total) && total > bytes.byteLength));
   });
 };
+
+export const saveProjectBrief = (projectId: string, content: string) =>
+  put<{ ok: boolean; bytesWritten: number }>(`/api/projects/${projectId}/brief`, { content });
 
 const isFilePresentation = (value: string | null): value is FilePresentation =>
   value === "image" || value === "audio" || value === "video" || value === "pdf" ||

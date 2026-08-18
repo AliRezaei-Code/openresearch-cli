@@ -62,6 +62,12 @@ BUILD="$(mktemp -d)"
 # backing image we're about to delete.
 trap '{ [[ -n "${DEV:-}" ]] && hdiutil detach "$DEV" -force >/dev/null 2>&1; } || true; rm -rf "$STAGE" "$BUILD"' EXIT
 cp -R "$APP" "$STAGE/"
+# Losing this to a dereferencing copy is silent: the app still builds, signs and
+# runs, and agents just quietly fall back to the user's own `orx` install.
+[[ -L "$STAGE/$(basename "$APP")/Contents/MacOS/orx" ]] || {
+  echo "package-macos-app.sh: the orx symlink did not survive staging" >&2
+  exit 1
+}
 ln -s /Applications "$STAGE/Applications"
 mkdir "$STAGE/.background"
 # HiDPI background: 1x + 2x combined into one multi-representation TIFF.

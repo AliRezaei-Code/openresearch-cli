@@ -1,61 +1,44 @@
 ---
 name: orx-compute
-description: "Launch experiment runs with `orx exp run`: backends (hf, modal, k8s, ssh, slurm, ray, openresearch, local), flavors, timeouts, images, sizing, and `orx exp wait`. Use before launching or re-launching any run, when choosing or switching a backend or GPU flavor, when a job OOMs, stalls, or times out, or when deciding GPU vs CPU."
+description: "Launch experiment runs with `orx exp run`: backends (hf, modal, k8s, ssh, slurm, ray, openresearch, local), flavors, timeouts, images, sizing, and choosing `orx exp wait` vs `orx exp wake`. Use before launching or re-launching any run, when choosing or switching a backend or GPU flavor, when a job OOMs, stalls, or times out, or when deciding GPU vs CPU."
 ---
 
-Each experiment node has a **run command** (the shell command that trains/evaluates
-it) and is launched on **compute** you choose at run time. Compute is *not* stored
-on the node — you pick a GPU, a CPU-only instance, or an existing sandbox each time
-you launch (local projects may instead carry a default target — see "The default
-compute target" below).
+Projects and experiments are created locally through `orx up`. Each run uses an
+immutable snapshot of the experiment branch's recorded commit and sends it to
+the selected execution backend.
 
 ```sh
-orx exp status <expId>                 # status, branch, parent, run command, latest run + commit, local diff recipe
-orx exp cmd <expId>                    # print the current run command
-orx exp cmd <baseId> --set "bash run.sh"   # set it ONCE on the baseline; children inherit it
+orx up                                 # open the dashboard and import the cloned repository
+orx exp status <expId>                 # status, branch, parent, run command, latest run + commit
 orx compute                            # browse GPU offers across all providers (price-sorted)
-orx compute --gpu H100_SXM --count 1   # filter by gpu / count
+orx compute --gpu H100_SXM --count 1   # filter by GPU/count
 orx compute --provider vast            # filter by provider
 orx compute --cpu                      # browse CPU-only offers (price-sorted)
-orx exp run <expId> --gpu H100_SXM --count 1 [--disk 100]     # launch on a NEW GPU instance (RunPod)
-orx exp run <expId> --gpu H100_SXM --provider vast       # launch on another provider's GPU
-orx exp run <expId> --cpu cpu5c --vcpus 8                 # launch on a NEW CPU-only instance
-orx exp run <expId> --sandbox <sandboxId>                 # launch on an EXISTING node
-orx exp cancel <expId>                 # cancel the in-flight run
+orx exp run <expId> --backend openresearch --flavor h100_sxm
+orx exp run <expId> --backend openresearch --flavor cpu5c:8
+orx exp cancel <expId>                 # cancel the in-flight local run
 ```
 
 Rules and notes:
 - **The run command is a fixed contract — set it once on the baseline, then leave
-  it alone.** Children inherit it (see the `orx-experiment-tree` skill). Don't
-  `--set` a different command per child, and don't bake swept hyperparameters into
-  it — vary the **code/config** on a child's git branch instead, so every variant
-  runs the same command and their `EVAL.md`s stay comparable. The normal reason to
-  touch a command is the baseline having none yet.
-- **Set a run command before launching.** `orx exp run` fails with a pointer to
-  `orx exp cmd --set` if the node has none.
-- **Commit your edits before launching.** Local projects run an immutable source
-  snapshot of the committed branch and never need a GitHub push. Managed server
-  projects still run their recorded remote revision. As a safety net, `orx exp
-  run` refuses a child whose branch has no changes over its parent; commit a
-  meaningful change and retry, or pass `--force` deliberately.
-- **Pick compute with exactly one of `--gpu`, `--cpu`, or `--sandbox`.** With
-  `--gpu`, `--count` defaults to `1` and `--disk` to `100` (GB). A new GPU
-  instance defaults to **RunPod** (the cheapest matching RunPod offer for the
-  chosen gpu/count); pass `--provider <name>` to launch from another provider
-  shown in `orx compute` (e.g. `vast`, `lambda`). New CPU instances are
-  RunPod-only. Browse valid gpu ids, providers, and prices with `orx compute`.
-- **GPU ids are exact enum strings, not family names.** `--gpu H100` is invalid —
-  the variant suffix is part of the id (`H100_SXM`, `H100_PCIE`, `A100_SXM_80GB`,
-  `RTX_4090`, …). Use the exact `GPU` column value from `orx compute`; run it
-  first if unsure.
-- **Use `--cpu` for GPU-less work** (data prep, eval harnesses, CPU-bound papers).
-  The flavor is one of `cpu5c` (compute), `cpu5g` (general), or `cpu5m` (memory);
-  `--vcpus` is one of `2`, `8`, `32` (default `8`). Browse offers with
-  `orx compute --cpu`. CPU instances size their disk from the vCPU count, so there
-  is no `--disk` knob.
+  it alone.** Children inherit it (see the `orx-experiment-tree` skill). Do not
+  give a child a different command or bake swept hyperparameters into it — vary
+  the **code/config** on a child's Git branch instead, so every variant
+  runs the same command and their logged results stay comparable. If the baseline has
+  no command, set the local project default with
+  `orx project edit <projectId> --run-command '<cmd>'`.
+- **Set a run command before launching.** Local projects inherit it from the
+  project; set it with `orx project edit <projectId> --run-command '<cmd>'`.
+- **Commit your edits before launching.** Every backend runs an immutable source snapshot
+  of the committed branch and never needs a GitHub push.
+- **Pick an execution backend.** OpenResearch compute uses `--backend
+  openresearch --flavor <shape>`; other supported backends include `hf`,
+  `modal`, `k8s`, `ssh`, `slurm`, `ray`, and `local`.
 - `orx exp run` **queues** the run and returns immediately — it does not wait.
   Follow progress with `orx runs <projectId>` and `orx logs <runId>`, or block
   with `orx exp wait` (below).
+- `--force` permits a deliberate concurrent run on the same experiment. Without
+  it, `orx` rejects a launch while another run for that node is still in flight.
 
 ## The default compute target (local projects)
 
@@ -66,18 +49,15 @@ set, `orx exp run <expId>` with no
 `--backend` launches there with the saved default flavor — omitting the flag is
 how you use it (flavor-required backends still need `--flavor` if no default
 flavor is saved). When none is set, ask the user to choose an explicit backend.
-Server projects are unaffected: managed compute (`--gpu`/`--cpu`/`--sandbox`)
-stays their default.
 
 ## Running on Hugging Face Jobs — `--backend hf`
 
-**Managed compute (`--gpu`/`--cpu`/`--sandbox`) is the default for server
-projects. `--backend hf` requires a local project (`orx up`); use it ONLY when
+**`--backend hf` requires a local project (`orx up`); use it ONLY when
 the user explicitly asks for Hugging Face Jobs**
 (e.g. "run this on HF", "use my huggingface account"), it is the configured
 default target, or the project context says to
 prefer it. A connected HF token by itself is NOT a signal to switch — it just
-means the option exists. When in doubt, launch on managed compute.
+means the option exists. When in doubt, ask which backend to use.
 
 With `--backend hf`, the job runs on the user's own HF account (requires
 `HF_TOKEN` in the environment — orgs that connect their HF account in compute
@@ -91,11 +71,10 @@ orx exp run <expId> --backend hf --flavor cpu-upgrade --image python:3.12
 ```
 
 Rules and notes:
-- **`--flavor` is required** and replaces `--gpu`/`--cpu`/`--sandbox`. Common
+- **`--flavor` is required.** Common
   flavors: `t4-small`, `a10g-small`, `a10g-large`, `l4x1`, `l40sx1`,
-  `a100-large`, `h200` (and `x2/x4/x8` multiples); CPU: `cpu-basic`,
-  `cpu-upgrade`. Prefer the smallest flavor that fits — same sizing discipline
-  as managed GPUs.
+  `a100-large`, `h100`, `h200` (and `x2/x4/x8` multiples); CPU: `cpu-basic`,
+  `cpu-upgrade`. Prefer the smallest flavor that fits.
 - **Set `--timeout` to cover the whole run** (default `4h`). HF kills the job
   at the timeout; a killed job reads as a failed run.
 - For a local project, `orx` uploads the committed source snapshot into a
@@ -105,9 +84,9 @@ Rules and notes:
   flavors, `python:3.12` on cpu flavors). Pick an image with your deps baked
   in when pip-install time dominates the run.
 - Everything downstream is identical: the run appears in the tree, `orx exp
-  wait` / `orx runs` / `orx logs` work unchanged, and cancellation through
-  OpenResearch or `orx exp cancel` reaches the job within a few seconds. A detached
-  `orx supervise` process mirrors status and logs; don't kill it.
+  wait` / `orx runs` / `orx logs` work unchanged, and `orx exp cancel` reaches
+  the job within a few seconds. A detached `orx supervise` process records
+  status and logs locally; don't kill it.
 
 ## Running on Modal — `--backend modal`
 
@@ -131,7 +110,7 @@ orx exp run <expId> --backend modal --flavor cpu --image python:3.12
 ```
 
 Rules and notes:
-- **`--flavor` is required** and replaces `--gpu`/`--cpu`/`--sandbox`. It's a
+- **`--flavor` is required.** It's a
   Modal GPU: `t4`, `l4`, `a10g`, `a100`, `a100-80gb`, `l40s`, `h100`, `h200`
   (append `:N` for a count, e.g. `h100:2`); or `cpu` / `cpu-large` for CPU-only.
   Prefer the smallest flavor that fits.
@@ -142,9 +121,9 @@ Rules and notes:
 - `--image` overrides the container (default: a CUDA pytorch image on GPU
   flavors, `python:3.12` on cpu). Pick one with your deps baked in when
   pip-install time dominates.
-- Everything downstream is identical (`orx exp wait` / `orx runs` / `orx logs`,
-  cancellation through OpenResearch or `orx exp cancel`). A detached `orx supervise` mirrors
-  status and logs; don't kill it.
+- Everything downstream is identical (`orx exp wait` / `orx runs` / `orx logs` /
+  `orx exp cancel`). A detached `orx supervise` records status and logs locally;
+  don't kill it.
 
 ## Running on your Kubernetes cluster — `--backend k8s`
 
@@ -169,7 +148,7 @@ orx exp run <expId> --backend ssh --host my-gpu-box     # ~/.ssh/config alias
 Rules and notes:
 - **`--host` is the ssh host alias** (from `~/.ssh/config`) — a machine, not a
   hardware shape, so there is no `--flavor` here. Use one of the user's
-  configured aliases; OpenResearch validates reachability and required tools.
+  configured aliases; `orx` validates reachability and required tools.
 - Auth is your ssh keys/agent — orx never reads a key, it just shells out to
   `ssh <alias>`. The host needs `bash` and `tar`; orx streams the committed
   source snapshot over SSH, extracts it into the run directory, and starts the
@@ -177,9 +156,9 @@ Rules and notes:
 - No `--image` (the host's environment is used as-is) and no `--timeout` (the
   process runs until it exits or you cancel).
 - The run lives under `~/.orx/runs/<runId>/` on the host (`run.sh`, `log`,
-  `pid`, `exit_code`). Cancellation through OpenResearch or `orx exp cancel` kills the remote
-  process group. Everything downstream (`orx exp wait` / `runs` / `logs`) is
-  identical; a detached `orx supervise` polls it over ssh — don't kill it.
+  `pid`, `exit_code`). `orx exp cancel` kills the remote process group.
+  Everything downstream (`orx exp wait` / `runs` / `logs`) is identical; a
+  detached `orx supervise` polls it over ssh — don't kill it.
 
 ## Running on your Slurm cluster — `--backend slurm`
 
@@ -205,7 +184,7 @@ Rules and notes:
 - `orx` streams the committed source snapshot to the login node before `sbatch`
   starts the fixed command. Everything downstream (`orx exp wait` / `orx runs`
   / `orx logs` / `orx exp cancel`) is
-  identical; a detached `orx supervise` mirrors status and logs — don't kill it.
+  identical; a detached `orx supervise` records status and logs locally — don't kill it.
 
 ## Running on a Ray Jobs cluster — `--backend ray`
 
@@ -233,16 +212,18 @@ Rules and notes:
   runtime env until it finishes; size and bound work in the run command itself.
 - Ray receives the committed snapshot as its `working_dir` package; downstream
   commands stay the same, and a detached
-  `orx supervise` mirrors status and logs — don't kill it.
+  `orx supervise` records status and logs locally — don't kill it.
 
 ## Running on an OpenResearch box — `--backend openresearch`
 
-**Same rule: use `--backend openresearch` ONLY when the user explicitly asks
-for it** ("use an openresearch box", "bill it to the org") or it is the
-configured default target. It provisions an **ephemeral OpenResearch machine
+**Requires a local project initialized with `orx up`. Use `--backend
+openresearch` ONLY when the user explicitly asks for it** ("use an openresearch
+box", "bill it to the org") or it is the configured default target. It
+provisions an **ephemeral OpenResearch machine
 billed to the user's org** — created for this run and deleted when it ends —
-with a fixed CUDA + PyTorch + uv image. Needs `orx login` and a registered SSH
-key.
+from the provider's pinned CUDA base with pinned `uv`. The run command installs
+project dependencies from the project's lockfile. Needs `orx login` and a
+registered SSH key.
 
 ```sh
 orx exp run <expId> --backend openresearch --flavor h100_sxm:2 --timeout 4h
@@ -253,13 +234,13 @@ Rules and notes:
 - **`--flavor` is a GPU id from `orx compute`** (`h100_sxm`, `h100_sxm:2` for a
   count) **or a CPU flavor** (`cpu5c` / `cpu5g` / `cpu5m`, with `:vcpus` like
   `cpu5c:32`). Run `orx compute` to see what's available.
-- Optional: `--org <id>` (when you belong to several), `--disk <GB>`, and
+- Optional: `--org <id>` from `orx orgs` (when you belong to several), `--disk <GB>`, and
   `--provider <P>`. No `--image` — the platform's image is fixed.
 - `--timeout` (default `4h`) applies — the box is deleted when the run ends
   either way, so nothing persists on it; everything you need must be in the log.
 - `orx` streams the committed source snapshot to the provisioned box;
   downstream commands stay the same, and a detached
-  `orx supervise` mirrors status and logs — don't kill it.
+  `orx supervise` records status and logs locally — don't kill it.
 
 ## Running on this machine — `--backend local`
 
@@ -281,11 +262,11 @@ Rules and notes:
   the machine.
 - The run extracts the committed source snapshot into its own run dir (never
   your checkout) and runs the fixed command. Never run training directly in your
-  shell instead: that would be unsupervised and untracked by OpenResearch.
+  shell instead: that would be unsupervised and untracked by `orx`.
 - The run lives under `<orx data dir>/local-runs/<runId>/` (`run.sh`, `log`,
-  `pid`, `exit_code`). Cancellation through OpenResearch or `orx exp cancel` TERMs the
-  process group. Everything downstream (`orx exp wait` / `orx runs` / `orx logs`) is
-  identical; a detached `orx supervise` watches it — don't kill it.
+  `pid`, `exit_code`). `orx exp cancel` TERMs the process group. Everything
+  downstream (`orx exp wait` / `orx runs` / `orx logs`) is identical; a detached
+  `orx supervise` watches it — don't kill it.
 
 ## Spinning up a standalone instance — `orx instance create`
 
@@ -299,9 +280,8 @@ orx instance create <orgId> --gpu H100_SXM --provider runpod        # pin a prov
 orx instance create <orgId> --cpu cpu5g --vcpus 8                    # CPU-only box
 ```
 
-- `<orgId>` comes from `orx projects` (the `org:` line). The flags mirror
-  `orx exp run`: exactly one of `--gpu` or `--cpu`; `--count`/`--disk` apply to
-  `--gpu`, `--vcpus` to `--cpu`.
+- `<orgId>` comes from `orx orgs`. Choose exactly one of
+  `--gpu` or `--cpu`; `--count`/`--disk` apply to `--gpu`, `--vcpus` to `--cpu`.
 - Unlike `orx exp run`, omitting `--provider` picks the **cheapest** matching
   offer across all providers; pass `--provider <name>` to pin one.
 - The box provisions asynchronously — the command prints its id and current
@@ -357,6 +337,13 @@ orx exp wait <expId> --interval 10 --timeout 3600   # tune polling
 - **A failed run is not a new node.** Re-launch the same `<expId>` — a failure
   answered nothing, so the node is still repairable in place
   (`orx-experiment-tree`).
+
+### Going idle instead — `orx exp wake`
+
+After launching a run, use `orx exp wake <expId>` when you want to end the
+current turn and resume after that run succeeds or fails. The wake-up is opt-in,
+fires only for `done` or `failed`, and waits behind any user messages already
+queued for the session. Use either `exp wait` or `exp wake` for a run, not both.
 
 ## Sizing compute
 

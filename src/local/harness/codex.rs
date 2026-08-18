@@ -141,14 +141,14 @@ fn codex_model_reasoning(model: &str) -> Option<&'static [&'static str]> {
 /// (the server already filters them by default; the guard is belt-and-braces).
 async fn codex_model_list(bin: &Path, configured_effort: Option<&str>) -> Option<Vec<ModelInfo>> {
     let fut = async {
-        let mut child = Command::new(bin)
-            .arg("app-server")
+        let mut cmd = Command::new(bin);
+        cmd.arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .ok()?;
+            .kill_on_drop(true);
+        prepare_env(&mut cmd);
+        let mut child = cmd.spawn().ok()?;
         let mut stdin = child.stdin.take()?;
         let mut lines = BufReader::new(child.stdout.take()?).lines();
 

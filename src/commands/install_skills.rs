@@ -201,7 +201,7 @@ pub async fn offer_install_after_login() {
 
     println!(
         "\norx ships one agent skill: a small file teaching your coding agent to run\n\
-         `orx skill` for the live guide. It can be installed now ({} file{}) for the\n\
+         `orx skill` for the bundled guide. It can be installed now ({} file{}) for the\n\
          agent{} detected on this machine:",
         present.len(),
         if present.len() == 1 { "" } else { "s" },

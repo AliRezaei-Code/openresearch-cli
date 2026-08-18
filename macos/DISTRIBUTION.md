@@ -29,6 +29,41 @@ the real gate on the certificate** — verify the tag points at trusted code (th
 `main`-only deployment-branch restriction covers the workflow file, not the
 checked-out tag).
 
+## The app updater's contract
+
+Installed apps update themselves from `macos-app.json`, uploaded to the release
+by the same step that uploads the DMG:
+
+```json
+{ "version": "0.1.104", "tag": "v0.1.104", "asset": "OpenResearch.dmg", "sha256": "…" }
+```
+
+Two rules, both load-bearing:
+
+- **Never publish the manifest without its DMG, or ahead of it.** The updater
+  treats the manifest as proof the app build exists; a manifest whose asset is
+  missing points every installed app at a 404, and one that outlives a re-run's
+  new DMG fails every checksum. Hence the upload order in the workflow: delete
+  the old manifest, upload the DMG, then publish the new manifest. A *missing*
+  manifest is fine — the updater reads a 404 as "nothing to update to" and
+  retries later, which is what happens between a release being published and
+  this workflow attaching its DMG.
+- **The app's version comes from this file, not the CLI's `dist-manifest.json`.**
+  The DMG is attached after the release, so the CLI's version can be ahead of the
+  published app build. An app install that read the CLI's manifest would
+  advertise, and endlessly retry, a build that does not exist for it — so
+  `updates::fetch_latest_for_channel` picks the manifest by install channel.
+
+The digest is published here because the release's own `sha256.sum` is generated
+by cargo-dist before this job runs and does not cover the DMG.
+
+Before swapping the bundle, `src/updates/macos_app.rs` checks the digest, then
+requires `codesign` against a Developer ID requirement pinned to team
+`9P69UXUJUK` *and* an `spctl` verdict of `source=Notarized Developer ID`. The
+signature check — not the digest — is what makes an unattended swap safe, so
+**changing the signing identity breaks self-update for every installed app**:
+update `EXPECTED_TEAM_ID` and ship that release before retiring the old cert.
+
 ## Configure signing (CI)
 
 Needs an Apple Developer Program account with a **Developer ID Application**
@@ -90,3 +125,46 @@ and an `/Applications` alias to drag it onto, over a branded background.
   headless shell; if it fails, a functional but unstyled DMG still ships. The
   window/icon constants live at the top of the "styled DMG" block, and the
   matching canvas size lives in `generate-dmg-background.mjs`.
+
+## App-mode runtime environment
+
+Finder launches the bundle through launchd, so the process starts with
+`PATH=/usr/bin:/bin:/usr/sbin:/sbin` and no shell rc ever sourced. Detection
+would then find no `codex` at all, and `claude`/`opencode` only at their default
+installer drop locations — the "works in my terminal, broken in the app" bug.
+
+`commands::app::hydrate_shell_env` therefore probes the user's shell
+(`$SHELL -ilc`, interactive because `.zshrc` is where these exports live) once at
+startup and installs the result via `local::shell_env`, which harness lookup,
+harness children, and directory resolution consult instead of the process
+environment. It is best-effort and capped at 5s; every outcome is logged. To see
+it, run the bundled binary from a terminal:
+
+```bash
+/Applications/OpenResearch.app/Contents/MacOS/OpenResearch
+```
+
+## Coexisting with a CLI install
+
+The app and a `curl`-installed `orx` share one data dir and one config dir, so
+both must be safe to have at once:
+
+- **Ports** — the app binds an ephemeral loopback port rather than `orx up`'s
+  4791.
+- **Store** — SQLite in WAL with a 5s busy timeout; concurrent readers/writers
+  are expected. Run supervisors hold a per-run exclusive lock, so a second
+  server recovering the same active run exits instead of double-driving it.
+- **Lifecycle lock** — app mode takes the same read lock `dispatch` takes for
+  `orx up`, so `orx delete` refuses to wipe the store under a running app.
+- **`orx` on the agent's PATH** — the bundle ships `Contents/MacOS/orx`, a
+  symlink to the executable, and `chat::prepare_env` prepends that directory.
+  Agents shelling out to `orx` therefore get *this* build rather than whatever
+  CLI version happens to be installed, and a DMG-only user needs no CLI at all.
+  Invoked under that name the binary stays a plain CLI — see
+  `launched_as_app_bundle`.
+
+- **Directories** — `ORX_DATA_DIR`, `XDG_DATA_HOME`, and `XDG_CONFIG_HOME` are
+  imported by the same startup probe (`local::shell_env::IMPORTED`), so a rc
+  file that redirects the store moves the app with it. Otherwise the app would
+  read the default database while the CLI read the user's, and the lock above
+  would guard a file neither shares.

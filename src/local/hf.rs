@@ -24,8 +24,8 @@ pub async fn launch_local_hf(args: &crate::ExpRunArgs) -> Result<()> {
     );
     println!("  watch  {}", backend.url.as_deref().unwrap_or(""));
     println!(
-        "  Follow it with `orx exp wait {}` or `orx logs {}`.",
-        run.experiment_id, run.id
+        "{}",
+        crate::invocation::follow_up(&run.experiment_id, &run.id)
     );
     Ok(())
 }
@@ -42,12 +42,6 @@ pub async fn submit_local_hf_with_source(
     source: SourceSnapshot,
     run_id: String,
 ) -> Result<StoredRun> {
-    if args.sandbox.is_some() || args.gpu.is_some() || args.cpu.is_some() {
-        return Err(anyhow!(
-            "Local experiments run on Hugging Face Jobs; drop --gpu/--cpu/--sandbox \
-             and pass --flavor instead (e.g. --flavor a10g-small)."
-        ));
-    }
     let flavor = args.flavor.clone().ok_or_else(|| {
         anyhow!(
             "--backend hf requires --flavor: t4-small, a10g-small/large, l4x1, \
@@ -75,17 +69,8 @@ pub async fn submit_local_hf_with_source(
     let run_command = Some(exp.run_command.clone())
         .filter(|c| !c.trim().is_empty())
         .or_else(|| project.run_command.clone().filter(|c| !c.trim().is_empty()))
-        .ok_or_else(|| {
-            anyhow!(
-                "No run command set for this experiment or its project. Set the project \
-                 default with `orx project edit {} --run-command '<cmd>'`, or pass \
-                 `--run-command '<cmd>'` to `orx create-experiment` — then relaunch.",
-                project.id
-            )
-        })?;
+        .ok_or_else(|| anyhow!("{}", crate::invocation::no_run_command(&project.id)))?;
 
-    // One run in flight per experiment unless the caller deliberately forces
-    // a concurrent launch — the double-click / double-submit guard.
     let token = hf::resolve_token()?;
     let namespace = hf::whoami(&token).await?;
 

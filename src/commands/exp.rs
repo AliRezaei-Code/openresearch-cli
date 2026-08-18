@@ -1,19 +1,12 @@
 //! The `exp` command group: operate on a single experiment node by id.
 //!
 //!   orx exp status <expId>            inspect status, run command, latest run
-//!   orx exp cmd    <expId> [--set …]  view or set the run command
-//!   orx exp run    <expId> …          launch a run on new or existing compute
+//!   orx exp run    <expId> …          launch a local orx-supervised run
 //!   orx exp cancel <expId>            cancel the in-flight run
 //!   orx exp wake   <expId>            resume this agent when the run succeeds or fails
 //!
 //! Unlike the project-scoped data commands, every verb here takes an
-//! *experiment* id (from `orx experiments <projectId>`).
-//!
-//! This module is now thin: it parses args and resolves the id to a
-//! `ControlPlane`, then calls one verb. The per-plane bodies live in
-//! `crate::plane::{server_plane, local_plane}`. Only the two job-launch helpers
-//! (`default_hf_image` / `spawn_detached_supervise`) stay
-//! here — every `src/local/*` backend imports them as `crate::commands::exp::*`.
+//! *experiment* id from `orx project view <projectId>`.
 
 use std::time::{Duration, Instant};
 
@@ -23,20 +16,12 @@ use crate::store::Store;
 use crate::ExpCommand;
 
 pub async fn run(args: crate::ExpArgs) -> Result<()> {
-    // Local-mode detection first: an id in `local_experiments` takes the local
-    // path, and credentials are only required on the server path (a local-only
-    // user may never have logged in). The plane resolver encodes that.
     let store = Store::open()?;
     match args.command {
         ExpCommand::Status { exp_id } => {
             crate::local::chat::record_chat_target("experiments", &exp_id);
             resolve_experiment(store, &exp_id)?
                 .experiment_status()
-                .await
-        }
-        ExpCommand::Cmd { exp_id, set } => {
-            resolve_experiment(store, &exp_id)?
-                .set_experiment_command(set)
                 .await
         }
         ExpCommand::Desc { exp_id, set, stdin } => {
@@ -103,7 +88,7 @@ fn wake(store: &Store, exp_id: &str) -> Result<()> {
 ///
 /// Polls every `--interval` seconds (default 5), gives up after `--timeout`
 /// seconds (default 1800) with a non-zero exit so callers can branch on it. The
-/// per-plane polling loops are `ControlPlane::{wait_experiment, wait_project}`.
+/// Polling reads only the local run store.
 async fn wait(
     store: Store,
     exp_id: Option<String>,
@@ -160,6 +145,15 @@ pub(crate) fn spawn_detached_supervise(run_id: &str) -> Result<()> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    // The supervisor re-resolves its directories from its own environment, so
+    // without this a run launched from the macOS app is tracked in a different
+    // store than the app is reading.
+    if let Some(path) = crate::local::shell_env::search_path() {
+        cmd.env("PATH", path);
+    }
+    crate::local::shell_env::export_to(|key, value| {
+        cmd.env(key, value);
+    });
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

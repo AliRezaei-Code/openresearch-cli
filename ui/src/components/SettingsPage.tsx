@@ -78,15 +78,21 @@ import {
   type SlurmSettings,
   type SshHost,
   type SshPreflight,
+  applyUpdate,
   harnessModelLabel,
+  installCli,
+  setAutoUpdate as setAutoUpdateApi,
+  type InstallChannel,
+  type InstalledCli,
 } from "../api";
 import { onDataDirMove, onHarnessAuth } from "../events";
+import { useUpdateStatus } from "./UpdateBanner";
 import { useThemePreference, type ThemePreference } from "../theme";
 import { GitTokenForm } from "./GitTokenForm";
 import { BackendBadge, BackendLogo } from "./BackendLogos";
 import { ProgressBar } from "./ProgressBar";
 import { StatusBadge } from "./StatusBadge";
-import { BADGE_CLASS_NAME, BUTTON_CLASS_NAME, ERROR_BADGE_CLASS_NAME, ICON_BUTTON_CLASS_NAME, MONO_CLASS_NAME, PRIMARY_BUTTON_CLASS_NAME, SETTINGS_LOADING_CLASS_NAME, SMALL_BUTTON_CLASS_NAME, SPINNER_CLASS_NAME, SUCCESS_BADGE_CLASS_NAME, WARNING_BADGE_CLASS_NAME } from "../styleClasses";
+import { BADGE_CLASS_NAME, BUTTON_CLASS_NAME, ERROR_BADGE_CLASS_NAME, ICON_BUTTON_CLASS_NAME, MONO_CLASS_NAME, PRIMARY_BUTTON_CLASS_NAME, SETTINGS_LOADING_CLASS_NAME, SETTINGS_SWITCH_CLASS_NAME, SMALL_BUTTON_CLASS_NAME, SPINNER_CLASS_NAME, SUCCESS_BADGE_CLASS_NAME, WARNING_BADGE_CLASS_NAME } from "../styleClasses";
 
 const SETTINGS_CARD_CLASS_NAME = [
   "settings-card [&_>_.error]:text-accent-red [&_>_.error]:text-md",
@@ -1987,6 +1993,226 @@ function AppearanceTab() {
   );
 }
 
+// --- updates -----------------------------------------------------------------
+
+const CHANNEL_LABELS: Record<InstallChannel, string> = {
+  installer: "Installed with the orx installer",
+  "app-bundle": "macOS app",
+  cargo: "Installed with cargo",
+  homebrew: "Installed with Homebrew",
+  nix: "Managed by Nix",
+  unknown: "Unknown install",
+};
+
+/** What to do about updates when orx can't do them itself. */
+const MANUAL_UPDATE_HINT: Partial<Record<InstallChannel, string>> = {
+  cargo: "Re-run your cargo install to update.",
+  homebrew: "Run brew upgrade to update.",
+  nix: "Update it through your Nix configuration.",
+};
+
+function UpdatesTab() {
+  const { status, error: loadError, apply } = useUpdateStatus();
+  // Per-action only so the right button reads "Working…"; any write disables
+  // all three, since they mutate overlapping state.
+  const [busy, setBusy] = useState<"auto" | "apply" | "cli" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  if (!status) {
+    return (
+      <>
+        <h2>Updates</h2>
+        {loadError ? (
+          <div className={SETTINGS_CARD_CLASS_NAME}>
+            <div className="error">{loadError}</div>
+          </div>
+        ) : (
+          <div className={SETTINGS_LOADING_CLASS_NAME}>
+            <span className={SPINNER_CLASS_NAME} /> Loading…
+          </div>
+        )}
+      </>
+    );
+  }
+
+  // Every mutating call returns the authoritative status; adopting it is what
+  // keeps the switch honest when a write fails or another client changes it.
+  const run = async (which: "auto" | "apply" | "cli", action: () => Promise<unknown>) => {
+    setBusy(which);
+    setError(null);
+    try {
+      await action();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <>
+      <h2>Updates</h2>
+      <p className="settings-sub mt-0 mx-0 mb-4.5 text-text text-md">
+        Keeping this copy of orx on the latest release.
+      </p>
+      <div className={SETTINGS_CARD_CLASS_NAME}>
+        <div className={KV_CLASS_NAME}>
+          <div className="k">Version</div>
+          <div className="v">{status.current}</div>
+          <div className="k">Latest</div>
+          <div className="v">{status.latest ?? "—"}</div>
+          <div className="k">Install</div>
+          <div className="v">{CHANNEL_LABELS[status.channel]}</div>
+        </div>
+
+        {status.restartRequired && (
+          <div className={PROJECT_DEFAULT_ROW_CLASS_NAME}>
+            <div>
+              <div className="project-default-title text-md font-semibold">
+                Restart to finish updating
+              </div>
+              <p>
+                Version {status.installedVersion} is installed. This window is still running{" "}
+                {status.current}.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {status.selfUpdates ? (
+          <>
+            <div className={PROJECT_DEFAULT_ROW_CLASS_NAME}>
+              <div>
+                <div className="project-default-title text-md font-semibold">
+                  Install updates automatically
+                </div>
+                <p>
+                  New releases are downloaded and installed in the background. Turning this off
+                  keeps the notice but leaves the install to you.
+                  {status.envDisabled &&
+                    " Updates are switched off for this environment by ORX_NO_UPDATE_CHECK, so this setting has no effect."}
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={status.autoUpdate}
+                aria-label="Install updates automatically"
+                className={`${SETTINGS_SWITCH_CLASS_NAME} ${status.autoUpdate ? "on" : ""}`}
+                disabled={busy !== null}
+                onClick={() =>
+                  void run("auto", () => setAutoUpdateApi(!status.autoUpdate).then(apply))
+                }
+              >
+                <span />
+              </button>
+            </div>
+            <div className={PROJECT_DEFAULT_ROW_CLASS_NAME}>
+              <div>
+                <div className="project-default-title text-md font-semibold">
+                  {status.updateAvailable ? `Update to ${status.latest}` : "Check for updates"}
+                </div>
+                <p>
+                  {status.updateAvailable
+                    ? "Install the new release now instead of waiting for the background update."
+                    : "orx checks a few times a day on its own."}
+                </p>
+              </div>
+              <button
+                type="button"
+                className={SMALL_BUTTON_CLASS_NAME}
+                disabled={busy !== null}
+                onClick={() => void run("apply", () => applyUpdate().then(apply))}
+              >
+                {busy === "apply"
+                  ? "Working…"
+                  : status.updateAvailable
+                    ? "Update now"
+                    : "Check now"}
+              </button>
+            </div>
+          </>
+        ) : (
+          <div className={PROJECT_DEFAULT_ROW_CLASS_NAME}>
+            <div>
+              <div className="project-default-title text-md font-semibold">
+                orx can't update this install
+              </div>
+              <p>
+                {MANUAL_UPDATE_HINT[status.channel] ??
+                  "Reinstall with the orx installer to get automatic updates."}
+              </p>
+            </div>
+          </div>
+        )}
+
+        {status.channel === "app-bundle" && <InstallCliRow busy={busy} run={run} />}
+        {error && <div className="error">{error}</div>}
+      </div>
+    </>
+  );
+}
+
+/** Offered only inside the macOS app: the bundle carries an `orx` its owner's
+ *  terminal can't see until it's linked onto PATH. */
+function InstallCliRow({
+  busy,
+  run,
+}: {
+  busy: "auto" | "apply" | "cli" | null;
+  run: (which: "cli", action: () => Promise<unknown>) => Promise<void>;
+}) {
+  const [result, setResult] = useState<InstalledCli | null>(null);
+  // Set once a plain install was refused for an existing orx on PATH; the retry
+  // is what makes the backend's "re-run with --force" reachable from here.
+  const [needsForce, setNeedsForce] = useState(false);
+
+  const install = (force: boolean) =>
+    void run("cli", () =>
+      installCli(force)
+        .then((r) => {
+          setResult(r);
+          setNeedsForce(false);
+        })
+        .catch((e) => {
+          // Only the PATH-collision refusal is retryable with force; an
+          // unrelated failure must not relabel the button "Replace anyway".
+          setNeedsForce(!force && String(e?.message ?? e).includes("--force"));
+          throw e;
+        }),
+    );
+
+  return (
+    <div className={PROJECT_DEFAULT_ROW_CLASS_NAME}>
+      <div>
+        <div className="project-default-title text-md font-semibold">
+          Install the <code>orx</code> command
+        </div>
+        {result ? (
+          <p>
+            {result.alreadyCurrent ? "Already linked at " : "Linked "}
+            <code>{result.link}</code>.
+            {!result.onPath && ` Add ${result.dir} to your PATH to use it.`}
+          </p>
+        ) : (
+          <p>
+            Adds <code>orx</code> to your terminal, pointing at this app — so the CLI and the app
+            are always the same version.
+          </p>
+        )}
+      </div>
+      <button
+        type="button"
+        className={SMALL_BUTTON_CLASS_NAME}
+        disabled={busy !== null}
+        onClick={() => install(needsForce)}
+      >
+        {busy === "cli" ? "Working…" : needsForce ? "Replace anyway" : result ? "Re-link" : "Install"}
+      </button>
+    </div>
+  );
+}
+
 // --- project defaults ----------------------------------------------------------
 
 function ProjectDefaultsTab() {
@@ -2041,7 +2267,7 @@ function ProjectDefaultsTab() {
               role="switch"
               aria-checked={settings.githubForNewProjects}
               aria-label="Enable GitHub syncing for new projects"
-              className={`settings-switch relative flex-none w-9.5 h-5.5 border border-border rounded-full bg-surface transition-[background,border-color] duration-120 ease-standard [&_span]:absolute [&_span]:top-[3px] [&_span]:left-[3px] [&_span]:w-3.5 [&_span]:h-3.5 [&_span]:rounded-full [&_span]:bg-muted [&_span]:transition-[translate,background] [&_span]:duration-120 [&_span]:ease-standard [&.on]:border-primary [&.on]:bg-primary [&.on_span]:bg-background [&.on_span]:translate-x-4 [&:disabled]:opacity-45 [&:disabled]:cursor-default [&:focus-visible]:outline-2 [&:focus-visible]:outline-solid [&:focus-visible]:outline-text [&:focus-visible]:outline-offset-2 ${settings.githubForNewProjects ? "on" : ""}`}
+              className={`${SETTINGS_SWITCH_CLASS_NAME} ${settings.githubForNewProjects ? "on" : ""}`}
               disabled={saving || (!settings.githubAuthenticated && !settings.githubForNewProjects)}
               onClick={toggle}
             >
@@ -2724,6 +2950,9 @@ export function SettingsView({
             </section>
             <section className={SETTINGS_STACK_SECTION_CLASS_NAME}>
               <StorageTab />
+            </section>
+            <section className={SETTINGS_STACK_SECTION_CLASS_NAME}>
+              <UpdatesTab />
             </section>
           </div>
         </>

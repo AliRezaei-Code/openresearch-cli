@@ -31,8 +31,10 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `opencode` on PATH, else the installer's default drop location.
 pub fn find_opencode() -> Result<PathBuf> {
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
+    if let Some(paths) = crate::local::shell_env::search_path() {
+        // An empty component (`PATH=":/usr/bin"`) means cwd — never a place to
+        // pick up a binary we are about to execute. Mirrors `find_on_path`.
+        for dir in std::env::split_paths(&paths).filter(|dir| !dir.as_os_str().is_empty()) {
             let candidate = dir.join("opencode");
             if candidate.is_file() {
                 return Ok(candidate);
@@ -98,11 +100,8 @@ fn opencode_config_json(model: Option<&str>, instructions: &str) -> String {
     serde_json::to_string_pretty(&cfg).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// The local-mode autoresearch playbook: project context + cardinal rules +
-/// the v1 local command surface. Ported from the cloud agent's
-/// `autoresearchMd()`/`projectContextMd()` prompts, adapted for `orx up`
-/// (external backends via `--backend`, analysis via `orx logs`, no
-/// artifacts/query/chart).
+/// The local research playbook: project context, cardinal rules, and the local
+/// command surface used by `orx up`.
 /// The playbook template — a literal, GitHub-readable markdown file. Rendered
 /// by [`playbook_md`]: the leading HTML comment is stripped and `{token}`
 /// placeholders are substituted (project facts, the compute default, and the
@@ -346,7 +345,7 @@ pub fn ensure_playbook(
     // Modular skills, written fresh beside the playbook (same freshness
     // semantics) so this session's agent discovers them natively.
     if let Some(dir) = session_skills_dir {
-        super::agent_skills::ensure_session_skills(&workdir, dir, project.github_enabled())?;
+        super::agent_skills::ensure_session_skills(&workdir, dir)?;
         // User-uploaded skills land beside the built-ins, same freshness.
         super::user_skills::write_into_session(&workdir, dir, &project.id)?;
     }
@@ -509,28 +508,9 @@ async fn spawn_agent(
         .stderr(Stdio::from(log))
         // Dies with `orx up` when the runtime drops the handle (Ctrl-C, exit).
         .kill_on_drop(true);
-    // The agent shells out to plain `orx`; prepend this binary's dir so it
-    // resolves to THIS orx (with local mode), not an older install on PATH.
-    if let Ok(exe) = std::env::current_exe().and_then(|p| p.canonicalize()) {
-        if let Some(dir) = exe.parent() {
-            let mut path = std::ffi::OsString::from(dir);
-            match std::env::var_os("PATH") {
-                Some(existing) if !existing.is_empty() => {
-                    path.push(":");
-                    path.push(existing);
-                }
-                _ => {}
-            }
-            cmd.env("PATH", path);
-        }
-    }
-    // Vars saved in the dashboard's Environment tab reach the agent too;
-    // the real process env still wins on conflicts.
-    for (key, value) in crate::config::list_synced_env() {
-        if std::env::var_os(&key).is_none() {
-            cmd.env(key, value);
-        }
-    }
+    // This orx first on PATH (the agent shells out to plain `orx`), the imported
+    // shell environment, and the dashboard's Environment tab vars.
+    crate::local::chat::prepare_env(&mut cmd);
     // Tag runs the agent launches (`orx exp run`) with this session so they can
     // be explicitly subscribed to. One serve child per session; set after the
     // synced-env loop so it isn't shadowed.
@@ -766,6 +746,21 @@ mod tests {
         assert!(md.contains("Unregistered runs never wake the chat"));
         assert!(md.contains("cancelled runs never send a wake-up"));
         assert!(!md.contains("OpenResearch injects an `[orx]` message"));
+    }
+
+    #[test]
+    fn playbook_makes_project_brief_descriptive_not_authoritative() {
+        let md = sample_playbook();
+        assert!(md.contains("PROJECT.md describes the project; the user directs it"));
+        assert!(md.contains("the user's latest request"));
+        assert!(md.contains("descriptive, never prescriptive"));
+        assert!(
+            md.contains("Never refuse, delay, redirect, or ask for confirmation solely because")
+        );
+        assert!(md.contains("Do not read the brief at session start"));
+        assert!(md.contains("orx project brief update"));
+        assert!(!md.contains("No project summary yet."));
+        assert!(!md.contains("None proposed yet."));
     }
 
     #[test]

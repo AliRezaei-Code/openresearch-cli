@@ -4,9 +4,9 @@
 
 `openresearch-cli` is the open-source Rust implementation of the `orx` command-line tool. It owns the local CLI, dashboard and API, SQLite store, coding-agent integrations, experiment orchestration, and execution backends.
 
-`openresearch.sh` is the companion hosted product. It owns the website and documentation, production API, accounts and organizations, cloud agents and sandboxes, and managed compute. The repositories are separate applications with shared product contracts: this repository consumes hosted APIs, while `openresearch.sh` installs and runs `orx` in hosted environments.
+`openresearch.sh` is the companion service. It owns the website and documentation, accounts and organizations, sandbox provisioning, and managed-compute catalogs. Research projects, experiments, runs, logs, and artifacts remain local to `orx`.
 
-When changing APIs, authentication, managed compute, or hosted `orx` integration, inspect the corresponding `openresearch.sh` implementation and keep both sides compatible. Do not edit the companion repository unless it is explicitly in scope.
+When changing authentication, organization, sandbox, or managed-compute APIs, inspect the corresponding `openresearch.sh` implementation and keep both sides compatible. Do not edit the companion repository unless it is explicitly in scope.
 
 ## Development guidelines
 

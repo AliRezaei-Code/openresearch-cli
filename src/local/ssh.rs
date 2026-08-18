@@ -24,8 +24,8 @@ pub async fn launch_local_ssh(args: &crate::ExpRunArgs) -> Result<()> {
     );
     println!("  run  {}", run.id);
     println!(
-        "  Follow it with `orx exp wait {}` or `orx logs {}`.",
-        run.experiment_id, run.id
+        "{}",
+        crate::invocation::follow_up(&run.experiment_id, &run.id)
     );
     Ok(())
 }
@@ -42,12 +42,6 @@ pub async fn submit_local_ssh_with_source(
     source: SourceSnapshot,
     run_id: String,
 ) -> Result<StoredRun> {
-    if args.sandbox.is_some() || args.gpu.is_some() || args.cpu.is_some() {
-        return Err(anyhow!(
-            "--backend ssh runs on your own box; drop --gpu/--cpu/--sandbox and pass \
-             --host <alias> (an ~/.ssh/config alias) instead."
-        ));
-    }
     if args.flavor.is_some() {
         return Err(anyhow!(
             "--backend ssh has no flavors — a machine is an address, not a shape. \
@@ -79,16 +73,8 @@ pub async fn submit_local_ssh_with_source(
     let run_command = Some(exp.run_command.clone())
         .filter(|c| !c.trim().is_empty())
         .or_else(|| project.run_command.clone().filter(|c| !c.trim().is_empty()))
-        .ok_or_else(|| {
-            anyhow!(
-                "No run command set for this experiment or its project. Set the project \
-                 default with `orx project edit {} --run-command '<cmd>'`, or pass \
-                 `--run-command '<cmd>'` to `orx create-experiment` — then relaunch.",
-                project.id
-            )
-        })?;
+        .ok_or_else(|| anyhow!("{}", crate::invocation::no_run_command(&project.id)))?;
 
-    // One run in flight per experiment unless deliberately forced.
     let target = ssh::SshTarget::alias(&host);
     ssh::stage_source(&target, &run_id, &source.path, &source.digest).await?;
     let script = crate::compute::staged_script(&run_command);
