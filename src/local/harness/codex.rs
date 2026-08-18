@@ -1102,11 +1102,8 @@ pub(crate) fn reconcile_interrupted_items(
     settle_interrupted_parts(&mut message.parts);
     store
         .upsert_chat_message(&StoredChatMessage {
-            id: message.id.clone(),
-            session_id: session_id.to_string(),
-            role: message.role.clone(),
             parts_json: serde_json::to_string(&message.parts).ok()?,
-            created_at: message.created_at,
+            ..stored.clone()
         })
         .ok()?;
     Some(message)

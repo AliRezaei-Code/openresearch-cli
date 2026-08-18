@@ -1241,6 +1241,7 @@ export interface ChatMessage {
   role: "user" | "assistant";
   parts: ChatPart[];
   createdAt: number;
+  parentId?: string | null;
 }
 
 /** How much of the model's context window a session has used, measured off the
@@ -1330,9 +1331,13 @@ export interface QueuedMessage {
 }
 
 export const getChatMessages = (sessionId: string) =>
-  get<{ messages: ChatMessage[]; queued?: QueuedMessage[] }>(
+  get<{ messages: ChatMessage[]; queued?: QueuedMessage[]; activeLeafId?: string | null }>(
     `/api/chat/sessions/${sessionId}/messages`,
-  ).then((r) => ({ messages: r.messages, queued: r.queued ?? [] }));
+  ).then((r) => ({
+    messages: r.messages,
+    queued: r.queued ?? [],
+    activeLeafId: r.activeLeafId ?? null,
+  }));
 
 /** Cancel a still-parked message (the ✕ on a queued chip). */
 export const cancelQueuedMessage = (sessionId: string, itemId: string) =>
@@ -1373,6 +1378,15 @@ export const sendChatMessage = (
     images,
     annotations,
   });
+
+/** Pass `text` to re-ask an edited version of a user message; omit it to retry a
+ * response. Returns immediately; the new turn streams over /api/events. */
+export const forkChatTurn = (sessionId: string, messageId: string, text?: string) =>
+  post<{ ok: boolean }>(`/api/chat/sessions/${sessionId}/fork`, { messageId, text });
+
+/** Show a different fork of a turn, along with the whole branch under it. */
+export const selectChatBranch = (sessionId: string, leafId: string) =>
+  post<{ ok: boolean }>(`/api/chat/sessions/${sessionId}/branch`, { leafId });
 
 export const interruptChat = (sessionId: string) =>
   post<{ ok: boolean }>(`/api/chat/sessions/${sessionId}/interrupt`);

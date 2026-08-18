@@ -329,6 +329,7 @@ fn seed_at(
         archived: false,
         context_usage_json: None,
         bootstrap_context: Some(BOOTSTRAP_CONTEXT.into()),
+        active_leaf_id: Some(ASSISTANT_MESSAGE_ID.into()),
         created_at: 1_785_824_322_614,
         updated_at: 1_785_879_263_859,
     };
@@ -338,6 +339,9 @@ fn seed_at(
         role: "user".into(),
         parts_json: serde_json::to_string(&vec![WirePart::text("user-prompt", USER_PROMPT)])?,
         created_at: 1_785_824_322_627,
+        parent_id: None,
+        base_native_session_id: None,
+        result_native_session_id: None,
     };
     let assistant = StoredChatMessage {
         id: ASSISTANT_MESSAGE_ID.into(),
@@ -345,6 +349,9 @@ fn seed_at(
         role: "assistant".into(),
         parts_json: serde_json::to_string(&assistant_parts(&selection.harness))?,
         created_at: 1_785_824_322_629,
+        parent_id: Some(USER_MESSAGE_ID.into()),
+        base_native_session_id: None,
+        result_native_session_id: None,
     };
     let figure_session = StoredChatSession {
         id: FIGURE_SESSION_ID.into(),
@@ -361,6 +368,7 @@ fn seed_at(
         archived: false,
         context_usage_json: None,
         bootstrap_context: Some(FIGURE_BOOTSTRAP_CONTEXT.into()),
+        active_leaf_id: Some(FIGURE_ASSISTANT_MESSAGE_ID.into()),
         created_at: 1_785_824_322_630,
         updated_at: 1_785_879_263_858,
     };
@@ -373,6 +381,9 @@ fn seed_at(
             FIGURE_USER_PROMPT,
         )])?,
         created_at: 1_785_824_322_631,
+        parent_id: None,
+        base_native_session_id: None,
+        result_native_session_id: None,
     };
     let figure_assistant = StoredChatMessage {
         id: FIGURE_ASSISTANT_MESSAGE_ID.into(),
@@ -380,6 +391,9 @@ fn seed_at(
         role: "assistant".into(),
         parts_json: serde_json::to_string(&figure_assistant_parts(&selection.harness))?,
         created_at: 1_785_824_322_633,
+        parent_id: Some(FIGURE_USER_MESSAGE_ID.into()),
+        base_native_session_id: None,
+        result_native_session_id: None,
     };
     let literature_session = StoredChatSession {
         id: LITERATURE_SESSION_ID.into(),
@@ -396,6 +410,7 @@ fn seed_at(
         archived: false,
         context_usage_json: None,
         bootstrap_context: Some(LITERATURE_BOOTSTRAP_CONTEXT.into()),
+        active_leaf_id: Some(LITERATURE_ASSISTANT_MESSAGE_ID.into()),
         created_at: 1_785_824_322_634,
         updated_at: 1_785_879_263_857,
     };
@@ -408,6 +423,9 @@ fn seed_at(
             LITERATURE_USER_PROMPT,
         )])?,
         created_at: 1_785_824_322_635,
+        parent_id: None,
+        base_native_session_id: None,
+        result_native_session_id: None,
     };
     let literature_assistant = StoredChatMessage {
         id: LITERATURE_ASSISTANT_MESSAGE_ID.into(),
@@ -415,6 +433,9 @@ fn seed_at(
         role: "assistant".into(),
         parts_json: serde_json::to_string(&literature_assistant_parts(&selection.harness))?,
         created_at: 1_785_824_322_636,
+        parent_id: Some(LITERATURE_USER_MESSAGE_ID.into()),
+        base_native_session_id: None,
+        result_native_session_id: None,
     };
     let cache_root = repo
         .parent()
@@ -1562,6 +1583,19 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[1].role, "assistant");
+        // Seeding runs long after the tree backfill, so an unparented reply here
+        // would stay unparented: the first message the user sends would start a
+        // second branch root and hide the whole seeded transcript.
+        assert_eq!(messages[0].parent_id, None);
+        assert_eq!(
+            messages[1].parent_id.as_deref(),
+            Some(messages[0].id.as_str())
+        );
+        let session = store.get_chat_session(SESSION_ID).unwrap().unwrap();
+        assert_eq!(
+            session.active_leaf_id.as_deref(),
+            Some(messages[1].id.as_str())
+        );
         let assistant: Vec<WirePart> = serde_json::from_str(&messages[1].parts_json).unwrap();
         assert!(!assistant.is_empty());
         assert!(!messages[1].parts_json.contains("/Users/"));

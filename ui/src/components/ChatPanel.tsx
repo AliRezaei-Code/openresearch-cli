@@ -4,6 +4,7 @@ import {
   BookOpen,
   ChartSpline,
   Check,
+  ChevronLeft,
   ChevronRight,
   CircleX,
   Clock,
@@ -22,6 +23,7 @@ import {
   Package,
   Pencil,
   Plus,
+  RotateCcw,
   Search,
   SlidersHorizontal,
   SquareTerminal,
@@ -51,6 +53,7 @@ import {
   DEMO_LITERATURE_SESSION_ID,
   DEMO_MAIN_SESSION_ID,
   DEMO_PROJECT_ID,
+  forkChatTurn,
   getChatMessages,
   getSkills,
   interruptChat,
@@ -59,6 +62,7 @@ import {
   reconcileReasoning,
   renameChatSession,
   respondChat,
+  selectChatBranch,
   sendChatMessage,
   setChatSessionArchived,
   setChatSessionPermissionMode,
@@ -74,6 +78,7 @@ import {
   type QueuedMessage,
   type SkillInfo,
 } from "../api";
+import { activePath, forkPositions } from "../transcriptTree";
 import { onChatEvent } from "../events";
 import { LitSourceLogo, parseOrxLit, paperUrl } from "./LitSourceLogo";
 import { LitSourcesList } from "./LitSourcesPicker";
@@ -698,10 +703,15 @@ const PROMPT_ACTIONS_CLASS_NAME = [
 // --- chat state --------------------------------------------------------------
 
 interface ChatState {
+  // Every branch of the transcript, not just the one on screen — switching
+  // forks is then a pointer move rather than a refetch.
   messagesBySession: Record<string, ChatMessage[]>;
   busySessions: Set<string>;
   // Messages parked behind a running turn, per session, oldest first.
   queuedBySession: Record<string, QueuedMessage[]>;
+  // Tip of the branch on screen, per session. Absent falls back to the whole
+  // transcript, which is exactly right for a session that was never forked.
+  activeLeafBySession: Record<string, string | null>;
 }
 
 type Action =
@@ -711,8 +721,13 @@ type Action =
       sessionId: string;
       messages: ChatMessage[];
       queued?: QueuedMessage[];
+      activeLeafId?: string | null;
       onlyIfAbsent?: boolean;
     }
+  | { type: "activeLeaf"; sessionId: string; leafId: string | null }
+  // Local-only; swept by upsertMessage's LOCAL_PREFIX filter when the next
+  // server message lands, and gone on reload.
+  | { type: "localError"; sessionId: string; text: string }
   | { type: "upsertMessage"; sessionId: string; message: ChatMessage }
   | {
       type: "optimisticUser";
@@ -729,6 +744,7 @@ type Action =
   | { type: "forget"; sessionId: string };
 
 const LOCAL_PREFIX = "local-";
+const NO_MESSAGES: ChatMessage[] = [];
 
 function upsertMessage(list: ChatMessage[], message: ChatMessage): ChatMessage[] {
   const i = list.findIndex((m) => m.id === message.id);
@@ -745,7 +761,12 @@ function upsertMessage(list: ChatMessage[], message: ChatMessage): ChatMessage[]
 function reducer(state: ChatState, action: Action): ChatState {
   switch (action.type) {
     case "reset":
-      return { messagesBySession: {}, busySessions: new Set(), queuedBySession: {} };
+      return {
+        messagesBySession: {},
+        busySessions: new Set(),
+        queuedBySession: {},
+        activeLeafBySession: {},
+      };
     case "seed":
       // onlyIfAbsent: recover a failed fetch without clobbering messages that
       // streamed in via SSE during it (a `message` event already created the key).
@@ -759,17 +780,62 @@ function reducer(state: ChatState, action: Action): ChatState {
           ...state.queuedBySession,
           [action.sessionId]: action.queued ?? [],
         },
+        activeLeafBySession: {
+          ...state.activeLeafBySession,
+          [action.sessionId]: action.activeLeafId ?? null,
+        },
       };
     case "upsertMessage": {
       const list = state.messagesBySession[action.sessionId] ?? [];
+      // A re-emitted message (a prompt card resolving, a streaming flush) must
+      // not drag the branch pointer backwards — only a message we have not seen
+      // extends the branch it arrived on.
+      const known = list.some((m) => m.id === action.message.id);
+      const leaf = state.activeLeafBySession[action.sessionId] ?? null;
+      const replacesOptimistic =
+        action.message.role === "user" && leaf !== null && leaf.startsWith(LOCAL_PREFIX);
+      // A known message still moves the pointer when it hangs off the leaf. That
+      // is forward-only, and it repairs a seed that raced the turn's first flush
+      // and would otherwise hide the reply for the rest of the turn.
+      const extendsBranch = action.message.parentId != null && action.message.parentId === leaf;
       return {
         ...state,
         messagesBySession: {
           ...state.messagesBySession,
           [action.sessionId]: upsertMessage(list, action.message),
         },
+        activeLeafBySession:
+          known && !replacesOptimistic && !extendsBranch
+            ? state.activeLeafBySession
+            : { ...state.activeLeafBySession, [action.sessionId]: action.message.id },
       };
     }
+    case "localError": {
+      const list = state.messagesBySession[action.sessionId] ?? [];
+      const msg: ChatMessage = {
+        id: `${LOCAL_PREFIX}senderr-${Date.now()}`,
+        role: "assistant",
+        parts: [
+          { id: "p0", type: "tool", tool: "error", state: { status: "error", error: action.text } },
+        ],
+        createdAt: Date.now(),
+        // Sit on the branch that is showing, not at the root of a new one.
+        parentId: state.activeLeafBySession[action.sessionId] ?? null,
+      };
+      return {
+        ...state,
+        messagesBySession: { ...state.messagesBySession, [action.sessionId]: [...list, msg] },
+        activeLeafBySession: { ...state.activeLeafBySession, [action.sessionId]: msg.id },
+      };
+    }
+    case "activeLeaf":
+      return {
+        ...state,
+        activeLeafBySession: {
+          ...state.activeLeafBySession,
+          [action.sessionId]: action.leafId,
+        },
+      };
     case "optimisticUser": {
       const list = state.messagesBySession[action.sessionId] ?? [];
       const parts: ChatPart[] = action.text
@@ -791,10 +857,12 @@ function reducer(state: ChatState, action: Action): ChatState {
         role: "user",
         parts,
         createdAt: Date.now(),
+        parentId: state.activeLeafBySession[action.sessionId] ?? null,
       };
       return {
         ...state,
         messagesBySession: { ...state.messagesBySession, [action.sessionId]: [...list, msg] },
+        activeLeafBySession: { ...state.activeLeafBySession, [action.sessionId]: msg.id },
       };
     }
     case "busy": {
@@ -824,7 +892,9 @@ function reducer(state: ChatState, action: Action): ChatState {
       busySessions.delete(action.sessionId);
       const queuedBySession = { ...state.queuedBySession };
       delete queuedBySession[action.sessionId];
-      return { messagesBySession, busySessions, queuedBySession };
+      const activeLeafBySession = { ...state.activeLeafBySession };
+      delete activeLeafBySession[action.sessionId];
+      return { messagesBySession, busySessions, queuedBySession, activeLeafBySession };
     }
   }
 }
@@ -2661,6 +2731,82 @@ function attachmentPartView(p: ChatPart): { src: string; isPdf: boolean; name: s
   return { src, isPdf, name };
 }
 
+const FORK_BUTTON_CLASS_NAME = [
+  ICON_BUTTON_BASE_CLASS_NAME,
+  "w-6 h-6 rounded-sm [&:disabled]:opacity-40 [&:disabled]:cursor-default",
+  "[&:disabled:hover]:bg-transparent [&:disabled:hover]:text-subtext",
+].join(" ");
+
+/** The pager stays visible once a turn has more than one fork — hiding it would
+ * leave no sign that the other replies exist. */
+function ForkControls({
+  count,
+  index,
+  prevId,
+  nextId,
+  onSelect,
+  pagerDisabled,
+  actionLabel,
+  icon,
+  onAction,
+  disabled,
+}: {
+  count: number;
+  index: number;
+  prevId?: string;
+  nextId?: string;
+  onSelect: (leafId: string) => void;
+  pagerDisabled: boolean;
+  actionLabel: string;
+  icon: React.ReactNode;
+  onAction: () => void;
+  disabled: boolean;
+}) {
+  const many = count > 1;
+  return (
+    <div
+      className={`fork-controls flex items-center gap-0.5 transition-opacity duration-80 ease-standard ${
+        many ? "opacity-100" : "opacity-0 group-hover/turn:opacity-100 group-focus-within/turn:opacity-100"
+      }`}
+    >
+      {many && (
+        <>
+          <button
+            className={FORK_BUTTON_CLASS_NAME}
+            title="Previous version"
+            aria-label="Previous version"
+            disabled={pagerDisabled || !prevId}
+            onClick={() => prevId && onSelect(prevId)}
+          >
+            <ChevronLeft size={14} />
+          </button>
+          <span className="fork-count text-xs text-subtext tabular-nums select-none">
+            {index + 1}/{count}
+          </span>
+          <button
+            className={FORK_BUTTON_CLASS_NAME}
+            title="Next version"
+            aria-label="Next version"
+            disabled={pagerDisabled || !nextId}
+            onClick={() => nextId && onSelect(nextId)}
+          >
+            <ChevronRight size={14} />
+          </button>
+        </>
+      )}
+      <button
+        className={FORK_BUTTON_CLASS_NAME}
+        title={actionLabel}
+        aria-label={actionLabel}
+        disabled={disabled}
+        onClick={onAction}
+      >
+        {icon}
+      </button>
+    </div>
+  );
+}
+
 const Message = memo(function Message({
   message,
   activePermissionId,
@@ -2675,6 +2821,14 @@ const Message = memo(function Message({
   onOpenSubagent,
   skills,
   predictTextTail = false,
+  forkCount,
+  forkIndex = 0,
+  forkPrevId,
+  forkNextId,
+  forkDisabled,
+  branchDisabled,
+  onFork,
+  onSelectFork,
 }: {
   message: ChatMessage;
   activePermissionId: string | null;
@@ -2692,7 +2846,21 @@ const Message = memo(function Message({
   /** Known slash-skills, for rendering a leading `/name` as a command chip. */
   skills?: SkillInfo[];
   predictTextTail?: boolean;
+  /** Set only on the one message of a turn that carries its fork controls. */
+  forkCount?: number;
+  forkIndex?: number;
+  forkPrevId?: string;
+  forkNextId?: string;
+  forkDisabled: boolean;
+  /** Paging between forks is a read-only pointer move, so it stays available
+   * when re-sampling does not (an unavailable harness still has replies to read). */
+  branchDisabled: boolean;
+  onFork: (messageId: string, text?: string) => void;
+  onSelectFork: (leafId: string) => void;
 }) {
+  // Editing re-asks as a new fork rather than rewriting history, so the original
+  // stays reachable through the pager.
+  const [editDraft, setEditDraft] = useState<string | null>(null);
   if (message.role === "user") {
     const text = message.parts
       .filter((p) => p.type === "text")
@@ -2714,8 +2882,52 @@ const Message = memo(function Message({
         id: part.id,
         text: part.text ?? "",
       }));
+    if (editDraft !== null) {
+      const submit = () => {
+        const next = editDraft.trim();
+        // Closing the editor on a send that cannot run would drop the edit with
+        // nothing to show for it.
+        if (!next || forkDisabled) return;
+        setEditDraft(null);
+        onFork(message.id, next);
+      };
+      return (
+        <div className="msg-user-group self-end flex w-full max-w-[88%] flex-col items-end gap-1.5">
+          <div className="msg-user-edit w-full bg-surface rounded-[16px] py-2.5 px-[15px] flex flex-col gap-2">
+            <textarea
+              className="w-full bg-transparent text-base text-text resize-none outline-none field-sizing-content min-h-16"
+              aria-label="Edit message"
+              value={editDraft}
+              autoFocus
+              onChange={(e) => setEditDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  setEditDraft(null);
+                } else if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                  e.preventDefault();
+                  submit();
+                }
+              }}
+            />
+            <div className={`${PROMPT_ACTIONS_CLASS_NAME} justify-end`}>
+              <button className="btn-ghost" onClick={() => setEditDraft(null)}>
+                Cancel
+              </button>
+              <button
+                className="btn-primary"
+                onClick={submit}
+                disabled={forkDisabled || !editDraft.trim()}
+              >
+                Send
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
     return (
-      <div className="msg-user-group self-end flex max-w-[88%] flex-col items-end gap-1.5">
+      <div className="msg-user-group group/turn self-end flex max-w-[88%] flex-col items-end gap-1.5">
         {annotations.length > 0 && (
           <AnnotationsPopover annotations={annotations} variant="sent" />
         )}
@@ -2748,11 +2960,25 @@ const Message = memo(function Message({
             </div>
           )}
         </div>
+        {forkCount !== undefined && (
+          <ForkControls
+            count={forkCount}
+            index={forkIndex}
+            prevId={forkPrevId}
+            nextId={forkNextId}
+            onSelect={onSelectFork}
+            pagerDisabled={branchDisabled}
+            actionLabel="Edit and re-send"
+            icon={<Pencil size={13} />}
+            onAction={() => setEditDraft(text)}
+            disabled={forkDisabled}
+          />
+        )}
       </div>
     );
   }
   return (
-    <div className="msg-assistant text-lg leading-[1.62] text-text min-w-0">
+    <div className="msg-assistant group/turn text-lg leading-[1.62] text-text min-w-0">
       {renderParts(message.parts, {
         activePermissionId,
         pendingTailToolId,
@@ -2766,6 +2992,20 @@ const Message = memo(function Message({
         onOpenSubagent,
         predictTextTail,
       })}
+      {forkCount !== undefined && (
+        <ForkControls
+          count={forkCount}
+          index={forkIndex}
+          prevId={forkPrevId}
+          nextId={forkNextId}
+          onSelect={onSelectFork}
+          pagerDisabled={branchDisabled}
+          actionLabel="Try another response"
+          icon={<RotateCcw size={13} />}
+          onAction={() => onFork(message.id)}
+          disabled={forkDisabled}
+        />
+      )}
     </div>
   );
 });
@@ -3133,6 +3373,10 @@ function streamTailTool(messages: ChatMessage[]): { messageId: string; toolId: s
 
 const Transcript = memo(function Transcript({
   messages,
+  allMessages,
+  canFork,
+  onFork,
+  onSelectFork,
   busy,
   onOpenFile,
   onOpenRun,
@@ -3144,7 +3388,14 @@ const Transcript = memo(function Transcript({
   onOpenSubagent,
   skills,
 }: {
+  /** The branch on screen, oldest first. */
   messages: ChatMessage[];
+  /** Every branch, for counting the forks of each turn. */
+  allMessages: ChatMessage[];
+  /** False greys out the re-sample controls (busy turn, harness not ready). */
+  canFork: boolean;
+  onFork: (messageId: string, text?: string) => void;
+  onSelectFork: (leafId: string) => void;
   busy: boolean;
   onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
@@ -3157,9 +3408,22 @@ const Transcript = memo(function Transcript({
   skills?: SkillInfo[];
 }) {
   const activePermissionId = firstPendingPermission(messages)?.id ?? null;
-  const visibleMessages = messages.filter((message) =>
-    messageHasVisibleContent(message, activePermissionId),
+  const visibleMessages = useMemo(
+    () => messages.filter((message) => messageHasVisibleContent(message, activePermissionId)),
+    [messages, activePermissionId],
   );
+  // A trailing local-only bubble is not part of the reply, so it must not take
+  // the controls off the reply above it.
+  const positions = useMemo(() => {
+    const persisted = visibleMessages.filter((m) => !m.id.startsWith(LOCAL_PREFIX));
+    const bearers = persisted.filter(
+      (message, i) =>
+        message.role === "user" ||
+        !persisted[i + 1] ||
+        persisted[i + 1].role === "user",
+    );
+    return forkPositions(allMessages, messages, bearers, (id) => id.startsWith(LOCAL_PREFIX));
+  }, [messages, visibleMessages, allMessages]);
   const activeMessage = visibleMessages.at(-1);
   const transcriptAnnouncement = useTranscriptAnnouncement(messages);
   const pendingTailTool = busy ? streamTailTool(messages) : null;
@@ -3172,6 +3436,14 @@ const Transcript = memo(function Transcript({
         <Message
           key={m.id}
           message={m}
+          forkCount={positions.get(m.id)?.count}
+          forkIndex={positions.get(m.id)?.index}
+          forkPrevId={positions.get(m.id)?.prevId}
+          forkNextId={positions.get(m.id)?.nextId}
+          forkDisabled={!canFork}
+          branchDisabled={busy}
+          onFork={onFork}
+          onSelectFork={onSelectFork}
           activePermissionId={activePermissionId}
           pendingTailToolId={pendingTailTool?.messageId === m.id ? pendingTailTool.toolId : null}
           onOpenFile={onOpenFile}
@@ -3567,6 +3839,7 @@ export function ChatPanel({
     messagesBySession: {},
     busySessions: new Set<string>(),
     queuedBySession: {},
+    activeLeafBySession: {},
   });
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
   const [selection, setSelection] = useState<ModelSelection | null>(preferredAgent);
@@ -4029,8 +4302,8 @@ export function ChatPanel({
     if (!activeId || loadedSessions.current.has(activeId)) return;
     loadedSessions.current.add(activeId);
     getChatMessages(activeId)
-      .then(({ messages, queued }) =>
-        dispatch({ type: "seed", sessionId: activeId, messages, queued }),
+      .then(({ messages, queued, activeLeafId }) =>
+        dispatch({ type: "seed", sessionId: activeId, messages, queued, activeLeafId }),
       )
       .catch(() => {
         // Recover from a failed fetch to a usable state rather than a stuck
@@ -4100,6 +4373,9 @@ export function ChatPanel({
         case "queued":
           dispatch({ type: "setQueued", sessionId: ev.sessionId, items: ev.items });
           break;
+        case "branch":
+          dispatch({ type: "activeLeaf", sessionId: ev.sessionId, leafId: ev.activeLeafId });
+          break;
         case "usage":
           setSessions((cur) =>
             cur.map((s) => (s.id === ev.sessionId ? { ...s, contextUsage: ev.usage } : s)),
@@ -4129,8 +4405,8 @@ export function ChatPanel({
       const reseed = (allowRetry: boolean) => {
         const gen = msgGen.current;
         getChatMessages(activeId)
-          .then(({ messages, queued }) => {
-            dispatch({ type: "seed", sessionId: activeId, messages, queued });
+          .then(({ messages, queued, activeLeafId }) => {
+            dispatch({ type: "seed", sessionId: activeId, messages, queued, activeLeafId });
             if (allowRetry && msgGen.current !== gen) reseed(false);
           })
           .catch(() => {});
@@ -4139,8 +4415,15 @@ export function ChatPanel({
     });
   }, [activeId, syncSessionList]);
 
-  const messages = activeId ? (state.messagesBySession[activeId] ?? []) : [];
+  // Every fork stays loaded; only the branch on screen drives the transcript,
+  // the streaming tail, and the pending-permission lookup.
+  const allMessages = activeId ? (state.messagesBySession[activeId] ?? NO_MESSAGES) : NO_MESSAGES;
+  const activeLeafId = activeId ? (state.activeLeafBySession[activeId] ?? null) : null;
+  const activeLeafRef = useRef(activeLeafId);
+  activeLeafRef.current = activeLeafId;
+  const messages = useMemo(() => activePath(allMessages, activeLeafId), [allMessages, activeLeafId]);
   const busy = activeId ? state.busySessions.has(activeId) : false;
+  const canFork = !busy && !!activeHarness?.agentReady;
   const hasPendingTailTool = busy && streamTailTool(messages) != null;
   // Messages the user parked behind the running turn (oldest first). Populated
   // by chat.queued events and the seed snapshot; each runs when its turn ends.
@@ -4571,37 +4854,51 @@ export function ChatPanel({
         }
       }
       dispatch({ type: "busy", sessionId: sid, busy: false });
-      // Surface the failure instead of swallowing it: a silently dropped send
-      // leaves the optimistic bubble unanswered and reads as "orx did nothing".
-      // Local-only — swept by upsertMessage's LOCAL_PREFIX filter when the next
-      // server user message lands (or by the reconnect reseed), and gone on
-      // reload.
-      dispatch({
-        type: "upsertMessage",
-        sessionId: sid,
-        message: {
-          id: `${LOCAL_PREFIX}senderr-${Date.now()}`,
-          role: "assistant",
-          parts: [
-            {
-              id: "p0",
-              type: "tool",
-              tool: "error",
-              state: {
-                status: "error",
-                error: `Message not sent: ${msg}`,
-              },
-            },
-          ],
-          createdAt: Date.now(),
-        },
-      });
+      dispatch({ type: "localError", sessionId: sid, text: `Message not sent: ${msg}` });
     }
   }
 
   function stop() {
     if (activeId) void interruptChat(activeId);
   }
+
+  const forkTurn = useCallback(
+    (messageId: string, text?: string) => {
+      if (!activeId || busy || !activeHarness?.agentReady) return;
+      const sid = activeId;
+      dispatch({ type: "busy", sessionId: sid, busy: true });
+      stickToBottom.current = true;
+      void queueSessionMutation(() => forkChatTurn(sid, messageId, text)).catch((err) => {
+        dispatch({ type: "busy", sessionId: sid, busy: false });
+        const detail = err instanceof Error ? err.message : String(err);
+        dispatch({ type: "localError", sessionId: sid, text: `Could not re-sample: ${detail}` });
+      });
+    },
+    [activeId, busy, activeHarness?.agentReady, queueSessionMutation],
+  );
+
+  /** Show a different fork. The server descends to that branch's newest tip and
+   * echoes the real leaf back over chat.branch. */
+  const selectBranch = useCallback(
+    (leafId: string) => {
+      // Moving the branch pointer out from under a running turn would land that
+      // turn's reply on whichever branch the pointer stopped at.
+      if (!activeId || busy) return;
+      const sid = activeId;
+      // Via the ref, not a dep: the leaf changes on every new message, and this
+      // callback reaches every row through the memoized `Message`.
+      const previous = activeLeafRef.current;
+      dispatch({ type: "activeLeaf", sessionId: sid, leafId });
+      void queueSessionMutation(() => selectChatBranch(sid, leafId)).catch((err) => {
+        // Leaving the client on a branch the server did not switch to would send
+        // the next message somewhere other than what is on screen.
+        dispatch({ type: "activeLeaf", sessionId: sid, leafId: previous });
+        const detail = err instanceof Error ? err.message : String(err);
+        dispatch({ type: "localError", sessionId: sid, text: `Could not switch fork: ${detail}` });
+      });
+    },
+    [activeId, busy, queueSessionMutation],
+  );
 
   // Optimistic: drop locally now; the server's chat.queued echo reconciles. A
   // message that already started running server-side simply isn't found.
@@ -4723,7 +5020,9 @@ export function ChatPanel({
           // just-started optimistic flag), so the optimistic dispatch above
           // can't wedge true after a no-op or failure.
           getChatMessages(sid)
-            .then(({ messages, queued }) => dispatch({ type: "seed", sessionId: sid, messages, queued }))
+            .then(({ messages, queued, activeLeafId }) =>
+              dispatch({ type: "seed", sessionId: sid, messages, queued, activeLeafId }),
+            )
             .catch(() => {});
           listChatSessions(projectId)
             .then((list) =>
@@ -5025,6 +5324,10 @@ export function ChatPanel({
           <div className="chat-thread-inner max-w-readable my-0 mx-auto pt-4 px-4 pb-8 flex flex-col gap-4" ref={threadInnerRef}>
             <Transcript
               messages={messages}
+              allMessages={allMessages}
+              canFork={canFork}
+              onFork={forkTurn}
+              onSelectFork={selectBranch}
               busy={busy}
               onOpenFile={openFileInSession}
               onOpenRun={onOpenRun}

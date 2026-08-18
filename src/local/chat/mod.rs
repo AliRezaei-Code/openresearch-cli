@@ -577,7 +577,7 @@ fn reconcile_target_file(session_id: &str, message_id: &str) -> Option<WireMessa
             session_id: session_id.to_string(),
             role: message.role.clone(),
             parts_json: serde_json::to_string(&message.parts).unwrap_or_default(),
-            created_at: message.created_at,
+            ..stored.clone()
         })
         .is_err()
     {
@@ -1058,6 +1058,10 @@ pub struct WireMessage {
     pub role: String,
     pub parts: Vec<WirePart>,
     pub created_at: i64,
+    /// Position on the transcript tree. None is a branch root; siblings sharing
+    /// a parent are the forks of one turn.
+    #[serde(default)]
+    pub parent_id: Option<String>,
 }
 
 pub fn session_json(s: &StoredChatSession, busy: bool) -> Value {
@@ -1085,6 +1089,7 @@ pub fn session_json(s: &StoredChatSession, busy: bool) -> Value {
         "updatedAt": s.updated_at,
         "busy": busy,
         "contextUsage": context_usage,
+        "activeLeafId": s.active_leaf_id,
     })
 }
 
@@ -1098,6 +1103,7 @@ pub(crate) fn stored_to_wire(m: &StoredChatMessage) -> WireMessage {
         role: m.role.clone(),
         parts: serde_json::from_str(&m.parts_json).unwrap_or_default(),
         created_at: m.created_at,
+        parent_id: m.parent_id.clone(),
     };
     cap_tool_parts(&mut message.parts);
     message
@@ -1485,12 +1491,31 @@ struct AnnotatedText {
 struct TranscriptDisplay {
     text: Option<String>,
     annotations: Option<Vec<TextAnnotation>>,
+    /// A re-sampled turn re-sends the anchor's attachments and annotations, which
+    /// would otherwise build a stray duplicate bubble even with the text blanked.
+    record_user_message: bool,
 }
 
 enum TurnAdmission {
     QueueIfBusy,
     RejectIfBusy,
     Preclaimed(TurnGuard),
+}
+
+/// Replayed files are already on disk, so a fork never re-decodes or duplicates
+/// them.
+enum TurnAttachments {
+    Uploaded(Vec<ImageAttachment>),
+    Replayed(Vec<SavedAttachment>),
+}
+
+impl TurnAttachments {
+    fn save(self) -> Result<Vec<SavedAttachment>> {
+        match self {
+            Self::Uploaded(images) => save_images(&images),
+            Self::Replayed(saved) => Ok(saved),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1902,18 +1927,22 @@ impl ChatHost {
         // The card rides its own assistant message: the running turn owns its
         // in-flight message's parts (a foreign part appended there would be
         // clobbered by the turn's next flush).
-        let msg = WireMessage {
+        let mut msg = WireMessage {
             id: format!("msg_{prompt_id}"),
             role: "assistant".into(),
             parts: vec![WirePart::prompt(prompt_id.clone(), prompt)],
             created_at: now_ms(),
+            parent_id: None,
         };
-        Store::open()?.upsert_chat_message(&StoredChatMessage {
+        msg.parent_id = Store::open()?.upsert_chat_message_on_branch(&StoredChatMessage {
             id: msg.id.clone(),
             session_id: session_id.to_string(),
             role: "assistant".into(),
             parts_json: serde_json::to_string(&msg.parts)?,
             created_at: msg.created_at,
+            parent_id: None,
+            base_native_session_id: None,
+            result_native_session_id: None,
         })?;
         self.emit("chat.message", message_json(&msg, session_id));
         // A question card answered mid-turn is NOT an exit recourse from plan
@@ -2281,9 +2310,10 @@ impl ChatHost {
                     TranscriptDisplay {
                         text: transcript_text,
                         annotations: None,
+                        record_user_message: true,
                     },
                     overrides,
-                    images,
+                    TurnAttachments::Uploaded(images),
                     TurnAdmission::Preclaimed(guard),
                 )
                 .await;
@@ -2315,13 +2345,159 @@ impl ChatHost {
             TranscriptDisplay {
                 text: transcript_text,
                 annotations: None,
+                record_user_message: true,
             },
             overrides,
-            images,
+            TurnAttachments::Uploaded(images),
             TurnAdmission::QueueIfBusy,
         )
         .await
         .map(|_| ())
+    }
+
+    /// Re-sample a turn as a new fork, leaving the existing branch intact.
+    ///
+    /// Forks share the session's git worktree, so a re-sampled turn starts from
+    /// whatever files the previous one left behind.
+    pub async fn fork_turn(
+        self: &Arc<Self>,
+        session_id: &str,
+        message_id: &str,
+        kind: ForkKind,
+    ) -> Result<()> {
+        let mut overrides = TurnOverrides::default();
+        let store = Store::open()?;
+        let messages = store.list_chat_messages(session_id)?;
+        let target = messages
+            .iter()
+            .find(|m| m.id == message_id)
+            .ok_or_else(|| anyhow!("message not found"))?;
+        let anchor = turn_anchor(&messages, target)
+            .ok_or_else(|| anyhow!("this message is not part of a turn that can be re-sampled"))?;
+        let anchor_parts: Vec<WirePart> = serde_json::from_str(&anchor.parts_json)?;
+        let text = match &kind {
+            ForkKind::Edit(edited) => edited.trim().to_string(),
+            ForkKind::Retry => anchor_parts
+                .iter()
+                .filter(|part| part.kind == "text")
+                .filter_map(|part| part.text.as_deref())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        let annotations = anchor_parts
+            .iter()
+            .filter(|part| part.kind == "annotation")
+            .filter_map(|part| part.text.clone())
+            .map(|text| TextAnnotation { text })
+            .collect::<Vec<_>>();
+        let attachments = match &kind {
+            // An edited message replaces the original outright, attachments
+            // included; a retry re-asks the same question, files and all.
+            ForkKind::Edit(_) => Vec::new(),
+            ForkKind::Retry => replayed_attachments(&anchor_parts)?,
+        };
+        if text.is_empty() && annotations.is_empty() && attachments.is_empty() {
+            return Err(anyhow!("nothing to re-sample"));
+        }
+        let guard = TurnGuard::claim(self, session_id, Some(&mut overrides))
+            .await
+            .ok_or_else(|| anyhow!("session is busy — interrupt it first"))?;
+        let (leaf, display) = match &kind {
+            // A retry keeps the user message and adds a reply beside the one it
+            // already has, so the fork point is the user message itself.
+            ForkKind::Retry => (
+                Some(anchor.id.clone()),
+                TranscriptDisplay {
+                    text: Some(String::new()),
+                    annotations: None,
+                    record_user_message: false,
+                },
+            ),
+            ForkKind::Edit(_) => (
+                anchor.parent_id.clone(),
+                TranscriptDisplay {
+                    text: Some(text.clone()),
+                    annotations: Some(annotations.clone()),
+                    record_user_message: true,
+                },
+            ),
+        };
+        let session = store
+            .get_chat_session(session_id)?
+            .ok_or_else(|| anyhow!("chat session not found"))?;
+        let rewind = rewind_target(anchor);
+        store.set_chat_session_active_leaf(session_id, leaf.as_deref())?;
+        if let Some(native) = &rewind {
+            store.set_chat_session_native_id(session_id, native.as_deref())?;
+        }
+        self.emit(
+            "chat.branch",
+            json!({ "sessionId": session_id, "activeLeafId": leaf }),
+        );
+        let submitted = self
+            .send_message_showing(
+                session_id,
+                vec![AnnotatedText { text, annotations }],
+                display,
+                overrides,
+                TurnAttachments::Replayed(attachments),
+                TurnAdmission::Preclaimed(guard),
+            )
+            .await;
+        // Nothing ran, so put the branch back: a rewound session with no turn
+        // behind it silently continues from the older harness thread. Best-effort
+        // and harness id first, because a half-applied restore that kept the
+        // rewind is worse than either end state.
+        if !matches!(submitted, Ok(TurnSubmission::Started)) {
+            if rewind.is_some() {
+                let _ = store
+                    .set_chat_session_native_id(session_id, session.native_session_id.as_deref());
+            }
+            let _ =
+                store.set_chat_session_active_leaf(session_id, session.active_leaf_id.as_deref());
+            self.emit(
+                "chat.branch",
+                json!({ "sessionId": session_id, "activeLeafId": session.active_leaf_id }),
+            );
+        }
+        submitted.map(|_| ())
+    }
+
+    /// Show a different fork of a turn. The whole branch under `leaf_id` comes
+    /// with it, and the harness is rewound to where that branch ended so the
+    /// next message continues what is on screen.
+    pub async fn select_branch(self: &Arc<Self>, session_id: &str, leaf_id: &str) -> Result<()> {
+        // Hold the turn slot for the rewrite. A turn is already appending onto
+        // the current leaf, and `turns` alone would miss one running in another
+        // `orx up` — either way its reply would graft onto the branch we moved to.
+        let _guard = TurnGuard::claim(self, session_id, None)
+            .await
+            .ok_or_else(|| anyhow!("session is busy — interrupt it first"))?;
+        let store = Store::open()?;
+        let messages = store.list_chat_messages(session_id)?;
+        let selected = messages
+            .iter()
+            .find(|m| m.id == leaf_id)
+            .ok_or_else(|| anyhow!("message not found"))?;
+        let tip = branch_tip(&messages, selected);
+        store.set_chat_session_active_leaf(session_id, Some(&tip.id))?;
+        // The id this branch ended at lives on its newest assistant message; a
+        // branch tipped by an unanswered user message resumes from that turn's
+        // own base.
+        let resume = active_path(&messages, Some(tip.id.as_str()))
+            .into_iter()
+            .rev()
+            .find_map(|m| {
+                m.result_native_session_id
+                    .clone()
+                    .or_else(|| m.base_native_session_id.clone())
+            });
+        store.set_chat_session_native_id(session_id, resume.as_deref())?;
+        self.emit(
+            "chat.branch",
+            json!({ "sessionId": session_id, "activeLeafId": tip.id }),
+        );
+        Ok(())
     }
 
     async fn send_hidden_message(
@@ -2339,9 +2515,10 @@ impl ChatHost {
             TranscriptDisplay {
                 text: Some(String::new()),
                 annotations: None,
+                record_user_message: false,
             },
             TurnOverrides::default(),
-            Vec::new(),
+            TurnAttachments::Uploaded(Vec::new()),
             TurnAdmission::Preclaimed(guard),
         )
         .await
@@ -2356,12 +2533,13 @@ impl ChatHost {
         messages: Vec<AnnotatedText>,
         transcript: TranscriptDisplay,
         mut overrides: TurnOverrides,
-        images: Vec<ImageAttachment>,
+        images: TurnAttachments,
         admission: TurnAdmission,
     ) -> Result<TurnSubmission> {
         let TranscriptDisplay {
             text: transcript_text,
             annotations: transcript_annotations,
+            record_user_message,
         } = transcript;
         let text = messages
             .iter()
@@ -2419,6 +2597,12 @@ impl ChatHost {
                     if matches!(turns.get(session_id), Some(TurnState::Cancelling)) {
                         return Err(anyhow!("session is stopping — send again once it is idle"));
                     }
+                    // The queue re-sends from the original upload; a re-sampled
+                    // turn holds already-saved files and claims its slot up front
+                    // rather than parking.
+                    let TurnAttachments::Uploaded(images) = images else {
+                        return Err(anyhow!("a re-sampled turn cannot be queued"));
+                    };
                     if text.trim().is_empty() && images.is_empty() && !has_annotations {
                         return Err(anyhow!("message content is required"));
                     }
@@ -2567,7 +2751,7 @@ impl ChatHost {
             store.set_chat_session_archived(&session.id, false)?;
             session.archived = false;
         }
-        let saved_images = save_images(&images)?;
+        let saved_images = images.save()?;
         let display_text = transcript_text.as_deref().unwrap_or(&text);
         // The input auto-titling runs on — set only on the first message.
         // Owned because `skills::expand` moves `text` below, ending the borrow
@@ -2609,19 +2793,23 @@ impl ChatHost {
         // A resume whose transcript text is empty (e.g. a note-less plan
         // approval) records no user message: the resolved card already tells
         // that part of the story, and an empty bubble would just be noise.
-        if !parts.is_empty() {
-            let user_msg = WireMessage {
+        if record_user_message && !parts.is_empty() {
+            let mut user_msg = WireMessage {
                 id: format!("msg_{}", uuid::Uuid::new_v4()),
                 role: "user".into(),
                 parts,
                 created_at: now_ms(),
+                parent_id: None,
             };
-            store.upsert_chat_message(&StoredChatMessage {
+            user_msg.parent_id = store.upsert_chat_message_on_branch(&StoredChatMessage {
                 id: user_msg.id.clone(),
                 session_id: session.id.clone(),
                 role: "user".into(),
                 parts_json: serde_json::to_string(&user_msg.parts)?,
                 created_at: user_msg.created_at,
+                parent_id: None,
+                base_native_session_id: session.native_session_id.clone(),
+                result_native_session_id: None,
             })?;
             if starts_session {
                 crate::telemetry::capture_chat_session_started(&session.harness);
@@ -2690,6 +2878,7 @@ impl ChatHost {
                 role: "assistant".into(),
                 parts: Vec::new(),
                 created_at: now_ms(),
+                parent_id: None,
             },
             // Seed from the persisted value so mid-turn reports (which carry a
             // token count but often no window) inherit last turn's window and
@@ -2924,7 +3113,7 @@ impl ChatHost {
             return Ok(());
         }
         self.clear_queue(session_id);
-        let msg = WireMessage {
+        let mut msg = WireMessage {
             id: format!("msg_{}", uuid::Uuid::new_v4()),
             role: "assistant".into(),
             parts: vec![WirePart::tool(
@@ -2934,19 +3123,32 @@ impl ChatHost {
                 None,
             )],
             created_at,
+            parent_id: None,
         };
         // Marker persistence is best-effort: the abort already happened, and an
         // Err here would surface as a failed Stop on a turn that IS stopped.
-        if let (Ok(store), Ok(json)) = (Store::open(), serde_json::to_string(&msg.parts)) {
-            let _ = store.upsert_chat_message(&StoredChatMessage {
-                id: msg.id.clone(),
-                session_id: session_id.to_string(),
-                role: "assistant".into(),
-                parts_json: json,
-                created_at: msg.created_at,
-            });
+        // Broadcasting one that did not persist is not harmless though — with no
+        // parent a live client reads it as a new branch root and blanks the
+        // transcript down to the marker.
+        let persisted = match (Store::open(), serde_json::to_string(&msg.parts)) {
+            (Ok(store), Ok(json)) => store
+                .upsert_chat_message_on_branch(&StoredChatMessage {
+                    id: msg.id.clone(),
+                    session_id: session_id.to_string(),
+                    role: "assistant".into(),
+                    parts_json: json,
+                    created_at: msg.created_at,
+                    parent_id: None,
+                    base_native_session_id: None,
+                    result_native_session_id: None,
+                })
+                .ok(),
+            _ => None,
+        };
+        if let Some(parent) = persisted {
+            msg.parent_id = parent;
+            self.emit("chat.message", message_json(&msg, session_id));
         }
-        self.emit("chat.message", message_json(&msg, session_id));
         Ok(())
     }
 
@@ -3076,9 +3278,10 @@ impl ChatHost {
                     TranscriptDisplay {
                         text: transcript,
                         annotations: Some(req.annotations.clone()),
+                        record_user_message: true,
                     },
                     overrides,
-                    Vec::new(),
+                    TurnAttachments::Uploaded(Vec::new()),
                     TurnAdmission::RejectIfBusy,
                 )
                 .await?;
@@ -3523,17 +3726,15 @@ fn mark_prompt_resolved(
                 stamp_resolved(prompt, answer);
             }
             store.upsert_chat_message(&StoredChatMessage {
-                id: msg.id.clone(),
-                session_id: session_id.to_string(),
-                role: msg.role.clone(),
                 parts_json: serde_json::to_string(&parts)?,
-                created_at: msg.created_at,
+                ..msg.clone()
             })?;
             return Ok(Some(WireMessage {
                 id: msg.id.clone(),
                 role: msg.role.clone(),
                 parts,
                 created_at: msg.created_at,
+                parent_id: msg.parent_id.clone(),
             }));
         }
     }
@@ -3571,17 +3772,15 @@ fn resolve_stale_prompts(
         let changed = resolve_stale_prompts_in_parts(&mut parts, native_only);
         if changed {
             store.upsert_chat_message(&StoredChatMessage {
-                id: msg.id.clone(),
-                session_id: session_id.to_string(),
-                role: msg.role.clone(),
                 parts_json: serde_json::to_string(&parts)?,
-                created_at: msg.created_at,
+                ..msg.clone()
             })?;
             updated.push(WireMessage {
                 id: msg.id,
                 role: msg.role,
                 parts,
                 created_at: msg.created_at,
+                parent_id: msg.parent_id,
             });
         }
     }
@@ -3779,6 +3978,7 @@ impl TurnCtx {
                 role: "assistant".into(),
                 parts: Vec::new(),
                 created_at: 0,
+                parent_id: None,
             },
             context_usage: None,
             last_flush: Instant::now(),
@@ -3879,7 +4079,7 @@ impl TurnCtx {
         }
         self.native_session_id = Some(native_id.to_string());
         if let Ok(store) = Store::open() {
-            let _ = store.set_chat_session_native_id(&self.session_id, native_id);
+            let _ = store.set_chat_session_native_id(&self.session_id, Some(native_id));
         }
     }
 
@@ -4022,12 +4222,17 @@ impl TurnCtx {
             }
             let mut wire_assistant = self.assistant.clone();
             cap_tool_parts(&mut wire_assistant.parts);
-            store.upsert_chat_message(&StoredChatMessage {
+            // Stamp the branch position onto the SSE copy (see the interrupt
+            // marker above for what an unparented broadcast does to a client).
+            wire_assistant.parent_id = store.upsert_chat_message_on_branch(&StoredChatMessage {
                 id: wire_assistant.id.clone(),
                 session_id: self.session_id.clone(),
                 role: wire_assistant.role.clone(),
                 parts_json: serde_json::to_string(&wire_assistant.parts)?,
                 created_at: wire_assistant.created_at,
+                parent_id: None,
+                base_native_session_id: None,
+                result_native_session_id: self.native_session_id.clone(),
             })?;
             wire_assistant
         };
@@ -4080,6 +4285,118 @@ impl TurnCtx {
             }
         }
     }
+}
+
+// --- transcript tree ------------------------------------------------------------
+
+/// Where to put the harness session id before re-sampling `anchor`'s turn.
+/// `None` leaves it alone: turns recorded before this build carry no fork point,
+/// and clearing it on their behalf would re-sample with none of the conversation
+/// and strand the original thread. Only a turn that began a session may clear it.
+fn rewind_target(anchor: &StoredChatMessage) -> Option<Option<String>> {
+    match &anchor.base_native_session_id {
+        Some(base) => Some(Some(base.clone())),
+        None if anchor.parent_id.is_none() => Some(None),
+        None => None,
+    }
+}
+
+/// The user message whose turn `message` belongs to — itself for a user message,
+/// otherwise the nearest user ancestor on its branch.
+fn turn_anchor<'a>(
+    messages: &'a [StoredChatMessage],
+    message: &'a StoredChatMessage,
+) -> Option<&'a StoredChatMessage> {
+    let mut current = message;
+    loop {
+        if current.role == "user" {
+            return Some(current);
+        }
+        let parent = current.parent_id.as_deref()?;
+        current = messages.iter().find(|m| m.id == parent)?;
+    }
+}
+
+/// The newest tip below `from`, following the most recent child at each step.
+/// Selecting a fork selects the whole branch under it, not just that message.
+fn branch_tip<'a>(
+    messages: &'a [StoredChatMessage],
+    from: &'a StoredChatMessage,
+) -> &'a StoredChatMessage {
+    let mut tip = from;
+    // `list_chat_messages` is ordered oldest-first, so the last match is newest.
+    while let Some(child) = messages
+        .iter()
+        .rfind(|m| m.parent_id.as_deref() == Some(tip.id.as_str()))
+    {
+        tip = child;
+    }
+    tip
+}
+
+/// The branch ending at `leaf`, oldest first. An absent or unknown leaf falls
+/// back to the whole list, which is exactly right for a session that has never
+/// been forked.
+fn active_path<'a>(
+    messages: &'a [StoredChatMessage],
+    leaf: Option<&str>,
+) -> Vec<&'a StoredChatMessage> {
+    let Some(mut current) = leaf.and_then(|id| messages.iter().find(|m| m.id == id)) else {
+        return messages.iter().collect();
+    };
+    let mut path = vec![current];
+    while let Some(parent) = current.parent_id.as_deref() {
+        let Some(found) = messages.iter().find(|m| m.id == parent) else {
+            break;
+        };
+        current = found;
+        path.push(current);
+    }
+    path.reverse();
+    path
+}
+
+/// Attachments of a turn being re-sampled. The files are already on disk from
+/// the original send, so a fork points at them instead of rewriting the bytes.
+fn replayed_attachments(parts: &[WirePart]) -> Result<Vec<SavedAttachment>> {
+    let dir = attachments_dir()?;
+    let mut saved = Vec::new();
+    for part in parts.iter().filter(|part| part.kind == "image") {
+        let Some(file_name) = part.text.clone() else {
+            continue;
+        };
+        // Names are server-minted (`att-<uuid>__<name>`); anything with a path
+        // separator did not come from `save_images`.
+        if file_name.contains('/') || file_name.contains('\\') || file_name.contains("..") {
+            continue;
+        }
+        let path = dir.join(&file_name);
+        if !path.exists() {
+            continue;
+        }
+        let display_name = file_name
+            .split_once("__")
+            .map(|(_, name)| name.to_string())
+            .unwrap_or_else(|| file_name.clone());
+        let is_pdf = file_name.ends_with(".pdf");
+        saved.push(SavedAttachment {
+            file_name,
+            path,
+            display_name,
+            is_pdf,
+        });
+    }
+    Ok(saved)
+}
+
+/// What a fork of a turn re-samples.
+pub enum ForkKind {
+    /// Ask the same question again: the user message is reused, so only the
+    /// assistant reply is new and the two replies sit side by side under it.
+    Retry,
+    /// Ask a different question in its place, as a sibling of the original user
+    /// message.
+    Edit(String),
 }
 
 // --- shared adapter helpers ----------------------------------------------------
@@ -5180,6 +5497,7 @@ mod bridge_tests {
             archived: false,
             context_usage_json: None,
             bootstrap_context: None,
+            active_leaf_id: None,
             created_at: 1,
             updated_at: 1,
         }
@@ -5312,6 +5630,7 @@ mod run_wakeup_tests {
                 archived: false,
                 context_usage_json: None,
                 bootstrap_context: None,
+                active_leaf_id: None,
                 created_at: 1,
                 updated_at: 1,
             })
@@ -5481,5 +5800,110 @@ with other project runs using `orx runs p1` and inspect this run's logs using `o
         assert_eq!(store.list_ready_run_wakeups().unwrap().len(), 1);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod transcript_tree_tests {
+    use super::*;
+    use crate::store::StoredChatMessage;
+
+    fn msg(id: &str, role: &str, parent: Option<&str>) -> StoredChatMessage {
+        StoredChatMessage {
+            id: id.into(),
+            session_id: "s1".into(),
+            role: role.into(),
+            parts_json: "[]".into(),
+            created_at: 0,
+            parent_id: parent.map(Into::into),
+            base_native_session_id: None,
+            result_native_session_id: None,
+        }
+    }
+
+    /// u1 → a1, plus a re-sampled a2 beside it; u2 → a3 continues under a1.
+    fn forked() -> Vec<StoredChatMessage> {
+        vec![
+            msg("u1", "user", None),
+            msg("a1", "assistant", Some("u1")),
+            msg("a2", "assistant", Some("u1")),
+            msg("u2", "user", Some("a1")),
+            msg("a3", "assistant", Some("u2")),
+        ]
+    }
+
+    fn ids(path: Vec<&StoredChatMessage>) -> Vec<&str> {
+        path.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    #[test]
+    fn active_path_follows_parents_from_the_leaf() {
+        let messages = forked();
+        assert_eq!(
+            ids(active_path(&messages, Some("a3"))),
+            ["u1", "a1", "u2", "a3"]
+        );
+        // The sibling fork hides everything that only exists under the other one.
+        assert_eq!(ids(active_path(&messages, Some("a2"))), ["u1", "a2"]);
+    }
+
+    #[test]
+    fn active_path_without_a_leaf_keeps_the_whole_transcript() {
+        let messages = forked();
+        assert_eq!(
+            ids(active_path(&messages, None)),
+            ["u1", "a1", "a2", "u2", "a3"]
+        );
+        // A pointer at a message that is gone must not blank the transcript.
+        assert_eq!(
+            active_path(&messages, Some("missing")).len(),
+            messages.len()
+        );
+    }
+
+    #[test]
+    fn only_a_turn_that_began_a_session_may_clear_the_harness_id() {
+        let mut anchor = msg("u1", "user", None);
+        // Recorded fork point: resume the turn from exactly where it started.
+        anchor.base_native_session_id = Some("sess-abc".into());
+        assert_eq!(rewind_target(&anchor), Some(Some("sess-abc".into())));
+
+        // A turn that opened the session has nothing to resume from, so clearing
+        // is what a fork of it should do.
+        anchor.base_native_session_id = None;
+        assert_eq!(rewind_target(&anchor), Some(None));
+
+        // Recorded before this build: leave the harness alone rather than wipe a
+        // live conversation's thread.
+        let legacy = msg("a1", "assistant", Some("u1"));
+        assert_eq!(rewind_target(&legacy), None);
+    }
+
+    #[test]
+    fn turn_anchor_is_the_user_message_the_reply_answers() {
+        let messages = forked();
+        let anchor = |id: &str| {
+            turn_anchor(&messages, messages.iter().find(|m| m.id == id).unwrap())
+                .unwrap()
+                .id
+                .clone()
+        };
+        assert_eq!(anchor("a2"), "u1");
+        assert_eq!(anchor("a3"), "u2");
+        // A user message anchors its own turn.
+        assert_eq!(anchor("u2"), "u2");
+    }
+
+    #[test]
+    fn selecting_a_fork_descends_to_its_newest_tip() {
+        let messages = forked();
+        let tip = |id: &str| {
+            branch_tip(&messages, messages.iter().find(|m| m.id == id).unwrap())
+                .id
+                .clone()
+        };
+        assert_eq!(tip("a1"), "a3");
+        // A fork with nothing under it is its own tip.
+        assert_eq!(tip("a2"), "a2");
     }
 }
