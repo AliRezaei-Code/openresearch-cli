@@ -49,7 +49,8 @@ on:
 permissions:
   contents: read
   actions: write # github.token fallback path dispatches release.yml
-  statuses: write # to set the version-bump commit status chip
+  issues: write # to create/apply the version label on the bump's PR
+  pull-requests: read # to resolve the bump commit to its squash-merged PR
 
 jobs:
   dispatch:
@@ -103,13 +104,24 @@ jobs:
             exit 0
           fi
 
-          # Chip on the bump commit showing which version it shipped. Best-effort:
-          # a status API hiccup must never block the release dispatch below.
-          if ! GH_TOKEN="$FALLBACK_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
-            -f state=success \
-            -f context="version" \
-            -f description="Bumped to ${tag}" >/dev/null; then
-            echo "::warning::Failed to set version status chip for ${GITHUB_SHA}"
+          # Label the bump's PR with the new version (e.g. "v1.0.101") so the
+          # version a bump PR released is visible from the PR list. Best-effort:
+          # a labeling hiccup must never block the release dispatch below.
+          if pr=$(GH_TOKEN="$FALLBACK_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+            --jq '.[0].number // empty' 2>/dev/null); then
+            if [ -n "${pr}" ]; then
+              # Create the label first (422 if it already exists — ignored) so
+              # the add below never depends on auto-creation behavior.
+              GH_TOKEN="$FALLBACK_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/labels" \
+                -f name="${tag}" -f color="0e8a16" >/dev/null 2>&1 || true
+              GH_TOKEN="$FALLBACK_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/issues/${pr}/labels" \
+                -f "labels[]=${tag}" >/dev/null \
+                || echo "::warning::Failed to label PR #${pr} with ${tag}"
+            else
+              echo "No PR associated with ${GITHUB_SHA} — skipping the version label."
+            fi
+          else
+            echo "::warning::Could not look up the PR for ${GITHUB_SHA} — skipping the version label."
           fi
 
           echo "Dispatching release.yml with tag=${tag} (version is unreleased)."
