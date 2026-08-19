@@ -255,6 +255,8 @@ export function FileViewer({
     };
   }, [projectId, path, source, sessionId, gitRef, nonce]);
 
+  // Stays a layout effect: the code views scroll to a `file:line` target in
+  // passive effects, which run after this and so win over the restore.
   useLayoutEffect(() => {
     const body = bodyRef.current;
     const position = scrollPositionRef.current;
