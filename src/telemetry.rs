@@ -699,8 +699,9 @@ fn pending() -> &'static std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>> {
 /// await.
 fn capture(event: impl Into<String>, extra: serde_json::Value) {
     if let Some(handle) = spawn_event(event, extra) {
-        if let Ok(mut v) = pending().lock() {
-            v.push(handle);
+        if let Ok(mut handles) = pending().lock() {
+            handles.retain(|pending| !pending.is_finished());
+            handles.push(handle);
         }
     }
 }
@@ -783,6 +784,10 @@ pub(crate) fn capture_project_created() {
 
 pub(crate) fn capture_chat_session_started(harness: &str) {
     capture("chat_session_started", json!({ "harness": harness }));
+}
+
+pub(crate) fn capture_chat_message_sent() {
+    capture("chat_message_sent", json!({}));
 }
 
 /// Flush every pending event send (the session's `cli_command` plus any key
@@ -1319,6 +1324,7 @@ mod tests {
             ),
             ("project_created", "cli_project_created"),
             ("chat_session_started", "cli_chat_session_started"),
+            ("chat_message_sent", "cli_chat_message_sent"),
             ("experiment_started", "cli_experiment_started"),
             ("telemetry_consent", "cli_telemetry_consent"),
         ] {
@@ -1467,6 +1473,10 @@ mod tests {
         assert_eq!(chat["events"][0]["name"], "cli_chat_session_started");
         assert_eq!(chat["events"][0]["properties"]["harness"], "codex");
         assert_eq!(property_keys(&chat), vec!["harness"]);
+
+        let message = build_payload("chat_message_sent", "did", json!({}));
+        assert_eq!(message["events"][0]["name"], "cli_chat_message_sent");
+        assert!(property_keys(&message).is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

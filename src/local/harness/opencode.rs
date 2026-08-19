@@ -57,6 +57,10 @@ impl Harness for OpenCode {
         true
     }
 
+    async fn generate_title(&self, first_message: &str) -> Option<String> {
+        opencode_generate_title(&find_opencode().ok()?, first_message).await
+    }
+
     async fn detect(&self) -> Option<HarnessInfo> {
         let mut info = HarnessInfo::new(self.id(), self.name());
         let mut models = Vec::new();
@@ -241,6 +245,48 @@ async fn opencode_models(bin: &PathBuf) -> Vec<super::ModelInfo> {
         return Vec::new();
     };
     model_id_lines(&plain).map(super::ModelInfo::new).collect()
+}
+
+/// One-shot session title from the first user message: a throwaway
+/// `opencode run` child on the user's default model. opencode's server no
+/// longer retitles parent sessions itself (only sub-agent child sessions get
+/// task-description titles), so the `session.updated` adoption path never
+/// fires for the session proper — this mirrors the claude/codex one-shot
+/// children instead. Any failure lands on `None` and keeps the placeholder.
+async fn opencode_generate_title(bin: &PathBuf, first_message: &str) -> Option<String> {
+    let mut cmd = tokio::process::Command::new(bin);
+    // The user's message is embedded in the prompt, so the child must not be
+    // able to act on it: the built-in read-only `plan` agent denies writes,
+    // `--pure` skips external plugins, and the temp cwd keeps any residual
+    // reads away from real repos. A tool call that still asks for permission
+    // just blocks the unattended child until TITLE_TIMEOUT kills it — the
+    // placeholder title stands.
+    cmd.args([
+        "run",
+        "--agent",
+        "plan",
+        "--pure",
+        &super::title::title_prompt(first_message),
+    ])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::null())
+    .kill_on_drop(true)
+    // Outside any repository, so the child doesn't ingest the server cwd's
+    // AGENTS.md into a request that only needs one sentence.
+    .current_dir(std::env::temp_dir());
+    crate::local::chat::prepare_env(&mut cmd);
+    // Plain text only — an ANSI-colorizing CLI (or a synced FORCE_COLOR) would
+    // otherwise write escape codes straight into the title column.
+    cmd.env("NO_COLOR", "1");
+    let out = tokio::time::timeout(super::title::TITLE_TIMEOUT, cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    super::title::sanitize_title(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// Run `opencode <args>` in the home dir, returning stdout on success.
