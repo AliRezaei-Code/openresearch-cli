@@ -5198,13 +5198,6 @@ export function ChatPanel({
       {/* Workspace tools open beside chat; settings sections replace the middle pane. */}
       <nav className="rail-nav flex flex-col gap-0.5 p-2 shrink-0">
         <button
-          className={`rail-nav-item flex items-center gap-2.5 py-[7px] px-2.5 text-base text-text rounded-md text-left [&:hover]:bg-surface [&.active]:bg-panel [&.active]:font-semibold ${experimentsActive ? "active" : ""}`}
-          onClick={onOpenExperiments}
-        >
-          <FlaskConical size={15} />
-          Experiments
-        </button>
-        <button
           className={`rail-nav-item flex items-center gap-2.5 py-[7px] px-2.5 text-base text-text rounded-md text-left [&:hover]:bg-surface [&.active]:bg-panel [&.active]:font-semibold ${filesActive ? "active" : ""}`}
           onClick={onOpenWorktree}
         >
@@ -5218,6 +5211,13 @@ export function ChatPanel({
         >
           <Package size={15} />
           Artifacts
+        </button>
+        <button
+          className={`rail-nav-item flex items-center gap-2.5 py-[7px] px-2.5 text-base text-text rounded-md text-left [&:hover]:bg-surface [&.active]:bg-panel [&.active]:font-semibold ${experimentsActive ? "active" : ""}`}
+          onClick={onOpenExperiments}
+        >
+          <FlaskConical size={15} />
+          Experiments
         </button>
         <button
           className={`rail-nav-item flex items-center gap-2.5 py-[7px] px-2.5 text-base text-text rounded-md text-left [&:hover]:bg-surface [&.active]:bg-panel [&.active]:font-semibold ${mainView === "skills" ? "active" : ""}`}
