@@ -1558,7 +1558,12 @@ export default function App() {
                   projectId={projectId}
                   path={fileTab.path}
                   source={fileTab.source}
-                  sessionId={fileTab.sessionId}
+                  // Artifacts tabs fall back to the checkout, which needs this session.
+                  sessionId={
+                    fileTab.source === "artifacts"
+                      ? (activeSessionId ?? undefined)
+                      : fileTab.sessionId
+                  }
                   gitRef={fileTab.ref}
                   line={fileTab.line}
                   branchLabel={fileBranchLabel(fileTab, activeProject?.baselineBranch)}
