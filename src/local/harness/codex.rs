@@ -1137,31 +1137,60 @@ pub(crate) fn reconcile_interrupted_items(
     settle_interrupted_parts(&mut message.parts);
     store
         .upsert_chat_message(&StoredChatMessage {
-            id: message.id.clone(),
-            session_id: session_id.to_string(),
-            role: message.role.clone(),
             parts_json: serde_json::to_string(&message.parts).ok()?,
-            created_at: message.created_at,
+            ..stored.clone()
         })
         .ok()?;
     Some(message)
 }
 
 fn reconcile_items(parts: &mut Vec<WirePart>, items: &[Value]) {
+    // History can repeat identical text; consume-once pairing keeps the Nth
+    // repeat restorable instead of collapsing every copy onto one part.
+    let mut claimed: Vec<String> = Vec::new();
     for item in items {
         let completed = item.get("status").and_then(Value::as_str) != Some("inProgress");
         let Some(part) = item_to_part(item, completed, parts) else {
             continue;
         };
-        if completed
-            && streamed_text_kind(item)
-            && part_text_is_empty(&part)
-            && parts.iter().any(|prior| prior.id == part.id)
-        {
+        let id_exists = parts.iter().any(|prior| prior.id == part.id);
+        if completed && streamed_text_kind(item) && part_text_is_empty(&part) && id_exists {
             continue;
+        }
+        // `thread/read` re-mints ids (`item-N`) for content the live stream
+        // keyed by its Responses id (`msg_…`/`rs_…`), so an unknown id whose
+        // text continues a non-empty same-kind part is that part's item
+        // renamed, not new content (OR-181) — adopt the authoritative text in
+        // place. An empty part carries no evidence of which item it is.
+        if !id_exists && renamable_text_kind(item) {
+            let incoming = part.text.as_deref().unwrap_or("");
+            let renamed = parts.iter().position(|prior| {
+                let prior_text = prior.text.as_deref().unwrap_or("");
+                !claimed.contains(&prior.id)
+                    && !prior.id.starts_with("plan-item-")
+                    && prior.kind == part.kind
+                    && !prior_text.is_empty()
+                    && incoming.starts_with(prior_text)
+            });
+            if let Some(i) = renamed {
+                claimed.push(parts[i].id.clone());
+                parts[i].text = part.text;
+                continue;
+            }
         }
         upsert_preserving_children(parts, part);
     }
+}
+
+/// Item types whose ids `thread/read` re-mints (see `reconcile_items`). Plan
+/// streams text too, but its part id is derived (`plan_part_id`), so history
+/// never renames it — and the `plan-item-` prior check is the other half of
+/// that exemption.
+fn renamable_text_kind(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("agentMessage") | Some("reasoning")
+    )
 }
 
 fn settle_interrupted_parts(parts: &mut [WirePart]) {
@@ -3456,6 +3485,115 @@ requires_openai_auth = false
             failed.state.as_ref().unwrap().output.as_deref(),
             Some("Operation not permitted (os error 1)\n")
         );
+    }
+
+    /// OR-181: `thread/read` re-mints item ids (`item-N`) for content the
+    /// live stream keyed by its Responses id, so reconcile must treat the
+    /// renamed item as the streamed part — not append a second copy.
+    #[test]
+    fn native_history_renamed_text_item_does_not_duplicate() {
+        let mut parts = vec![
+            WirePart::reasoning("rs_0ea484ab".to_string(), ""),
+            WirePart::text("msg_0ea484ab".to_string(), "**Decision:** no JSD."),
+        ];
+        let items = serde_json::json!([
+            { "type": "userMessage", "id": "item-11", "content": "which loss?" },
+            { "type": "agentMessage", "id": "item-12", "text": "**Decision:** no JSD." },
+            { "type": "agentMessage", "id": "item-13", "text": "A message the stream missed." }
+        ]);
+
+        reconcile_items(&mut parts, items.as_array().unwrap());
+
+        let ids: Vec<&str> = parts.iter().map(|part| part.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["rs_0ea484ab", "msg_0ea484ab", "item-13"],
+            "the streamed part survives under its own id; only the genuinely \
+             missing message is appended"
+        );
+        assert_eq!(parts[1].text.as_deref(), Some("**Decision:** no JSD."));
+        assert_eq!(
+            parts[2].text.as_deref(),
+            Some("A message the stream missed.")
+        );
+    }
+
+    /// A renamed item whose live part streamed only partial text completes
+    /// the streamed part in place instead of appending a sibling.
+    #[test]
+    fn native_history_renamed_item_completes_partial_streamed_text() {
+        let mut parts = vec![
+            WirePart::reasoning("rs_aa".to_string(), "Weighing"),
+            WirePart::text("msg_bb".to_string(), "**Decision:** no J"),
+        ];
+        let items = serde_json::json!([
+            { "type": "reasoning", "id": "item-1", "summary": ["Weighing the losses."] },
+            { "type": "agentMessage", "id": "item-2", "text": "**Decision:** no JSD." }
+        ]);
+
+        reconcile_items(&mut parts, items.as_array().unwrap());
+
+        assert_eq!(parts.len(), 2, "renamed items must not add parts");
+        assert_eq!(parts[0].id, "rs_aa");
+        assert_eq!(parts[0].text.as_deref(), Some("Weighing the losses."));
+        assert_eq!(parts[1].id, "msg_bb");
+        assert_eq!(parts[1].text.as_deref(), Some("**Decision:** no JSD."));
+    }
+
+    /// Consume-once matching: two identical history messages pair with at
+    /// most one streamed part each, so a genuine repeat is still restored.
+    #[test]
+    fn native_history_identical_repeat_is_still_restored() {
+        let mut parts = vec![WirePart::text("msg_aa".to_string(), "Done.")];
+        let items = serde_json::json!([
+            { "type": "agentMessage", "id": "item-1", "text": "Done." },
+            { "type": "agentMessage", "id": "item-2", "text": "Done." }
+        ]);
+
+        reconcile_items(&mut parts, items.as_array().unwrap());
+
+        let ids: Vec<&str> = parts.iter().map(|part| part.id.as_str()).collect();
+        assert_eq!(ids, ["msg_aa", "item-2"], "the second repeat is appended");
+    }
+
+    /// A plan part sharing its text with the final message must not swallow a
+    /// missing message (plan ids are derived, never re-minted by history).
+    #[test]
+    fn native_history_message_matching_plan_text_is_restored() {
+        let mut parts = vec![WirePart::text("plan-item-plan_1".to_string(), "the plan")];
+        let items = serde_json::json!([
+            { "type": "agentMessage", "id": "item-2", "text": "the plan" }
+        ]);
+
+        reconcile_items(&mut parts, items.as_array().unwrap());
+
+        let ids: Vec<&str> = parts.iter().map(|part| part.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["plan-item-plan_1", "item-2"],
+            "a plan part must not absorb a real message"
+        );
+    }
+
+    /// An empty streamed part carries no evidence of which item it is —
+    /// `starts_with("")` matches anything — so it never adopts history text.
+    #[test]
+    fn native_history_empty_part_is_not_a_wildcard_match() {
+        let mut parts = vec![WirePart::reasoning("rs_empty".to_string(), "")];
+        let items = serde_json::json!([
+            { "type": "reasoning", "id": "item-1", "summary": ["First thought."] }
+        ]);
+
+        reconcile_items(&mut parts, items.as_array().unwrap());
+
+        let ids: Vec<&str> = parts.iter().map(|part| part.id.as_str()).collect();
+        assert_eq!(ids, ["rs_empty", "item-1"], "the item appends, not adopts");
+        assert_eq!(
+            parts[0].text.as_deref(),
+            Some(""),
+            "the empty part stays untouched"
+        );
+        assert_eq!(parts[1].text.as_deref(), Some("First thought."));
     }
 
     #[test]

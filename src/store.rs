@@ -331,7 +331,10 @@ impl Store {
                 session_id TEXT NOT NULL,
                 role       TEXT NOT NULL,
                 parts_json TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                parent_id                TEXT,
+                base_native_session_id   TEXT,
+                result_native_session_id TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_chat_messages_session
                 ON chat_messages(session_id, created_at);
@@ -432,8 +435,50 @@ impl Store {
             "ALTER TABLE chat_run_wakeups ADD COLUMN claim_token TEXT",
             "ALTER TABLE chat_run_wakeups ADD COLUMN claimed_at INTEGER",
             "ALTER TABLE chat_run_wakeups ADD COLUMN delivered_at INTEGER",
+            "ALTER TABLE chat_messages ADD COLUMN parent_id TEXT",
+            "ALTER TABLE chat_messages ADD COLUMN base_native_session_id TEXT",
+            "ALTER TABLE chat_messages ADD COLUMN result_native_session_id TEXT",
+            "ALTER TABLE chat_sessions ADD COLUMN active_leaf_id TEXT",
         ] {
             let _ = conn.execute(ddl, []);
+        }
+        // Chat messages became a tree (forked turns). Legacy rows are one linear
+        // chain each; after this a NULL parent_id genuinely means "branch root".
+        // All-or-nothing, because a half-applied backfill that still bumped the
+        // marker would leave those transcripts unparented for good.
+        let schema_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if schema_version < 1 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE chat_messages AS m SET parent_id = (
+                     SELECT p.id FROM chat_messages p
+                     WHERE p.session_id = m.session_id
+                       AND (p.created_at, p.rowid) < (m.created_at, m.rowid)
+                     ORDER BY p.created_at DESC, p.rowid DESC LIMIT 1
+                 ) WHERE m.parent_id IS NULL",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE chat_sessions SET active_leaf_id = (
+                     SELECT m.id FROM chat_messages m WHERE m.session_id = chat_sessions.id
+                     ORDER BY m.created_at DESC, m.rowid DESC LIMIT 1
+                 ) WHERE active_leaf_id IS NULL",
+                [],
+            )?;
+            // Legacy turns never recorded where the harness stood, so hand the
+            // session's live id to its newest message: without it, switching
+            // back to a pre-upgrade branch would resume from nothing and strand
+            // that conversation's harness history.
+            tx.execute(
+                "UPDATE chat_messages SET result_native_session_id = (
+                     SELECT s.native_session_id FROM chat_sessions s WHERE s.id = session_id
+                 ) WHERE id IN (
+                     SELECT active_leaf_id FROM chat_sessions WHERE active_leaf_id IS NOT NULL
+                 )",
+                [],
+            )?;
+            tx.pragma_update(None, "user_version", 1)?;
+            tx.commit()?;
         }
         // Older builds of this branch created a one-root-per-project unique
         // index; multiple baselines are allowed, so make sure it's gone.
@@ -1122,8 +1167,8 @@ impl Store {
                                             title_source, model, permission_mode, plan_mode,
                                             plan_reset_pending, reasoning_level,
                                             archived, context_usage_json, bootstrap_context,
-                                            created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                                            active_leaf_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     session.id,
                     session.project_id,
@@ -1139,6 +1184,7 @@ impl Store {
                     session.archived,
                     session.context_usage_json,
                     session.bootstrap_context,
+                    session.active_leaf_id,
                     session.created_at,
                     session.updated_at,
                 ],
@@ -1146,14 +1192,19 @@ impl Store {
         }
         for message in messages {
             tx.execute(
-                "INSERT INTO chat_messages (id, session_id, role, parts_json, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO chat_messages (id, session_id, role, parts_json, created_at,
+                                            parent_id, base_native_session_id,
+                                            result_native_session_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     message.id,
                     message.session_id,
                     message.role,
                     message.parts_json,
                     message.created_at,
+                    message.parent_id,
+                    message.base_native_session_id,
+                    message.result_native_session_id,
                 ],
             )?;
         }
@@ -1332,8 +1383,8 @@ impl Store {
         self.conn.execute(
             "INSERT INTO chat_sessions (id, project_id, harness, native_session_id, title, title_source, model,
                                         permission_mode, plan_mode, plan_reset_pending, reasoning_level, archived, bootstrap_context,
-                                        created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                                        active_leaf_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 s.id,
                 s.project_id,
@@ -1348,6 +1399,7 @@ impl Store {
                 s.reasoning_level,
                 s.archived,
                 s.bootstrap_context,
+                s.active_leaf_id,
                 s.created_at,
                 s.updated_at,
             ],
@@ -1391,10 +1443,22 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_chat_session_native_id(&self, id: &str, native_id: &str) -> Result<()> {
+    /// `None` clears it, which a fork of the session's very first turn needs:
+    /// that turn ran with no harness session to resume from.
+    pub fn set_chat_session_native_id(&self, id: &str, native_id: Option<&str>) -> Result<()> {
         self.conn.execute(
             "UPDATE chat_sessions SET native_session_id = ?2, updated_at = ?3 WHERE id = ?1",
             params![id, native_id, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Deliberately leaves `updated_at` alone: paging between forks is not
+    /// activity, and would otherwise reorder the Recents list.
+    pub fn set_chat_session_active_leaf(&self, id: &str, leaf_id: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chat_sessions SET active_leaf_id = ?2 WHERE id = ?1",
+            params![id, leaf_id],
         )?;
         Ok(())
     }
@@ -1524,13 +1588,52 @@ impl Store {
     /// Insert or replace a message's parts — assistant messages are rewritten
     /// as their parts stream in.
     pub fn upsert_chat_message(&self, m: &StoredChatMessage) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO chat_messages (id, session_id, role, parts_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(id) DO UPDATE SET parts_json = excluded.parts_json",
-            params![m.id, m.session_id, m.role, m.parts_json, m.created_at],
+        upsert_chat_message_with(&self.conn, m)
+    }
+
+    /// Persist a message on the session's active branch and report its parent.
+    /// `m.parent_id` is derived from the session's leaf, not read. Immediate: a
+    /// torn read-leaf/append would make a permission card and its own reply
+    /// siblings, hiding one of them.
+    pub fn upsert_chat_message_on_branch(&self, m: &StoredChatMessage) -> Result<Option<String>> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
         )?;
-        Ok(())
+        // Outer None = no such row yet; inner None = a row that is a branch root.
+        let known: Option<Option<String>> = tx
+            .query_row(
+                "SELECT parent_id FROM chat_messages WHERE id = ?1",
+                params![m.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let parent = match &known {
+            Some(parent) => parent.clone(),
+            None => tx
+                .query_row(
+                    "SELECT active_leaf_id FROM chat_sessions WHERE id = ?1",
+                    params![m.session_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten(),
+        };
+        upsert_chat_message_with(
+            &tx,
+            &StoredChatMessage {
+                parent_id: parent.clone(),
+                ..m.clone()
+            },
+        )?;
+        if known.is_none() {
+            tx.execute(
+                "UPDATE chat_sessions SET active_leaf_id = ?2 WHERE id = ?1",
+                params![m.session_id, m.id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(parent)
     }
 
     pub fn upsert_chat_recovery_message_if_actionable(
@@ -1576,7 +1679,10 @@ impl Store {
         user_message: Option<&StoredChatMessage>,
         turn: &StoredChatTurn,
     ) -> Result<ChatTurnAdmission> {
-        let tx = self.begin()?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         let session_exists = tx
             .query_row(
                 "SELECT 1 FROM chat_sessions WHERE id = ?1",
@@ -1608,15 +1714,24 @@ impl Store {
         }
         if let Some(message) = user_message {
             tx.execute(
-                "INSERT INTO chat_messages (id, session_id, role, parts_json, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO chat_messages
+                 (id, session_id, role, parts_json, created_at, parent_id,
+                  base_native_session_id, result_native_session_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     message.id,
                     message.session_id,
                     message.role,
                     message.parts_json,
                     message.created_at,
+                    message.parent_id,
+                    message.base_native_session_id,
+                    message.result_native_session_id,
                 ],
+            )?;
+            tx.execute(
+                "UPDATE chat_sessions SET active_leaf_id = ?2 WHERE id = ?1",
+                params![message.session_id, message.id],
             )?;
         }
         tx.execute(
@@ -1982,7 +2097,9 @@ impl Store {
     pub fn list_chat_messages(&self, session_id: &str) -> Result<Vec<StoredChatMessage>> {
         let mut stmt = self.conn.prepare(
             // rowid tiebreak: a user message and its reply can share a millisecond.
-            "SELECT id, session_id, role, parts_json, created_at FROM chat_messages
+            "SELECT id, session_id, role, parts_json, created_at, parent_id,
+                    base_native_session_id, result_native_session_id
+             FROM chat_messages
              WHERE session_id = ?1 ORDER BY created_at ASC, rowid ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
@@ -1992,6 +2109,9 @@ impl Store {
                 role: row.get(2)?,
                 parts_json: row.get(3)?,
                 created_at: row.get(4)?,
+                parent_id: row.get(5)?,
+                base_native_session_id: row.get(6)?,
+                result_native_session_id: row.get(7)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -2011,8 +2131,9 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, session_id, role, parts_json, created_at FROM chat_messages
-                 WHERE id = ?1",
+                "SELECT id, session_id, role, parts_json, created_at, parent_id,
+                        base_native_session_id, result_native_session_id
+                 FROM chat_messages WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok(StoredChatMessage {
@@ -2021,6 +2142,9 @@ impl Store {
                         role: row.get(2)?,
                         parts_json: row.get(3)?,
                         created_at: row.get(4)?,
+                        parent_id: row.get(5)?,
+                        base_native_session_id: row.get(6)?,
+                        result_native_session_id: row.get(7)?,
                     })
                 },
             )
@@ -2104,6 +2228,9 @@ pub struct StoredChatSession {
     /// Hidden context prepended only when a seeded transcript starts its first
     /// real native harness session. Never serialized to the UI.
     pub bootstrap_context: Option<String>,
+    /// Tip of the branch the UI is currently showing. Forked turns make the
+    /// transcript a tree; this picks which path through it is live.
+    pub active_leaf_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -2135,6 +2262,43 @@ pub struct StoredChatMessage {
     pub role: String,
     pub parts_json: String,
     pub created_at: i64,
+    /// Message this one follows on its branch. NULL only for a branch root.
+    pub parent_id: Option<String>,
+    /// Harness session id current *before* this turn ran. Re-sampling a turn
+    /// resumes from it, so a fork branches the harness's own history instead of
+    /// appending onto the sibling's.
+    pub base_native_session_id: Option<String>,
+    /// Harness session id this turn ended at, recorded on the assistant reply.
+    /// Selecting a branch restores it, so the next message continues the branch
+    /// on screen rather than whichever fork ran most recently.
+    pub result_native_session_id: Option<String>,
+}
+
+fn upsert_chat_message_with(conn: &Connection, m: &StoredChatMessage) -> Result<()> {
+    conn.execute(
+        // A streaming message is written many times; only its parts and a
+        // late-arriving harness session id may change, never its place in
+        // the tree.
+        "INSERT INTO chat_messages
+                 (id, session_id, role, parts_json, created_at, parent_id,
+                  base_native_session_id, result_native_session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+                 parts_json = excluded.parts_json,
+                 result_native_session_id = COALESCE(
+                     excluded.result_native_session_id, result_native_session_id)",
+        params![
+            m.id,
+            m.session_id,
+            m.role,
+            m.parts_json,
+            m.created_at,
+            m.parent_id,
+            m.base_native_session_id,
+            m.result_native_session_id
+        ],
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -2209,7 +2373,7 @@ fn row_to_chat_turn(
 
 const CHAT_SESSION_COLS: &str = "id, project_id, harness, native_session_id, title, model, \
      permission_mode, plan_mode, plan_reset_pending, reasoning_level, archived, context_usage_json, \
-     created_at, updated_at, title_source, bootstrap_context";
+     created_at, updated_at, title_source, bootstrap_context, active_leaf_id";
 
 fn row_to_chat_session(
     row: &rusqlite::Row<'_>,
@@ -2231,6 +2395,7 @@ fn row_to_chat_session(
         updated_at: row.get(13)?,
         title_source: row.get(14)?,
         bootstrap_context: row.get(15)?,
+        active_leaf_id: row.get(16)?,
     })
 }
 
@@ -2478,6 +2643,9 @@ mod tests {
                 role: "user".into(),
                 parts_json: "[]".into(),
                 created_at: 1,
+                parent_id: None,
+                base_native_session_id: None,
+                result_native_session_id: None,
             })
             .unwrap();
         assert!(store.has_chat_messages("chat_1").unwrap());
@@ -2522,6 +2690,9 @@ mod tests {
             role: "user".into(),
             parts_json: "[]".into(),
             created_at: 2,
+            parent_id: None,
+            base_native_session_id: None,
+            result_native_session_id: None,
         };
         assert_eq!(
             store.admit_chat_turn(Some(&user), &turn).unwrap(),
@@ -2641,6 +2812,75 @@ mod tests {
     }
 
     #[test]
+    fn migration_chains_a_legacy_transcript_into_one_branch() {
+        let dir = std::env::temp_dir().join(format!("orx-store-tree-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store
+            .create_chat_session(&chat_session_fixture("chat_1"))
+            .unwrap();
+        for (i, (id, role)) in [("m1", "user"), ("m2", "assistant"), ("m3", "user")]
+            .into_iter()
+            .enumerate()
+        {
+            store
+                .upsert_chat_message(&StoredChatMessage {
+                    id: id.into(),
+                    session_id: "chat_1".into(),
+                    role: role.into(),
+                    parts_json: "[]".into(),
+                    created_at: i as i64,
+                    parent_id: None,
+                    base_native_session_id: None,
+                    result_native_session_id: None,
+                })
+                .unwrap();
+        }
+        // Rewind the marker so reopening replays the backfill against rows that
+        // look exactly like a pre-fork database: every parent NULL.
+        store.conn.pragma_update(None, "user_version", 0).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE chat_sessions SET active_leaf_id = NULL, native_session_id = 'sess-abc'",
+                [],
+            )
+            .unwrap();
+        drop(store);
+
+        let store = Store::open_at(dir.clone()).unwrap();
+        let parents = store
+            .list_chat_messages("chat_1")
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.id, m.parent_id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parents,
+            vec![
+                ("m1".to_string(), None),
+                ("m2".to_string(), Some("m1".into())),
+                ("m3".to_string(), Some("m2".into())),
+            ]
+        );
+        // The session resumes where it left off, not at the start.
+        let session = store.get_chat_session("chat_1").unwrap().unwrap();
+        assert_eq!(session.active_leaf_id.as_deref(), Some("m3"));
+        // The newest message inherits the live harness id, so paging back to a
+        // pre-upgrade branch resumes that conversation instead of starting over.
+        let tip = store.get_chat_message("m3").unwrap().unwrap();
+        assert_eq!(tip.result_native_session_id.as_deref(), Some("sess-abc"));
+        assert_eq!(
+            store
+                .get_chat_message("m1")
+                .unwrap()
+                .unwrap()
+                .result_native_session_id,
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn retry_reuses_the_turn_without_duplicating_the_user_message() {
         let dir = std::env::temp_dir().join(format!("orx-store-retry-{}", uuid::Uuid::new_v4()));
         let store = Store::open_at(dir.clone()).unwrap();
@@ -2654,6 +2894,9 @@ mod tests {
             role: "user".into(),
             parts_json: "[]".into(),
             created_at: 1,
+            parent_id: None,
+            base_native_session_id: None,
+            result_native_session_id: None,
         };
         store.admit_chat_turn(Some(&user), &turn).unwrap();
         assert!(store
@@ -2690,6 +2933,9 @@ mod tests {
             role: "assistant".into(),
             parts_json: "[]".into(),
             created_at: 1,
+            parent_id: None,
+            base_native_session_id: None,
+            result_native_session_id: None,
         };
         assert!(store
             .mark_chat_turn_recovered_with_message("turn_1", "recovery_1", &assistant)
@@ -2784,6 +3030,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_branched_message_keeps_its_parent_across_streaming_rewrites() {
+        let dir = std::env::temp_dir().join(format!("orx-store-branch-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store
+            .create_chat_session(&chat_session_fixture("chat_1"))
+            .unwrap();
+        let message = |id: &str, role: &str, parts: &str| StoredChatMessage {
+            id: id.into(),
+            session_id: "chat_1".into(),
+            role: role.into(),
+            parts_json: parts.into(),
+            created_at: 0,
+            parent_id: None,
+            base_native_session_id: None,
+            result_native_session_id: None,
+        };
+        assert_eq!(
+            store
+                .upsert_chat_message_on_branch(&message("m1", "user", "[]"))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .upsert_chat_message_on_branch(&message("m2", "assistant", "[1]"))
+                .unwrap(),
+            Some("m1".to_string())
+        );
+        // A later flush of the same message refreshes its parts without
+        // re-parenting it or advancing the branch past itself.
+        assert_eq!(
+            store
+                .upsert_chat_message_on_branch(&message("m2", "assistant", "[1,2]"))
+                .unwrap(),
+            Some("m1".to_string())
+        );
+        let stored = store.get_chat_message("m2").unwrap().unwrap();
+        assert_eq!(stored.parts_json, "[1,2]");
+        assert_eq!(stored.parent_id.as_deref(), Some("m1"));
+        assert_eq!(
+            store
+                .get_chat_session("chat_1")
+                .unwrap()
+                .unwrap()
+                .active_leaf_id
+                .as_deref(),
+            Some("m2")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn chat_session_fixture(id: &str) -> StoredChatSession {
         StoredChatSession {
             id: id.into(),
@@ -2800,6 +3098,7 @@ mod tests {
             archived: false,
             context_usage_json: None,
             bootstrap_context: None,
+            active_leaf_id: None,
             created_at: 1,
             updated_at: 1,
         }

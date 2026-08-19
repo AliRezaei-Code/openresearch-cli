@@ -312,6 +312,22 @@ export const getProjectFile = (projectId: string, path: string, opts: CheckoutRe
 export const projectFileUrl = (projectId: string, path: string, opts: CheckoutRef = {}) =>
   `/api/projects/${projectId}/file/raw?${checkoutQuery(opts, new URLSearchParams({ path }))}`;
 
+/** A file read by absolute path, outside the project's checkout and artifacts
+ * (e.g. `/Users/me/.ssh/config`). Same capped/decoded body as `ProjectFile`;
+ * the wire `root` is always `"abs"`, so it's dropped here rather than widening
+ * `CheckoutRoot` — nothing reads it, and it isn't part of any git tree. */
+export type AbsoluteFile = Omit<ProjectFile, "root">;
+
+/** One file by absolute path — the escape hatch for a file an agent references
+ * that lives outside the checkout and artifacts. Server-side capped (~512 KB);
+ * loopback-only, so it reads whatever the user running `orx up` can read. */
+export const getAbsoluteFile = (path: string) =>
+  get<AbsoluteFile>(`/api/files/abs?path=${encodeURIComponent(path)}`);
+
+/** Byte-exact absolute-path file for browser-native media rendering or download. */
+export const absoluteFileUrl = (path: string) =>
+  `/api/files/abs/raw?path=${encodeURIComponent(path)}`;
+
 /** Overwrite a text file in the project's live checkout (worktree when
  * `sessionId` is given, else the hub clone). Committed branch trees are
  * read-only, so pass no `ref`. */
@@ -1253,6 +1269,7 @@ export interface ChatMessage {
   role: "user" | "assistant";
   parts: ChatPart[];
   createdAt: number;
+  parentId?: string | null;
 }
 
 /** How much of the model's context window a session has used, measured off the
@@ -1345,9 +1362,13 @@ export interface QueuedMessage {
 }
 
 export const getChatMessages = (sessionId: string) =>
-  get<{ messages: ChatMessage[]; queued?: QueuedMessage[] }>(
+  get<{ messages: ChatMessage[]; queued?: QueuedMessage[]; activeLeafId?: string | null }>(
     `/api/chat/sessions/${sessionId}/messages`,
-  ).then((r) => ({ messages: r.messages, queued: r.queued ?? [] }));
+  ).then((r) => ({
+    messages: r.messages,
+    queued: r.queued ?? [],
+    activeLeafId: r.activeLeafId ?? null,
+  }));
 
 /** Cancel a still-parked message (the ✕ on a queued chip). */
 export const cancelQueuedMessage = (sessionId: string, itemId: string) =>
@@ -1407,6 +1428,15 @@ export const recoverChatTurn = (
     `/api/chat/sessions/${sessionId}/turns/${turnId}/recover`,
     { action, ...opts },
   );
+
+/** Pass `text` to re-ask an edited version of a user message; omit it to retry a
+ * response. Returns immediately; the new turn streams over /api/events. */
+export const forkChatTurn = (sessionId: string, messageId: string, text?: string) =>
+  post<{ ok: boolean }>(`/api/chat/sessions/${sessionId}/fork`, { messageId, text });
+
+/** Show a different fork of a turn, along with the whole branch under it. */
+export const selectChatBranch = (sessionId: string, leafId: string) =>
+  post<{ ok: boolean }>(`/api/chat/sessions/${sessionId}/branch`, { leafId });
 
 export const interruptChat = (sessionId: string) =>
   post<{ ok: boolean }>(`/api/chat/sessions/${sessionId}/interrupt`);
