@@ -272,8 +272,8 @@ async fn opencode_generate_title(bin: &PathBuf, first_message: &str) -> Option<S
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::null())
     .kill_on_drop(true)
-    // Hermetic: run outside any repo so the child doesn't ingest the
-    // server cwd's AGENTS.md into a request that only needs one sentence.
+    // Outside any repository, so the child doesn't ingest the server cwd's
+    // AGENTS.md into a request that only needs one sentence.
     .current_dir(std::env::temp_dir());
     crate::local::chat::prepare_env(&mut cmd);
     // Plain text only — an ANSI-colorizing CLI (or a synced FORCE_COLOR) would

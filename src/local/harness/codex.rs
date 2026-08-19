@@ -1571,7 +1571,7 @@ fn apply_sub_notification(
     tid: &str,
     method: &str,
     params: &Value,
-) -> Vec<(String, String, bool)> {
+) -> Vec<DiscoveredSubThread> {
     let mut discovered = Vec::new();
     match method {
         "item/started" | "item/completed" => {
@@ -1585,7 +1585,11 @@ fn apply_sub_notification(
                     // A grandchild spawn: register its threads under this part.
                     if part.tool.as_deref() == Some("subagent") {
                         for gtid in subagent_thread_ids(item) {
-                            discovered.push((gtid, part.id.clone(), item_arms_thread(item)));
+                            discovered.push(DiscoveredSubThread {
+                                thread_id: gtid,
+                                spawn_part_id: part.id.clone(),
+                                arms: item_arms_thread(item),
+                            });
                         }
                     }
                     let completed_streamed =
@@ -1627,8 +1631,9 @@ fn apply_sub_notification(
             }
         }
         // A sub-agent's own turn/completed / error / other notifications don't
-        // add transcript parts here (the spawn part's status is driven from the
-        // parent's collab item), and crucially never end the parent turn.
+        // add transcript parts here (`route_sub_event` handles the thread's
+        // terminal turn notifications and mirrors liveness onto the spawn
+        // part), and crucially never end the parent turn.
         _ => {}
     }
     discovered
@@ -1678,8 +1683,21 @@ fn register_sub_threads_from(
         if tid == parent_thread {
             continue;
         }
-        register_sub_thread(sub_threads, tid, spawn_id.to_string(), item);
+        register_sub_thread(
+            sub_threads,
+            tid,
+            spawn_id.to_string(),
+            item_arms_thread(item),
+        );
     }
+}
+
+/// A sub-agent thread referenced by a collab item, with whether that item
+/// drives it (see `item_arms_thread`).
+struct DiscoveredSubThread {
+    thread_id: String,
+    spawn_part_id: String,
+    arms: bool,
 }
 
 /// Insert/re-point one sub-agent thread. Ownership (which spawn row the
@@ -1693,13 +1711,13 @@ fn register_sub_threads_from(
 /// them). Only the thread's own `turn/completed` retires it.
 fn register_sub_thread(
     sub_threads: &mut HashMap<String, SubThread>,
-    tid: String,
+    thread_id: String,
     spawn_part_id: String,
-    item: &Value,
+    arms: bool,
 ) {
-    let live = item_arms_thread(item) || sub_threads.get(&tid).is_some_and(|s| s.live);
+    let live = arms || sub_threads.get(&thread_id).is_some_and(|s| s.live);
     sub_threads.insert(
-        tid,
+        thread_id,
         SubThread {
             spawn_part_id,
             live,
@@ -1778,22 +1796,18 @@ fn route_sub_event(
         }
     }
     let discovered = apply_sub_notification(&mut spawn_part.children, tid, method, params);
-    for (gtid, spawn_id, arms) in discovered {
+    for found in discovered {
         // Same parent-thread guard as `register_sub_threads_from`: a child's
         // handoff item can reference the parent, which must never become a
         // waitable "sub-agent".
-        if gtid == parent_thread {
+        if found.thread_id == parent_thread {
             continue;
         }
-        // Re-point, same as `register_sub_threads_from` for top-level threads,
-        // with the same liveness semantics (see `register_sub_thread`).
-        let live = arms || sub_threads.get(&gtid).is_some_and(|s| s.live);
-        sub_threads.insert(
-            gtid,
-            SubThread {
-                spawn_part_id: spawn_id,
-                live,
-            },
+        register_sub_thread(
+            sub_threads,
+            found.thread_id,
+            found.spawn_part_id,
+            found.arms,
         );
     }
 }

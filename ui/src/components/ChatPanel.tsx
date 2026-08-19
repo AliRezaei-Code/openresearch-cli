@@ -2228,7 +2228,10 @@ function useDwelledActivity(activity: ToolActivity | null, provisional: boolean)
     }, remaining);
     return () => window.clearTimeout(timeout);
   }, [activity, shown, provisional]);
-  return shown;
+  // Same-label activities pass through fresh: the dwell paces label swaps
+  // only, so metadata that resolves later (run ids, file refs) isn't held
+  // back with a stale copy.
+  return activity != null && activity.label === shown?.label ? activity : shown;
 }
 
 const TOOL_TAIL_SHIMMER_DELAY_MS = 160;
@@ -3292,11 +3295,11 @@ export function SubagentTranscript({
   );
 }
 
-/** A Codex/Claude/OpenCode sub-agent spawn row. A single clickable line — a
- * status dot + label — that opens the sub-agent's full transcript in the
- * right-side panel (like the Claude/Codex desktop apps). The transcript is
- * never expanded inline; the row stays a one-liner whether the sub-agent is
- * running (pulsing dot) or done. */
+/** A Codex/Claude/OpenCode sub-agent spawn row: a one-liner (icon + label)
+ * whether the agent is running (shimmer) or done. Click-to-open — the
+ * transcript shows in a right-side panel tab, never inline — when there is
+ * anything to open (streamed children, a final report, or an error); a pure
+ * interaction marker renders as an inert status line instead. */
 function SubagentBlock({
   part,
   pendingTail,
