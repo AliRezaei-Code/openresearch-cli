@@ -211,8 +211,8 @@ function initialRightPaneSessionState(
 ): RightPaneSessionState {
   const initial: RightPaneSessionState = {
     rightTab: "experiments",
-    tabHistory: ["experiments"],
-    experimentsTabOpen: true,
+    tabHistory: [],
+    experimentsTabOpen: false,
     filesTabOpen: false,
     artifactsTabOpen: false,
     expTabs: [],
@@ -224,7 +224,7 @@ function initialRightPaneSessionState(
     filesToggled: new Set(),
     selectedRunId: null,
     scope: "project",
-    panelOpen: true,
+    panelOpen: false,
     panelMax: false,
   };
   if (sessionId === DEMO_MAIN_SESSION_ID && openDemoBrief) {
@@ -235,8 +235,9 @@ function initialRightPaneSessionState(
     return {
       ...initial,
       rightTab: projectBriefTab,
-      tabHistory: ["experiments", projectBriefTab],
+      tabHistory: [projectBriefTab],
       fileTabs: [projectBriefTab],
+      panelOpen: true,
     };
   }
   if (sessionId === DEMO_FIGURE_SESSION_ID) {
@@ -250,8 +251,8 @@ function initialRightPaneSessionState(
       ...initial,
       rightTab: fileTabs[0],
       tabHistory: [...fileTabs.slice(1), fileTabs[0]],
-      experimentsTabOpen: false,
       fileTabs,
+      panelOpen: true,
     };
   }
   if (sessionId === DEMO_LITERATURE_SESSION_ID) {
@@ -262,8 +263,8 @@ function initialRightPaneSessionState(
       ...initial,
       rightTab: fileTabs[0],
       tabHistory: [fileTabs[0]],
-      experimentsTabOpen: false,
       fileTabs,
+      panelOpen: true,
     };
   }
   return initial;
@@ -433,6 +434,14 @@ export default function App() {
   // (they feed the memoized transcript, which needs stable props).
   const runsRef = useRef(runs);
   runsRef.current = runs;
+  // A first-seen running row may be a snapshot; only baseline-new ids or observed edges are live.
+  const observedRunsRef = useRef(new Map<string, Run>());
+  const liveRunIdsRef = useRef(new Set<string>());
+  const observedRunsProjectRef = useRef<string | null>(null);
+  const runsBaselineReadyRef = useRef(false);
+  const baselineRunsRef = useRef(new Map<string, Run>());
+  const pendingFirstRunningRunsRef = useRef(new Map<string, Run>());
+  const runsVisitRef = useRef(0);
   const experimentsRef = useRef(experiments);
   experimentsRef.current = experiments;
   const [artifacts, setArtifacts] = useState<ProjectArtifacts | null>(null);
@@ -468,8 +477,8 @@ export default function App() {
   // Right-panel tab strip: closable home and working tabs. The same experiment
   // can keep both its overview and terminal open.
   const [rightTab, setRightTab] = useState<RightTab>("experiments");
-  const [tabHistory, setTabHistory] = useState<RightTab[]>(["experiments"]);
-  const [experimentsTabOpen, setExperimentsTabOpen] = useState(true);
+  const [tabHistory, setTabHistory] = useState<RightTab[]>([]);
+  const [experimentsTabOpen, setExperimentsTabOpen] = useState(false);
   const [filesTabOpen, setFilesTabOpen] = useState(false);
   const [artifactsTabOpen, setArtifactsTabOpen] = useState(false);
   const [expTabs, setExpTabs] = useState<ExpViewDef[]>([]);
@@ -483,7 +492,7 @@ export default function App() {
   const [filesToggled, setFilesToggled] = useState<ReadonlySet<string>>(new Set());
   // The right pane is a floating panel: closable, edge-resizable, expandable
   // to (nearly) full screen. Width persists across sessions.
-  const [panelOpen, setPanelOpen] = useState(true);
+  const [panelOpen, setPanelOpen] = useState(false);
   const [panelMax, setPanelMax] = useState(false);
   const [panelWidth, setPanelWidth] = useState(initialPanelWidth);
   // The agents rail is a floating panel too: fixed-width, collapsible.
@@ -498,10 +507,12 @@ export default function App() {
   const rightPaneStatesRef = useRef(new Map<string, RightPaneSessionState>());
   const currentRightPaneStateRef = useRef<RightPaneSessionState>(initialRightPaneSessionState());
   const activeSessionIdRef = useRef<string | null>(null);
+  const pendingExperimentsAutoOpenRef = useRef(false);
   const tabHistoryRef = useRef(tabHistory);
   tabHistoryRef.current = tabHistory;
 
   const selectRightTab = useCallback((tab: RightTab) => {
+    pendingExperimentsAutoOpenRef.current = false;
     const key = rightTabKey(tab);
     const next = [
       ...tabHistoryRef.current.filter((item) => rightTabKey(item) !== key),
@@ -513,6 +524,7 @@ export default function App() {
   }, []);
 
   const forgetRightTab = useCallback((tab: RightTab, selectFallback: boolean) => {
+    pendingExperimentsAutoOpenRef.current = false;
     const key = rightTabKey(tab);
     const next = tabHistoryRef.current.filter((item) => rightTabKey(item) !== key);
     tabHistoryRef.current = next;
@@ -524,6 +536,11 @@ export default function App() {
       setPanelOpen(false);
       setPanelMax(false);
     }
+  }, []);
+
+  const selectMainView = useCallback((view: "chat" | "skills" | SettingsTab) => {
+    if (view !== "chat") pendingExperimentsAutoOpenRef.current = false;
+    setMainView(view);
   }, []);
 
   currentRightPaneStateRef.current = {
@@ -561,6 +578,22 @@ export default function App() {
         setDemoBriefLeading(true);
       }
       nextState = initialRightPaneSessionState(nextSessionId ?? undefined, openDemoBrief);
+    }
+    if (nextSessionId && pendingExperimentsAutoOpenRef.current) {
+      pendingExperimentsAutoOpenRef.current = false;
+      const experimentsTab: RightTab = "experiments";
+      nextState = {
+        ...nextState,
+        rightTab: experimentsTab,
+        tabHistory: [
+          ...nextState.tabHistory.filter(
+            (tab) => rightTabKey(tab) !== rightTabKey(experimentsTab),
+          ),
+          experimentsTab,
+        ],
+        experimentsTabOpen: true,
+        panelOpen: true,
+      };
     }
     setRightTab(nextState.rightTab);
     tabHistoryRef.current = nextState.tabHistory;
@@ -605,6 +638,14 @@ export default function App() {
 
   const projectIdRef = useRef(projectId);
   projectIdRef.current = projectId;
+
+  const openExperimentsTab = useCallback(() => {
+    setMainView("chat");
+    setExperimentsTabOpen(true);
+    selectRightTab("experiments");
+    setPanelOpen(true);
+    if (!activeSessionIdRef.current) pendingExperimentsAutoOpenRef.current = true;
+  }, [selectRightTab]);
 
   const loadInitialState = useCallback(() => {
     setStartupError(null);
@@ -670,6 +711,53 @@ export default function App() {
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
+  const loadRunsBaseline = useCallback((baselineProjectId: string) => {
+    runsBaselineReadyRef.current = false;
+    baselineRunsRef.current.clear();
+    pendingFirstRunningRunsRef.current.clear();
+    const runsVisit = ++runsVisitRef.current;
+    listRuns(baselineProjectId)
+      .then((loadedRuns) => {
+        if (
+          projectIdRef.current !== baselineProjectId ||
+          observedRunsProjectRef.current !== baselineProjectId ||
+          runsVisitRef.current !== runsVisit
+        ) return;
+        baselineRunsRef.current = new Map(loadedRuns.map((run) => [run.id, run]));
+        const shouldAutoOpen = [...pendingFirstRunningRunsRef.current.values()].some(
+          (liveRun) => {
+            const baselineRun = baselineRunsRef.current.get(liveRun.id);
+            return (
+              !baselineRun ||
+              (baselineRun.status !== "running" && baselineRun.updatedAt <= liveRun.updatedAt)
+            );
+          },
+        );
+        pendingFirstRunningRunsRef.current.clear();
+        for (const run of loadedRuns) {
+          const observed = observedRunsRef.current.get(run.id);
+          if (!observed || observed.updatedAt < run.updatedAt) {
+            observedRunsRef.current.set(run.id, run);
+          }
+        }
+        setRuns((current) => {
+          const merged = new Map(loadedRuns.map((run) => [run.id, run]));
+          for (const liveRun of current) {
+            const fetchedRun = merged.get(liveRun.id);
+            if (!fetchedRun || fetchedRun.updatedAt <= liveRun.updatedAt) {
+              merged.set(liveRun.id, liveRun);
+            }
+          }
+          return [...merged.values()];
+        });
+        runsBaselineReadyRef.current = true;
+        if (shouldAutoOpen) openExperimentsTab();
+      })
+      .catch(() => {
+        if (runsVisitRef.current === runsVisit) pendingFirstRunningRunsRef.current.clear();
+      });
+  }, [openExperimentsTab]);
+
   // Per-project data. Harness agents spawn lazily on the first chat message.
   useEffect(() => {
     if (!projectId) return;
@@ -678,7 +766,11 @@ export default function App() {
       rightPaneStatesRef.current.set(previousSessionId, currentRightPaneStateRef.current);
     }
     activeSessionIdRef.current = null;
+    pendingExperimentsAutoOpenRef.current = false;
     setActiveSessionId(null);
+    observedRunsProjectRef.current = projectId;
+    observedRunsRef.current.clear();
+    liveRunIdsRef.current.clear();
     // Record the visit; the resulting project.updated SSE event refreshes the
     // list's recency order.
     openProject(projectId).catch(() => {});
@@ -694,19 +786,21 @@ export default function App() {
     setCodeTabs([]);
     setFilesView("files");
     setFilesToggled(new Set());
-    tabHistoryRef.current = ["experiments"];
-    setTabHistory(["experiments"]);
+    tabHistoryRef.current = [];
+    setTabHistory([]);
     setRightTab("experiments");
-    setExperimentsTabOpen(true);
+    setExperimentsTabOpen(false);
     setFilesTabOpen(false);
     setArtifactsTabOpen(false);
+    setPanelOpen(false);
+    setPanelMax(false);
     // Scoping is an explicit per-project choice — don't let Current task scope
     // re-bind to whichever session ChatPanel auto-selects in the next project.
     setScope("project");
     listExperiments(projectId).then(setExperiments).catch(() => {});
-    listRuns(projectId).then(setRuns).catch(() => {});
+    loadRunsBaseline(projectId);
     getArtifacts(projectId).then(setArtifacts).catch(() => {});
-  }, [projectId]);
+  }, [loadRunsBaseline, projectId]);
 
   // Refetch artifacts on open and whenever the directory changes.
   const refreshArtifacts = useCallback(() => {
@@ -722,17 +816,35 @@ export default function App() {
     setPanelOpen(true);
   }, [refreshArtifacts, selectRightTab]);
 
-  const openExperimentsTab = useCallback(() => {
-    setMainView("chat");
-    setExperimentsTabOpen(true);
-    selectRightTab("experiments");
-    setPanelOpen(true);
-  }, [selectRightTab]);
-
   // Live store updates.
   useOrxEvents({
+    onReconnect: () => {
+      const id = projectIdRef.current;
+      if (!id) return;
+      observedRunsProjectRef.current = id;
+      observedRunsRef.current.clear();
+      liveRunIdsRef.current.clear();
+      loadRunsBaseline(id);
+    },
     onRun: (run) => {
-      if (run.projectId === projectIdRef.current) setRuns((cur) => upsert(cur, run));
+      if (
+        run.projectId !== projectIdRef.current ||
+        run.projectId !== observedRunsProjectRef.current
+      ) return;
+      const previous = observedRunsRef.current.get(run.id);
+      const previouslyLive = liveRunIdsRef.current.has(run.id);
+      if (previous && previous.updatedAt > run.updatedAt) return;
+      observedRunsRef.current.set(run.id, run);
+      liveRunIdsRef.current.add(run.id);
+      setRuns((current) => upsert(current, run));
+      if (run.status !== "running" || previous?.status === "running") return;
+      const baselineRun = baselineRunsRef.current.get(run.id);
+      const newSinceBaseline =
+        runsBaselineReadyRef.current &&
+        (!baselineRun ||
+          (baselineRun.status !== "running" && baselineRun.updatedAt <= run.updatedAt));
+      if ((previouslyLive && previous) || newSinceBaseline) openExperimentsTab();
+      else if (!runsBaselineReadyRef.current) pendingFirstRunningRunsRef.current.set(run.id, run);
     },
     onExperiment: (experiment) => {
       if (experiment.projectId === projectIdRef.current)
@@ -1173,7 +1285,7 @@ export default function App() {
     setHomeOpen(false);
     if (publicationError) {
       setGithubPublicationError({ projectId: project.id, message: publicationError });
-      setMainView("git");
+      selectMainView("git");
     }
   };
 
@@ -1287,7 +1399,7 @@ export default function App() {
       projectName={projects.find((p) => p.id === projectId)?.name ?? ""}
       onHome={() => setHomeOpen(true)}
       onNewProject={() => setNewProjectOpen(true)}
-      onRepository={() => setMainView("git")}
+      onRepository={() => selectMainView("git")}
       onCollapse={() => setRailOpen(false)}
     />
   );
@@ -1316,7 +1428,7 @@ export default function App() {
             railOpen={railOpen}
             onShowRail={() => setRailOpen(true)}
             mainView={mainView}
-            onSelectMainView={setMainView}
+            onSelectMainView={selectMainView}
             experimentsActive={
               mainView === "chat" && panelOpen && rightTab === "experiments"
             }
@@ -1354,7 +1466,7 @@ export default function App() {
                   setProjects((current) => (current ? upsert(current, project) : [project]));
                   if (project.githubEnabled) setGithubPublicationError(null);
                 }}
-                onSelectTab={setMainView}
+                onSelectTab={selectMainView}
               />
             ) : null}
           </ChatPanel>
@@ -1373,6 +1485,15 @@ export default function App() {
           <div className="tabs flex items-end gap-0 pt-1 pr-1.5 pb-0 pl-2 h-10 border-b border-b-border bg-background shrink-0">
             <div className="tab-strip flex items-end gap-0.5 flex-1 min-w-0 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
               {leadingFileTabs.map(renderFileTab)}
+              {filesTabOpen && (
+                <ClosableTab
+                  active={rightTab === "files"}
+                  label="Files"
+                  icon={<FolderOpen size={12} style={{ flexShrink: 0 }} />}
+                  onSelect={() => selectRightTab("files")}
+                  onClose={() => closeHomeTab("files")}
+                />
+              )}
               {artifactsTabOpen && (
                 <ClosableTab
                   active={rightTab === "artifacts"}
@@ -1389,15 +1510,6 @@ export default function App() {
                   icon={<FlaskConical size={12} style={{ flexShrink: 0 }} />}
                   onSelect={() => selectRightTab("experiments")}
                   onClose={() => closeHomeTab("experiments")}
-                />
-              )}
-              {filesTabOpen && (
-                <ClosableTab
-                  active={rightTab === "files"}
-                  label="Files"
-                  icon={<FolderOpen size={12} style={{ flexShrink: 0 }} />}
-                  onSelect={() => selectRightTab("files")}
-                  onClose={() => closeHomeTab("files")}
                 />
               )}
               {expTabs.map((t) => {
@@ -1469,6 +1581,7 @@ export default function App() {
                 title="Close panel"
                 aria-label="Close panel"
                 onClick={() => {
+                  pendingExperimentsAutoOpenRef.current = false;
                   setPanelOpen(false);
                   setPanelMax(false);
                 }}
@@ -1486,7 +1599,7 @@ export default function App() {
                   artifacts={artifacts}
                   onChanged={refreshArtifacts}
                   onOpenFile={openArtifactFileTab}
-                  onOpenStorage={() => setMainView("storage")}
+                  onOpenStorage={() => selectMainView("storage")}
                 />
               )}
             </div>
