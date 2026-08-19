@@ -1682,26 +1682,22 @@ fn register_sub_threads_from(
     }
 }
 
-/// Insert/re-point one sub-agent thread, deriving liveness from the item's
-/// semantics: a re-fire of the same item (started→completed) preserves the
-/// thread's current liveness, a NEW driving item (spawn / sendInput / resume /
-/// a `started` activity) arms it — even for a thread that already retired,
-/// so a resumed agent's continuation is drained — and a NEW passive item
-/// (wait, close, an interaction/interruption marker) never invents liveness:
-/// e.g. a next-turn report marker for a long-finished agent must not stall the
-/// drain waiting on a `turn/completed` that will never come.
+/// Insert/re-point one sub-agent thread. Ownership (which spawn row the
+/// transcript streams into) always re-points to the newest item; liveness is
+/// a separate axis: a driving item (spawn / sendInput / resume / a `started`
+/// activity) ARMS it — even for a thread that already retired, so a resumed
+/// agent's continuation is drained — while a passive item (wait, close, an
+/// interaction/interruption marker) neither invents liveness for an unknown
+/// thread (a next-turn report marker must not stall the drain) nor retires a
+/// thread that is still live (a `wait` over running agents must not clear
+/// them). Only the thread's own `turn/completed` retires it.
 fn register_sub_thread(
     sub_threads: &mut HashMap<String, SubThread>,
     tid: String,
     spawn_part_id: String,
     item: &Value,
 ) {
-    let existing = sub_threads.get(&tid);
-    let live = if existing.is_some_and(|s| s.spawn_part_id == spawn_part_id) {
-        existing.is_some_and(|s| s.live)
-    } else {
-        item_arms_thread(item)
-    };
+    let live = item_arms_thread(item) || sub_threads.get(&tid).is_some_and(|s| s.live);
     sub_threads.insert(
         tid,
         SubThread {
@@ -1791,12 +1787,7 @@ fn route_sub_event(
         }
         // Re-point, same as `register_sub_threads_from` for top-level threads,
         // with the same liveness semantics (see `register_sub_thread`).
-        let existing = sub_threads.get(&gtid);
-        let live = if existing.is_some_and(|s| s.spawn_part_id == spawn_id) {
-            existing.is_some_and(|s| s.live)
-        } else {
-            arms
-        };
+        let live = arms || sub_threads.get(&gtid).is_some_and(|s| s.live);
         sub_threads.insert(
             gtid,
             SubThread {

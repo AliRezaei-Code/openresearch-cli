@@ -1075,7 +1075,7 @@ struct TurnState {
     /// continuation. The tool_use_id side keeps the spawn part `running` (the
     /// async launch acknowledgement would otherwise complete it at launch and
     /// kill every running indicator while the agent works).
-    pending_tasks: HashMap<String, String>,
+    pending_tasks: HashMap<String, Option<String>>,
     /// Whether any background task ran this turn (stays true after completion)
     /// — gates the post-result grace wait for the auto-resume segment, which
     /// can trail the result even when every task already finished.
@@ -1265,16 +1265,13 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
             Some("task_started") => {
                 if event.get("task_type").and_then(Value::as_str) == Some("local_agent") {
                     if let Some(id) = event.get("task_id").and_then(Value::as_str) {
-                        // A missing tool_use_id stores "" — it never equals a
-                        // real part id, so the spawn-part association simply
-                        // doesn't apply; the task still gates the turn's end.
+                        // No tool_use_id → no spawn-part association; the
+                        // task still gates the turn's end.
                         let tool_id = event
                             .get("tool_use_id")
                             .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        state
-                            .pending_tasks
-                            .insert(id.to_string(), tool_id.to_string());
+                            .map(str::to_string);
+                        state.pending_tasks.insert(id.to_string(), tool_id);
                         state.saw_background_task = true;
                     }
                 }
@@ -1283,7 +1280,7 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
             // — the async-launch tool_result deliberately left it `running`.
             Some("task_notification") => {
                 if let Some(id) = event.get("task_id").and_then(Value::as_str) {
-                    let tool_id = state.pending_tasks.remove(id);
+                    let tool_id = state.pending_tasks.remove(id).flatten();
                     if let Some(part) = tool_id
                         .as_deref()
                         .and_then(|tid| find_part_mut(&mut ctx.assistant.parts, tid))
@@ -1491,7 +1488,10 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                 // pending here: their task_notification precedes this result.)
                 let launch_ack = parent.is_none()
                     && !is_error
-                    && state.pending_tasks.values().any(|tid| tid == &part_id);
+                    && state
+                        .pending_tasks
+                        .values()
+                        .any(|tid| tid.as_deref() == Some(part_id.as_str()));
                 if launch_ack {
                     continue;
                 }

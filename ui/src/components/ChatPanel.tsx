@@ -2202,8 +2202,10 @@ function useDwelledActivity(activity: ToolActivity | null, provisional: boolean)
   const [shown, setShown] = useState<ToolActivity | null>(activity);
   const shownAt = useRef(Date.now());
   const latest = useRef(activity);
-  latest.current = activity;
   useEffect(() => {
+    // Updated in the effect (not during render) so discarded concurrent
+    // renders can't leak into the pending swap's timer.
+    latest.current = activity;
     if (activity?.label === shown?.label) return;
     // A provisional activity (its call not yet classifiable) never replaces a
     // real label — hold the previous one until the call resolves. It still
@@ -2742,10 +2744,10 @@ function PromptCard({
 }
 
 /** Whether a part paints anything in the transcript. The single source of
- * truth for "invisible": empty text/reasoning (encrypted-thinking models
- * stored these before the harness-side skip existed) and resolved permission
- * cards (which leave no trace). Shared by `messageHasVisibleContent` and
- * `renderParts` so the two can't drift. */
+ * truth for "invisible": ALL reasoning (deliberately never rendered — see the
+ * comment inside), empty text, and resolved permission cards (which leave no
+ * trace). Shared by `messageHasVisibleContent`, the stream-tail computation,
+ * and `renderParts` so they can't drift. */
 function partIsVisible(part: ChatPart, activePermissionId?: string | null): boolean {
   if (part.type === "prompt") {
     if (!part.prompt) return false;
@@ -3138,10 +3140,15 @@ function renderParts(
     // consecutive tools into single-row groups.
     if (!partIsVisible(part, activePermissionId)) continue;
     // A sub-agent spawn part streams its own transcript in `children` — render
-    // it as a standalone nested block, not folded into a tool run. The signal is
-    // harness-agnostic: Codex tags the row `subagent`, while Claude's `Task` /
-    // OpenCode's `task` rows are spawns whenever they carry children.
-    if (part.type === "tool" && (part.tool === "subagent" || (part.children?.length ?? 0) > 0)) {
+    // it as a standalone nested block, not folded into a tool run. Codex tags
+    // its rows `subagent`; Claude's `Task`/`Agent` and OpenCode's `task` are
+    // spawn tools by name (a prose-only agent may have zero children yet still
+    // carry a final report); anything else with children streamed into it is a
+    // spawn too.
+    if (
+      part.type === "tool" &&
+      (isSpawnTool(part.tool) || (part.children?.length ?? 0) > 0)
+    ) {
       flushTools();
       rendered.push(
         <SubagentBlock
@@ -3191,6 +3198,13 @@ function renderParts(
 /** A sub-agent spawn row's display title — what its tab is named. */
 export function spawnRowTitle(part: ChatPart): string {
   return toolActivity(part).label;
+}
+
+/** Whether a tool name is a sub-agent spawn: codex tags rows `subagent`,
+ * Claude spawns via `Task`/`Agent`, OpenCode via `task`. */
+function isSpawnTool(tool: string | undefined): boolean {
+  const name = (tool ?? "").toLowerCase();
+  return name === "subagent" || name === "task" || name === "agent";
 }
 
 /** The spawn tool result that stands in for a prose-less sub-agent transcript
@@ -3320,26 +3334,21 @@ function SubagentBlock({
   // children — offering a transcript there opens an empty pane.
   if (inert) {
     return (
-      <div
-        className="subagent-row flex items-center gap-2 w-full my-3.5 mx-0 py-[3px] px-1 text-text text-lg text-left rounded-sm [&_.tool-line]:text-lg"
-        title={errored && errorMessage ? errorMessage : undefined}
-      >
+      <div className="subagent-row flex items-center gap-2 w-full my-3.5 mx-0 py-[3px] px-1 text-text text-lg text-left rounded-sm [&_.tool-line]:text-lg">
         {line}
       </div>
     );
   }
   return (
-    <>
-      <button
-        className="subagent-row flex items-center gap-2 w-full my-3.5 mx-0 py-[3px] px-1 cursor-pointer text-text text-lg text-left rounded-sm [&:hover:not(:disabled)]:bg-surface [&:disabled]:cursor-default [&_.tool-line]:text-lg"
-        title={errored && errorMessage ? errorMessage : "Open sub-agent transcript"}
-        onClick={() => onOpenSubagent?.(part.id, activity.label)}
-        disabled={!onOpenSubagent}
-      >
-        {line}
-        <ChevronRight size={12} className="subagent-row-chevron shrink-0 text-muted" />
-      </button>
-    </>
+    <button
+      className="subagent-row flex items-center gap-2 w-full my-3.5 mx-0 py-[3px] px-1 cursor-pointer text-text text-lg text-left rounded-sm [&:hover:not(:disabled)]:bg-surface [&:disabled]:cursor-default [&_.tool-line]:text-lg"
+      title={errored && errorMessage ? errorMessage : "Open sub-agent transcript"}
+      onClick={() => onOpenSubagent?.(part.id, activity.label)}
+      disabled={!onOpenSubagent}
+    >
+      {line}
+      <ChevronRight size={12} className="subagent-row-chevron shrink-0 text-muted" />
+    </button>
   );
 }
 

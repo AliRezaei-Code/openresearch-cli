@@ -1014,11 +1014,16 @@ export default function App() {
         return next;
       });
     };
+    // Generation token: a reconnect starts fresh seeds, and a stale in-flight
+    // response from an earlier generation must not land after them.
+    let seedGen = 0;
     const seed = () => {
+      const gen = ++seedGen;
       for (const sid of new Set(subagentTabs.map((t) => t.sessionId))) {
         getChatMessages(sid)
           .then(({ messages }) => {
-            if (live) apply(messages, subagentTabs.filter((t) => t.sessionId === sid), true);
+            if (live && gen === seedGen)
+              apply(messages, subagentTabs.filter((t) => t.sessionId === sid), true);
           })
           .catch(() => {});
       }
