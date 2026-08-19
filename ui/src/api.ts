@@ -1098,6 +1098,9 @@ export interface Harness {
   plan?: string;
   agentReady: boolean;
   agentNote?: string;
+  /** A running turn takes further input, so the composer steers instead of
+   * queueing. Narrowed per installation (codex's legacy exec path can't). */
+  supportsSteering: boolean;
   models: HarnessModel[];
   options: HarnessOptions;
 }
@@ -1240,7 +1243,7 @@ export interface ChatPrompt {
 
 export interface ChatPart {
   id: string;
-  type: string; // text | reasoning | tool | prompt | image
+  type: string; // text | reasoning | tool | prompt | image | steer
   text?: string;
   /** Original file name for an `image` (attachment) part, when known. */
   name?: string;
@@ -1384,6 +1387,7 @@ export const sendChatMessage = (
   opts: TurnOptions = {},
   images?: ChatImageAttachment[],
   annotations?: ChatTextAnnotation[],
+  mode?: "steer",
 ) =>
   post<{ ok: boolean }>(`/api/chat/sessions/${sessionId}/message`, {
     text,
@@ -1393,6 +1397,7 @@ export const sendChatMessage = (
     reasoningLevel: opts.reasoningLevel,
     images,
     annotations,
+    mode,
   });
 
 /** Pass `text` to re-ask an edited version of a user message; omit it to retry a

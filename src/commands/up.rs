@@ -4671,6 +4671,15 @@ struct SendChatReq {
     images: Vec<local::chat::ImageAttachment>,
     #[serde(default)]
     annotations: Vec<local::chat::TextAnnotation>,
+    /// `"steer"` hands the message to a turn already running; omitted (an
+    /// older client) keeps the parked-queue path.
+    mode: Option<SendMode>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SendMode {
+    Steer,
 }
 
 async fn send_chat_message(
@@ -4697,11 +4706,19 @@ async fn send_chat_message(
         reasoning_level: req.reasoning_level,
     };
     // The turn runs in the background; progress streams over /api/events.
-    state
-        .chat
-        .send_message(&id, text, overrides, req.images, annotations)
-        .await
-        .map_err(bad_request)?;
+    let sent = if matches!(req.mode, Some(SendMode::Steer)) {
+        state
+            .chat
+            .steer_message(&id, text, overrides, req.images, annotations)
+            .await
+    } else {
+        state
+            .chat
+            .send_message(&id, text, overrides, req.images, annotations)
+            .await
+    };
+    sent.map_err(bad_request)?;
+    // A steered message is still a message the user sent.
     crate::telemetry::capture_chat_message_sent();
     Ok(Json(json!({ "ok": true })))
 }

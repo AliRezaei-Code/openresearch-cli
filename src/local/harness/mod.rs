@@ -32,7 +32,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::error::{anyhow, Result};
-use crate::local::chat::{PromptAnswer, ResumeCtx, TurnCtx, WirePrompt};
+use crate::local::chat::{
+    PromptAnswer, ResumeCtx, SteerMessage, SteerReceiver, TurnCtx, WirePrompt,
+};
 
 pub(crate) use claude::{question_prompt, should_synthesize_plan, synthesize_resume};
 pub use detect::{HarnessAuthState, HarnessInfo, ModelInfo};
@@ -113,6 +115,13 @@ pub trait Harness: Send + Sync {
     /// parts onto `ctx`. Default is "not a chat harness".
     async fn run_turn(&self, _ctx: &mut TurnCtx) -> Result<()> {
         Err(anyhow!("{} cannot run chat turns", self.id()))
+    }
+
+    /// Whether this harness can take user input into a running turn. Gates
+    /// whether a turn registers a steering sink at all; `detect` may narrow it
+    /// per installation (codex's legacy exec path can't steer).
+    fn supports_steering(&self) -> bool {
+        false
     }
 
     /// The permission-mode / reasoning-level vocabulary this harness supports,
@@ -237,6 +246,31 @@ pub fn effective_permission_id(harness_id: &str, stored: Option<&str>) -> Option
     options.default_permission_mode.map(str::to_string)
 }
 
+/// One wait in a harness's turn loop: the harness's own next event, or a
+/// message the user steered into the turn meanwhile.
+pub(crate) enum Waited<T> {
+    Event(T),
+    Steer(SteerMessage),
+}
+
+/// The next message the user steers into a running turn. A turn without a
+/// steering sink parks here forever, so the arm is inert on harnesses that
+/// can't steer. `recv` is cancel-safe: a steer that arrives while the event
+/// arm wins the select survives to the next iteration.
+pub(crate) async fn next_steer(steering: &mut Option<SteerReceiver>) -> SteerMessage {
+    match steering {
+        Some(rx) => match rx.recv().await {
+            Some(message) => message,
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
+    }
+}
+
+pub fn supports_steering(harness_id: &str) -> bool {
+    chat_harness(harness_id).is_some_and(|harness| harness.supports_steering())
+}
+
 pub fn supports_command_plan(harness_id: &str) -> bool {
     chat_harness(harness_id).and_then(|harness| harness.options().plan_activation)
         == Some(options::PlanActivation::Command)
@@ -286,6 +320,10 @@ async fn detect_one(harness: &dyn Harness) -> Option<HarnessInfo> {
             };
         }
         info.options = harness.options();
+        // The trait is the ceiling: a `detect` narrows it for an installation
+        // whose run path can't steer. A steering harness whose `detect` forgets
+        // to set it reports false and silently queues every send.
+        info.supports_steering &= harness.supports_steering();
         info
     })
 }

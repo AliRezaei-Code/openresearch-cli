@@ -192,7 +192,8 @@ impl CodexClient {
             .await
     }
 
-    async fn try_request_with_timeout(
+    /// [`Self::try_request`] with a caller-chosen deadline.
+    pub async fn try_request_with_timeout(
         &self,
         method: &str,
         params: Value,

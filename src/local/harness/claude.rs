@@ -36,7 +36,7 @@ use super::detect::{
 use super::options::{
     HarnessOptions, OptionChoice, PermissionMode, PlanActivation, REASONING_DEFAULT_ID,
 };
-use super::{Harness, ResumeAction};
+use super::{Harness, ResumeAction, Waited};
 use crate::error::{anyhow, Result};
 use crate::local::chat::{
     find_part_mut, prepare_env, ContextUsage, PromptAnswer, ResumeCtx, TurnCtx, WirePart,
@@ -435,6 +435,12 @@ impl Harness for ClaudeCode {
         true
     }
 
+    /// The resident child holds stdin open, so a second stream-json user
+    /// message reaches the turn already running.
+    fn supports_steering(&self) -> bool {
+        true
+    }
+
     async fn detect(&self) -> Option<HarnessInfo> {
         let mut info = HarnessInfo::new(self.id(), self.name());
         if let Some(bin) = find_claude() {
@@ -478,6 +484,8 @@ impl Harness for ClaudeCode {
 
         info.agent_ready = info.installed && info.authenticated;
         if info.agent_ready {
+            // The resident child is only spawnable once the CLI is ready.
+            info.supports_steering = true;
             // Ask the installed CLI for its own catalog: `list_models` for the
             // models and their per-model effort tiers, and the parser probe for
             // `ultracode` (a session mode the catalog never advertises — see
@@ -1681,45 +1689,75 @@ async fn run_attempt(ctx: &mut TurnCtx, spec: SpawnSpec) -> Result<(TurnState, u
     };
     let mut saw_event = false;
     let mut saw_user_echo = false;
+    // Absolute, so steering can't push it back: a wedged child that the user
+    // keeps typing at must still trip the detector.
+    let mut deadline = tokio::time::Instant::now() + FIRST_EVENT_TIMEOUT;
     // An event received during the post-result grace wait below, replayed at
     // the top of the next iteration.
     let mut queued: Option<TurnEvent> = None;
     loop {
-        let deadline = if saw_event {
-            super::TURN_WATCHDOG
-        } else {
-            FIRST_EVENT_TIMEOUT
-        };
-        let event = match queued.take() {
-            Some(event) => Some(event),
-            None => match tokio::time::timeout(deadline, rx.recv()).await {
-                Ok(event) => event,
-                Err(_) if ctx.host.has_pending_permission(&ctx.session_id) => continue,
-                Err(_) => {
-                    commit_attempt_session(ctx, &state);
-                    ctx.host.claude.kill_session(&ctx.session_id).await;
-                    let _ = ctx.flush();
-                    let (what, hint) = if saw_event {
-                        (
-                            format!(
-                                "went quiet for {} minutes",
-                                super::TURN_WATCHDOG.as_secs() / 60
-                            ),
-                            "",
-                        )
-                    } else {
-                        (
-                            format!("produced no output for {}s", FIRST_EVENT_TIMEOUT.as_secs()),
-                            " (check Claude Code authentication in Harnesses)",
-                        )
-                    };
-                    return Err(anyhow!(
-                        "claude {what} — killed the wedged child{hint}. Sending another message \
-                         resumes the session; see {}",
-                        crate::store::data_dir().join("agent-claude.log").display()
-                    ));
+        // A continuation stashed by the grace wait replays without waiting.
+        // Otherwise `steering` is borrowed out of `ctx` so the borrow ends with
+        // the select — the steer arm's handler needs `&mut ctx`.
+        let waited = match queued.take() {
+            Some(event) => Waited::Event(Ok(Some(event))),
+            None => {
+                let steering = &mut ctx.steering;
+                tokio::select! {
+                    event = tokio::time::timeout_at(deadline, rx.recv()) => Waited::Event(event),
+                    steer = super::next_steer(steering) => Waited::Steer(steer),
                 }
-            },
+            }
+        };
+        let event = match waited {
+            Waited::Steer(steer) => {
+                // A failed write means the child is gone and this turn is about
+                // to error out — park the text so it survives into the next one.
+                match client.send_user_message(&steer.text).await {
+                    Ok(()) => ctx.record_steer(&steer.display),
+                    Err(_) => ctx.host.park_steer(&ctx.session_id, steer),
+                }
+                continue;
+            }
+            Waited::Event(Ok(event)) => {
+                deadline = tokio::time::Instant::now() + super::TURN_WATCHDOG;
+                event
+            }
+            // Card think-time is unbounded by design: re-arm, or an elapsed
+            // absolute deadline would spin this arm instead of waiting.
+            Waited::Event(Err(_)) if ctx.host.has_pending_permission(&ctx.session_id) => {
+                deadline = tokio::time::Instant::now()
+                    + if saw_event {
+                        super::TURN_WATCHDOG
+                    } else {
+                        FIRST_EVENT_TIMEOUT
+                    };
+                continue;
+            }
+            Waited::Event(Err(_)) => {
+                commit_attempt_session(ctx, &state);
+                ctx.host.claude.kill_session(&ctx.session_id).await;
+                let _ = ctx.flush();
+                let (what, hint) = if saw_event {
+                    (
+                        format!(
+                            "went quiet for {} minutes",
+                            super::TURN_WATCHDOG.as_secs() / 60
+                        ),
+                        "",
+                    )
+                } else {
+                    (
+                        format!("produced no output for {}s", FIRST_EVENT_TIMEOUT.as_secs()),
+                        " (check Claude Code authentication in Harnesses)",
+                    )
+                };
+                return Err(anyhow!(
+                    "claude {what} — killed the wedged child{hint}. Sending another message \
+                     resumes the session; see {}",
+                    crate::store::data_dir().join("agent-claude.log").display()
+                ));
+            }
         };
         let Some(event) = event else {
             break;

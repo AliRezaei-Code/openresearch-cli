@@ -44,12 +44,14 @@ use super::options::{
     resolve_reasoning, HarnessOptions, OptionChoice, PermissionMode, PlanActivation,
     REASONING_DEFAULT_ID,
 };
-use super::{should_synthesize_plan, synthesize_resume, Harness, ResumeAction, TURN_WATCHDOG};
+use super::{
+    should_synthesize_plan, synthesize_resume, Harness, ResumeAction, Waited, TURN_WATCHDOG,
+};
 use crate::error::{anyhow, Result};
 use crate::local::chat::{
     find_part_mut, prepare_env, set_chat_session_env, upsert_preserving_children, ContextUsage,
-    PromptAnswer, ResumeCtx, TurnCtx, WireMessage, WirePart, WirePrompt, WireQuestionOption,
-    WireToolState,
+    PromptAnswer, ResumeCtx, SteerMessage, TurnCtx, WireMessage, WirePart, WirePrompt,
+    WireQuestionOption, WireToolState,
 };
 use crate::local::codex::{CodexClient, ServerReqKind, TurnEvent};
 use crate::local::opencode::ensure_playbook;
@@ -427,6 +429,12 @@ impl Harness for Codex {
         true
     }
 
+    /// The app-server takes `turn/steer` against the active turn; `detect`
+    /// withholds it from installations that fall back to the exec path.
+    fn supports_steering(&self) -> bool {
+        true
+    }
+
     async fn detect(&self) -> Option<HarnessInfo> {
         let mut info = HarnessInfo::new(self.id(), self.name());
         if let Some(bin) = find_codex() {
@@ -511,6 +519,9 @@ impl Harness for Codex {
             // Old CLIs still work via the legacy exec path, but miss the
             // app-server wins (permission prompts on sandbox escalations;
             // thread resume).
+            // `turn/steer` is an app-server method, so this must follow the
+            // dispatch predicate rather than the version alone.
+            info.supports_steering = runs_app_server().await;
             let too_old = info
                 .version
                 .as_deref()
@@ -536,11 +547,7 @@ impl Harness for Codex {
     }
 
     async fn run_turn(&self, ctx: &mut TurnCtx) -> Result<()> {
-        // app-server for codex ≥ 0.144 (the validated protocol version);
-        // legacy exec for older CLIs, for one release. ORX_CODEX_EXEC=1 is the
-        // escape hatch if app-server misbehaves ("0"/empty don't count).
-        let force_exec = std::env::var("ORX_CODEX_EXEC").is_ok_and(|v| !v.is_empty() && v != "0");
-        if force_exec || !app_server_supported().await {
+        if !runs_app_server().await {
             return run_turn_exec(ctx).await;
         }
         run_turn_app_server(ctx).await
@@ -724,6 +731,15 @@ impl Harness for Codex {
 /// First protocol version the harness was validated against (schema dump +
 /// live spike). Older CLIs take the exec fallback below.
 const MIN_APP_SERVER_VERSION: (u64, u64, u64) = (0, 144, 0);
+
+/// Whether a turn will run over the app-server: a supported codex, unless
+/// ORX_CODEX_EXEC forces the legacy exec path ("0"/empty don't count).
+/// Capability reporting reads the same answer, so the composer can't offer
+/// app-server-only features the exec path lacks.
+async fn runs_app_server() -> bool {
+    let force_exec = std::env::var("ORX_CODEX_EXEC").is_ok_and(|v| !v.is_empty() && v != "0");
+    !force_exec && app_server_supported().await
+}
 
 /// Whether the installed codex speaks the validated app-server protocol.
 /// Probed once per process (a codex upgrade mid-run takes an `orx up` restart
@@ -1520,6 +1536,16 @@ async fn finish_completed_turn(
 /// a finished agent's report on the next turn either way.
 const DRAIN_QUIET_SETTLE: Duration = Duration::from_secs(180);
 
+/// How long a turn may stay quiet before the loop acts on it. Held absolute by
+/// the caller so steering can't push either bound back.
+fn turn_phase_quiet(parent_done: bool) -> Duration {
+    if parent_done {
+        DRAIN_QUIET_SETTLE
+    } else {
+        TURN_WATCHDOG
+    }
+}
+
 /// A sub-agent thread discovered this parent turn, keyed by its threadId.
 struct SubThread {
     /// The `subagent` spawn part (anywhere in the tree) that owns this thread's
@@ -2076,6 +2102,8 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
     // requests natively first, and the next turn's entry sweep in this function
     // resolves whatever survived.)
     let mut open_requests: HashMap<String, (Value, ServerReqKind)> = HashMap::new();
+    // Absolute, so steering can't push the watchdog back on a wedged turn.
+    let mut deadline = tokio::time::Instant::now() + TURN_WATCHDOG;
 
     // Sub-agent threads spawned this turn (Codex collaboration). Their events
     // stream on this same connection with a foreign turnId; we route them into
@@ -2091,55 +2119,69 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
         // Suspended while a card is pending — user think-time is unbounded by
         // design (question think-time too); codex's own ~5-minute approval
         // deadline still applies server-side.
-        //
         // The post-parent drain gets a much shorter deadline: the parent turn
         // is already over, so the only legitimate wait is agents actively
         // streaming — a long-quiet drain means a terminal event was missed (or
         // codex never sent one). Settling then is graceful, not lossy: codex
         // holds a finished agent's report for the next turn regardless.
-        let deadline = if parent_done {
-            DRAIN_QUIET_SETTLE
-        } else {
-            TURN_WATCHDOG
-        };
-        let event = if open_requests.is_empty() {
-            match tokio::time::timeout(deadline, rx.recv()).await {
-                Ok(event) => event,
-                Err(_) if parent_done => {
-                    let stuck: Vec<&str> = sub_threads
-                        .iter()
-                        .filter(|(_, s)| s.live)
-                        .map(|(tid, _)| tid.as_str())
-                        .collect();
-                    eprintln!(
-                        "orx up: codex sub-agent drain settled after {}s of silence \
-                         (threads without a terminal event: {stuck:?})",
-                        DRAIN_QUIET_SETTLE.as_secs()
-                    );
-                    finish_completed_turn(
-                        ctx,
-                        &client,
-                        &thread_id,
-                        turn_id.as_deref(),
-                        plan_turn,
-                        &mut open_requests,
-                    )
-                    .await;
-                    return Ok(());
+        //
+        // `steering` is borrowed out of `ctx` so the borrow ends with the
+        // select — the steer arm's handler needs `&mut ctx`.
+        let waited = {
+            let steering = &mut ctx.steering;
+            let event = async {
+                if open_requests.is_empty() {
+                    tokio::time::timeout_at(deadline, rx.recv()).await
+                } else {
+                    Ok(rx.recv().await)
                 }
-                Err(_) => {
-                    client.interrupt_active_turn().await;
-                    ctx.push_error(format!(
-                        "codex produced no output for {} minutes — turn interrupted",
-                        TURN_WATCHDOG.as_secs() / 60
-                    ));
-                    settle_running_subagents(&mut ctx.assistant.parts);
-                    let _ = ctx.flush();
-                    return Ok(());
-                }
+            };
+            tokio::select! {
+                event = event => Waited::Event(event),
+                steer = super::next_steer(steering) => Waited::Steer(steer),
             }
-        } else {
-            rx.recv().await
+        };
+        let event = match waited {
+            Waited::Steer(steer) => {
+                steer_turn(ctx, &client, &thread_id, turn_id.as_deref(), steer).await;
+                continue;
+            }
+            Waited::Event(Ok(event)) => {
+                deadline = tokio::time::Instant::now() + turn_phase_quiet(parent_done);
+                event
+            }
+            Waited::Event(Err(_)) if parent_done => {
+                let stuck: Vec<&str> = sub_threads
+                    .iter()
+                    .filter(|(_, s)| s.live)
+                    .map(|(tid, _)| tid.as_str())
+                    .collect();
+                eprintln!(
+                    "orx up: codex sub-agent drain settled after {}s of silence \
+                     (threads without a terminal event: {stuck:?})",
+                    DRAIN_QUIET_SETTLE.as_secs()
+                );
+                finish_completed_turn(
+                    ctx,
+                    &client,
+                    &thread_id,
+                    turn_id.as_deref(),
+                    plan_turn,
+                    &mut open_requests,
+                )
+                .await;
+                return Ok(());
+            }
+            Waited::Event(Err(_)) => {
+                client.interrupt_active_turn().await;
+                ctx.push_error(format!(
+                    "codex produced no output for {} minutes — turn interrupted",
+                    TURN_WATCHDOG.as_secs() / 60
+                ));
+                settle_running_subagents(&mut ctx.assistant.parts);
+                let _ = ctx.flush();
+                return Ok(());
+            }
         };
         let Some(event) = event else {
             settle_running_subagents(&mut ctx.assistant.parts);
@@ -2199,6 +2241,7 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                         // thread that never does. An interrupt ends everything.
                         if !interrupted && sub_threads.values().any(|s| s.live) {
                             parent_done = true;
+                            deadline = tokio::time::Instant::now() + turn_phase_quiet(parent_done);
                             let _ = ctx.flush();
                             continue;
                         }
@@ -2608,6 +2651,54 @@ fn has_error_part(ctx: &TurnCtx, message: &str) -> bool {
             .as_ref()
             .is_some_and(|s| s.status == "error" && s.error.as_deref() == Some(message))
     })
+}
+
+/// Bounded well under the shared request timeout: a steer is awaited *in* the
+/// event loop, so a slow app-server would otherwise freeze the transcript and
+/// hide any card it raises.
+const STEER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Hand one steer to the turn already running.
+///
+/// codex rejects `turn/steer` on review and compaction turns, and older
+/// app-servers lack the method — those answer definitively, so the message
+/// parks for the next turn. A transport failure or timeout answers nothing:
+/// codex may already have applied the text, so re-running it as a fresh turn
+/// could execute the instruction twice. Say so instead.
+async fn steer_turn(
+    ctx: &mut TurnCtx,
+    client: &CodexClient,
+    thread_id: &str,
+    turn_id: Option<&str>,
+    steer: SteerMessage,
+) {
+    let Some(turn_id) = turn_id else {
+        ctx.host.park_steer(&ctx.session_id, steer);
+        return;
+    };
+    let answered = client
+        .try_request_with_timeout(
+            "turn/steer",
+            serde_json::json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": steer.text }],
+                "expectedTurnId": turn_id,
+            }),
+            STEER_TIMEOUT,
+        )
+        .await;
+    match answered {
+        Ok(Ok(_)) => ctx.record_steer(&steer.display),
+        Ok(Err(_)) => ctx.host.park_steer(&ctx.session_id, steer),
+        Err(e) => {
+            // Record it anyway: the composer is already cleared, so this is
+            // the only copy of what the user typed.
+            ctx.record_steer(&steer.display);
+            ctx.push_error(format!(
+                "codex did not confirm the steering message ({e}) — send it again if the turn ignores it"
+            ));
+        }
+    }
 }
 
 /// `thread/start` and record the new thread id as the session's native id.

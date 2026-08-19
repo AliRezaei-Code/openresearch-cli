@@ -3116,7 +3116,11 @@ function renderParts(
     onOpenSubagent,
     predictTextTail = false,
   } = opts;
-  const visibleTail = parts.filter((part) => partIsVisible(part, activePermissionId)).at(-1);
+  // A steer never becomes the tail — the streaming caret belongs on the
+  // assistant text it interrupted.
+  const visibleTail = parts
+    .filter((part) => part.type !== "steer" && partIsVisible(part, activePermissionId))
+    .at(-1);
   const rendered: React.ReactNode[] = [];
   let toolRun: ChatPart[] = [];
   const flushTools = () => {
@@ -3182,6 +3186,19 @@ function renderParts(
           onOpenRun={onOpenRun}
           predict={predictTextTail && part.id === visibleTail?.id}
         />,
+      );
+    else if (part.type === "steer")
+      // A message the user sent into this turn while it ran — the same bubble a
+      // user message gets, sitting where the agent received it.
+      rendered.push(
+        <div
+          key={part.id}
+          role="note"
+          aria-label="You, mid-task"
+          className="msg-steer my-2 ml-auto w-fit max-w-[88%] bg-surface rounded-[16px] py-2.5 px-[15px] text-base whitespace-pre-wrap wrap-anywhere"
+        >
+          {part.text}
+        </div>,
       );
     else if (part.type === "prompt" && part.prompt)
       rendered.push(
@@ -3481,7 +3498,8 @@ function useTranscriptAnnouncement(messages: ChatMessage[]): TranscriptAnnouncem
 function partsTailToolId(parts: ChatPart[]): string | null {
   for (let index = parts.length - 1; index >= 0; index--) {
     const part = parts[index];
-    if (!partIsVisible(part)) continue;
+    // A steer lands at the tail without ending the tool that is still running.
+    if (part.type === "steer" || !partIsVisible(part)) continue;
     if (part.type !== "tool" || part.state?.status === "error") return null;
     return part.id;
   }
@@ -4660,6 +4678,20 @@ export function ChatPanel({
     if (!stillBusy || replaced) setRevising(null);
   }, [revising, pendingPlan, state.busySessions, activeId]);
 
+  const pendingPermission = useMemo(() => firstPendingPermission(messages), [messages]);
+  // Enter hands the message to the running turn. Attachments still park (only
+  // a full turn builds their on-disk preamble), and a pending card owns typed
+  // text — there the card is the affordance, not a steer.
+  const steering =
+    busy &&
+    !!activeHarness?.supportsSteering &&
+    !!activeHarness?.agentReady &&
+    !pendingPlan &&
+    !pendingQuestion &&
+    !pendingPermission &&
+    attachments.length === 0 &&
+    annotations.length === 0;
+
   // Plan opens are stamped with the session like file opens are. Memoized
   // (along with openFileInSession and respond below) so the memoized Message
   // rows don't all re-render on every streaming tick.
@@ -4738,7 +4770,8 @@ export function ChatPanel({
     return () => ro.disconnect();
   }, [threadMounted]);
 
-  async function send() {
+  /** `queue` (the ⌘/Ctrl+Enter chord) parks the message even on a harness that steers. */
+  async function send({ queue = false }: { queue?: boolean } = {}) {
     const args = draft.trim();
     // Reassemble the picked skill chip into the plain `/name args` wire form —
     // the backend's slash expansion and the transcript both see only text.
@@ -4833,10 +4866,11 @@ export function ChatPanel({
       return;
     }
     if (busy) {
-      // A turn is already running: park this message (Claude-desktop steering)
-      // so it runs when the turn ends, instead of dropping it. The server
-      // enqueues it and echoes chat.queued to render the chip — no optimistic
-      // transcript bubble, since it hasn't run yet.
+      // A turn is already running. Steering hands the message to it now, and
+      // the delivered text comes back inline on the assistant message. Parking
+      // (no steering support, or the queue chord) instead runs it when the turn
+      // ends: the server enqueues it and echoes chat.queued to render the chip
+      // — no optimistic transcript bubble, since it hasn't run yet.
       if (!activeId || !activeHarness?.agentReady) {
         clearFailedPlanCommand();
         return;
@@ -4847,11 +4881,21 @@ export function ChatPanel({
       setAttachments([]);
       setAnnotations([]);
       setAttachError(null);
+      // Always send the composer's settings, steer or not: a permission or
+      // plan change persists itself before this message, so the server's
+      // comparison against the *running* turn is the only thing that catches
+      // it — and a mismatch parks the message, which also persists the change.
       const turnOpts = effective
         ? {
             model: effective.model,
             permissionMode: effective.permissionMode,
-            planMode: independentPlanMode,
+            // The composer's plan state, not just an unpersisted toggle: a
+            // toggle that already persisted would otherwise reach the server
+            // as "no change" and steer into a turn still running without it.
+            planMode:
+              opts?.planActivation === "command"
+                ? (independentPlanMode ?? openSession?.planMode)
+                : independentPlanMode,
             reasoningLevel: effective.reasoningLevel,
           }
         : {};
@@ -4862,17 +4906,18 @@ export function ChatPanel({
         name: a.name,
       }));
       try {
-        const sendQueued = () =>
+        const sendBusy = () =>
           sendChatMessage(
             sid,
             text,
             turnOpts,
             images.length ? images : undefined,
             wireAnnotations,
+            steering && !queue && !planRequested ? "steer" : undefined,
           );
-        await queueSessionMutation(sendQueued);
+        await queueSessionMutation(sendBusy);
       } catch {
-        // Never reached the queue — restore the composer so a retry is one keypress.
+        // Never reached the turn — restore the composer so a retry is one keypress.
         clearFailedPlanCommand();
         restoreComposer();
       }
@@ -5166,9 +5211,9 @@ export function ChatPanel({
   );
 
   const visibleSessions = sessions.filter((s) => matchesFilter(sessionFilter, s.archived));
-  const newTaskShortcut = /Mac|iPhone|iPad/.test(navigator.platform)
-    ? "⌘ ⇧ Enter"
-    : "Ctrl + Shift + Enter";
+  const isApple = /Mac|iPhone|iPad/.test(navigator.platform);
+  const newTaskShortcut = isApple ? "⌘ ⇧ Enter" : "Ctrl + Shift + Enter";
+  const queueChord = isApple ? "⌘ Enter" : "Ctrl + Enter";
   const startNewTask = useCallback(() => {
     setSessionFilter("active");
     setActiveId(null);
@@ -5638,6 +5683,9 @@ export function ChatPanel({
                 // the paper-reproduction skills with a paper attached, both parts
                 // are optional — paper defaults to it, compute to the configured
                 // target — so the hint just states the defaults.
+                // While a steerable turn runs, Enter goes to that turn, so name
+                // the gesture and its queue chord — the send button is a Stop
+                // button for the whole busy stretch.
                 // Otherwise follow `composerSelection` so the name tracks the
                 // picker for a new session and the open session once one exists.
                 pendingQuestion
@@ -5647,6 +5695,8 @@ export function ChatPanel({
                       paperId
                       ? `[optional — defaults to ${paperId} on your default compute]`
                       : pickedSkill.argHint
+                    : steering && activeHarness
+                      ? `Steer ${HARNESS_LABELS[activeHarness.id]}… (${queueChord} to queue)`
                     : composerSelection
                       ? activeHarness?.agentReady
                         ? `Message ${HARNESS_LABELS[composerSelection.harness]}… ( / for commands)`
@@ -5735,7 +5785,7 @@ export function ChatPanel({
                 }
                 if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                   e.preventDefault();
-                  void send();
+                  void send({ queue: e.metaKey || e.ctrlKey });
                 }
               }}
             />
