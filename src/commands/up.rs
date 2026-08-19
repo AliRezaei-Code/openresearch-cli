@@ -4701,6 +4701,7 @@ async fn send_chat_message(
         .send_message(&id, text, overrides, req.images, annotations)
         .await
         .map_err(bad_request)?;
+    crate::telemetry::capture_chat_message_sent();
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -4720,10 +4721,10 @@ async fn fork_chat_turn(
     Json(req): Json<ForkChatReq>,
 ) -> ApiResult {
     reject_if_moving(&state)?;
-    let kind = match req.text {
-        Some(text) if !text.trim().is_empty() => local::chat::ForkKind::Edit(text),
+    let (kind, is_edited_resubmission) = match req.text {
+        Some(text) if !text.trim().is_empty() => (local::chat::ForkKind::Edit(text), true),
         Some(_) => return Err(bad_request("text is required")),
-        None => local::chat::ForkKind::Retry,
+        None => (local::chat::ForkKind::Retry, false),
     };
     // A fork re-samples under the session's current settings, so it takes no
     // overrides — the turn runs in the background and streams over /api/events.
@@ -4732,6 +4733,9 @@ async fn fork_chat_turn(
         .fork_turn(&id, &req.message_id, kind)
         .await
         .map_err(bad_request)?;
+    if is_edited_resubmission {
+        crate::telemetry::capture_chat_message_sent();
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
