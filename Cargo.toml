@@ -53,7 +53,9 @@ libc = "0.2"
 # while the dashboard server runs on background threads. macOS-only so the
 # static musl Linux builds are untouched.
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication", "NSWorkspace"] }
+# Default-browser lookup for the Dock-click handler (NSWorkspace takes NSURLs).
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSEnumerator", "NSURL", "NSString"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

@@ -141,6 +141,188 @@ async fn hydrate_shell_env() {
     }
 }
 
+/// Dock-icon click: raise the dashboard the user already has open instead of
+/// opening the URL again, which lands on a *new* tab once the SPA has navigated
+/// off `/`.
+#[cfg(target_os = "macos")]
+fn focus_or_open(url: &str) {
+    // The first attempt parks on the Automation permission prompt, which needs
+    // unbounded user time; without this, every impatient re-click stacks
+    // another blocked thread and, once they all unblock, another tab.
+    let Some(in_flight) = InFlight::claim() else {
+        return;
+    };
+    let url = url.to_string();
+    // Off the main thread for that same prompt — the AppKit run loop has to
+    // stay responsive while it is up.
+    std::thread::spawn(move || {
+        if !raise_dashboard(&url) {
+            crate::browser::open_browser(&url);
+        }
+        // Named so the closure captures it: dropping at the end of
+        // `focus_or_open` instead would end the claim before the attempt starts.
+        drop(in_flight);
+    });
+}
+
+#[cfg(target_os = "macos")]
+static ATTEMPT_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+struct InFlight;
+
+#[cfg(target_os = "macos")]
+impl InFlight {
+    fn claim() -> Option<Self> {
+        // Constructed only on the winning branch: `then_some` would build one
+        // for the loser too and its `Drop` would free the winner's claim.
+        if ATTEMPT_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            None
+        } else {
+            Some(Self)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for InFlight {
+    /// Released here rather than on the happy path so a panic cannot latch the
+    /// claim on and kill the Dock icon for the life of the process.
+    fn drop(&mut self) {
+        ATTEMPT_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// True when a dashboard the user already had open was brought forward. False
+/// means the caller must open the URL — a duplicate tab beats a Dock icon that
+/// visibly does nothing, since app mode's port is ephemeral and the user has no
+/// other way back to the dashboard.
+#[cfg(target_os = "macos")]
+fn raise_dashboard(url: &str) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const NEVER: u64 = u64::MAX;
+    // Long enough to cover looking at the browser and deciding the dashboard is
+    // not there, short enough that a click minutes later still prefers a raise
+    // over a duplicate tab. Guessing wrong either way costs one tab.
+    const ACTIVATION_IS_RECENT_MS: u64 = 5_000;
+    // Only a real activation is recorded, so a click that fell through cannot
+    // slide the window forward and suppress the next one.
+    static LAST_ACTIVATION_MS: AtomicU64 = AtomicU64::new(NEVER);
+
+    if focus_existing_tab(url) {
+        return true;
+    }
+    // Firefox exposes no tab API, so a tab there can only be inferred from its
+    // event stream, and nothing finer than its whole browser can be raised.
+    // Clicking again within seconds says that did not surface the dashboard —
+    // it was left on another tab — so the repeat click opens the URL instead.
+    if !crate::commands::up::has_live_dashboard_clients() {
+        return false;
+    }
+    let last = LAST_ACTIVATION_MS.load(Ordering::SeqCst);
+    if last != NEVER && monotonic_ms() - last < ACTIVATION_IS_RECENT_MS {
+        return false;
+    }
+    if !activate_default_browser() {
+        return false;
+    }
+    LAST_ACTIVATION_MS.store(monotonic_ms(), Ordering::SeqCst);
+    true
+}
+
+/// Monotonic, so an NTP correction cannot suppress the fallback or end its
+/// window early.
+#[cfg(target_os = "macos")]
+fn monotonic_ms() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Activates the browser tab whose URL starts with `url`. False when no tab
+/// matches, no scriptable browser is running, or Automation permission was
+/// denied.
+#[cfg(target_os = "macos")]
+fn focus_existing_tab(url: &str) -> bool {
+    let out = std::process::Command::new("osascript")
+        .args(["-l", "JavaScript", "-e", FOCUS_TAB_SCRIPT, url])
+        .output();
+    let Ok(out) = out else {
+        return false;
+    };
+    match String::from_utf8_lossy(&out.stdout).trim() {
+        "ok" => true,
+        // Silent otherwise: "no tab open" is the ordinary case, but a denied
+        // Automation prompt is invisible without a line in the log.
+        "blocked" => {
+            eprintln!(
+                "openresearch app: not allowed to search browser tabs — grant OpenResearch \
+                 Automation access in System Settings › Privacy & Security"
+            );
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Brings the default browser forward without opening anything, so the tab the
+/// user left open stays put. False when it is not running, where `open -a`
+/// would raise an empty browser instead of the dashboard.
+#[cfg(target_os = "macos")]
+fn activate_default_browser() -> bool {
+    let Some(browser) = default_browser_path() else {
+        return false;
+    };
+    if !is_running(&browser) {
+        return false;
+    }
+    std::process::Command::new("open")
+        .arg("-a")
+        .arg(&browser)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// True when the app bundle at `bundle_path` is running. Both sides come from
+/// `NSURL.path`, so plain string equality is enough. The autorelease pools here
+/// and in `default_browser_path` are explicit because this runs on a plain
+/// `std::thread`, which never gets one of its own.
+#[cfg(target_os = "macos")]
+fn is_running(bundle_path: &str) -> bool {
+    use objc2_app_kit::NSWorkspace;
+
+    objc2::rc::autoreleasepool(|_| {
+        NSWorkspace::sharedWorkspace()
+            .runningApplications()
+            .iter()
+            .any(|app| {
+                app.bundleURL()
+                    .and_then(|url| url.path())
+                    .is_some_and(|path| path.to_string() == bundle_path)
+            })
+    })
+}
+
+/// macOS has no "which browser is default" call, so ask which app would open a
+/// throwaway `http://` URL.
+#[cfg(target_os = "macos")]
+fn default_browser_path() -> Option<String> {
+    use objc2_app_kit::NSWorkspace;
+    use objc2_foundation::{NSString, NSURL};
+
+    objc2::rc::autoreleasepool(|_| {
+        let probe = NSURL::URLWithString(&NSString::from_str("http://127.0.0.1/"))?;
+        let app = NSWorkspace::sharedWorkspace().URLForApplicationToOpenURL(&probe)?;
+        app.path().map(|path| path.to_string())
+    })
+}
+
+#[cfg(target_os = "macos")]
+const FOCUS_TAB_SCRIPT: &str = include_str!("../../macos/focus-dashboard-tab.js");
+
 #[cfg(target_os = "macos")]
 mod imp {
     use objc2::rc::Retained;
@@ -163,10 +345,10 @@ mod imp {
         unsafe impl NSObjectProtocol for Delegate {}
 
         unsafe impl NSApplicationDelegate for Delegate {
-            // Dock-icon click with no open windows → reopen the dashboard.
+            // Dock-icon click with no open windows → raise the dashboard.
             #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
             fn should_handle_reopen(&self, _app: &NSApplication, _has_windows: bool) -> bool {
-                crate::browser::open_browser(&self.ivars().url);
+                super::focus_or_open(&self.ivars().url);
                 true
             }
         }
