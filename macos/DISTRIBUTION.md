@@ -97,6 +97,11 @@ Also enable **Require a pull request** + **Require review from Code Owners** on
 `main` (see `.github/CODEOWNERS`) so the signing scripts can't change unreviewed.
 Never commit the `.p12`.
 
+`package-macos-app.sh` signs with `macos/entitlements.plist`, which grants the
+Apple-events entitlement the Dock-click tab focus needs. Without it that path is
+denied in signed builds only — unsigned local bundles never exercise the check —
+and the first Dock click prompts once for Automation access.
+
 ## Build / sign locally
 
 ```bash
