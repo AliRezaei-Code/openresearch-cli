@@ -2241,8 +2241,7 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                         // thread that never does. An interrupt ends everything.
                         if !interrupted && sub_threads.values().any(|s| s.live) {
                             parent_done = true;
-                            deadline = tokio::time::Instant::now()
-                                + turn_phase_quiet(parent_done);
+                            deadline = tokio::time::Instant::now() + turn_phase_quiet(parent_done);
                             let _ = ctx.flush();
                             continue;
                         }
