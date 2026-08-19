@@ -429,7 +429,8 @@ impl Harness for Codex {
         true
     }
 
-    /// The app-server takes `turn/steer` against the active turn.
+    /// The app-server takes `turn/steer` against the active turn; `detect`
+    /// withholds it from installations that fall back to the exec path.
     fn supports_steering(&self) -> bool {
         true
     }
@@ -518,6 +519,9 @@ impl Harness for Codex {
             // Old CLIs still work via the legacy exec path, but miss the
             // app-server wins (permission prompts on sandbox escalations;
             // thread resume).
+            // `turn/steer` is an app-server method, so this must follow the
+            // dispatch predicate rather than the version alone.
+            info.supports_steering = runs_app_server().await;
             let too_old = info
                 .version
                 .as_deref()
@@ -543,11 +547,7 @@ impl Harness for Codex {
     }
 
     async fn run_turn(&self, ctx: &mut TurnCtx) -> Result<()> {
-        // app-server for codex ≥ 0.144 (the validated protocol version);
-        // legacy exec for older CLIs, for one release. ORX_CODEX_EXEC=1 is the
-        // escape hatch if app-server misbehaves ("0"/empty don't count).
-        let force_exec = std::env::var("ORX_CODEX_EXEC").is_ok_and(|v| !v.is_empty() && v != "0");
-        if force_exec || !app_server_supported().await {
+        if !runs_app_server().await {
             return run_turn_exec(ctx).await;
         }
         run_turn_app_server(ctx).await
@@ -731,6 +731,15 @@ impl Harness for Codex {
 /// First protocol version the harness was validated against (schema dump +
 /// live spike). Older CLIs take the exec fallback below.
 const MIN_APP_SERVER_VERSION: (u64, u64, u64) = (0, 144, 0);
+
+/// Whether a turn will run over the app-server: a supported codex, unless
+/// ORX_CODEX_EXEC forces the legacy exec path ("0"/empty don't count).
+/// Capability reporting reads the same answer, so the composer can't offer
+/// app-server-only features the exec path lacks.
+async fn runs_app_server() -> bool {
+    let force_exec = std::env::var("ORX_CODEX_EXEC").is_ok_and(|v| !v.is_empty() && v != "0");
+    !force_exec && app_server_supported().await
+}
 
 /// Whether the installed codex speaks the validated app-server protocol.
 /// Probed once per process (a codex upgrade mid-run takes an `orx up` restart
@@ -1939,6 +1948,8 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
     // requests natively first, and the next turn's entry sweep in this function
     // resolves whatever survived.)
     let mut open_requests: HashMap<String, (Value, ServerReqKind)> = HashMap::new();
+    // Absolute, so steering can't push the watchdog back on a wedged turn.
+    let mut deadline = tokio::time::Instant::now() + TURN_WATCHDOG;
 
     // Sub-agent threads spawned this turn (Codex collaboration). Their events
     // stream on this same connection with a foreign turnId; we route them into
@@ -1950,21 +1961,20 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
         // Suspended while a card is pending — user think-time is unbounded by
         // design (question think-time too); codex's own ~5-minute approval
         // deadline still applies server-side.
-        // The steer arm sits beside the event wait so a message the user sends
-        // mid-turn reaches `turn/steer` while the turn is still running,
-        // instead of waiting out the turn.
+        // `steering` is borrowed out of `ctx` so the borrow ends with the
+        // select — the steer arm's handler needs `&mut ctx`.
         let waited = {
             let steering = &mut ctx.steering;
-            if open_requests.is_empty() {
-                tokio::select! {
-                    event = tokio::time::timeout(TURN_WATCHDOG, rx.recv()) => Waited::Event(event),
-                    steer = super::next_steer(steering) => Waited::Steer(steer),
+            let event = async {
+                if open_requests.is_empty() {
+                    tokio::time::timeout_at(deadline, rx.recv()).await
+                } else {
+                    Ok(rx.recv().await)
                 }
-            } else {
-                tokio::select! {
-                    event = rx.recv() => Waited::Event(Ok(event)),
-                    steer = super::next_steer(steering) => Waited::Steer(steer),
-                }
+            };
+            tokio::select! {
+                event = event => Waited::Event(event),
+                steer = super::next_steer(steering) => Waited::Steer(steer),
             }
         };
         let event = match waited {
@@ -1972,7 +1982,10 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                 steer_turn(ctx, &client, &thread_id, turn_id.as_deref(), steer).await;
                 continue;
             }
-            Waited::Event(Ok(event)) => event,
+            Waited::Event(Ok(event)) => {
+                deadline = tokio::time::Instant::now() + TURN_WATCHDOG;
+                event
+            }
             Waited::Event(Err(_)) => {
                 client.interrupt_active_turn().await;
                 ctx.push_error(format!(
@@ -2430,9 +2443,18 @@ fn has_error_part(ctx: &TurnCtx, message: &str) -> bool {
     })
 }
 
-/// Hand one steer to the turn already running. `turn/steer` is rejected on
-/// review and compaction turns and missing from older app-servers, so any
-/// failure parks the message for the next turn instead of dropping it.
+/// Bounded well under the shared request timeout: a steer is awaited *in* the
+/// event loop, so a slow app-server would otherwise freeze the transcript and
+/// hide any card it raises.
+const STEER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Hand one steer to the turn already running.
+///
+/// codex rejects `turn/steer` on review and compaction turns, and older
+/// app-servers lack the method — those answer definitively, so the message
+/// parks for the next turn. A transport failure or timeout answers nothing:
+/// codex may already have applied the text, so re-running it as a fresh turn
+/// could execute the instruction twice. Say so instead.
 async fn steer_turn(
     ctx: &mut TurnCtx,
     client: &CodexClient,
@@ -2440,24 +2462,32 @@ async fn steer_turn(
     turn_id: Option<&str>,
     steer: SteerMessage,
 ) {
-    let delivered = match turn_id {
-        Some(turn_id) => client
-            .try_request(
-                "turn/steer",
-                serde_json::json!({
-                    "threadId": thread_id,
-                    "input": [{ "type": "text", "text": steer.text }],
-                    "expectedTurnId": turn_id,
-                }),
-            )
-            .await
-            .is_ok_and(|result| result.is_ok()),
-        None => false,
-    };
-    if delivered {
-        ctx.record_steer(&steer.display);
-    } else {
+    let Some(turn_id) = turn_id else {
         ctx.host.park_steer(&ctx.session_id, steer);
+        return;
+    };
+    let answered = client
+        .try_request_with_timeout(
+            "turn/steer",
+            serde_json::json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": steer.text }],
+                "expectedTurnId": turn_id,
+            }),
+            STEER_TIMEOUT,
+        )
+        .await;
+    match answered {
+        Ok(Ok(_)) => ctx.record_steer(&steer.display),
+        Ok(Err(_)) => ctx.host.park_steer(&ctx.session_id, steer),
+        Err(e) => {
+            // Record it anyway: the composer is already cleared, so this is
+            // the only copy of what the user typed.
+            ctx.record_steer(&steer.display);
+            ctx.push_error(format!(
+                "codex did not confirm the steering message ({e}) — send it again if the turn ignores it"
+            ));
+        }
     }
 }
 

@@ -484,6 +484,8 @@ impl Harness for ClaudeCode {
 
         info.agent_ready = info.installed && info.authenticated;
         if info.agent_ready {
+            // The resident child is only spawnable once the CLI is ready.
+            info.supports_steering = true;
             // Ask the installed CLI for its own catalog: `list_models` for the
             // models and their per-model effort tiers, and the parser probe for
             // `ultracode` (a session mode the catalog never advertises — see
@@ -1596,19 +1598,16 @@ async fn run_attempt(ctx: &mut TurnCtx, spec: SpawnSpec) -> Result<(TurnState, u
     };
     let mut saw_event = false;
     let mut saw_user_echo = false;
+    // Absolute, so steering can't push it back: a wedged child that the user
+    // keeps typing at must still trip the detector.
+    let mut deadline = tokio::time::Instant::now() + FIRST_EVENT_TIMEOUT;
     loop {
-        let deadline = if saw_event {
-            super::TURN_WATCHDOG
-        } else {
-            FIRST_EVENT_TIMEOUT
-        };
-        // The steer arm sits beside the event wait so a message the user sends
-        // mid-turn reaches the child's stdin while it is still working, rather
-        // than waiting out the turn.
+        // `steering` is borrowed out of `ctx` so the borrow ends with the
+        // select — the steer arm's handler needs `&mut ctx`.
         let waited = {
             let steering = &mut ctx.steering;
             tokio::select! {
-                event = tokio::time::timeout(deadline, rx.recv()) => Waited::Event(event),
+                event = tokio::time::timeout_at(deadline, rx.recv()) => Waited::Event(event),
                 steer = super::next_steer(steering) => Waited::Steer(steer),
             }
         };
@@ -1622,8 +1621,21 @@ async fn run_attempt(ctx: &mut TurnCtx, spec: SpawnSpec) -> Result<(TurnState, u
                 }
                 continue;
             }
-            Waited::Event(Ok(event)) => event,
-            Waited::Event(Err(_)) if ctx.host.has_pending_permission(&ctx.session_id) => continue,
+            Waited::Event(Ok(event)) => {
+                deadline = tokio::time::Instant::now() + super::TURN_WATCHDOG;
+                event
+            }
+            // Card think-time is unbounded by design: re-arm, or an elapsed
+            // absolute deadline would spin this arm instead of waiting.
+            Waited::Event(Err(_)) if ctx.host.has_pending_permission(&ctx.session_id) => {
+                deadline = tokio::time::Instant::now()
+                    + if saw_event {
+                        super::TURN_WATCHDOG
+                    } else {
+                        FIRST_EVENT_TIMEOUT
+                    };
+                continue;
+            }
             Waited::Event(Err(_)) => {
                 commit_attempt_session(ctx, &state);
                 ctx.host.claude.kill_session(&ctx.session_id).await;

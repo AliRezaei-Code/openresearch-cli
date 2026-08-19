@@ -4670,9 +4670,15 @@ struct SendChatReq {
     images: Vec<local::chat::ImageAttachment>,
     #[serde(default)]
     annotations: Vec<local::chat::TextAnnotation>,
-    /// `"steer"` hands the message to a turn already running; anything else
-    /// (including an older client that omits it) keeps the parked-queue path.
-    mode: Option<String>,
+    /// `"steer"` hands the message to a turn already running; omitted (an
+    /// older client) keeps the parked-queue path.
+    mode: Option<SendMode>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SendMode {
+    Steer,
 }
 
 async fn send_chat_message(
@@ -4699,7 +4705,7 @@ async fn send_chat_message(
         reasoning_level: req.reasoning_level,
     };
     // The turn runs in the background; progress streams over /api/events.
-    let sent = if req.mode.as_deref() == Some("steer") {
+    let sent = if matches!(req.mode, Some(SendMode::Steer)) {
         state
             .chat
             .steer_message(&id, text, overrides, req.images, annotations)

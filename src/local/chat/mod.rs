@@ -1465,7 +1465,7 @@ pub struct ChatHost {
     /// harnesses that can accept input into a live turn. Absent between turns
     /// and on harnesses without the capability, which is what routes a send
     /// back to [`ChatHost::queued`].
-    steering: std::sync::Mutex<HashMap<String, mpsc::UnboundedSender<SteerMessage>>>,
+    steering: std::sync::Mutex<HashMap<String, SteerSink>>,
 }
 
 struct ActiveTurn {
@@ -1500,54 +1500,67 @@ struct QueuedMessage {
 /// The running turn's end of the steering channel.
 pub type SteerReceiver = mpsc::UnboundedReceiver<SteerMessage>;
 
+/// A running turn's steering sink, paired with the settings that turn is
+/// actually running under. The session row is the wrong thing to compare a
+/// send against: the composer persists a permission change *before* the
+/// message that carries it, so the row already agrees while the live child
+/// still holds the old policy.
+struct SteerSink {
+    tx: mpsc::UnboundedSender<SteerMessage>,
+    settings: TurnSettings,
+}
+
+/// The composer selections a turn started with, in the wire vocabulary a send
+/// carries.
+#[derive(Default)]
+struct TurnSettings {
+    model: Option<String>,
+    permission_mode: Option<String>,
+    plan_mode: bool,
+    reasoning_level: Option<String>,
+}
+
+impl TurnSettings {
+    fn of(ctx: &TurnCtx) -> Self {
+        Self {
+            model: ctx.model.clone(),
+            permission_mode: ctx
+                .permission_mode
+                .and_then(|mode| crate::local::harness::permission_id_for_mode(&ctx.harness, mode)),
+            plan_mode: ctx.plan_mode,
+            reasoning_level: ctx.reasoning_level.clone(),
+        }
+    }
+
+    /// Whether a send's settings are the ones this turn is already running
+    /// under. A real change only takes effect at a turn boundary, so it routes
+    /// the message to the queue instead of the live turn.
+    fn accept(&self, overrides: &TurnOverrides) -> bool {
+        let matches = |sent: Option<&str>, running: Option<&str>| {
+            sent.filter(|value| !value.is_empty())
+                .is_none_or(|value| running == Some(value))
+        };
+        matches(overrides.model.as_deref(), self.model.as_deref())
+            && matches(
+                overrides.permission_mode.as_deref(),
+                self.permission_mode.as_deref(),
+            )
+            && matches(
+                overrides.reasoning_level.as_deref(),
+                self.reasoning_level.as_deref(),
+            )
+            && overrides
+                .plan_mode
+                .is_none_or(|mode| mode == self.plan_mode)
+    }
+}
+
 /// A message handed to a turn already in flight: what the transcript shows,
 /// and the expanded text the harness receives.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub struct SteerMessage {
     pub display: String,
     pub text: String,
-}
-
-/// Slash-skills: the transcript keeps the `/name` the user typed, the harness
-/// gets the expanded prompt — the same substitution `send_message_showing`
-/// applies to a full turn. Best-effort: an unreadable project steers the text
-/// exactly as typed rather than failing the send.
-fn expand_for_harness(session: &StoredChatSession, text: &str) -> String {
-    let project = Store::open()
-        .ok()
-        .and_then(|store| store.get_local_project(&session.project_id).ok().flatten());
-    let Some(project) = project else {
-        return text.to_string();
-    };
-    crate::local::skills::expand(text, project.github_enabled())
-        .or_else(|| crate::local::user_skills::expand(text, &project.id))
-        .unwrap_or_else(|| text.to_string())
-}
-
-/// Whether a send's composer settings are the ones the running turn already
-/// has. A real change can only take effect at a turn boundary, so it routes
-/// the message to the queue instead of the live turn.
-fn overrides_match_session(session: &StoredChatSession, overrides: &TurnOverrides) -> bool {
-    let matches_option = |sent: Option<&str>, stored: Option<&str>| {
-        sent.filter(|value| !value.is_empty())
-            .is_none_or(|value| Some(value) == stored)
-    };
-    matches_option(overrides.model.as_deref(), session.model.as_deref())
-        && matches_option(
-            overrides.permission_mode.as_deref(),
-            crate::local::harness::effective_permission_id(
-                &session.harness,
-                session.permission_mode.as_deref(),
-            )
-            .as_deref(),
-        )
-        && matches_option(
-            overrides.reasoning_level.as_deref(),
-            session.reasoning_level.as_deref(),
-        )
-        && overrides
-            .plan_mode
-            .is_none_or(|mode| mode == session.plan_mode)
 }
 
 #[derive(Clone)]
@@ -1630,6 +1643,18 @@ fn transcript_parts(
         ));
     }
     parts
+}
+
+/// Slash-skills: the transcript keeps the `/name` the user typed, the harness
+/// gets the expanded prompt.
+fn expand_slash_skills(project: &LocalProject, text: &str) -> String {
+    crate::local::skills::expand(text, project.github_enabled())
+        .or_else(|| crate::local::user_skills::expand(text, &project.id))
+        .unwrap_or_else(|| text.to_string())
+}
+
+fn new_queued_id() -> String {
+    format!("q_{}", uuid::Uuid::new_v4())
 }
 
 /// Chip label for a parked message: its text, or an attachment count for an
@@ -1823,7 +1848,7 @@ impl Drop for TurnGuard {
 /// RAII registration of a turn's steering sink. An aborted turn's guard can
 /// drop *after* a successor turn registered its own, so drop only detaches its
 /// own channel (the `same_channel` discipline `TurnRoute` uses for events).
-pub struct SteerRoute {
+struct SteerRoute {
     host: Arc<ChatHost>,
     session_id: String,
     tx: mpsc::UnboundedSender<SteerMessage>,
@@ -1834,7 +1859,7 @@ impl Drop for SteerRoute {
         let mut steering = self.host.steering.lock().unwrap();
         if steering
             .get(&self.session_id)
-            .is_some_and(|tx| tx.same_channel(&self.tx))
+            .is_some_and(|sink| sink.tx.same_channel(&self.tx))
         {
             steering.remove(&self.session_id);
         }
@@ -2245,15 +2270,19 @@ impl ChatHost {
     /// Register the running turn's steering sink. The returned guard
     /// deregisters on drop (including task abort mid-turn), so a send between
     /// turns can never be handed to a dead turn.
-    pub fn register_steering(
+    fn register_steering(
         self: &Arc<Self>,
         session_id: &str,
         tx: mpsc::UnboundedSender<SteerMessage>,
+        settings: TurnSettings,
     ) -> SteerRoute {
-        self.steering
-            .lock()
-            .unwrap()
-            .insert(session_id.to_string(), tx.clone());
+        self.steering.lock().unwrap().insert(
+            session_id.to_string(),
+            SteerSink {
+                tx: tx.clone(),
+                settings,
+            },
+        );
         SteerRoute {
             host: self.clone(),
             session_id: session_id.to_string(),
@@ -2272,7 +2301,7 @@ impl ChatHost {
             .entry(session_id.to_string())
             .or_default()
             .push_back(QueuedMessage {
-                id: format!("q_{}", uuid::Uuid::new_v4()),
+                id: new_queued_id(),
                 // The raw text: the queue path expands slash-skills itself.
                 text: message.display,
                 transcript_text: None,
@@ -2454,14 +2483,11 @@ impl ChatHost {
         })
     }
 
-    /// Deliver a message into the session's *running* turn so the agent can
-    /// change course without the user waiting for it to finish. Falls back to
+    /// Deliver a message into the session's *running* turn. Falls back to
     /// [`send_message`](Self::send_message) — a fresh turn when idle, the
-    /// parked queue when busy — whenever the live turn can't take it: a
-    /// harness without the capability (no sink registered), a turn that ended
-    /// underneath us, attachments (they need the on-disk preamble only a full
-    /// turn builds), or composer settings the user changed, which apply to a
-    /// turn at its start and so belong to the next one.
+    /// parked queue when busy — whenever the live turn can't take it, notably
+    /// attachments (they need the on-disk preamble only a full turn builds)
+    /// and changed composer settings, which apply only at a turn boundary.
     pub async fn steer_message(
         self: &Arc<Self>,
         session_id: &str,
@@ -2471,13 +2497,23 @@ impl ChatHost {
         annotations: Vec<TextAnnotation>,
     ) -> Result<()> {
         if !text.trim().is_empty() && images.is_empty() && annotations.is_empty() {
-            let session = Store::open()?
-                .get_chat_session(session_id)?
-                .ok_or_else(|| anyhow!("chat session not found"))?;
-            let sink = self.steering.lock().unwrap().get(session_id).cloned();
-            if let Some(sink) = sink.filter(|_| overrides_match_session(&session, &overrides)) {
+            let sink = {
+                let steering = self.steering.lock().unwrap();
+                steering
+                    .get(session_id)
+                    .filter(|sink| sink.settings.accept(&overrides))
+                    .map(|sink| sink.tx.clone())
+            };
+            if let Some(sink) = sink {
+                let store = Store::open()?;
+                let session = store
+                    .get_chat_session(session_id)?
+                    .ok_or_else(|| anyhow!("chat session not found"))?;
+                let project = store.get_local_project(&session.project_id)?;
                 let message = SteerMessage {
-                    text: expand_for_harness(&session, &text),
+                    text: project
+                        .map(|project| expand_slash_skills(&project, &text))
+                        .unwrap_or_else(|| text.clone()),
                     display: text.clone(),
                 };
                 if sink.send(message).is_ok() {
@@ -2543,12 +2579,20 @@ impl ChatHost {
         let anchor_parts: Vec<WirePart> = serde_json::from_str(&anchor.parts_json)?;
         let text = match &kind {
             ForkKind::Edit(edited) => edited.trim().to_string(),
-            ForkKind::Retry => anchor_parts
-                .iter()
-                .filter(|part| part.kind == "text")
-                .filter_map(|part| part.text.as_deref())
-                .collect::<Vec<_>>()
-                .join("\n"),
+            // A retry re-asks the anchor's question *plus* whatever the user
+            // steered into the reply being re-sampled: those parts ride the
+            // assistant message, so taking only the anchor would silently
+            // re-run the pre-steer prompt.
+            ForkKind::Retry => {
+                let steered: Vec<WirePart> = serde_json::from_str(&target.parts_json)?;
+                anchor_parts
+                    .iter()
+                    .filter(|part| part.kind == "text")
+                    .chain(steered.iter().filter(|part| part.kind == "steer"))
+                    .filter_map(|part| part.text.as_deref())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
         };
         let annotations = anchor_parts
             .iter()
@@ -2793,7 +2837,17 @@ impl ChatHost {
                         let reset_pending = !plan_mode
                             && current.harness == "codex"
                             && (current.plan_mode || current.plan_reset_pending);
-                        store.set_chat_session_plan_state(session_id, plan_mode, reset_pending)?;
+                        // Every busy send carries the composer's plan state, so
+                        // only write when it actually moves.
+                        if current.plan_mode != plan_mode
+                            || current.plan_reset_pending != reset_pending
+                        {
+                            store.set_chat_session_plan_state(
+                                session_id,
+                                plan_mode,
+                                reset_pending,
+                            )?;
+                        }
                         overrides.plan_mode = None;
                         overrides.plan_revision = None;
                     }
@@ -2805,7 +2859,7 @@ impl ChatHost {
                         .entry(session_id.to_string())
                         .or_default()
                         .push_back(QueuedMessage {
-                            id: format!("q_{}", uuid::Uuid::new_v4()),
+                            id: new_queued_id(),
                             text,
                             transcript_text,
                             overrides,
@@ -2994,13 +3048,8 @@ impl ChatHost {
             json!({ "sessionId": session.id, "busy": true }),
         );
 
-        // Slash-skills: the transcript keeps the `/name` the user typed; the
-        // harness gets the expanded prompt.
-        let turn_text = contextualize_messages(messages, |text| {
-            crate::local::skills::expand(text, project.github_enabled())
-                .or_else(|| crate::local::user_skills::expand(text, &project.id))
-                .unwrap_or_else(|| text.to_string())
-        });
+        let turn_text =
+            contextualize_messages(messages, |text| expand_slash_skills(&project, text));
         // Demo evidence caveats are not PROJECT.md and never include its contents.
         let mut turn_text = with_turn_context(
             session.native_session_id.as_deref(),
@@ -3085,14 +3134,24 @@ impl ChatHost {
             let steer_route = crate::local::harness::supports_steering(&ctx.harness).then(|| {
                 let (tx, rx) = mpsc::unbounded_channel();
                 ctx.steering = Some(rx);
-                self.register_steering(&sid, tx)
+                self.register_steering(&sid, tx, TurnSettings::of(&ctx))
             });
             let task = tokio::spawn(async move {
-                let _steer_route = steer_route;
                 let result = match crate::local::harness::chat_harness(&ctx.harness) {
                     Some(harness) => harness.run_turn(&mut ctx).await,
                     None => Err(anyhow!("unknown harness: {}", ctx.harness)),
                 };
+                // Deregister before draining: a send racing the turn's end
+                // would otherwise land in a reader-less channel and vanish.
+                drop(steer_route);
+                if let Some(mut steering) = ctx.steering.take() {
+                    steering.close();
+                    // Drain to `None`, not to `try_recv`'s `Empty`: a sender
+                    // that passed the closed check mid-push is still landing.
+                    while let Some(message) = steering.recv().await {
+                        ctx.host.park_steer(&ctx.session_id, message);
+                    }
+                }
                 if let Err(err) = result {
                     ctx.push_error(format!("{err}"));
                 }
@@ -6101,93 +6160,80 @@ mod transcript_tree_tests {
 #[cfg(test)]
 mod steering_tests {
     use super::*;
-    use crate::store::StoredChatSession;
 
-    fn steer_session(harness: &str) -> StoredChatSession {
-        StoredChatSession {
-            id: "owner".into(),
-            project_id: "p1".into(),
-            harness: harness.into(),
-            native_session_id: None,
-            title: None,
-            title_source: None,
+    fn test_host() -> Arc<ChatHost> {
+        Arc::new(ChatHost::new(
+            Arc::new(crate::local::opencode::AgentHost::new(None)),
+            Arc::new(crate::local::codex::CodexHost::new()),
+            Arc::new(crate::local::claude::ClaudeHost::new()),
+        ))
+    }
+
+    fn running_settings() -> TurnSettings {
+        TurnSettings {
             model: Some("opus".into()),
-            permission_mode: None,
+            permission_mode: Some("auto".into()),
             plan_mode: false,
-            plan_reset_pending: false,
             reasoning_level: None,
-            archived: false,
-            context_usage_json: None,
-            bootstrap_context: None,
-            active_leaf_id: None,
-            created_at: 1,
-            updated_at: 1,
+        }
+    }
+
+    fn steer(text: &str) -> SteerMessage {
+        SteerMessage {
+            display: text.into(),
+            text: text.into(),
         }
     }
 
     #[test]
-    fn composer_settings_the_turn_already_has_still_steer() {
-        let session = steer_session("claude-code");
-        // What the composer sends every time: the session's own settings.
-        assert!(overrides_match_session(
-            &session,
-            &TurnOverrides {
-                model: Some("opus".into()),
-                permission_mode: Some("auto".into()),
-                plan_mode: Some(false),
-                ..TurnOverrides::default()
-            },
-        ));
+    fn the_settings_a_turn_is_running_under_are_accepted() {
+        // What the composer sends every time: the turn's own settings.
+        assert!(running_settings().accept(&TurnOverrides {
+            model: Some("opus".into()),
+            permission_mode: Some("auto".into()),
+            plan_mode: Some(false),
+            ..TurnOverrides::default()
+        }));
         // An empty string is "unset", not a different model.
-        assert!(overrides_match_session(
-            &session,
-            &TurnOverrides {
-                model: Some(String::new()),
-                ..TurnOverrides::default()
-            },
-        ));
+        assert!(running_settings().accept(&TurnOverrides {
+            model: Some(String::new()),
+            ..TurnOverrides::default()
+        }));
     }
 
     #[test]
     fn a_changed_composer_setting_routes_to_the_queue() {
-        let session = steer_session("claude-code");
         for changed in [
             TurnOverrides {
                 model: Some("sonnet".into()),
                 ..TurnOverrides::default()
             },
+            // The session row already says "plan" by the time this arrives —
+            // only the running turn's own mode can catch it.
             TurnOverrides {
                 permission_mode: Some("plan".into()),
-                ..TurnOverrides::default()
-            },
-            TurnOverrides {
-                reasoning_level: Some("high".into()),
                 ..TurnOverrides::default()
             },
             TurnOverrides {
                 plan_mode: Some(true),
                 ..TurnOverrides::default()
             },
+            // A turn that pinned no reasoning level is still a different
+            // setting from one that pins it.
+            TurnOverrides {
+                reasoning_level: Some("high".into()),
+                ..TurnOverrides::default()
+            },
         ] {
-            assert!(!overrides_match_session(&session, &changed));
+            assert!(!running_settings().accept(&changed));
         }
     }
 
     #[tokio::test]
     async fn an_undeliverable_steer_becomes_a_queued_chip() {
-        let host = Arc::new(ChatHost::new(
-            Arc::new(crate::local::opencode::AgentHost::new(None)),
-            Arc::new(crate::local::codex::CodexHost::new()),
-            Arc::new(crate::local::claude::ClaudeHost::new()),
-        ));
+        let host = test_host();
 
-        host.park_steer(
-            "owner",
-            SteerMessage {
-                display: "/plan the migration".into(),
-                text: "expanded playbook text".into(),
-            },
-        );
+        host.park_steer("owner", steer("/plan the migration"));
 
         let queued = host.queued_items("owner");
         assert_eq!(queued.len(), 1);
@@ -6197,25 +6243,23 @@ mod steering_tests {
 
     #[tokio::test]
     async fn a_dead_turns_route_never_detaches_its_successors() {
-        let host = Arc::new(ChatHost::new(
-            Arc::new(crate::local::opencode::AgentHost::new(None)),
-            Arc::new(crate::local::codex::CodexHost::new()),
-            Arc::new(crate::local::claude::ClaudeHost::new()),
-        ));
+        let host = test_host();
         let (first_tx, _first_rx) = mpsc::unbounded_channel();
-        let first = host.register_steering("owner", first_tx);
+        let first = host.register_steering("owner", first_tx, TurnSettings::default());
         let (second_tx, mut second_rx) = mpsc::unbounded_channel();
-        let _second = host.register_steering("owner", second_tx);
+        let _second = host.register_steering("owner", second_tx, TurnSettings::default());
 
         // The aborted turn's guard drops after its successor registered.
         drop(first);
 
-        let sink = host.steering.lock().unwrap().get("owner").cloned();
+        let sink = host
+            .steering
+            .lock()
+            .unwrap()
+            .get("owner")
+            .map(|sink| sink.tx.clone());
         sink.expect("successor sink survives")
-            .send(SteerMessage {
-                display: "keep going".into(),
-                text: "keep going".into(),
-            })
+            .send(steer("keep going"))
             .unwrap();
         assert_eq!(second_rx.recv().await.unwrap().display, "keep going");
     }
@@ -6230,5 +6274,47 @@ mod steering_tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_steer_survives_the_event_arm_winning_the_select() {
+        // Cancel-safety is what lets the harness loops park a steer beside
+        // their own event wait; without it this message would be swallowed.
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut steering = Some(rx);
+        tx.send(steer("go")).unwrap();
+        tokio::select! {
+            biased;
+            () = std::future::ready(()) => {}
+            _ = crate::local::harness::next_steer(&mut steering) => unreachable!(),
+        }
+        assert_eq!(
+            crate::local::harness::next_steer(&mut steering)
+                .await
+                .display,
+            "go"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_sink_sends_the_message_back_to_the_queue() {
+        // What the turn epilogue does: detach, close, park the remainder.
+        let host = test_host();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let route = host.register_steering("owner", tx.clone(), TurnSettings::default());
+        let mut steering = Some(rx);
+
+        tx.send(steer("still here")).unwrap();
+        drop(route);
+        if let Some(mut rx) = steering.take() {
+            rx.close();
+            while let Some(message) = rx.recv().await {
+                host.park_steer("owner", message);
+            }
+        }
+
+        assert!(host.steering.lock().unwrap().get("owner").is_none());
+        assert!(tx.send(steer("too late")).is_err());
+        assert_eq!(host.queued_items("owner")[0]["text"], "still here");
     }
 }

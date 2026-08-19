@@ -117,8 +117,9 @@ pub trait Harness: Send + Sync {
         Err(anyhow!("{} cannot run chat turns", self.id()))
     }
 
-    /// Whether a running turn can take further user input (steering). Default
-    /// is no: the composer then parks the message until the turn ends.
+    /// Whether this harness can take user input into a running turn. Gates
+    /// whether a turn registers a steering sink at all; `detect` may narrow it
+    /// per installation (codex's legacy exec path can't steer).
     fn supports_steering(&self) -> bool {
         false
     }
@@ -251,8 +252,9 @@ pub(crate) enum Waited<T> {
 }
 
 /// The next message the user steers into a running turn. A turn without a
-/// steering sink parks here forever, which is what makes this a safe
-/// `select!` arm next to a harness's own event wait.
+/// steering sink parks here forever, so the arm is inert on harnesses that
+/// can't steer. `recv` is cancel-safe: a steer that arrives while the event
+/// arm wins the select survives to the next iteration.
 pub(crate) async fn next_steer(steering: &mut Option<SteerReceiver>) -> SteerMessage {
     match steering {
         Some(rx) => match rx.recv().await {
@@ -316,7 +318,10 @@ async fn detect_one(harness: &dyn Harness) -> Option<HarnessInfo> {
             };
         }
         info.options = harness.options();
-        info.supports_steering = harness.supports_steering();
+        // The trait is the ceiling: a `detect` narrows it for an installation
+        // whose run path can't steer. A steering harness whose `detect` forgets
+        // to set it reports false and silently queues every send.
+        info.supports_steering &= harness.supports_steering();
         info
     })
 }

@@ -1098,7 +1098,8 @@ export interface Harness {
   plan?: string;
   agentReady: boolean;
   agentNote?: string;
-  /** A running turn takes further input, so the composer steers instead of queueing. */
+  /** A running turn takes further input, so the composer steers instead of
+   * queueing. Narrowed per installation (codex's legacy exec path can't). */
   supportsSteering: boolean;
   models: HarnessModel[];
   options: HarnessOptions;
