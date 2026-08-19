@@ -186,6 +186,13 @@ function rightTabKey(tab: RightTab): string {
   return `experiment:${tab.id}:${tab.view}`;
 }
 
+/** Drop `key`'s tab from one strip list, keeping the array identity (and so the
+ * effects keyed on it) when the tab doesn't live in this list. */
+function withoutTab<T extends RightTab>(tabs: T[], key: string): T[] {
+  const next = tabs.filter((tab) => rightTabKey(tab) !== key);
+  return next.length === tabs.length ? tabs : next;
+}
+
 interface RightPaneSessionState {
   rightTab: RightTab;
   tabHistory: RightTab[];
@@ -197,6 +204,8 @@ interface RightPaneSessionState {
   planTabs: PlanViewDef[];
   subagentTabs: SubagentViewDef[];
   codeTabs: CodeTabDef[];
+  /** The tab open in preview mode, replaced by the next chat chip click. */
+  previewTab: RightTab | null;
   filesView: WorktreeView;
   filesToggled: ReadonlySet<string>;
   selectedRunId: string | null;
@@ -220,6 +229,7 @@ function initialRightPaneSessionState(
     planTabs: [],
     subagentTabs: [],
     codeTabs: [],
+    previewTab: null,
     filesView: "files",
     filesToggled: new Set(),
     selectedRunId: null,
@@ -488,6 +498,7 @@ export default function App() {
   const [planTabs, setPlanTabs] = useState<PlanViewDef[]>([]);
   const [subagentTabs, setSubagentTabs] = useState<SubagentViewDef[]>([]);
   const [codeTabs, setCodeTabs] = useState<CodeTabDef[]>([]);
+  const [previewTab, setPreviewTabState] = useState<RightTab | null>(null);
   const [filesView, setFilesView] = useState<WorktreeView>("files");
   const [filesToggled, setFilesToggled] = useState<ReadonlySet<string>>(new Set());
   // The right pane is a floating panel: closable, edge-resizable, expandable
@@ -510,10 +521,43 @@ export default function App() {
   const pendingExperimentsAutoOpenRef = useRef(false);
   const tabHistoryRef = useRef(tabHistory);
   tabHistoryRef.current = tabHistory;
+  const previewTabRef = useRef<RightTab | null>(null);
 
-  const selectRightTab = useCallback((tab: RightTab) => {
+  const setPreviewTab = useCallback((tab: RightTab | null) => {
+    previewTabRef.current = tab;
+    setPreviewTabState(tab);
+  }, []);
+
+  // Retire the outgoing preview tab: it leaves the strip and the history, but
+  // never the active slot — the caller selects its replacement right after.
+  const dropRightTab = useCallback((tab: RightTab) => {
+    const key = rightTabKey(tab);
+    setExpTabs((prev) => withoutTab(prev, key));
+    setFileTabs((prev) => withoutTab(prev, key));
+    setPlanTabs((prev) => withoutTab(prev, key));
+    setSubagentTabs((prev) => withoutTab(prev, key));
+    const project = projectIdRef.current;
+    if (project && typeof tab === "object" && "path" in tab) {
+      fileScrollPositionsRef.current.delete(
+        fileScrollKey(project, activeSessionIdRef.current, tab),
+      );
+    }
+    const next = tabHistoryRef.current.filter((item) => rightTabKey(item) !== key);
+    tabHistoryRef.current = next;
+    setTabHistory(next);
+  }, []);
+
+  const selectRightTab = useCallback((tab: RightTab, preview = false) => {
     pendingExperimentsAutoOpenRef.current = false;
     const key = rightTabKey(tab);
+    // A chip click on an already-open tab just focuses it, leaving both that
+    // tab's mode and the current preview tab alone.
+    const alreadyOpen = tabHistoryRef.current.some((item) => rightTabKey(item) === key);
+    if (preview && !alreadyOpen) {
+      const outgoing = previewTabRef.current;
+      if (outgoing && rightTabKey(outgoing) !== key) dropRightTab(outgoing);
+      setPreviewTab(persistentRightTab(tab));
+    }
     const next = [
       ...tabHistoryRef.current.filter((item) => rightTabKey(item) !== key),
       persistentRightTab(tab),
@@ -521,11 +565,18 @@ export default function App() {
     tabHistoryRef.current = next;
     setTabHistory(next);
     setRightTab(tab);
-  }, []);
+  }, [dropRightTab, setPreviewTab]);
+
+  const promoteRightTab = useCallback((tab: RightTab) => {
+    const current = previewTabRef.current;
+    if (current && rightTabKey(current) === rightTabKey(tab)) setPreviewTab(null);
+  }, [setPreviewTab]);
 
   const forgetRightTab = useCallback((tab: RightTab, selectFallback: boolean) => {
     pendingExperimentsAutoOpenRef.current = false;
     const key = rightTabKey(tab);
+    const preview = previewTabRef.current;
+    if (preview && rightTabKey(preview) === key) setPreviewTab(null);
     const next = tabHistoryRef.current.filter((item) => rightTabKey(item) !== key);
     tabHistoryRef.current = next;
     setTabHistory(next);
@@ -536,7 +587,7 @@ export default function App() {
       setPanelOpen(false);
       setPanelMax(false);
     }
-  }, []);
+  }, [setPreviewTab]);
 
   const selectMainView = useCallback((view: "chat" | "skills" | SettingsTab) => {
     if (view !== "chat") pendingExperimentsAutoOpenRef.current = false;
@@ -554,6 +605,7 @@ export default function App() {
     planTabs,
     subagentTabs,
     codeTabs,
+    previewTab,
     filesView,
     filesToggled,
     selectedRunId,
@@ -606,6 +658,7 @@ export default function App() {
     setPlanTabs(nextState.planTabs);
     setSubagentTabs(nextState.subagentTabs);
     setCodeTabs(nextState.codeTabs);
+    setPreviewTab(nextState.previewTab);
     setFilesView(nextState.filesView);
     setFilesToggled(nextState.filesToggled);
     setSelectedRunId(nextState.selectedRunId);
@@ -614,7 +667,7 @@ export default function App() {
     setPanelMax(nextState.panelMax);
     activeSessionIdRef.current = nextSessionId;
     setActiveSessionId(nextSessionId);
-  }, []);
+  }, [setPreviewTab]);
   const onboarded = uiState?.onboardingCompleted ?? false;
   const [demoWelcomeOpen, setDemoWelcomeOpen] = useState(false);
   const openDemoWelcome = useCallback(() => setDemoWelcomeOpen(true), []);
@@ -784,6 +837,7 @@ export default function App() {
     setPlanTabs([]);
     setSubagentTabs([]);
     setCodeTabs([]);
+    setPreviewTab(null);
     setFilesView("files");
     setFilesToggled(new Set());
     tabHistoryRef.current = [];
@@ -800,7 +854,7 @@ export default function App() {
     listExperiments(projectId).then(setExperiments).catch(() => {});
     loadRunsBaseline(projectId);
     getArtifacts(projectId).then(setArtifacts).catch(() => {});
-  }, [loadRunsBaseline, projectId]);
+  }, [loadRunsBaseline, projectId, setPreviewTab]);
 
   // Refetch artifacts on open and whenever the directory changes.
   const refreshArtifacts = useCallback(() => {
@@ -864,10 +918,10 @@ export default function App() {
 
   // Open an experiment view as a right-panel tab (creating it if needed) and
   // focus it.
-  const openExperimentTab = useCallback((id: string, view: ExperimentView = "overview") => {
+  const openExperimentTab = useCallback((id: string, view: ExperimentView = "overview", preview = false) => {
     const tab = { id, view };
     setExpTabs((prev) => (prev.some((t) => sameExpTab(t, tab)) ? prev : [...prev, tab]));
-    selectRightTab(tab);
+    selectRightTab(tab, preview);
     setPanelOpen(true);
   }, [selectRightTab]);
 
@@ -880,7 +934,7 @@ export default function App() {
       const run = matches.length === 1 ? matches[0] : null;
       if (!run) return;
       setSelectedRunId(run.id);
-      openExperimentTab(run.experimentId, "terminal");
+      openExperimentTab(run.experimentId, "terminal", true);
     },
     [openExperimentTab],
   );
@@ -917,7 +971,7 @@ export default function App() {
     const matches = experimentsRef.current.filter(
       (experiment) => experiment.id === experimentId || experiment.id.startsWith(experimentId),
     );
-    if (matches.length === 1) openExperimentTab(matches[0].id, "overview");
+    if (matches.length === 1) openExperimentTab(matches[0].id, "overview", true);
   }, [openExperimentTab]);
 
   const closeExperimentTab = useCallback(
@@ -931,7 +985,7 @@ export default function App() {
   );
 
   const openResolvedFileTab = useCallback(
-    (tab: FileViewDef) => {
+    (tab: FileViewDef, preview = false) => {
       const persistentTab = persistentFileTab(tab);
       setFileTabs((prev) => {
         const idx = prev.findIndex((item) => sameFileTab(item, tab));
@@ -940,16 +994,16 @@ export default function App() {
         next[idx] = persistentTab;
         return next;
       });
-      selectRightTab(tab);
+      selectRightTab(tab, preview);
       setPanelOpen(true);
     },
     [selectRightTab],
   );
 
-  // Open a project file as a right-panel tab. `contextSessionId` is the chat
+  // Resolve a reported path to a file tab. `contextSessionId` is the chat
   // session (or viewed file's session) the click came from — see
   // parseFilePath for how it resolves against the reported path.
-  const openFileTab = useCallback(
+  const resolveFileTab = useCallback(
     (
       rawPath: string,
       contextSessionId?: string,
@@ -966,7 +1020,7 @@ export default function App() {
         project?.artifactsDir ?? project?.filesDir,
         project?.slug,
       );
-      if (!tab) return;
+      if (!tab) return null;
       // A cited experiment pins the file to that node's committed branch, so the
       // tab shows (and labels) the version behind the claim. Agents cite the
       // short id (`orx` prints an 8-char prefix), so match the full id or prefix.
@@ -983,16 +1037,31 @@ export default function App() {
       // Label an editable (ref-less) checkout with its branch, so a worktree on
       // a non-baseline branch still names it in the header.
       if (displayBranch && !tab.ref && isRepoFile) tab.branchLabel = displayBranch;
+      // Line is not part of tab identity: reopening a file at a new line reuses
+      // the tab but makes the new (line-carrying) def the active one so the
+      // viewer re-scrolls.
       if (line != null) {
         tab.line = line;
         tab.lineScrollRequest = ++fileLineScrollRequestRef.current;
       }
-      // Line is not part of tab identity: reopening a file at a new line reuses
-      // the tab but makes the new (line-carrying) def the active one so the
-      // viewer re-scrolls.
-      openResolvedFileTab(tab);
+      return tab;
     },
-    [projects, projectId, openResolvedFileTab],
+    [projects, projectId],
+  );
+
+  const openFileTab = useCallback(
+    (
+      rawPath: string,
+      contextSessionId?: string,
+      ref?: string,
+      line?: number,
+      exp?: string,
+      displayBranch?: string,
+    ) => {
+      const tab = resolveFileTab(rawPath, contextSessionId, ref, line, exp, displayBranch);
+      if (tab) openResolvedFileTab(tab);
+    },
+    [openResolvedFileTab, resolveFileTab],
   );
 
   const openArtifactFileTab = useCallback(
@@ -1001,11 +1070,24 @@ export default function App() {
   );
 
   // Chat file chips may carry a target line, cited experiment, or an exact Git
-  // ref from a `git show ref:path` tool call.
+  // ref from a `git show ref:path` tool call. Chips preview; markdown links in
+  // a plan or file tab commit, since following a link is navigation.
   const openChatFile = useCallback(
-    (path: string, sessionId?: string, line?: number, exp?: string, ref?: string) =>
-      openFileTab(path, sessionId, ref, line, exp),
-    [openFileTab],
+    (path: string, sessionId?: string, line?: number, exp?: string, ref?: string) => {
+      const tab = resolveFileTab(path, sessionId, ref, line, exp);
+      if (tab) openResolvedFileTab(tab, true);
+    },
+    [openResolvedFileTab, resolveFileTab],
+  );
+
+  // Following a chip or link out of a tab commits it, so the transcript or file
+  // the user navigated from isn't what the next preview replaces.
+  const openFromRightTab = useCallback(
+    (host: RightTab, open: () => void) => {
+      promoteRightTab(host);
+      open();
+    },
+    [promoteRightTab],
   );
 
   const closeFileTab = useCallback(
@@ -1052,7 +1134,7 @@ export default function App() {
       next[idx] = tab;
       return next;
     });
-    selectRightTab(tab);
+    selectRightTab(tab, true);
     setPanelOpen(true);
   }, [selectRightTab]);
 
@@ -1074,7 +1156,7 @@ export default function App() {
     setSubagentTabs((prev) =>
       prev.some((t) => t.spawnPartId === spawnPartId) ? prev : [...prev, tab],
     );
-    selectRightTab(tab);
+    selectRightTab(tab, true);
     setPanelOpen(true);
   }, [selectRightTab]);
 
@@ -1326,13 +1408,17 @@ export default function App() {
   const codeTab = requestedCodeTab
     ? (codeTabs.find((tab) => sameCodeTab(tab, requestedCodeTab)) ?? null)
     : null;
+  const isPreviewTab = (tab: RightTab) =>
+    previewTab !== null && rightTabKey(previewTab) === rightTabKey(tab);
   const renderFileTab = (tab: FileViewDef) => (
     <ClosableTab
       key={`file:${fileTabKey(tab)}`}
       active={fileTab !== null && sameFileTab(fileTab, tab)}
       label={tab.path.split("/").pop() || tab.path}
       icon={<FileCode size={12} style={{ flexShrink: 0 }} />}
+      preview={isPreviewTab(tab)}
       onSelect={() => selectRightTab(tab)}
+      onPromote={() => promoteRightTab(tab)}
       onClose={() => closeFileTab(tab)}
     />
   );
@@ -1526,7 +1612,9 @@ export default function App() {
                         <Terminal size={12} style={{ flexShrink: 0 }} />
                       )
                     }
+                    preview={isPreviewTab(t)}
                     onSelect={() => selectRightTab(t)}
+                    onPromote={() => promoteRightTab(t)}
                     onClose={() => closeExperimentTab(t)}
                   />
                 );
@@ -1538,7 +1626,9 @@ export default function App() {
                   active={planTab !== null && planTab.promptId === t.promptId}
                   label="Plan"
                   icon={<ScrollText size={12} style={{ flexShrink: 0 }} />}
+                  preview={isPreviewTab(t)}
                   onSelect={() => selectRightTab(t)}
+                  onPromote={() => promoteRightTab(t)}
                   onClose={() => closePlanTab(t)}
                 />
               ))}
@@ -1549,7 +1639,9 @@ export default function App() {
                   label={spawnMeta[t.spawnPartId]?.label ?? t.label ?? "Sub-agent"}
                   shimmer={spawnMeta[t.spawnPartId]?.running ?? false}
                   icon={<Users size={12} style={{ flexShrink: 0 }} />}
+                  preview={isPreviewTab(t)}
                   onSelect={() => selectRightTab(t)}
+                  onPromote={() => promoteRightTab(t)}
                   onClose={() => closeSubagentTab(t)}
                 />
               ))}
@@ -1756,7 +1848,9 @@ export default function App() {
                   gitRef={fileTab.ref}
                   line={fileTab.line}
                   branchLabel={fileBranchLabel(fileTab, activeProject?.baselineBranch)}
-                  onOpenFile={openFileTab}
+                  onOpenFile={(path, sessionId, ref) =>
+                    openFromRightTab(fileTab, () => openFileTab(path, sessionId, ref))
+                  }
                   scrollPosition={fileScrollPositionsRef.current.get(
                     fileScrollKey(projectId, activeSessionId, fileTab),
                   )}
@@ -1768,6 +1862,7 @@ export default function App() {
                   }}
                   lineScrollRequest={fileTab.lineScrollRequest}
                   onLineScrollRequestHandled={() => consumeFileLineScrollRequest(fileTab)}
+                  onEdit={() => promoteRightTab(fileTab)}
                 />
               )}
             </div>
@@ -1778,7 +1873,9 @@ export default function App() {
               <div className="pane-content flex-1 min-h-0 relative plan-tab-content overflow-y-auto bg-background py-4.5 px-6 [&_.md]:max-w-readable">
                 <Md
                   text={planTab.plan}
-                  onOpenFile={(path) => openFileTab(path, planTab.sessionId)}
+                  onOpenFile={(path) =>
+                    openFromRightTab(planTab, () => openFileTab(path, planTab.sessionId))
+                  }
                 />
               </div>
             </div>
@@ -1788,12 +1885,20 @@ export default function App() {
               key={subagentTab.spawnPartId}
               sessionId={subagentTab.sessionId}
               spawnPartId={subagentTab.spawnPartId}
-              onOpenFile={(path) => openFileTab(path, subagentTab.sessionId)}
-              onOpenRun={openRunLogs}
+              onOpenFile={(path) =>
+                openFromRightTab(subagentTab, () => openChatFile(path, subagentTab.sessionId))
+              }
+              onOpenRun={(runId) => openFromRightTab(subagentTab, () => openRunLogs(runId))}
               runExperimentName={runExperimentName}
-              onOpenExperiment={openExperimentNotes}
+              onOpenExperiment={(experimentId) =>
+                openFromRightTab(subagentTab, () => openExperimentNotes(experimentId))
+              }
               experimentName={experimentName}
-              onOpenSubagent={(pid, label) => openSubagentTab(subagentTab.sessionId, pid, label)}
+              onOpenSubagent={(pid, label) =>
+                openFromRightTab(subagentTab, () =>
+                  openSubagentTab(subagentTab.sessionId, pid, label),
+                )
+              }
             />
           ) : codeTab ? (
             <div className={TAB_BODY_CLASS_NAME}>
