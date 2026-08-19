@@ -1,19 +1,23 @@
 // Mirror of openresearch.sh's AgentFileView: one file from the project —
 // a branch's committed copy when the tab carries a ref, else the chat
-// session's worktree, else the hub clone, else the project's artifacts —
+// session's worktree, else the hub clone, else the project's artifacts, with
+// an artifacts tab falling back the other way when only the checkout has it —
 // refractor-highlighted, opened as a right-pane tab from chat tool rows or
 // the code browser.
 
 import { Code, ExternalLink, FileText, GitBranch, RotateCw } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
+  absoluteFileUrl,
   artifactUrl,
+  getAbsoluteFile,
   getArtifactFileMetadata,
   getArtifactFileText,
   getProjectFile,
   openFileInEditor,
   projectFileUrl,
   saveProjectFile,
+  type AbsoluteFile,
   type CheckoutRoot,
   type ProjectFile,
 } from "../api";
@@ -28,7 +32,8 @@ import { ICON_BUTTON_CLASS_NAME, SPINNER_CLASS_NAME } from "../styleClasses";
 type ArtifactPreviewFile = Omit<ProjectFile, "root">;
 type LoadedFile =
   | { source: "checkout"; file: ProjectFile }
-  | { source: "artifact"; file: ArtifactPreviewFile; checkoutRoot?: CheckoutRoot };
+  | { source: "artifact"; file: ArtifactPreviewFile; checkoutRoot?: CheckoutRoot }
+  | { source: "absolute"; file: AbsoluteFile };
 
 export interface FileScrollPosition {
   top: number;
@@ -52,10 +57,11 @@ export function FileViewer({
   projectId: string;
   path: string;
   /** Which backend serves this file. "artifacts" reads the project's durable
-   * output directory, else the repo/worktree checkout. */
-  source?: "repo" | "artifacts";
-  /** Chat session whose worktree holds the file (absent → hub clone).
-   * Never set for tabs opened with source:"artifacts". */
+   * output directory; "abs" reads an absolute path off disk (a file outside
+   * the checkout and artifacts); else the repo/worktree checkout. */
+  source?: "repo" | "artifacts" | "abs";
+  /** Chat session whose worktree holds the file (absent → hub clone). An
+   * "artifacts" tab carries it only for the checkout fallback; "abs" never. */
   sessionId?: string;
   /** Branch whose committed copy to show — overrides the live checkout.
    * (Named gitRef because `ref` is reserved on React components.) */
@@ -77,9 +83,12 @@ export function FileViewer({
   const [loading, setLoading] = useState(true);
   const [nonce, setNonce] = useState(0);
   const isArtifacts = source === "artifacts";
+  const isAbsolute = source === "abs";
   // Markdown renders by default; the header toggle shows the raw source.
   const isMarkdown = isMarkdownFile(path);
-  const artifactsFolder = path.split("/").slice(0, -1).join("/");
+  // This file's parent dir: the artifact report folder for image resolution,
+  // and the anchor for a relative link inside an abs file.
+  const parentFolder = path.split("/").slice(0, -1).join("/");
   const [showSource, setShowSource] = useState(false);
   // Live edit buffer for the code file. It IS the view for editable files (no
   // edit mode); it tracks the loaded content and diverges as the user types.
@@ -89,13 +98,17 @@ export function FileViewer({
   const bodyRef = useRef<HTMLDivElement>(null);
   const scrollPositionRef = useRef(scrollPosition);
   const data = loaded?.file ?? null;
+  // A cited `artifacts/…` file can answer from either name in the checkout, so
+  // writes, the editor, and raw bytes must target the path that answered.
+  const filePath = loaded?.source === "checkout" ? loaded.file.path : path;
   const mediaKind = mediaPreviewKind(data?.presentation);
   const viaArtifacts = loaded?.source === "artifact" && !isArtifacts;
-  const artifactsMode = isArtifacts || loaded?.source === "artifact";
+  const viaCheckout = isArtifacts && loaded?.source === "checkout";
+  // An artifacts tab that fell back must render as the checkout, not the store.
+  const artifactsMode = loaded?.source === "artifact";
   // A file that exists in the live checkout on disk (not a committed branch tree
   // or an artifact) — the only source the write/open endpoints can resolve.
-  const onDisk =
-    !isArtifacts && !gitRef && loaded?.source === "checkout" && data != null && !data.notFound;
+  const onDisk = !gitRef && loaded?.source === "checkout" && data != null && !data.notFound;
   // Editable = a live checkout text file. A session read that fell back to the
   // clone isn't the worktree it names, so it stays read-only rather than
   // silently editing another checkout.
@@ -133,7 +146,7 @@ export function FileViewer({
     setSaving(true);
     setSaveError(null);
     try {
-      await saveProjectFile(projectId, path, content, { sessionId });
+      await saveProjectFile(projectId, filePath, content, { sessionId });
       // Advance the baseline to what we wrote so `dirty` clears without a refetch;
       // mark it so the reseed effect ignores this self-inflicted change.
       lastWriteRef.current = content;
@@ -157,16 +170,18 @@ export function FileViewer({
     setOpeningEditor(true);
     setEditorError(null);
     try {
-      await openFileInEditor(projectId, path, { sessionId });
+      await openFileInEditor(projectId, filePath, { sessionId });
     } catch (e) {
       setEditorError(e instanceof Error ? e.message : String(e));
     } finally {
       setOpeningEditor(false);
     }
   };
-  const rawUrlBase = artifactsMode
-    ? artifactUrl(projectId, path)
-    : projectFileUrl(projectId, path, { sessionId, ref: gitRef });
+  const rawUrlBase = isAbsolute
+    ? absoluteFileUrl(path)
+    : artifactsMode
+      ? artifactUrl(projectId, path)
+      : projectFileUrl(projectId, filePath, { sessionId, ref: gitRef });
   const rawUrl = `${rawUrlBase}&v=${nonce}`;
 
   useEffect(() => {
@@ -195,11 +210,25 @@ export function FileViewer({
           : (metadata?.presentation ?? "download"),
       };
     };
-    // A checkout path the /file endpoint doesn't have may still name an
-    // artifact, so try that directory before declaring it missing. Branch tabs
-    // do not fall back because a ref names a committed tree.
-    const load: Promise<LoadedFile> = isArtifacts
-      ? fromArtifacts().then((file) => ({ source: "artifact", file }))
+    // A cited artifact path arrives stripped of its `artifacts/` prefix, which
+    // the checkout copy usually keeps — try that first; a throwing probe
+    // (unknown session, directory name) just means "not here".
+    const fromCheckout = async (): Promise<ProjectFile | null> => {
+      for (const candidate of [`artifacts/${path}`, path]) {
+        const file = await getProjectFile(projectId, candidate, { sessionId }).catch(() => null);
+        if (file && !file.notFound) return file;
+      }
+      return null;
+    };
+    // Branch tabs do not fall back because a ref names a committed tree.
+    const load: Promise<LoadedFile> = isAbsolute
+      ? getAbsoluteFile(path).then((file) => ({ source: "absolute", file }))
+      : isArtifacts
+      ? fromArtifacts().then(async (file) => {
+          if (!file.notFound) return { source: "artifact", file };
+          const checkout = await fromCheckout();
+          return checkout ? { source: "checkout", file: checkout } : { source: "artifact", file };
+        })
       : getProjectFile(projectId, path, { sessionId, ref: gitRef }).then((d) =>
           d.notFound && !gitRef
             ? fromArtifacts().then((f) =>
@@ -235,7 +264,11 @@ export function FileViewer({
   }, [data]);
 
   const notFoundCopy = (d: LoadedFile) => {
-    if (isArtifacts) return "Artifact not found in the project.";
+    if (d.source === "absolute") return "File not found on disk.";
+    if (isArtifacts)
+      return `File not found in the project's artifacts or the ${
+        sessionId ? "session's worktree" : "project clone"
+      }.`;
     if (gitRef) return `File not found on branch ${gitRef}.`;
     if (sessionId && d.source === "checkout" && d.file.root === "clone")
       return "This session's worktree isn't available, and the file isn't in the project clone or its artifacts.";
@@ -247,8 +280,8 @@ export function FileViewer({
     <div className="file-view flex flex-col h-full min-h-0">
       <div className="file-view-header flex items-center gap-2 py-1.5 px-3 border-b border-b-border-variant text-text shrink-0">
         <FileText size={13} style={{ flexShrink: 0 }} />
-        <code className="file-view-path font-mono text-sm text-text flex-1 min-w-0 overflow-hidden text-ellipsis whitespace-nowrap" title={path}>
-          {path}
+        <code className="file-view-path font-mono text-sm text-text flex-1 min-w-0 overflow-hidden text-ellipsis whitespace-nowrap" title={filePath}>
+          {filePath}
         </code>
         {branchLabel && (
           <span className="file-view-branch inline-flex items-center gap-1 min-w-0 font-mono text-xs text-muted border border-border-variant rounded-sm py-px px-1.5 max-w-65 overflow-hidden text-ellipsis whitespace-nowrap shrink-0 [&_svg]:flex-none" title={`Branch: ${branchLabel}`}>
@@ -305,6 +338,14 @@ export function FileViewer({
           {loading ? <span className={SPINNER_CLASS_NAME} /> : <RotateCw size={13} />}
         </button>
       </div>
+      {/* Outside the scroll body, unlike its siblings: this state can be
+          editable, and the editor's `h-full` would push it out of view. */}
+      {!error && viaCheckout && loaded?.source === "checkout" && (
+        <div className="file-view-note py-2.5 px-4 text-sm text-muted border-b border-b-border-variant shrink-0">
+          Not in the project&apos;s artifacts — showing the copy from the{" "}
+          {loaded.file.root === "worktree" ? "session's worktree" : "project clone"}.
+        </div>
+      )}
       <div
         ref={bodyRef}
         className="file-view-body flex-1 min-h-0 overflow-auto bg-background"
@@ -317,7 +358,7 @@ export function FileViewer({
           onScrollPositionChange?.(position);
         }}
       >
-        {!showingEditor && !error && loaded?.source === "checkout" && !loaded.file.notFound && !gitRef && sessionId && loaded.file.root === "clone" && (
+        {!showingEditor && !error && !isArtifacts && loaded?.source === "checkout" && !loaded.file.notFound && !gitRef && sessionId && loaded.file.root === "clone" && (
           <div className="file-view-note py-2.5 px-4 text-sm text-muted">
             This session&apos;s worktree isn&apos;t available — showing the project clone&apos;s copy.
           </div>
@@ -351,13 +392,24 @@ export function FileViewer({
             {artifactsMode ? (
               <ArtifactMarkdown
                 projectId={projectId}
-                folder={artifactsFolder}
+                folder={parentFolder}
                 markdown={data.content}
               />
             ) : (
               <Md
                 text={data.content}
-                onOpenFile={onOpenFile && ((p) => onOpenFile(p, sessionId, gitRef))}
+                onOpenFile={
+                  onOpenFile &&
+                  ((p) =>
+                    // A relative link inside an abs file names a sibling on disk,
+                    // not a repo-relative path — anchor it to this file's dir so
+                    // it re-enters the abs branch instead of hitting the clone.
+                    onOpenFile(
+                      isAbsolute && !p.startsWith("/") ? `${parentFolder}/${p}` : p,
+                      sessionId,
+                      gitRef,
+                    ))
+                }
               />
             )}
           </div>

@@ -48,6 +48,8 @@ export type ChatEvent =
   | { type: "busy"; sessionId: string; busy: boolean }
   | { type: "usage"; sessionId: string; usage: ContextUsage }
   | { type: "queued"; sessionId: string; items: QueuedMessage[] }
+  /** A different fork of a turn is now the branch on screen. */
+  | { type: "branch"; sessionId: string; activeLeafId: string | null }
   /** The EventSource re-connected after a drop. Chat events are edge-only (no
    * snapshot on connect), so frames emitted during the gap are lost for good —
    * subscribers must refetch whatever they render from chat events. */
@@ -205,6 +207,11 @@ export function useOrxEvents(handlers: OrxEventHandlers) {
     es.addEventListener("chat.queued", (e) => {
       const d = parse<{ sessionId: string; items: QueuedMessage[] }>(e as MessageEvent);
       if (d?.sessionId) emitChat({ type: "queued", sessionId: d.sessionId, items: d.items ?? [] });
+    });
+    es.addEventListener("chat.branch", (e) => {
+      const d = parse<{ sessionId: string; activeLeafId: string | null }>(e as MessageEvent);
+      if (d?.sessionId)
+        emitChat({ type: "branch", sessionId: d.sessionId, activeLeafId: d.activeLeafId ?? null });
     });
     es.addEventListener("harness.auth", (e) => {
       const d = parse<HarnessAuthEvent>(e as MessageEvent);

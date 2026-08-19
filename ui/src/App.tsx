@@ -84,10 +84,12 @@ interface FileViewDef {
   /** Which backend serves this file. Absent/"repo" → the repo `/file`
    * endpoint (worktree/clone/branch), falling back to artifacts when a
    * non-ref path misses the checkout; "artifacts" → the project's durable
-   * output directory through the compatibility `/files/file` endpoint. */
-  source?: "repo" | "artifacts";
+   * output directory through the compatibility `/files/file` endpoint;
+   * "abs" → an absolute path on disk outside both (the `/files/abs`
+   * endpoint), for files an agent references anywhere on the machine. */
+  source?: "repo" | "artifacts" | "abs";
   /** Chat session whose worktree holds the file (absent → hub clone).
-   * Artifact tabs never carry this. */
+   * Artifact and absolute-path tabs never carry this. */
   sessionId?: string;
   /** Branch whose committed copy to show (code browser in branch mode);
    * overrides the live checkout. */
@@ -294,15 +296,30 @@ function parseFilePath(
     path = path.slice("artifacts/".length);
     return path ? { path, source: "artifacts" } : null;
   }
+  // A home-anchored path (`~` or `~/…`) is disk, never a repo file — the backend
+  // expands the `~`, so hand it over verbatim.
+  if (path === "~" || path.startsWith("~/")) return { path, source: "abs" };
+  // `path` relative to `base` (`""` when equal), else null. macOS symlinks
+  // `/tmp`→`/private/tmp` and `/var`→`/private/var`, so an agent-inlined path
+  // and the stored dir can differ only by that prefix — strip it on both sides.
+  const relUnder = (base: string): string | null => {
+    const strip = (p: string) => p.replace(/^\/private(?=\/(?:tmp|var)(?:\/|$))/, "");
+    const [p, b] = [strip(path), strip(base)];
+    if (p === b) return "";
+    return p.startsWith(`${b}/`) ? p.slice(b.length).replace(/^\/+/, "") : null;
+  };
+  // A relative path names a file in the click context's checkout; the absolute
+  // branches below are keyed off the (non-canonical) stored dirs.
+  const artifactRel = path.startsWith("/") && artifacts ? relUnder(artifacts) : null;
+  const cloneRel = path.startsWith("/") && clone ? relUnder(clone) : null;
   if (!path.startsWith("/")) {
     sessionId = contextSessionId;
-  } else if (artifacts && (path === artifacts || path.startsWith(`${artifacts}/`))) {
-    // Artifact — exact prefix match against the non-canonical dir the
-    // backend surfaced, which mirrors what the agent inlines.
-    const rel = path.slice(artifacts.length).replace(/^\/+/, "");
-    return rel ? { path: rel, source: "artifacts" } : null;
-  } else if (clone && (path === clone || path.startsWith(`${clone}/`))) {
-    path = path.slice(clone.length).replace(/^\/+/, "");
+  } else if (artifactRel !== null) {
+    // Artifact — prefix match against the non-canonical dir the backend
+    // surfaced, which mirrors what the agent inlines.
+    return artifactRel ? { path: artifactRel, source: "artifacts" } : null;
+  } else if (cloneRel !== null) {
+    path = cloneRel;
   } else {
     // Artifact fallback for a symlink-divergent path (e.g. /tmp vs
     // /private/tmp) where the exact prefix missed: match the …/files/<slug>/<rel>
@@ -321,15 +338,21 @@ function parseFilePath(
       path = hub[1];
     }
   }
-  return path ? { path, sessionId } : null;
+  if (!path) return null;
+  // An absolute path none of the checkout/artifacts branches recognized (e.g.
+  // /Users/me/.ssh/config) reads straight off disk — the repo /file endpoint
+  // only takes repo-relative paths and would reject it.
+  if (path.startsWith("/")) return { path, source: "abs" };
+  return { path, sessionId };
 }
 
 /** The git branch a code file tab is showing, for the header pill — a cited
  * experiment's branch (or any ref view) names that branch, and a worktree/clone
  * file falls back to the baseline branch, so a code tab always says which
- * branch its contents came from. Artifacts have no branch. */
+ * branch its contents came from. Artifacts and absolute-path files have no
+ * branch. */
 function fileBranchLabel(tab: FileViewDef, baselineBranch?: string): string | undefined {
-  if (tab.source === "artifacts") return undefined;
+  if (tab.source === "artifacts" || tab.source === "abs") return undefined;
   return tab.ref ?? tab.branchLabel ?? baselineBranch;
 }
 
@@ -840,11 +863,13 @@ export default function App() {
           )
         : undefined;
       const effectiveRef = ref ?? experiment?.branchName;
-      // A branch ref only applies to repo files; artifacts have no branch.
-      if (effectiveRef && tab.source !== "artifacts") tab.ref = effectiveRef;
+      // A branch ref only applies to repo files; artifacts and absolute-path
+      // files have no branch.
+      const isRepoFile = tab.source == null || tab.source === "repo";
+      if (effectiveRef && isRepoFile) tab.ref = effectiveRef;
       // Label an editable (ref-less) checkout with its branch, so a worktree on
       // a non-baseline branch still names it in the header.
-      if (displayBranch && !tab.ref && tab.source !== "artifacts") tab.branchLabel = displayBranch;
+      if (displayBranch && !tab.ref && isRepoFile) tab.branchLabel = displayBranch;
       if (line != null) {
         tab.line = line;
         tab.lineScrollRequest = ++fileLineScrollRequestRef.current;
@@ -1581,7 +1606,12 @@ export default function App() {
                   projectId={projectId}
                   path={fileTab.path}
                   source={fileTab.source}
-                  sessionId={fileTab.sessionId}
+                  // Artifacts tabs fall back to the checkout, which needs this session.
+                  sessionId={
+                    fileTab.source === "artifacts"
+                      ? (activeSessionId ?? undefined)
+                      : fileTab.sessionId
+                  }
                   gitRef={fileTab.ref}
                   line={fileTab.line}
                   branchLabel={fileBranchLabel(fileTab, activeProject?.baselineBranch)}

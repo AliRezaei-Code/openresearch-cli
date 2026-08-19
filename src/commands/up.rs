@@ -316,6 +316,8 @@ fn router(state: AppState) -> Router {
         )
         .route("/api/projects/{id}/file/raw", get(project_raw_file))
         .route("/api/projects/{id}/file/open", post(open_project_file))
+        .route("/api/files/abs", get(absolute_file))
+        .route("/api/files/abs/raw", get(absolute_raw_file))
         .route(
             "/api/projects/{id}/files",
             get(list_artifacts).delete(delete_artifact),
@@ -416,6 +418,8 @@ fn router(state: AppState) -> Router {
         .route("/api/chat/sessions/{id}/messages", get(chat_messages))
         .route("/api/chat/sessions/{id}/worktree", get(session_worktree))
         .route("/api/chat/sessions/{id}/message", post(send_chat_message))
+        .route("/api/chat/sessions/{id}/fork", post(fork_chat_turn))
+        .route("/api/chat/sessions/{id}/branch", post(select_chat_branch))
         .route("/api/chat/sessions/{id}/interrupt", post(interrupt_chat))
         .route(
             "/api/chat/sessions/{id}/queue/{itemId}",
@@ -2452,6 +2456,151 @@ async fn project_raw_file(
     }
 }
 
+#[derive(Deserialize)]
+struct AbsoluteFileQuery {
+    path: String,
+}
+
+/// Validate an absolute-path request and resolve a leading `~`/`~/` to the home
+/// dir (the shell never expands it for us, and agents inline `~/…` paths). The
+/// display string stays as typed — it's what the tab shows and what the agent
+/// wrote; only the returned `PathBuf` is home-expanded. `~otheruser` is left
+/// alone and simply fails the absolute check. The bind is loopback-only and the
+/// server runs as the user, so any file the user could read is fair game — this
+/// only rejects malformed input, not location.
+fn validated_absolute_file_path(
+    path: &str,
+) -> std::result::Result<(String, std::path::PathBuf), ApiError> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed.len() > 4096 {
+        return Err(bad_request("invalid path"));
+    }
+    let resolved = match trimmed.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => dirs::home_dir()
+            .ok_or_else(|| bad_request("no home directory"))?
+            .join(rest.trim_start_matches('/')),
+        _ => std::path::PathBuf::from(trimmed),
+    };
+    if !resolved.is_absolute() {
+        return Err(bad_request("path must be absolute"));
+    }
+    Ok((trimmed.to_string(), resolved))
+}
+
+/// One file by absolute path, for the UI file viewer — the escape hatch for a
+/// file an agent references that lives outside the project's checkout and
+/// artifacts (e.g. `/Users/me/.ssh/config`). Same decoded/capped body shape as
+/// `project_file`; `root: "abs"`. Loopback-only and no auth, so it reads
+/// whatever the user running `orx up` can read — matching how the raw variant
+/// and the OS-open endpoint already expose the local disk.
+async fn absolute_file(
+    Query(q): Query<AbsoluteFileQuery>,
+) -> std::result::Result<Json<ProjectFileResponse>, ApiError> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        let (display, abs) = validated_absolute_file_path(&q.path)?;
+        let presentation = local::files::presentation_for_path(&display);
+        let full = match std::fs::canonicalize(&abs) {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Json(ProjectFileResponse::missing(
+                    display,
+                    "abs",
+                    presentation,
+                )))
+            }
+            Err(e) => return Err(ApiError::from(anyhow!("read failed: {e}"))),
+        };
+        if full.is_dir() {
+            return Err(bad_request("path is a directory"));
+        }
+        if !matches!(
+            presentation,
+            local::files::FilePresentation::Text | local::files::FilePresentation::Unknown
+        ) {
+            return Ok(Json(ProjectFileResponse::non_text(
+                display,
+                "abs",
+                presentation,
+            )));
+        }
+        let file = match std::fs::File::open(&full) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Json(ProjectFileResponse::missing(
+                    display,
+                    "abs",
+                    presentation,
+                )))
+            }
+            Err(e) => return Err(ApiError::from(anyhow!("read failed: {e}"))),
+        };
+        let mut buf = Vec::new();
+        std::io::Read::take(file, FILE_READ_LIMIT + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| ApiError::from(anyhow!("read failed: {e}")))?;
+        let truncated = buf.len() as u64 > FILE_READ_LIMIT;
+        buf.truncate(FILE_READ_LIMIT as usize);
+        let (content, binary) = decode_project_file_text(buf, truncated);
+        let presentation = if binary {
+            local::files::FilePresentation::Download
+        } else {
+            local::files::FilePresentation::Text
+        };
+        Ok(Json(ProjectFileResponse::text(
+            display,
+            "abs",
+            content,
+            truncated,
+            binary,
+            presentation,
+        )))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("file task failed: {e}")))?
+}
+
+/// Byte-exact absolute-path file for browser-native media previews and
+/// downloads — the streamed counterpart to `absolute_file`, mirroring
+/// `project_raw_file` for arbitrary on-disk paths.
+async fn absolute_raw_file(
+    Query(q): Query<AbsoluteFileQuery>,
+    method: Method,
+    headers: HeaderMap,
+) -> std::result::Result<Response, ApiError> {
+    let (display, file) = tokio::task::spawn_blocking(
+        move || -> std::result::Result<(String, std::fs::File), ApiError> {
+            let (display, abs) = validated_absolute_file_path(&q.path)?;
+            let full = std::fs::canonicalize(&abs).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    not_found("file")
+                } else {
+                    ApiError::from(anyhow!("read failed: {e}"))
+                }
+            })?;
+            if full.is_dir() {
+                return Err(bad_request("path is a directory"));
+            }
+            let file = std::fs::File::open(&full)
+                .map_err(|e| ApiError::from(anyhow!("read failed: {e}")))?;
+            Ok((display, file))
+        },
+    )
+    .await
+    .map_err(|e| ApiError::from(anyhow!("file task failed: {e}")))??;
+    let presentation = local::files::presentation_for_path(&display);
+    crate::commands::file_serve::disk_response(
+        &display,
+        file,
+        presentation,
+        &method,
+        &headers,
+        "no-cache",
+    )
+    .await
+    .map_err(ApiError::from)
+}
+
 // --- project artifacts ----------------------------------------------------
 
 /// Listing of the project's artifacts dir — the filesystem is the source of
@@ -4423,6 +4572,7 @@ async fn create_chat_session(
         archived: false,
         context_usage_json: None,
         bootstrap_context: None,
+        active_leaf_id: None,
         created_at: now_ms(),
         updated_at: now_ms(),
     };
@@ -4491,14 +4641,21 @@ async fn update_chat_session(
 }
 
 async fn chat_messages(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
-    Store::open()?
+    // Messages first: these are two connections, so a turn writing between them
+    // can only leave the leaf *ahead* of the list, which the client falls back on
+    // safely — the other order hides a reply that is already in the list.
+    let messages = local::chat::list_messages(&id)?;
+    let session = Store::open()?
         .get_chat_session(&id)?
         .ok_or_else(|| not_found("chat session"))?;
-    let messages = local::chat::list_messages(&id)?;
     // Parked messages are in-memory, so a reload mid-turn recovers them here
     // rather than from the store.
     let queued = state.chat.queued_items(&id);
-    Ok(Json(json!({ "messages": messages, "queued": queued })))
+    Ok(Json(json!({
+        "messages": messages,
+        "queued": queued,
+        "activeLeafId": session.active_leaf_id,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -4542,6 +4699,58 @@ async fn send_chat_message(
     state
         .chat
         .send_message(&id, text, overrides, req.images, annotations)
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForkChatReq {
+    /// The message being re-sampled: an assistant reply to retry, or a user
+    /// message to re-ask with `text`.
+    message_id: String,
+    /// Edited prompt. Absent re-sends the original message unchanged.
+    text: Option<String>,
+}
+
+async fn fork_chat_turn(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ForkChatReq>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    let kind = match req.text {
+        Some(text) if !text.trim().is_empty() => local::chat::ForkKind::Edit(text),
+        Some(_) => return Err(bad_request("text is required")),
+        None => local::chat::ForkKind::Retry,
+    };
+    // A fork re-samples under the session's current settings, so it takes no
+    // overrides — the turn runs in the background and streams over /api/events.
+    state
+        .chat
+        .fork_turn(&id, &req.message_id, kind)
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectBranchReq {
+    /// The fork to show. Its whole branch comes with it.
+    leaf_id: String,
+}
+
+async fn select_chat_branch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<SelectBranchReq>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    state
+        .chat
+        .select_branch(&id, &req.leaf_id)
         .await
         .map_err(bad_request)?;
     Ok(Json(json!({ "ok": true })))
@@ -5179,6 +5388,39 @@ mod tests {
                 "accepted {path:?}"
             );
         }
+    }
+
+    // ApiError has no Debug, so `.unwrap()` on the Err path won't compile; drop
+    // the error to its message string to make the Result assertion-friendly.
+    fn abs_path(path: &str) -> std::result::Result<(String, std::path::PathBuf), String> {
+        validated_absolute_file_path(path).map_err(|error| error.1)
+    }
+
+    #[test]
+    fn absolute_file_paths_require_an_absolute_path() {
+        assert_eq!(
+            abs_path("  /etc/hosts  "),
+            Ok((
+                "/etc/hosts".to_string(),
+                std::path::PathBuf::from("/etc/hosts")
+            )),
+        );
+        for path in ["", "   ", "relative/path", "../secret", &"/x".repeat(3000)] {
+            assert!(abs_path(path).is_err(), "accepted {path:?}");
+        }
+    }
+
+    #[test]
+    fn absolute_file_paths_expand_a_leading_tilde() {
+        let home = dirs::home_dir().expect("home dir");
+        // `~/x` and bare `~` resolve under home; the display stays as typed.
+        assert_eq!(
+            abs_path("~/.ssh/config"),
+            Ok(("~/.ssh/config".to_string(), home.join(".ssh/config"))),
+        );
+        assert_eq!(abs_path("~").map(|(_, p)| p), Ok(home));
+        // `~otheruser` isn't expanded, so it stays relative and is rejected.
+        assert!(abs_path("~otheruser/x").is_err());
     }
 
     fn no_key(path: Option<&str>) -> SshReadiness {
