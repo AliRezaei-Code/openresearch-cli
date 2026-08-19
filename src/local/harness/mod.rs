@@ -126,9 +126,11 @@ pub trait Harness: Send + Sync {
     /// configuration. `None` = can't or failed — the caller keeps the
     /// first-line placeholder.
     ///
-    /// Default: no generation. OpenCode adopts its own native titles (minus its
-    /// creation seed) through `TurnCtx::set_title`, and Cursor has no chat
-    /// capability at all.
+    /// Default: no generation (e.g. Cursor has no chat capability). OpenCode
+    /// also still adopts a native `session.updated` title (minus its creation
+    /// seed) through `TurnCtx::set_title` if its server ever offers one, but
+    /// runs its own one-shot child since the server stopped titling parent
+    /// sessions.
     async fn generate_title(&self, _first_message: &str) -> Option<String> {
         None
     }

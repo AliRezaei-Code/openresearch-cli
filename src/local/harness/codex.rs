@@ -1435,13 +1435,36 @@ fn subagent_spawn_part(id: &str, item: &Value, completed: bool) -> WirePart {
         "completed"
     };
     // Surface only what the UI labels the row from (`toolLine`'s subagent arm
-    // reads `tool` / `prompt` / `kind`) — the transcript is located via the
-    // spawn part id + `children`, not via any thread id in the payload.
+    // reads `tool` / `prompt` / `kind` / `nickname`) — the transcript is
+    // located via the spawn part id + `children`, not via any thread id in the
+    // payload.
     let mut input = serde_json::Map::new();
     for key in ["tool", "prompt", "kind"] {
         if let Some(v) = item.get(key) {
             input.insert(key.into(), v.clone());
         }
+    }
+    // The model-assigned agent identity — the row's best label. Collab items
+    // carry it on the first receiver agent; activity items on the agent path,
+    // whose last segment is the agent name.
+    let nickname = item
+        .get("receiverAgents")
+        .and_then(Value::as_array)
+        .and_then(|agents| agents.first())
+        .and_then(|agent| {
+            agent
+                .get("agentNickname")
+                .or_else(|| agent.get("agentRole"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            item.get("agentPath")
+                .and_then(Value::as_str)
+                .and_then(|path| path.rsplit('/').next())
+                .filter(|name| !name.is_empty() && *name != "root")
+        });
+    if let Some(nickname) = nickname {
+        input.insert("nickname".into(), nickname.into());
     }
     tool_part(
         id.to_string(),
@@ -1465,11 +1488,48 @@ fn subagent_spawn_part(id: &str, item: &Value, completed: bool) -> WirePart {
 // thread we know is a sub-agent spawned this turn, route its items/deltas into
 // the spawning part's `children` instead.
 
+/// Shared tail of every successfully-completed turn: sweep still-open request
+/// cards, reconcile final item states, settle orphaned spawn rows, synthesize
+/// the plan card when applicable, and flush. Kept in one place so the three
+/// exit paths (plain completion, drain completion, drain quiet-settle) can't
+/// drift.
+async fn finish_completed_turn(
+    ctx: &mut TurnCtx,
+    client: &CodexClient,
+    thread_id: &str,
+    turn_id: Option<&str>,
+    plan_card_wanted: bool,
+    open_requests: &mut HashMap<String, (Value, ServerReqKind)>,
+) {
+    sweep_open_requests(ctx, client, open_requests).await;
+    reconcile_turn_items(ctx, client, thread_id, turn_id).await;
+    // A sub-agent whose `turn/completed` never arrived before the turn ended
+    // would otherwise spin forever.
+    settle_running_subagents(&mut ctx.assistant.parts);
+    if plan_card_wanted {
+        if let Some(part) = plan_card(&ctx.assistant.parts, &ctx.assistant.id) {
+            ctx.upsert_part(part);
+        }
+    }
+    let _ = ctx.flush();
+}
+
+/// How long a quiet post-parent drain waits before settling the turn. The
+/// parent's turn is already complete, so only actively-streaming agents
+/// justify waiting; settling early degrades gracefully because codex delivers
+/// a finished agent's report on the next turn either way.
+const DRAIN_QUIET_SETTLE: Duration = Duration::from_secs(180);
+
 /// A sub-agent thread discovered this parent turn, keyed by its threadId.
 struct SubThread {
     /// The `subagent` spawn part (anywhere in the tree) that owns this thread's
     /// transcript. Its `children` is the bucket the thread's parts stream into.
     spawn_part_id: String,
+    /// Still running: no terminal `turn/completed` seen for this thread yet.
+    /// Spawned agents outlive the parent turn (codex delivers their reports on
+    /// the NEXT turn), so the parent's `turn/completed` doesn't end our turn
+    /// while any of these are live — see the drain in `run_turn_app_server`.
+    live: bool,
 }
 
 /// Where an incoming notification/request should be routed.
@@ -1511,7 +1571,7 @@ fn apply_sub_notification(
     tid: &str,
     method: &str,
     params: &Value,
-) -> Vec<(String, String)> {
+) -> Vec<DiscoveredSubThread> {
     let mut discovered = Vec::new();
     match method {
         "item/started" | "item/completed" => {
@@ -1525,7 +1585,11 @@ fn apply_sub_notification(
                     // A grandchild spawn: register its threads under this part.
                     if part.tool.as_deref() == Some("subagent") {
                         for gtid in subagent_thread_ids(item) {
-                            discovered.push((gtid, part.id.clone()));
+                            discovered.push(DiscoveredSubThread {
+                                thread_id: gtid,
+                                spawn_part_id: part.id.clone(),
+                                arms: item_arms_thread(item),
+                            });
                         }
                     }
                     let completed_streamed =
@@ -1567,8 +1631,9 @@ fn apply_sub_notification(
             }
         }
         // A sub-agent's own turn/completed / error / other notifications don't
-        // add transcript parts here (the spawn part's status is driven from the
-        // parent's collab item), and crucially never end the parent turn.
+        // add transcript parts here (`route_sub_event` handles the thread's
+        // terminal turn notifications and mirrors liveness onto the spawn
+        // part), and crucially never end the parent turn.
         _ => {}
     }
     discovered
@@ -1586,6 +1651,7 @@ fn namespaced_part_id(thread_id: &str, item_id: &str) -> String {
 /// `spawn_part_id` is namespaced when the collab item itself belongs to a
 /// sub-agent (a grandchild spawn), plain for a top-level parent spawn.
 fn register_sub_threads_from(
+    parent_thread: &str,
     method: &str,
     params: &Value,
     sub_threads: &mut HashMap<String, SubThread>,
@@ -1611,12 +1677,64 @@ fn register_sub_threads_from(
     // rather than the original (already-completed) spawn row. Re-firing the same
     // spawn item (started→completed) re-points to the same id: a harmless no-op.
     for tid in subagent_thread_ids(item) {
-        sub_threads.insert(
+        // NEVER the parent's own thread: a handoff/interaction item can
+        // reference it, and registering it would add a "sub-agent" that can
+        // never retire — the post-parent drain would wait on it forever.
+        if tid == parent_thread {
+            continue;
+        }
+        register_sub_thread(
+            sub_threads,
             tid,
-            SubThread {
-                spawn_part_id: spawn_id.to_string(),
-            },
+            spawn_id.to_string(),
+            item_arms_thread(item),
         );
+    }
+}
+
+/// A sub-agent thread referenced by a collab item, with whether that item
+/// drives it (see `item_arms_thread`).
+struct DiscoveredSubThread {
+    thread_id: String,
+    spawn_part_id: String,
+    arms: bool,
+}
+
+/// Insert/re-point one sub-agent thread. Ownership (which spawn row the
+/// transcript streams into) always re-points to the newest item; liveness is
+/// a separate axis: a driving item (spawn / sendInput / resume / a `started`
+/// activity) ARMS it — even for a thread that already retired, so a resumed
+/// agent's continuation is drained — while a passive item (wait, close, an
+/// interaction/interruption marker) neither invents liveness for an unknown
+/// thread (a next-turn report marker must not stall the drain) nor retires a
+/// thread that is still live (a `wait` over running agents must not clear
+/// them). Only the thread's own `turn/completed` retires it.
+fn register_sub_thread(
+    sub_threads: &mut HashMap<String, SubThread>,
+    thread_id: String,
+    spawn_part_id: String,
+    arms: bool,
+) {
+    let live = arms || sub_threads.get(&thread_id).is_some_and(|s| s.live);
+    sub_threads.insert(
+        thread_id,
+        SubThread {
+            spawn_part_id,
+            live,
+        },
+    );
+}
+
+/// Whether a collab item DRIVES its referenced threads (starts or re-drives an
+/// agent), as opposed to passively referencing them.
+fn item_arms_thread(item: &Value) -> bool {
+    match item.get("type").and_then(Value::as_str) {
+        Some("collabAgentToolCall") => matches!(
+            item.get("tool").and_then(Value::as_str),
+            Some("spawnAgent") | Some("sendInput") | Some("resumeAgent")
+        ),
+        Some("subAgentActivity") => item.get("kind").and_then(Value::as_str) == Some("started"),
+        _ => false,
     }
 }
 
@@ -1627,6 +1745,7 @@ fn register_sub_threads_from(
 fn route_sub_event(
     ctx: &mut TurnCtx,
     sub_threads: &mut HashMap<String, SubThread>,
+    parent_thread: &str,
     tid: &str,
     method: &str,
     params: &Value,
@@ -1634,9 +1753,19 @@ fn route_sub_event(
     let Some(spawn_part_id) = sub_threads.get(tid).map(|s| s.spawn_part_id.clone()) else {
         return;
     };
+    // Track liveness for the post-parent drain: a new turn on this thread (a
+    // resumed / re-driven agent) re-arms it, its `turn/completed` retires it.
+    if method == "turn/started" {
+        if let Some(sub) = sub_threads.get_mut(tid) {
+            sub.live = true;
+        }
+    }
     // A sub-agent's turn/completed → mark the spawn part terminal (don't add a
     // transcript part for it, and never end the parent turn).
     if method == "turn/completed" {
+        if let Some(sub) = sub_threads.get_mut(tid) {
+            sub.live = false;
+        }
         if let Some(part) = find_part_mut(&mut ctx.assistant.parts, &spawn_part_id) {
             let interrupted = params
                 .get("turn")
@@ -1651,19 +1780,34 @@ fn route_sub_event(
         }
         return;
     }
+    let live = sub_threads.get(tid).is_some_and(|s| s.live);
     let Some(spawn_part) = find_part_mut(&mut ctx.assistant.parts, &spawn_part_id) else {
         return;
     };
+    // Mirror thread liveness onto the spawn part: an async spawn's collab item
+    // completes at launch, which would otherwise leave the row (and every
+    // running indicator keyed off it) unspinning while the agent still works.
+    // The thread's `turn/completed` above stamps it terminal again.
+    if live {
+        if let Some(state) = spawn_part.state.as_mut() {
+            if state.status == "completed" {
+                state.status = "running".into();
+            }
+        }
+    }
     let discovered = apply_sub_notification(&mut spawn_part.children, tid, method, params);
-    for (gtid, spawn_id) in discovered {
-        // Re-point, same as `register_sub_threads_from` for top-level threads: a
-        // later collab item on this grandchild thread (sendInput/resumeAgent)
-        // owns its continued transcript.
-        sub_threads.insert(
-            gtid,
-            SubThread {
-                spawn_part_id: spawn_id,
-            },
+    for found in discovered {
+        // Same parent-thread guard as `register_sub_threads_from`: a child's
+        // handoff item can reference the parent, which must never become a
+        // waitable "sub-agent".
+        if found.thread_id == parent_thread {
+            continue;
+        }
+        register_sub_thread(
+            sub_threads,
+            found.thread_id,
+            found.spawn_part_id,
+            found.arms,
         );
     }
 }
@@ -1937,15 +2081,52 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
     // stream on this same connection with a foreign turnId; we route them into
     // the spawning part's `children` instead of dropping them.
     let mut sub_threads: HashMap<String, SubThread> = HashMap::new();
+    // The parent turn's `turn/completed` arrived while sub-agent threads were
+    // still live — we're draining their tails before ending the turn (bounded
+    // by DRAIN_QUIET_SETTLE, see the deadline below).
+    let mut parent_done = false;
 
     loop {
         // Watchdog (see TURN_WATCHDOG for the false-positive trade-off).
         // Suspended while a card is pending — user think-time is unbounded by
         // design (question think-time too); codex's own ~5-minute approval
         // deadline still applies server-side.
+        //
+        // The post-parent drain gets a much shorter deadline: the parent turn
+        // is already over, so the only legitimate wait is agents actively
+        // streaming — a long-quiet drain means a terminal event was missed (or
+        // codex never sent one). Settling then is graceful, not lossy: codex
+        // holds a finished agent's report for the next turn regardless.
+        let deadline = if parent_done {
+            DRAIN_QUIET_SETTLE
+        } else {
+            TURN_WATCHDOG
+        };
         let event = if open_requests.is_empty() {
-            match tokio::time::timeout(TURN_WATCHDOG, rx.recv()).await {
+            match tokio::time::timeout(deadline, rx.recv()).await {
                 Ok(event) => event,
+                Err(_) if parent_done => {
+                    let stuck: Vec<&str> = sub_threads
+                        .iter()
+                        .filter(|(_, s)| s.live)
+                        .map(|(tid, _)| tid.as_str())
+                        .collect();
+                    eprintln!(
+                        "orx up: codex sub-agent drain settled after {}s of silence \
+                         (threads without a terminal event: {stuck:?})",
+                        DRAIN_QUIET_SETTLE.as_secs()
+                    );
+                    finish_completed_turn(
+                        ctx,
+                        &client,
+                        &thread_id,
+                        turn_id.as_deref(),
+                        plan_turn,
+                        &mut open_requests,
+                    )
+                    .await;
+                    return Ok(());
+                }
                 Err(_) => {
                     client.interrupt_active_turn().await;
                     ctx.push_error(format!(
@@ -1970,8 +2151,22 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                 match classify_event_thread(turn_id.as_deref(), &sub_threads, &params) {
                     EventScope::Stale => continue,
                     EventScope::SubAgent(tid) => {
-                        route_sub_event(ctx, &mut sub_threads, &tid, &method, &params);
+                        route_sub_event(ctx, &mut sub_threads, &thread_id, &tid, &method, &params);
                         ctx.maybe_flush();
+                        // Draining after the parent's turn/completed: the last
+                        // live thread retiring ends the turn for real.
+                        if parent_done && !sub_threads.values().any(|s| s.live) {
+                            finish_completed_turn(
+                                ctx,
+                                &client,
+                                &thread_id,
+                                turn_id.as_deref(),
+                                plan_turn,
+                                &mut open_requests,
+                            )
+                            .await;
+                            return Ok(());
+                        }
                         continue;
                     }
                     EventScope::Parent => {}
@@ -1992,23 +2187,32 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                 // A parent collab item spawns/drives sub-agents — register the
                 // thread ids it references so their (foreign-turn) events route
                 // into this spawn part's `children` from here on.
-                register_sub_threads_from(&method, &params, &mut sub_threads);
+                register_sub_threads_from(&thread_id, &method, &params, &mut sub_threads);
                 match apply_notification(ctx, &method, &params) {
                     Some(TurnEnd::Done { interrupted }) => {
-                        sweep_open_requests(ctx, &client, &mut open_requests).await;
-                        reconcile_turn_items(ctx, &client, &thread_id, turn_id.as_deref()).await;
-                        // A sub-agent whose `turn/completed` never arrived before
-                        // the parent turn ended would otherwise spin forever.
-                        settle_running_subagents(&mut ctx.assistant.parts);
-                        // Synthesize the end-turn plan card (Plan mode, not
-                        // interrupted). Attach before the final flush so the
-                        // PlanStrip appears atomically with the finished turn.
-                        if plan_turn && !interrupted {
-                            if let Some(part) = plan_card(&ctx.assistant.parts, &ctx.assistant.id) {
-                                ctx.upsert_part(part);
-                            }
+                        // Spawned sub-agents outlive the parent turn — codex
+                        // holds their reports for the NEXT turn and their
+                        // threads keep streaming on this connection. Ending now
+                        // would freeze those transcripts mid-run, so drain
+                        // until every live thread retires (its own
+                        // turn/completed); the watchdog still backstops a
+                        // thread that never does. An interrupt ends everything.
+                        if !interrupted && sub_threads.values().any(|s| s.live) {
+                            parent_done = true;
+                            let _ = ctx.flush();
+                            continue;
                         }
-                        let _ = ctx.flush();
+                        // Plan card only for a non-interrupted Plan turn — an
+                        // interrupted plan turn has no finished plan.
+                        finish_completed_turn(
+                            ctx,
+                            &client,
+                            &thread_id,
+                            turn_id.as_deref(),
+                            plan_turn && !interrupted,
+                            &mut open_requests,
+                        )
+                        .await;
                         return Ok(());
                     }
                     Some(TurnEnd::Failed(message)) => {
@@ -3411,6 +3615,7 @@ requires_openai_auth = false
             "sub".into(),
             SubThread {
                 spawn_part_id: "spawn1".into(),
+                live: true,
             },
         );
         // Same turn as parent → Parent.
@@ -3448,7 +3653,7 @@ requires_openai_auth = false
         let spawn = json!({"item":{"type":"collabAgentToolCall","id":"spawn1",
             "tool":"spawnAgent","status":"inProgress","receiverThreadIds":["sub"],
             "prompt":"go"},"threadId":"parent","turnId":"turn1"});
-        register_sub_threads_from("item/started", &spawn, &mut subs);
+        register_sub_threads_from("parent-thread", "item/started", &spawn, &mut subs);
         apply_notification(&mut ctx, "item/started", &spawn);
         assert_eq!(subs.get("sub").unwrap().spawn_part_id, "spawn1");
         assert_eq!(ctx.assistant.parts[0].tool.as_deref(), Some("subagent"));
@@ -3461,6 +3666,7 @@ requires_openai_auth = false
         route_sub_event(
             &mut ctx,
             &mut subs,
+            "parent-thread",
             "sub",
             "item/completed",
             &json!({"item":{"type":"commandExecution","id":"c1","command":"ls",
@@ -3479,6 +3685,7 @@ requires_openai_auth = false
         route_sub_event(
             &mut ctx,
             &mut subs,
+            "parent-thread",
             "sub",
             "turn/completed",
             &json!({"turn":{"id":"subturn","status":"completed"},"threadId":"sub"}),
@@ -3534,13 +3741,14 @@ requires_openai_auth = false
         let spawn = json!({"item":{"type":"collabAgentToolCall","id":"spawn1",
             "tool":"spawnAgent","status":"inProgress","receiverThreadIds":["child"]},
             "threadId":"parent","turnId":"turn1"});
-        register_sub_threads_from("item/started", &spawn, &mut subs);
+        register_sub_threads_from("parent-thread", "item/started", &spawn, &mut subs);
         apply_notification(&mut ctx, "item/started", &spawn);
 
         // Child spawns a grandchild — a collab item on the CHILD thread.
         route_sub_event(
             &mut ctx,
             &mut subs,
+            "parent-thread",
             "child",
             "item/started",
             &json!({"item":{"type":"collabAgentToolCall","id":"spawn2",
@@ -3554,6 +3762,7 @@ requires_openai_auth = false
         route_sub_event(
             &mut ctx,
             &mut subs,
+            "parent-thread",
             "grand",
             "item/completed",
             &json!({"item":{"type":"agentMessage","id":"m1","text":"hi"},
@@ -3589,7 +3798,7 @@ requires_openai_auth = false
         let spawn = json!({"item":{"type":"collabAgentToolCall","id":"spawn1",
             "tool":"spawnAgent","status":"completed","receiverThreadIds":["sub"]},
             "threadId":"parent","turnId":"turn1"});
-        register_sub_threads_from("item/completed", &spawn, &mut subs);
+        register_sub_threads_from("parent-thread", "item/completed", &spawn, &mut subs);
         apply_notification(&mut ctx, "item/completed", &spawn);
         assert_eq!(subs.get("sub").unwrap().spawn_part_id, "spawn1");
 
@@ -3597,7 +3806,7 @@ requires_openai_auth = false
         let send = json!({"item":{"type":"collabAgentToolCall","id":"spawn2",
             "tool":"sendInput","status":"inProgress","receiverThreadIds":["sub"]},
             "threadId":"parent","turnId":"turn1"});
-        register_sub_threads_from("item/started", &send, &mut subs);
+        register_sub_threads_from("parent-thread", "item/started", &send, &mut subs);
         apply_notification(&mut ctx, "item/started", &send);
         // Thread now owned by the new row.
         assert_eq!(subs.get("sub").unwrap().spawn_part_id, "spawn2");
@@ -3606,6 +3815,7 @@ requires_openai_auth = false
         route_sub_event(
             &mut ctx,
             &mut subs,
+            "parent-thread",
             "sub",
             "item/completed",
             &json!({"item":{"type":"agentMessage","id":"m2","text":"more"},
@@ -3628,6 +3838,40 @@ requires_openai_auth = false
             "original row gets no new activity"
         );
         assert_eq!(spawn2.children[0].id, "sub:m2");
+    }
+
+    /// The parent's own thread must never be registered as a waitable
+    /// sub-agent: a child's handoff/interaction item can reference it, and a
+    /// registered parent thread never emits another `turn/completed` — the
+    /// post-parent drain would wait on it forever (the OR-178 hang).
+    #[test]
+    fn parent_thread_is_never_registered_as_a_sub_agent() {
+        let mut subs: HashMap<String, SubThread> = HashMap::new();
+        let activity = json!({"item":{"type":"subAgentActivity","id":"act1",
+            "kind":"interacted","agentThreadId":"parent-thread"},
+            "threadId":"child","turnId":"childturn"});
+        register_sub_threads_from("parent-thread", "item/completed", &activity, &mut subs);
+        assert!(subs.is_empty(), "parent thread must not be registered");
+
+        // Same guard on the grandchild-discovery path inside route_sub_event.
+        let mut ctx = TurnCtx::test_stub();
+        let spawn = json!({"item":{"type":"collabAgentToolCall","id":"spawn1",
+            "tool":"spawnAgent","status":"inProgress","receiverThreadIds":["child"]},
+            "threadId":"parent-thread","turnId":"turn1"});
+        register_sub_threads_from("parent-thread", "item/started", &spawn, &mut subs);
+        apply_notification(&mut ctx, "item/started", &spawn);
+        route_sub_event(
+            &mut ctx,
+            &mut subs,
+            "parent-thread",
+            "child",
+            "item/completed",
+            &activity,
+        );
+        assert!(
+            !subs.contains_key("parent-thread"),
+            "handoff item must not re-register the parent"
+        );
     }
 
     #[test]

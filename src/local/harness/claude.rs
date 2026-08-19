@@ -1034,7 +1034,9 @@ struct TurnState {
     /// bridge on, ExitPlanMode / AskUserQuestion come from the bridge (held,
     /// mid-turn-answerable), so their `tool_use` renders nothing.
     bridge_active: bool,
-    /// The `result` event has landed — the turn is over.
+    /// At least one `result` event has landed. With background tasks a turn
+    /// spans several segments, each with its own result — this validates the
+    /// stream ended shaped like a turn, not that a given result was terminal.
     saw_result: bool,
     /// An interactive card was surfaced this turn (suppresses the synthesized
     /// plan card — see `should_synthesize_plan`).
@@ -1065,6 +1067,19 @@ struct TurnState {
     /// per message id (subagent events namespaced by `parent_tool_use_id`) —
     /// see the `assistant` arm for why this offset exists.
     assistant_blocks_seen: HashMap<String, usize>,
+    /// Background (`local_agent`) tasks spawned this turn that haven't reached
+    /// their terminal `task_notification` yet, task_id → spawning tool_use_id.
+    /// A `result` while entries remain is a segment boundary, not the end of
+    /// the turn — the CLI auto-resumes with the task's report once it
+    /// finishes, and ending the turn there would silently drop that whole
+    /// continuation. The tool_use_id side keeps the spawn part `running` (the
+    /// async launch acknowledgement would otherwise complete it at launch and
+    /// kill every running indicator while the agent works).
+    pending_tasks: HashMap<String, Option<String>>,
+    /// Whether any background task ran this turn (stays true after completion)
+    /// — gates the post-result grace wait for the auto-resume segment, which
+    /// can trail the result even when every task already finished.
+    saw_background_task: bool,
 }
 
 /// The spawning `Task` tool_use id for a sub-agent event (`parent_tool_use_id`),
@@ -1239,13 +1254,61 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                 _ => {}
             }
         }
-        Some("system") => {
-            if event.get("subtype").and_then(Value::as_str) == Some("init") {
+        Some("system") => match event.get("subtype").and_then(Value::as_str) {
+            Some("init") => {
                 if let Some(sid) = event.get("session_id").and_then(Value::as_str) {
                     state.native_session_id = Some(sid.to_string());
                 }
             }
-        }
+            // Track background sub-agents so the `result` arm knows a turn
+            // isn't over while one still runs (see `pending_tasks`).
+            Some("task_started") => {
+                if event.get("task_type").and_then(Value::as_str) == Some("local_agent") {
+                    if let Some(id) = event.get("task_id").and_then(Value::as_str) {
+                        // No tool_use_id → no spawn-part association; the
+                        // task still gates the turn's end.
+                        let tool_id = event
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        state.pending_tasks.insert(id.to_string(), tool_id);
+                        state.saw_background_task = true;
+                    }
+                }
+            }
+            // The task's real end: retire it and stamp the spawn part terminal
+            // — the async-launch tool_result deliberately left it `running`.
+            Some("task_notification") => {
+                if let Some(id) = event.get("task_id").and_then(Value::as_str) {
+                    let tool_id = state.pending_tasks.remove(id).flatten();
+                    if let Some(part) = tool_id
+                        .as_deref()
+                        .and_then(|tid| find_part_mut(&mut ctx.assistant.parts, tid))
+                    {
+                        if let Some(part_state) = part.state.as_mut() {
+                            if part_state.status == "running" {
+                                let ok = event.get("status").and_then(Value::as_str)
+                                    == Some("completed");
+                                part_state.status = if ok { "completed" } else { "error" }.into();
+                                if !ok {
+                                    // Give the failure a real message — the
+                                    // spawn tool's own result was only the
+                                    // launch acknowledgement.
+                                    part_state.error = Some(
+                                        event
+                                            .get("summary")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("The background agent failed")
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        },
         Some("assistant") => {
             if event
                 .get("error")
@@ -1416,6 +1479,22 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                     Some(p) => format!("{p}:{tool_id}"),
                     None => tool_id.to_string(),
                 };
+                // An async spawn's immediate acknowledgement ("Async agent
+                // launched…") is not the call's real end — the agent is still
+                // running, and completing the part here would kill every
+                // running indicator for it. It's internal metadata, not a
+                // report, so it isn't stored either; the terminal
+                // task_notification stamps the part. (Sync spawns are never
+                // pending here: their task_notification precedes this result.)
+                let launch_ack = parent.is_none()
+                    && !is_error
+                    && state
+                        .pending_tasks
+                        .values()
+                        .any(|tid| tid.as_deref() == Some(part_id.as_str()));
+                if launch_ack {
+                    continue;
+                }
                 if let Some(part) = find_part_mut(&mut ctx.assistant.parts, &part_id) {
                     if let Some(state) = part.state.as_mut() {
                         state.status = if is_error { "error" } else { "completed" }.into();
@@ -1464,6 +1543,13 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                 }
             }
             state.had_activity |= report_result_usage(ctx, event).is_some_and(|used| used > 0);
+            // A result while background sub-agents still run is only a segment
+            // boundary: the model ended ITS reply, but the CLI auto-resumes
+            // with the agents' reports when they finish. Keep listening — the
+            // continuation's own result (no tasks pending) ends the turn.
+            if !state.pending_tasks.is_empty() {
+                return false;
+            }
             return true;
         }
         _ => {}
@@ -1569,6 +1655,11 @@ fn spawn_config(ctx: &TurnCtx) -> SpawnConfig {
 /// or an API backoff burst emits nothing for minutes, legitimately).
 const FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long after a `result` to wait for the CLI's background-task auto-resume
+/// segment before declaring the turn over. The continuation is queued locally
+/// by the CLI, so it arrives within milliseconds when it exists at all.
+const BACKGROUND_RESUME_GRACE: Duration = Duration::from_secs(3);
+
 async fn run_attempt(ctx: &mut TurnCtx, spec: SpawnSpec) -> Result<(TurnState, u64)> {
     let client = ctx.host.claude.ensure(spec).await?;
     let auth_generation = client.auth_generation();
@@ -1590,39 +1681,45 @@ async fn run_attempt(ctx: &mut TurnCtx, spec: SpawnSpec) -> Result<(TurnState, u
     };
     let mut saw_event = false;
     let mut saw_user_echo = false;
+    // An event received during the post-result grace wait below, replayed at
+    // the top of the next iteration.
+    let mut queued: Option<TurnEvent> = None;
     loop {
         let deadline = if saw_event {
             super::TURN_WATCHDOG
         } else {
             FIRST_EVENT_TIMEOUT
         };
-        let event = match tokio::time::timeout(deadline, rx.recv()).await {
-            Ok(event) => event,
-            Err(_) if ctx.host.has_pending_permission(&ctx.session_id) => continue,
-            Err(_) => {
-                commit_attempt_session(ctx, &state);
-                ctx.host.claude.kill_session(&ctx.session_id).await;
-                let _ = ctx.flush();
-                let (what, hint) = if saw_event {
-                    (
-                        format!(
-                            "went quiet for {} minutes",
-                            super::TURN_WATCHDOG.as_secs() / 60
-                        ),
-                        "",
-                    )
-                } else {
-                    (
-                        format!("produced no output for {}s", FIRST_EVENT_TIMEOUT.as_secs()),
-                        " (check Claude Code authentication in Harnesses)",
-                    )
-                };
-                return Err(anyhow!(
-                    "claude {what} — killed the wedged child{hint}. Sending another message \
-                     resumes the session; see {}",
-                    crate::store::data_dir().join("agent-claude.log").display()
-                ));
-            }
+        let event = match queued.take() {
+            Some(event) => Some(event),
+            None => match tokio::time::timeout(deadline, rx.recv()).await {
+                Ok(event) => event,
+                Err(_) if ctx.host.has_pending_permission(&ctx.session_id) => continue,
+                Err(_) => {
+                    commit_attempt_session(ctx, &state);
+                    ctx.host.claude.kill_session(&ctx.session_id).await;
+                    let _ = ctx.flush();
+                    let (what, hint) = if saw_event {
+                        (
+                            format!(
+                                "went quiet for {} minutes",
+                                super::TURN_WATCHDOG.as_secs() / 60
+                            ),
+                            "",
+                        )
+                    } else {
+                        (
+                            format!("produced no output for {}s", FIRST_EVENT_TIMEOUT.as_secs()),
+                            " (check Claude Code authentication in Harnesses)",
+                        )
+                    };
+                    return Err(anyhow!(
+                        "claude {what} — killed the wedged child{hint}. Sending another message \
+                         resumes the session; see {}",
+                        crate::store::data_dir().join("agent-claude.log").display()
+                    ));
+                }
+            },
         };
         let Some(event) = event else {
             break;
@@ -1647,7 +1744,19 @@ async fn run_attempt(ctx: &mut TurnCtx, spec: SpawnSpec) -> Result<(TurnState, u
                 }
                 ctx.maybe_flush();
                 if done {
-                    break;
+                    // A turn that spawned background sub-agents can auto-resume
+                    // right AFTER its result (the CLI queues a completed task's
+                    // report as a fresh segment: init + messages + another
+                    // result). Give that continuation a short window to show up
+                    // before ending the turn; a quiet window means the report
+                    // was already delivered in this segment.
+                    if !state.saw_background_task {
+                        break;
+                    }
+                    match tokio::time::timeout(BACKGROUND_RESUME_GRACE, rx.recv()).await {
+                        Ok(Some(event)) => queued = Some(event),
+                        _ => break,
+                    }
                 }
             }
             TurnEvent::Closed => {
@@ -2583,6 +2692,71 @@ mod tests {
         .unwrap();
         apply_event(&mut ctx, &mut TurnState::default(), &subagent);
         assert_eq!(ctx.context_usage, Some(before));
+    }
+
+    #[test]
+    fn result_with_pending_background_task_does_not_end_the_turn() {
+        // A `result` that arrives while a spawned local_agent task is still
+        // running is a segment boundary (the CLI auto-resumes with the
+        // agent's report) — ending the turn there would drop that whole
+        // continuation. The result AFTER the task's terminal notification is
+        // the real end.
+        let mut ctx = TurnCtx::test_stub();
+        let mut state = TurnState::default();
+        let spawn: Value = serde_json::from_str(
+            r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"toolu_1","name":"Agent","input":{"prompt":"go","run_in_background":true}}]}}"#,
+        )
+        .unwrap();
+        assert!(!apply_event(&mut ctx, &mut state, &spawn));
+        let started: Value = serde_json::from_str(
+            r#"{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"toolu_1","task_type":"local_agent"}"#,
+        )
+        .unwrap();
+        assert!(!apply_event(&mut ctx, &mut state, &started));
+        assert!(state.saw_background_task);
+
+        // The immediate async-launch acknowledgement must not complete the
+        // spawn part — the agent is still running and the row's every running
+        // indicator keys off its status.
+        let ack: Value = serde_json::from_str(
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"Async agent launched successfully."}]}}"#,
+        )
+        .unwrap();
+        assert!(!apply_event(&mut ctx, &mut state, &ack));
+        let status = |ctx: &TurnCtx| {
+            ctx.assistant.parts[0]
+                .state
+                .as_ref()
+                .unwrap()
+                .status
+                .clone()
+        };
+        assert_eq!(status(&ctx), "running");
+
+        let result: Value =
+            serde_json::from_str(r#"{"type":"result","subtype":"success","is_error":false}"#)
+                .unwrap();
+        assert!(
+            !apply_event(&mut ctx, &mut state, &result),
+            "result with a pending task must not end the turn"
+        );
+        assert!(state.saw_result);
+        assert!(!state.turn_errored);
+
+        let notified: Value = serde_json::from_str(
+            r#"{"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"toolu_1","status":"completed"}"#,
+        )
+        .unwrap();
+        assert!(!apply_event(&mut ctx, &mut state, &notified));
+        assert_eq!(
+            status(&ctx),
+            "completed",
+            "task_notification stamps the spawn part"
+        );
+        assert!(
+            apply_event(&mut ctx, &mut state, &result),
+            "the post-continuation result ends the turn"
+        );
     }
 
     #[test]
