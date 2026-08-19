@@ -1724,6 +1724,8 @@ function toolActivity(part: ChatPart): ToolActivity {
       return { kind: "web", label: url ? `Read ${url}` : description ?? "Read a web page" };
     }
     case "task":
+      // Always the task description — the row is the sub-agent's identity;
+      // liveness is the shimmer, and the current step lives in its tab.
       return { kind: "agent", label: description ?? "Ran a subagent" };
     case "subagent":
       return { kind: "agent", label: subagentLine(normalizedInput) };
@@ -1739,32 +1741,43 @@ function toolActivity(part: ChatPart): ToolActivity {
 }
 
 /** Readable one-liner for a Codex sub-agent spawn/activity row, from the
- * collab item fields the backend put in `state.input`. */
+ * collab item fields the backend put in `state.input`. The model-assigned
+ * agent name (`nickname`) is the row's identity when present — matching how
+ * Claude rows show the task description — with the generic verb phrasing as
+ * the fallback. */
 function subagentLine(input: Record<string, unknown>): string {
   const trim = (s: string) => (s.length > 60 ? `${s.slice(0, 60)}…` : s);
   const prompt = typeof input.prompt === "string" && input.prompt ? ` — “${trim(input.prompt)}”` : "";
+  const nickname = typeof input.nickname === "string" && input.nickname
+    ? input.nickname.replace(/[_-]+/g, " ")
+    : "";
+  // Sentence-cased for label-initial use; the bare snake_case name stays
+  // lowercase when composed mid-sentence ("Sent input to audit experiments").
+  const nickLabel = nickname && nickname.charAt(0).toUpperCase() + nickname.slice(1);
   // collabAgentToolCall carries `tool`; subAgentActivity carries `kind`.
   switch (typeof input.tool === "string" ? input.tool : "") {
     case "spawnAgent":
-      return `Spawned agent${prompt}`;
+      return nickLabel || `Spawned agent${prompt}`;
     case "sendInput":
-      return `Sent input to agent${prompt}`;
+      return nickname ? `Sent input to ${nickname}` : `Sent input to agent${prompt}`;
     case "resumeAgent":
-      return "Resumed agent";
+      return nickname ? `Resumed ${nickname}` : "Resumed agent";
     case "wait":
-      return "Waiting on agent";
+      return `Waiting on ${nickname || "agent"}`;
     case "closeAgent":
-      return "Closed agent";
+      return `Closed ${nickname || "agent"}`;
   }
   switch (typeof input.kind === "string" ? input.kind : "") {
     case "started":
-      return "Sub-agent started";
+      return nickLabel || "Sub-agent started";
     case "interacted":
-      return "Sub-agent activity";
+      // Codex's cross-agent interaction marker — in practice, the agent
+      // handing its report up when it finishes.
+      return nickname ? `${nickLabel} reported back` : "Agent reported back";
     case "interrupted":
-      return "Sub-agent interrupted";
+      return nickname ? `${nickLabel} interrupted` : "Sub-agent interrupted";
   }
-  return "Sub-agent";
+  return nickLabel || "Sub-agent";
 }
 
 function ToolActivityIcon({ activity, className = "" }: { activity: ToolActivity; className?: string }) {
@@ -2103,6 +2116,48 @@ function resolvedActivityLabel(
   return activity.label;
 }
 
+/** Hold each in-progress tool label on screen for a minimum dwell before
+ * swapping to the next, so a burst of sub-second calls reads as a steady
+ * sequence instead of a flicker. Activation and deactivation are immediate —
+ * only label→label swaps are paced — and the swap always lands on the latest
+ * activity, skipping intermediates that expired within one dwell. */
+function emptyToolInput(input: unknown): boolean {
+  if (input == null) return true;
+  return typeof input === "object" && !Array.isArray(input) && Object.keys(input).length === 0;
+}
+
+const TOOL_LABEL_DWELL_MS = 250;
+function useDwelledActivity(activity: ToolActivity | null, provisional: boolean): ToolActivity | null {
+  const [shown, setShown] = useState<ToolActivity | null>(activity);
+  const shownAt = useRef(Date.now());
+  const latest = useRef(activity);
+  latest.current = activity;
+  useEffect(() => {
+    if (activity?.label === shown?.label) return;
+    // A provisional activity (its call not yet classifiable) never replaces a
+    // real label — hold the previous one until the call resolves. It still
+    // paints when there is nothing better to show.
+    if (provisional && activity != null && shown != null) return;
+    if (activity == null || shown == null) {
+      shownAt.current = Date.now();
+      setShown(activity);
+      return;
+    }
+    const remaining = TOOL_LABEL_DWELL_MS - (Date.now() - shownAt.current);
+    if (remaining <= 0) {
+      shownAt.current = Date.now();
+      setShown(activity);
+      return;
+    }
+    const timeout = window.setTimeout(() => {
+      shownAt.current = Date.now();
+      setShown(latest.current);
+    }, remaining);
+    return () => window.clearTimeout(timeout);
+  }, [activity, shown, provisional]);
+  return shown;
+}
+
 const TOOL_TAIL_SHIMMER_DELAY_MS = 160;
 function useDelayedToolShimmer(active: boolean): boolean {
   const [visible, setVisible] = useState(false);
@@ -2269,9 +2324,15 @@ function ToolGroup({
   const displayParts = squashToolParts(parts);
   const activities = displayParts.map(({ part }) => toolActivity(part));
   const tailPart = pendingTail ? parts.at(-1) : undefined;
-  const pendingActivity = tailPart?.state?.status !== "error"
-    ? tailPart && activityInProgress(toolActivity(tailPart))
+  const rawPending = tailPart?.state?.status !== "error"
+    ? (tailPart && activityInProgress(toolActivity(tailPart))) ?? null
     : null;
+  // A running call is unclassified while its input hasn't streamed in (or its
+  // command is still blank) — its label would be a generic "Running a command"
+  // that re-resolves moments later, so the header holds the prior label instead.
+  const tailUnclassified = !!tailPart && tailPart.state?.status === "running" &&
+    (emptyToolInput(tailPart.state?.input) || rawPending?.label === "Running a command");
+  const pendingActivity = useDwelledActivity(rawPending, tailUnclassified);
   const shimmering = useDelayedToolShimmer(pendingActivity != null);
   const summary = summarizeToolGroup(activities);
   const iconActivity = pendingActivity ?? groupIconActivity(activities);
@@ -2623,7 +2684,11 @@ function partIsVisible(part: ChatPart, activePermissionId?: string | null): bool
     }
     return true;
   }
-  if (part.type === "text" || part.type === "reasoning") return !!part.text;
+  // Reasoning is stored but never rendered, so it is invisible to every layout
+  // decision too — in particular a sub-second thinking burst between tool calls
+  // must not steal the stream tail and flash the group shimmer off.
+  if (part.type === "reasoning") return false;
+  if (part.type === "text") return !!part.text;
   return true; // tool, image, …
 }
 
@@ -2688,7 +2753,7 @@ const Message = memo(function Message({
   /** Open a plan's full markdown in the right pane (plan cards/strip). */
   onOpenPlan?: (plan: string, promptId: string) => void;
   /** Open a sub-agent's transcript in the right pane (spawn-row "view"). */
-  onOpenSubagent?: (spawnPartId: string) => void;
+  onOpenSubagent?: (spawnPartId: string, label?: string) => void;
   /** Known slash-skills, for rendering a leading `/name` as a command chip. */
   skills?: SkillInfo[];
   predictTextTail?: boolean;
@@ -2772,9 +2837,10 @@ const Message = memo(function Message({
 
 /** Shared assistant-parts renderer, reused for a message body and (recursively)
  * for a sub-agent's nested transcript. Coalesces consecutive tool parts into one
- * collapsed group (Claude-desktop style); text / reasoning / prompt parts break
- * a run and render inline. A sub-agent spawn part (tool `subagent`) also breaks
- * the run and renders as its own nested block. */
+ * collapsed group (Claude-desktop style); text / prompt parts break a run and
+ * render inline, while reasoning parts are never rendered. A sub-agent spawn
+ * part (tool `subagent`) also breaks the run and renders as its own nested
+ * block. */
 function renderParts(
   parts: ChatPart[],
   opts: {
@@ -2787,7 +2853,7 @@ function renderParts(
     experimentName?: (experimentId: string) => string;
     onRespond?: (answer: PromptAnswer) => void;
     onOpenPlan?: (plan: string, promptId: string) => void;
-    onOpenSubagent?: (spawnPartId: string) => void;
+    onOpenSubagent?: (spawnPartId: string, label?: string) => void;
     predictTextTail?: boolean;
   },
 ): React.ReactNode[] {
@@ -2840,7 +2906,10 @@ function renderParts(
         <SubagentBlock
           key={part.id}
           part={part}
-          pendingTail={part.id === pendingTailToolId}
+          // A spawn row runs in parallel with whatever streams after it, so its
+          // shimmer follows its own status while the turn is live — the shared
+          // tail-tool id only ever points at one row and would freeze the rest.
+          pendingTail={(predictTextTail && part.state?.status === "running") || part.id === pendingTailToolId}
           onOpenSubagent={onOpenSubagent}
         />,
       );
@@ -2851,8 +2920,8 @@ function renderParts(
       continue;
     }
     flushTools();
-    // The visibility skip above guarantees text/reasoning parts here are
-    // non-empty.
+    // The visibility skip above guarantees text parts here are non-empty and
+    // that reasoning parts never reach this point.
     if (part.type === "text")
       rendered.push(
         <Md
@@ -2862,13 +2931,6 @@ function renderParts(
           onOpenRun={onOpenRun}
           predict={predictTextTail && part.id === visibleTail?.id}
         />,
-      );
-    else if (part.type === "reasoning")
-      rendered.push(
-        <details key={part.id} className="reasoning text-muted text-md my-0.5 mx-0 [&_summary]:cursor-pointer [&_summary]:list-none [&_summary]:select-none [&_summary]:font-semibold [&[open]]:whitespace-pre-wrap">
-          <summary>thinking…</summary>
-          {part.text}
-        </details>,
       );
     else if (part.type === "prompt" && part.prompt)
       rendered.push(
@@ -2883,6 +2945,11 @@ function renderParts(
   }
   flushTools();
   return rendered;
+}
+
+/** A sub-agent spawn row's display title — what its tab is named. */
+export function spawnRowTitle(part: ChatPart): string {
+  return toolActivity(part).label;
 }
 
 /** Find a part by id anywhere in a parts tree (depth-first). Used by the
@@ -2914,7 +2981,7 @@ export function SubagentTranscript({
   runExperimentName?: (runId: string) => string;
   onOpenExperiment?: (experimentId: string) => void;
   experimentName?: (experimentId: string) => string;
-  onOpenSubagent?: (spawnPartId: string) => void;
+  onOpenSubagent?: (spawnPartId: string, label?: string) => void;
 }) {
   const parts = spawn.children ?? [];
   const running = spawn.state?.status === "running";
@@ -2932,28 +2999,32 @@ export function SubagentTranscript({
     experimentName,
     onOpenSubagent,
     predictTextTail: running,
+    // Same contract as the main transcript's streamTailTool: while the
+    // sub-agent runs, its tail tool (completed or not) keeps the group lit.
+    pendingTailToolId: running ? partsTailToolId(parts) : null,
   });
-  const spawnActivity = running ? activityInProgress(toolActivity(spawn)) : toolActivity(spawn);
+  // Claude Code forwards a sub-agent's tool activity but never its text/thinking
+  // blocks — the final report only exists as the spawn tool's result. When the
+  // streamed transcript carries no prose of its own, close it with that report.
+  // (The async-launch acknowledgement is internal metadata, not a report.)
+  const hasProseChild = parts.some((p) => p.type === "text" && !!p.text);
+  const spawnOutput = spawn.state?.status === "completed" ? (spawn.state?.output ?? "") : "";
+  const finalReport = !hasProseChild && !spawnOutput.startsWith("Async agent launched") ? spawnOutput : "";
   return (
     <div className="msg-assistant text-lg leading-[1.62] text-text min-w-0">
-      <div className="subagent-tab-header flex items-center gap-2 pb-2 mb-2 border-b border-b-border-variant">
-        {errored && <span className="sr-only">Failed: </span>}
-        {errored ? (
-          <CircleX size={16} strokeWidth={1.75} className="tool-kind-icon shrink-0 text-accent-red" aria-hidden="true" />
-        ) : (
-          <ToolActivityIcon activity={spawnActivity} className={running ? "tool-running-shimmer-icon" : "text-muted"} />
-        )}
-        <span className={`${TOOL_LINE_CLASS_NAME} ${running ? "tool-running-shimmer" : errored ? "text-accent-red" : ""}`}>{spawnActivity.label}</span>
-      </div>
+      {errored && <span className="sr-only">Failed: </span>}
       {errorMessage && (
         <div className="tool-output py-1.5 px-2.5 font-mono text-xs text-subtext whitespace-pre-wrap wrap-anywhere max-h-65 overflow-y-auto bg-background border border-border-variant rounded-sm">
           {errorMessage.slice(0, 20000)}
         </div>
       )}
-      {rendered.length === 0 && !errorMessage ? (
+      {rendered.length === 0 && !finalReport && !errorMessage ? (
         <div className="subagent-empty py-[3px] px-1 text-md text-muted">{running ? "Working…" : "No activity"}</div>
       ) : (
-        rendered
+        <>
+          {rendered}
+          {finalReport && <Md text={finalReport} onOpenFile={onOpenFile} onOpenRun={onOpenRun} />}
+        </>
       )}
     </div>
   );
@@ -2971,7 +3042,7 @@ function SubagentBlock({
 }: {
   part: ChatPart;
   pendingTail?: boolean;
-  onOpenSubagent?: (spawnPartId: string) => void;
+  onOpenSubagent?: (spawnPartId: string, label?: string) => void;
 }) {
   const errored = part.state?.status === "error";
   const errorMessage = cleanToolError(part.state?.error || part.state?.output || "");
@@ -2979,21 +3050,42 @@ function SubagentBlock({
     ? activityInProgress(toolActivity(part))
     : toolActivity(part);
   const shimmering = useDelayedToolShimmer(Boolean(pendingTail && !errored));
+  const inert = (part.children?.length ?? 0) === 0;
+  const line = (
+    <>
+      {errored && <span className="sr-only">Failed: </span>}
+      {errored ? (
+        <CircleX size={16} strokeWidth={1.75} className="subagent-icon shrink-0 text-accent-red" aria-hidden="true" />
+      ) : (
+        <ToolActivityIcon activity={activity} className={`subagent-icon shrink-0 ${shimmering ? "tool-running-shimmer-icon" : "text-muted"}`} />
+      )}
+      {/* Spawn rows read as activity, not prose — gray like the tool rows
+          around them. */}
+      <span className={`${TOOL_LINE_CLASS_NAME} ${shimmering ? "tool-running-shimmer" : errored ? "text-accent-red" : "text-subtext"}`}>{activity.label}</span>
+    </>
+  );
+  // Only a row that actually owns a transcript is click-to-open. Codex's
+  // interaction markers (and a spawn row before any activity arrived) have no
+  // children — offering a transcript there opens an empty pane.
+  if (inert) {
+    return (
+      <div
+        className="subagent-row flex items-center gap-2 w-full my-3.5 mx-0 py-[3px] px-1 text-text text-lg text-left rounded-sm [&_.tool-line]:text-lg"
+        title={errored && errorMessage ? errorMessage : undefined}
+      >
+        {line}
+      </div>
+    );
+  }
   return (
     <>
       <button
         className="subagent-row flex items-center gap-2 w-full my-3.5 mx-0 py-[3px] px-1 cursor-pointer text-text text-lg text-left rounded-sm [&:hover:not(:disabled)]:bg-surface [&:disabled]:cursor-default [&_.tool-line]:text-lg"
         title={errored && errorMessage ? errorMessage : "Open sub-agent transcript"}
-        onClick={() => onOpenSubagent?.(part.id)}
+        onClick={() => onOpenSubagent?.(part.id, activity.label)}
         disabled={!onOpenSubagent}
       >
-        {errored && <span className="sr-only">Failed: </span>}
-        {errored ? (
-          <CircleX size={16} strokeWidth={1.75} className="subagent-icon shrink-0 text-accent-red" aria-hidden="true" />
-        ) : (
-          <ToolActivityIcon activity={activity} className={`subagent-icon shrink-0 ${shimmering ? "tool-running-shimmer-icon" : "text-muted"}`} />
-        )}
-        <span className={`${TOOL_LINE_CLASS_NAME} ${shimmering ? "tool-running-shimmer" : errored ? "text-accent-red" : "text-text"}`}>{activity.label}</span>
+        {line}
         <ChevronRight size={12} className="subagent-row-chevron shrink-0 text-muted" />
       </button>
     </>
@@ -3119,16 +3211,25 @@ function useTranscriptAnnouncement(messages: ChatMessage[]): TranscriptAnnouncem
   return announcement;
 }
 
+/** The tail tool of a parts list: the last *visible* part, iff it is a
+ * non-errored tool — completed still counts, so the shimmer holds steady in the
+ * gap between consecutive calls. Shared by the main transcript
+ * (`streamTailTool`) and the sub-agent tab so the two can't drift. */
+function partsTailToolId(parts: ChatPart[]): string | null {
+  for (let index = parts.length - 1; index >= 0; index--) {
+    const part = parts[index];
+    if (!partIsVisible(part)) continue;
+    if (part.type !== "tool" || part.state?.status === "error") return null;
+    return part.id;
+  }
+  return null;
+}
+
 function streamTailTool(messages: ChatMessage[]): { messageId: string; toolId: string } | null {
   const message = messages.at(-1);
   if (message?.role !== "assistant") return null;
-  for (let index = message.parts.length - 1; index >= 0; index--) {
-    const part = message.parts[index];
-    if (!partIsVisible(part)) continue;
-    if (part.type !== "tool" || part.state?.status === "error") return null;
-    return { messageId: message.id, toolId: part.id };
-  }
-  return null;
+  const toolId = partsTailToolId(message.parts);
+  return toolId ? { messageId: message.id, toolId } : null;
 }
 
 const Transcript = memo(function Transcript({
@@ -3153,7 +3254,7 @@ const Transcript = memo(function Transcript({
   experimentName?: (experimentId: string) => string;
   onRespond?: (answer: PromptAnswer) => void;
   onOpenPlan?: (plan: string, promptId: string) => void;
-  onOpenSubagent?: (spawnPartId: string) => void;
+  onOpenSubagent?: (spawnPartId: string, label?: string) => void;
   skills?: SkillInfo[];
 }) {
   const activePermissionId = firstPendingPermission(messages)?.id ?? null;
@@ -3528,7 +3629,7 @@ export function ChatPanel({
   onOpenPlan?: (plan: string, sessionId: string, promptId: string) => void;
   /** Open a sub-agent's transcript as a right-pane tab (spawn-row "view").
    * `sessionId` is the chat session; `spawnPartId` locates the spawn part. */
-  onOpenSubagent?: (sessionId: string, spawnPartId: string) => void;
+  onOpenSubagent?: (sessionId: string, spawnPartId: string, label?: string) => void;
   /** Open the pinned Files home for the active session. */
   onOpenWorktree: () => void;
   /** Reopen the demo welcome modal from the chat header. */
@@ -4267,7 +4368,7 @@ export function ChatPanel({
   const openSubagent = useMemo(
     () =>
       onOpenSubagent && activeId
-        ? (spawnPartId: string) => onOpenSubagent(activeId, spawnPartId)
+        ? (spawnPartId: string, label?: string) => onOpenSubagent(activeId, spawnPartId, label)
         : undefined,
     [onOpenSubagent, activeId],
   );

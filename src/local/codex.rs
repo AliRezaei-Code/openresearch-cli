@@ -482,6 +482,24 @@ async fn read_loop(client: Arc<CodexClient>, stdout: tokio::process::ChildStdout
                     }
                 }
                 let turn = client.turn.lock().unwrap();
+                // Raw event tracing for sub-agent lifecycle debugging; enable
+                // with ORX_CODEX_EVENT_LOG=1 on the backend (dev only).
+                if std::env::var("ORX_CODEX_EVENT_LOG").is_ok_and(|v| !v.is_empty() && v != "0") {
+                    eprintln!(
+                        "[codex-event] listener={} method={} thread={} turn={}",
+                        turn.is_some(),
+                        method,
+                        params
+                            .get("threadId")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("-"),
+                        params
+                            .get("turnId")
+                            .or_else(|| params.pointer("/turn/id"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("-")
+                    );
+                }
                 if let Some(tx) = turn.as_ref() {
                     let _ = tx.send(TurnEvent::Notification { method, params });
                 }

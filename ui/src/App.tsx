@@ -36,7 +36,8 @@ import {
   type Run,
   type UiState,
 } from "./api";
-import { ChatPanel } from "./components/ChatPanel";
+import { getChatMessages, type ChatMessage } from "./api";
+import { ChatPanel, findPartById, spawnRowTitle } from "./components/ChatPanel";
 import { SubagentTab } from "./components/SubagentTab";
 import { CodeTab, type CodeView } from "./components/CodeTab";
 import { WorktreeTab, type WorktreeView } from "./components/WorktreeTab";
@@ -56,7 +57,7 @@ import { SettingsView, type SettingsTab } from "./components/SettingsPage";
 import { DemoWelcomeModal } from "./components/Tour";
 import { clearReadDemoSessions } from "./demoSessionState";
 import { TreeView } from "./components/TreeView";
-import { useOrxEvents } from "./events";
+import { onChatEvent, useOrxEvents } from "./events";
 import { CODE_TAB_BODY_CLASS_NAME, ICON_BUTTON_BASE_CLASS_NAME, ICON_BUTTON_CLASS_NAME, MODEL_ITEM_CLASS_NAME, PRIMARY_BUTTON_CLASS_NAME, SPINNER_CLASS_NAME, TAB_BODY_CLASS_NAME } from "./styleClasses";
 
 const EMPTY_STATE_CLASS_NAME = [
@@ -145,6 +146,8 @@ interface SubagentViewDef {
   sessionId: string;
   /** The `subagent` spawn part whose `children` are the sub-agent transcript. */
   spawnPartId: string;
+  /** The spawn row's activity label at open time — the tab title. */
+  label?: string;
 }
 
 /** One committed code-browser tab per experiment branch. Source, selected
@@ -928,8 +931,8 @@ export default function App() {
   // Open a sub-agent's transcript as a right-panel tab (a chat spawn row's
   // "view"). One tab per spawn part; its parts stream live off the chat message,
   // so the tab body just reads the current part and needs no fetch.
-  const openSubagentTab = useCallback((sessionId: string, spawnPartId: string) => {
-    const tab: SubagentViewDef = { kind: "subagent", sessionId, spawnPartId };
+  const openSubagentTab = useCallback((sessionId: string, spawnPartId: string, label?: string) => {
+    const tab: SubagentViewDef = { kind: "subagent", sessionId, spawnPartId, label };
     setSubagentTabs((prev) =>
       prev.some((t) => t.spawnPartId === spawnPartId) ? prev : [...prev, tab],
     );
@@ -946,6 +949,50 @@ export default function App() {
     },
     [forgetRightTab, rightTab, subagentTabs],
   );
+
+  // Live title + running state for open sub-agent tabs, straight off the spawn
+  // parts' message stream — so a tab is named for its task and shimmers while
+  // the agent still works (the open-time `label` is only the seed/fallback).
+  const [spawnMeta, setSpawnMeta] = useState<Record<string, { label: string; running: boolean }>>({});
+  useEffect(() => {
+    if (subagentTabs.length === 0) return;
+    let live = true;
+    const apply = (msgs: ChatMessage[], tabs: SubagentViewDef[]) => {
+      setSpawnMeta((prev) => {
+        let next = prev;
+        for (const t of tabs) {
+          for (const m of msgs) {
+            const part = findPartById(m.parts, t.spawnPartId);
+            if (!part) continue;
+            const meta = { label: spawnRowTitle(part), running: part.state?.status === "running" };
+            const cur = next[t.spawnPartId];
+            if (!cur || cur.label !== meta.label || cur.running !== meta.running) {
+              if (next === prev) next = { ...prev };
+              next[t.spawnPartId] = meta;
+            }
+            break;
+          }
+        }
+        return next;
+      });
+    };
+    for (const sid of new Set(subagentTabs.map((t) => t.sessionId))) {
+      getChatMessages(sid)
+        .then(({ messages }) => {
+          if (live) apply(messages, subagentTabs.filter((t) => t.sessionId === sid));
+        })
+        .catch(() => {});
+    }
+    const off = onChatEvent((ev) => {
+      if (ev.type !== "message") return;
+      const tabs = subagentTabs.filter((t) => t.sessionId === ev.sessionId);
+      if (tabs.length) apply([ev.message], tabs);
+    });
+    return () => {
+      live = false;
+      off();
+    };
+  }, [subagentTabs]);
 
   // One Git-backed code tab per branch. Reopening the same branch focuses it
   // at the requested subview; another branch gets its own tab.
@@ -1334,7 +1381,8 @@ export default function App() {
                 <ClosableTab
                   key={`subagent:${t.spawnPartId}`}
                   active={subagentTab !== null && subagentTab.spawnPartId === t.spawnPartId}
-                  label="Sub-agent"
+                  label={spawnMeta[t.spawnPartId]?.label ?? t.label ?? "Sub-agent"}
+                  shimmer={spawnMeta[t.spawnPartId]?.running ?? false}
                   icon={<Users size={12} style={{ flexShrink: 0 }} />}
                   onSelect={() => selectRightTab(t)}
                   onClose={() => closeSubagentTab(t)}
@@ -1574,7 +1622,7 @@ export default function App() {
               runExperimentName={runExperimentName}
               onOpenExperiment={openExperimentNotes}
               experimentName={experimentName}
-              onOpenSubagent={(pid) => openSubagentTab(subagentTab.sessionId, pid)}
+              onOpenSubagent={(pid, label) => openSubagentTab(subagentTab.sessionId, pid, label)}
             />
           ) : codeTab ? (
             <div className={TAB_BODY_CLASS_NAME}>
