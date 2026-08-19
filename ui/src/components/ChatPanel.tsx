@@ -2186,17 +2186,18 @@ function resolvedActivityLabel(
   return activity.label;
 }
 
-/** Hold each in-progress tool label on screen for a minimum dwell before
- * swapping to the next, so a burst of sub-second calls reads as a steady
- * sequence instead of a flicker. Activation and deactivation are immediate —
- * only label→label swaps are paced — and the swap always lands on the latest
- * activity, skipping intermediates that expired within one dwell. */
 function emptyToolInput(input: unknown): boolean {
   if (input == null) return true;
   return typeof input === "object" && !Array.isArray(input) && Object.keys(input).length === 0;
 }
 
 const TOOL_LABEL_DWELL_MS = 250;
+
+/** Hold each in-progress tool label on screen for a minimum dwell before
+ * swapping to the next, so a burst of sub-second calls reads as a steady
+ * sequence instead of a flicker. Activation and deactivation are immediate —
+ * only label→label swaps are paced — and the swap always lands on the latest
+ * activity, skipping intermediates that expired within one dwell. */
 function useDwelledActivity(activity: ToolActivity | null, provisional: boolean): ToolActivity | null {
   const [shown, setShown] = useState<ToolActivity | null>(activity);
   const shownAt = useRef(Date.now());
@@ -3192,6 +3193,15 @@ export function spawnRowTitle(part: ChatPart): string {
   return toolActivity(part).label;
 }
 
+/** The spawn tool result that stands in for a prose-less sub-agent transcript
+ * (a sync Claude agent's final report is delivered as the tool output). The
+ * async-launch acknowledgement is internal metadata, not a report — newly
+ * stored parts omit it, and the prefix guard covers older transcripts. */
+function spawnFinalReport(part: ChatPart): string {
+  const output = part.state?.status === "completed" ? (part.state?.output ?? "") : "";
+  return output.startsWith("Async agent launched") ? "" : output;
+}
+
 /** Find a part by id anywhere in a parts tree (depth-first). Used by the
  * right-pane sub-agent tab to locate a spawn part across a session's messages. */
 export function findPartById(parts: ChatPart[], id: string): ChatPart | null {
@@ -3246,10 +3256,8 @@ export function SubagentTranscript({
   // Claude Code forwards a sub-agent's tool activity but never its text/thinking
   // blocks — the final report only exists as the spawn tool's result. When the
   // streamed transcript carries no prose of its own, close it with that report.
-  // (The async-launch acknowledgement is internal metadata, not a report.)
   const hasProseChild = parts.some((p) => p.type === "text" && !!p.text);
-  const spawnOutput = spawn.state?.status === "completed" ? (spawn.state?.output ?? "") : "";
-  const finalReport = !hasProseChild && !spawnOutput.startsWith("Async agent launched") ? spawnOutput : "";
+  const finalReport = hasProseChild ? "" : spawnFinalReport(spawn);
   return (
     <div className="msg-assistant text-lg leading-[1.62] text-text min-w-0">
       {errored && <span className="sr-only">Failed: </span>}
@@ -3290,7 +3298,10 @@ function SubagentBlock({
     ? activityInProgress(toolActivity(part))
     : toolActivity(part);
   const shimmering = useDelayedToolShimmer(Boolean(pendingTail && !errored));
-  const inert = (part.children?.length ?? 0) === 0;
+  // Openable when there is anything to show in the tab: streamed children, a
+  // final report standing in for them, or an error. Only a pure interaction
+  // marker (codex's "reported back" rows) is inert.
+  const inert = (part.children?.length ?? 0) === 0 && !errored && !spawnFinalReport(part);
   const line = (
     <>
       {errored && <span className="sr-only">Failed: </span>}

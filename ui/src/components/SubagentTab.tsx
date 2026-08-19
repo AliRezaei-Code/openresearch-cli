@@ -6,9 +6,9 @@ import { TAB_BODY_CLASS_NAME } from "../styleClasses";
 
 const PANE_CONTENT_CLASS_NAME = [
   "pane-content flex-1 min-h-0 relative subagent-tab-content overflow-y-auto",
-  // pb matches the main chat thread's bottom padding so a finished transcript
-  // doesn't end flush against the pane edge.
-  "bg-background pt-3 pb-8 px-4",
+  // Same breathing room top and bottom (matches the main chat thread's pb) so
+  // the transcript isn't cramped under the tab strip or flush at the end.
+  "bg-background py-8 px-4",
 ].join(" ");
 
 /** Right-pane tab body for a sub-agent transcript. The spawn part (and its

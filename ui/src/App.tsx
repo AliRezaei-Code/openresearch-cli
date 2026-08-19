@@ -21,6 +21,7 @@ import {
   DEMO_LITERATURE_SESSION_ID,
   DEMO_MAIN_SESSION_ID,
   getArtifacts,
+  getChatMessages,
   getUiState,
   isDemoProjectId,
   listExperiments,
@@ -34,9 +35,9 @@ import {
   type ProjectArtifacts,
   type Project,
   type Run,
+  type ChatMessage,
   type UiState,
 } from "./api";
-import { getChatMessages, type ChatMessage } from "./api";
 import { ChatPanel, findPartById, spawnRowTitle } from "./components/ChatPanel";
 import { SubagentTab } from "./components/SubagentTab";
 import { CodeTab, type CodeView } from "./components/CodeTab";
@@ -980,15 +981,27 @@ export default function App() {
   // the agent still works (the open-time `label` is only the seed/fallback).
   const [spawnMeta, setSpawnMeta] = useState<Record<string, { label: string; running: boolean }>>({});
   useEffect(() => {
+    // Closed tabs drop their metadata — the map only ever holds open tabs.
+    setSpawnMeta((prev) => {
+      const open = new Set(subagentTabs.map((t) => t.spawnPartId));
+      if (Object.keys(prev).every((id) => open.has(id))) return prev;
+      return Object.fromEntries(Object.entries(prev).filter(([id]) => open.has(id)));
+    });
     if (subagentTabs.length === 0) return;
     let live = true;
-    const apply = (msgs: ChatMessage[], tabs: SubagentViewDef[]) => {
+    // Spawn ids a live event already updated: the initial fetch can resolve
+    // AFTER newer stream frames and must not roll those tabs back (a stale
+    // `running` snapshot would shimmer forever).
+    const liveUpdated = new Set<string>();
+    const apply = (msgs: ChatMessage[], tabs: SubagentViewDef[], fromSeed: boolean) => {
       setSpawnMeta((prev) => {
         let next = prev;
         for (const t of tabs) {
+          if (fromSeed && liveUpdated.has(t.spawnPartId)) continue;
           for (const m of msgs) {
             const part = findPartById(m.parts, t.spawnPartId);
             if (!part) continue;
+            if (!fromSeed) liveUpdated.add(t.spawnPartId);
             const meta = { label: spawnRowTitle(part), running: part.state?.status === "running" };
             const cur = next[t.spawnPartId];
             if (!cur || cur.label !== meta.label || cur.running !== meta.running) {
@@ -1001,17 +1014,27 @@ export default function App() {
         return next;
       });
     };
-    for (const sid of new Set(subagentTabs.map((t) => t.sessionId))) {
-      getChatMessages(sid)
-        .then(({ messages }) => {
-          if (live) apply(messages, subagentTabs.filter((t) => t.sessionId === sid));
-        })
-        .catch(() => {});
-    }
+    const seed = () => {
+      for (const sid of new Set(subagentTabs.map((t) => t.sessionId))) {
+        getChatMessages(sid)
+          .then(({ messages }) => {
+            if (live) apply(messages, subagentTabs.filter((t) => t.sessionId === sid), true);
+          })
+          .catch(() => {});
+      }
+    };
+    seed();
     const off = onChatEvent((ev) => {
+      if (ev.type === "reconnected") {
+        // Frames lost during the outage may include the terminal update —
+        // refetch, letting the fresh seed overwrite everything.
+        liveUpdated.clear();
+        seed();
+        return;
+      }
       if (ev.type !== "message") return;
       const tabs = subagentTabs.filter((t) => t.sessionId === ev.sessionId);
-      if (tabs.length) apply([ev.message], tabs);
+      if (tabs.length) apply([ev.message], tabs, false);
     });
     return () => {
       live = false;

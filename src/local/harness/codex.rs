@@ -1488,6 +1488,32 @@ fn subagent_spawn_part(id: &str, item: &Value, completed: bool) -> WirePart {
 // thread we know is a sub-agent spawned this turn, route its items/deltas into
 // the spawning part's `children` instead.
 
+/// Shared tail of every successfully-completed turn: sweep still-open request
+/// cards, reconcile final item states, settle orphaned spawn rows, synthesize
+/// the plan card when applicable, and flush. Kept in one place so the three
+/// exit paths (plain completion, drain completion, drain quiet-settle) can't
+/// drift.
+async fn finish_completed_turn(
+    ctx: &mut TurnCtx,
+    client: &CodexClient,
+    thread_id: &str,
+    turn_id: Option<&str>,
+    plan_card_wanted: bool,
+    open_requests: &mut HashMap<String, (Value, ServerReqKind)>,
+) {
+    sweep_open_requests(ctx, client, open_requests).await;
+    reconcile_turn_items(ctx, client, thread_id, turn_id).await;
+    // A sub-agent whose `turn/completed` never arrived before the turn ended
+    // would otherwise spin forever.
+    settle_running_subagents(&mut ctx.assistant.parts);
+    if plan_card_wanted {
+        if let Some(part) = plan_card(&ctx.assistant.parts, &ctx.assistant.id) {
+            ctx.upsert_part(part);
+        }
+    }
+    let _ = ctx.flush();
+}
+
 /// How long a quiet post-parent drain waits before settling the turn. The
 /// parent's turn is already complete, so only actively-streaming agents
 /// justify waiting; settling early degrades gracefully because codex delivers
@@ -1545,7 +1571,7 @@ fn apply_sub_notification(
     tid: &str,
     method: &str,
     params: &Value,
-) -> Vec<(String, String)> {
+) -> Vec<(String, String, bool)> {
     let mut discovered = Vec::new();
     match method {
         "item/started" | "item/completed" => {
@@ -1559,7 +1585,7 @@ fn apply_sub_notification(
                     // A grandchild spawn: register its threads under this part.
                     if part.tool.as_deref() == Some("subagent") {
                         for gtid in subagent_thread_ids(item) {
-                            discovered.push((gtid, part.id.clone()));
+                            discovered.push((gtid, part.id.clone(), item_arms_thread(item)));
                         }
                     }
                     let completed_streamed =
@@ -1652,16 +1678,49 @@ fn register_sub_threads_from(
         if tid == parent_thread {
             continue;
         }
-        // Preserve a known-terminal thread's `live: false` — re-seeing the
-        // spawn item (started→completed) must not resurrect a finished agent.
-        let live = sub_threads.get(&tid).map_or(true, |s| s.live);
-        sub_threads.insert(
-            tid,
-            SubThread {
-                spawn_part_id: spawn_id.to_string(),
-                live,
-            },
-        );
+        register_sub_thread(sub_threads, tid, spawn_id.to_string(), item);
+    }
+}
+
+/// Insert/re-point one sub-agent thread, deriving liveness from the item's
+/// semantics: a re-fire of the same item (started→completed) preserves the
+/// thread's current liveness, a NEW driving item (spawn / sendInput / resume /
+/// a `started` activity) arms it — even for a thread that already retired,
+/// so a resumed agent's continuation is drained — and a NEW passive item
+/// (wait, close, an interaction/interruption marker) never invents liveness:
+/// e.g. a next-turn report marker for a long-finished agent must not stall the
+/// drain waiting on a `turn/completed` that will never come.
+fn register_sub_thread(
+    sub_threads: &mut HashMap<String, SubThread>,
+    tid: String,
+    spawn_part_id: String,
+    item: &Value,
+) {
+    let existing = sub_threads.get(&tid);
+    let live = if existing.is_some_and(|s| s.spawn_part_id == spawn_part_id) {
+        existing.is_some_and(|s| s.live)
+    } else {
+        item_arms_thread(item)
+    };
+    sub_threads.insert(
+        tid,
+        SubThread {
+            spawn_part_id,
+            live,
+        },
+    );
+}
+
+/// Whether a collab item DRIVES its referenced threads (starts or re-drives an
+/// agent), as opposed to passively referencing them.
+fn item_arms_thread(item: &Value) -> bool {
+    match item.get("type").and_then(Value::as_str) {
+        Some("collabAgentToolCall") => matches!(
+            item.get("tool").and_then(Value::as_str),
+            Some("spawnAgent") | Some("sendInput") | Some("resumeAgent")
+        ),
+        Some("subAgentActivity") => item.get("kind").and_then(Value::as_str) == Some("started"),
+        _ => false,
     }
 }
 
@@ -1723,17 +1782,21 @@ fn route_sub_event(
         }
     }
     let discovered = apply_sub_notification(&mut spawn_part.children, tid, method, params);
-    for (gtid, spawn_id) in discovered {
+    for (gtid, spawn_id, arms) in discovered {
         // Same parent-thread guard as `register_sub_threads_from`: a child's
         // handoff item can reference the parent, which must never become a
         // waitable "sub-agent".
         if gtid == parent_thread {
             continue;
         }
-        // Re-point, same as `register_sub_threads_from` for top-level threads: a
-        // later collab item on this grandchild thread (sendInput/resumeAgent)
-        // owns its continued transcript.
-        let live = sub_threads.get(&gtid).map_or(true, |s| s.live);
+        // Re-point, same as `register_sub_threads_from` for top-level threads,
+        // with the same liveness semantics (see `register_sub_thread`).
+        let existing = sub_threads.get(&gtid);
+        let live = if existing.is_some_and(|s| s.spawn_part_id == spawn_id) {
+            existing.is_some_and(|s| s.live)
+        } else {
+            arms
+        };
         sub_threads.insert(
             gtid,
             SubThread {
@@ -2048,15 +2111,15 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                          (threads without a terminal event: {stuck:?})",
                         DRAIN_QUIET_SETTLE.as_secs()
                     );
-                    sweep_open_requests(ctx, &client, &mut open_requests).await;
-                    reconcile_turn_items(ctx, &client, &thread_id, turn_id.as_deref()).await;
-                    settle_running_subagents(&mut ctx.assistant.parts);
-                    if plan_turn {
-                        if let Some(part) = plan_card(&ctx.assistant.parts, &ctx.assistant.id) {
-                            ctx.upsert_part(part);
-                        }
-                    }
-                    let _ = ctx.flush();
+                    finish_completed_turn(
+                        ctx,
+                        &client,
+                        &thread_id,
+                        turn_id.as_deref(),
+                        plan_turn,
+                        &mut open_requests,
+                    )
+                    .await;
                     return Ok(());
                 }
                 Err(_) => {
@@ -2088,18 +2151,15 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                         // Draining after the parent's turn/completed: the last
                         // live thread retiring ends the turn for real.
                         if parent_done && !sub_threads.values().any(|s| s.live) {
-                            sweep_open_requests(ctx, &client, &mut open_requests).await;
-                            reconcile_turn_items(ctx, &client, &thread_id, turn_id.as_deref())
-                                .await;
-                            settle_running_subagents(&mut ctx.assistant.parts);
-                            if plan_turn {
-                                if let Some(part) =
-                                    plan_card(&ctx.assistant.parts, &ctx.assistant.id)
-                                {
-                                    ctx.upsert_part(part);
-                                }
-                            }
-                            let _ = ctx.flush();
+                            finish_completed_turn(
+                                ctx,
+                                &client,
+                                &thread_id,
+                                turn_id.as_deref(),
+                                plan_turn,
+                                &mut open_requests,
+                            )
+                            .await;
                             return Ok(());
                         }
                         continue;
@@ -2137,20 +2197,17 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                             let _ = ctx.flush();
                             continue;
                         }
-                        sweep_open_requests(ctx, &client, &mut open_requests).await;
-                        reconcile_turn_items(ctx, &client, &thread_id, turn_id.as_deref()).await;
-                        // A sub-agent whose `turn/completed` never arrived before
-                        // the parent turn ended would otherwise spin forever.
-                        settle_running_subagents(&mut ctx.assistant.parts);
-                        // Synthesize the end-turn plan card (Plan mode, not
-                        // interrupted). Attach before the final flush so the
-                        // PlanStrip appears atomically with the finished turn.
-                        if plan_turn && !interrupted {
-                            if let Some(part) = plan_card(&ctx.assistant.parts, &ctx.assistant.id) {
-                                ctx.upsert_part(part);
-                            }
-                        }
-                        let _ = ctx.flush();
+                        // Plan card only for a non-interrupted Plan turn — an
+                        // interrupted plan turn has no finished plan.
+                        finish_completed_turn(
+                            ctx,
+                            &client,
+                            &thread_id,
+                            turn_id.as_deref(),
+                            plan_turn && !interrupted,
+                            &mut open_requests,
+                        )
+                        .await;
                         return Ok(());
                     }
                     Some(TurnEnd::Failed(message)) => {

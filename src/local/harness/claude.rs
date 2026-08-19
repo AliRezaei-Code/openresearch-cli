@@ -1034,7 +1034,9 @@ struct TurnState {
     /// bridge on, ExitPlanMode / AskUserQuestion come from the bridge (held,
     /// mid-turn-answerable), so their `tool_use` renders nothing.
     bridge_active: bool,
-    /// The `result` event has landed — the turn is over.
+    /// At least one `result` event has landed. With background tasks a turn
+    /// spans several segments, each with its own result — this validates the
+    /// stream ended shaped like a turn, not that a given result was terminal.
     saw_result: bool,
     /// An interactive card was surfaced this turn (suppresses the synthesized
     /// plan card — see `should_synthesize_plan`).
@@ -1263,6 +1265,9 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
             Some("task_started") => {
                 if event.get("task_type").and_then(Value::as_str) == Some("local_agent") {
                     if let Some(id) = event.get("task_id").and_then(Value::as_str) {
+                        // A missing tool_use_id stores "" — it never equals a
+                        // real part id, so the spawn-part association simply
+                        // doesn't apply; the task still gates the turn's end.
                         let tool_id = event
                             .get("tool_use_id")
                             .and_then(Value::as_str)
@@ -1288,6 +1293,18 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                                 let ok = event.get("status").and_then(Value::as_str)
                                     == Some("completed");
                                 part_state.status = if ok { "completed" } else { "error" }.into();
+                                if !ok {
+                                    // Give the failure a real message — the
+                                    // spawn tool's own result was only the
+                                    // launch acknowledgement.
+                                    part_state.error = Some(
+                                        event
+                                            .get("summary")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("The background agent failed")
+                                            .to_string(),
+                                    );
+                                }
                             }
                         }
                     }
@@ -1468,17 +1485,18 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                 // An async spawn's immediate acknowledgement ("Async agent
                 // launched…") is not the call's real end — the agent is still
                 // running, and completing the part here would kill every
-                // running indicator for it. Store the output but keep the part
-                // `running`; the terminal task_notification stamps it.
+                // running indicator for it. It's internal metadata, not a
+                // report, so it isn't stored either; the terminal
+                // task_notification stamps the part. (Sync spawns are never
+                // pending here: their task_notification precedes this result.)
                 let launch_ack = parent.is_none()
                     && !is_error
                     && state.pending_tasks.values().any(|tid| tid == &part_id);
+                if launch_ack {
+                    continue;
+                }
                 if let Some(part) = find_part_mut(&mut ctx.assistant.parts, &part_id) {
                     if let Some(state) = part.state.as_mut() {
-                        if launch_ack {
-                            state.output = Some(text.clone());
-                            continue;
-                        }
                         state.status = if is_error { "error" } else { "completed" }.into();
                         if is_error {
                             state.error = Some(text.clone());
