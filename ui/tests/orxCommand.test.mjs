@@ -68,6 +68,18 @@ test("paper discovery commands expose their strategy and query", () => {
       query: "biology agent benchmark",
     },
   );
+  assert.deepEqual(parseOrxLit('orx discover openalex "protein folding" --limit 20'), {
+    kind: "discover",
+    source: "openalex",
+    strategy: "openalex",
+    query: "protein folding",
+  });
+  assert.deepEqual(parseOrxLit('orx discover biorxiv "single-cell atlas"'), {
+    kind: "discover",
+    source: "biorxiv",
+    strategy: "biorxiv",
+    query: "single-cell atlas",
+  });
 });
 
 test("existing literature and paper parsing remains intact", () => {

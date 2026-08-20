@@ -106,11 +106,11 @@ enum Command {
     #[command(name = "install-skills")]
     InstallSkills(InstallSkillsArgs),
 
-    /// Search literature by full-text query across alphaXiv, OpenAlex, or
-    /// bioRxiv (`--source`; no login required).
+    /// Deprecated one-shot literature search. Use `orx discover` instead.
+    #[command(hide = true)]
     Lit(LitArgs),
 
-    /// Call one alphaXiv paper-retrieval primitive; the caller owns the search loop.
+    /// Call one paper-retrieval primitive; the caller owns the search loop.
     Discover(DiscoverArgs),
 
     /// Fetch a paper: alphaXiv report/full-text, or OpenAlex/bioRxiv metadata.
@@ -604,7 +604,7 @@ pub enum TelemetryCommand {
     Off,
 }
 
-/// Which corpus `orx lit` searches / `orx paper` reads from.
+/// Which corpus a literature command searches or reads from.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 #[value(rename_all = "lower")]
 pub enum LitSource {
@@ -666,10 +666,14 @@ pub struct DiscoverArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum DiscoverCommand {
-    /// Full-text BM25 retrieval with match snippets.
+    /// alphaXiv full-text BM25 retrieval with match snippets.
     Keyword(DiscoverySearchArgs),
-    /// Semantic title/abstract retrieval with similarity/popularity reranking.
+    /// alphaXiv semantic title/abstract retrieval with similarity/popularity reranking.
     Embedding(DiscoverySearchArgs),
+    /// OpenAlex scholarly-graph search across disciplines.
+    Openalex(DiscoverySearchArgs),
+    /// bioRxiv preprint search through OpenAlex's bioRxiv source index.
+    Biorxiv(DiscoverySearchArgs),
 }
 
 #[derive(Args, Debug)]
@@ -686,6 +690,9 @@ pub struct DiscoverySearchArgs {
     /// Ranking policy after topical relevance is accounted for.
     #[arg(long, value_enum, default_value = "default")]
     pub prioritize: DiscoveryPriority,
+    /// Maximum results to emit (default 15). alphaXiv uses its fixed server-side candidate pool.
+    #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u32).range(1..=200))]
+    pub limit: u32,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -983,6 +990,8 @@ mod cli_tests {
             "2025-12-31",
             "--prioritize",
             "historical",
+            "--limit",
+            "9",
         ])
         .expect("discover embedding should parse");
 
@@ -996,6 +1005,27 @@ mod cli_tests {
         assert_eq!(args.published_after.as_deref(), Some("2024-01-01"));
         assert_eq!(args.published_before.as_deref(), Some("2025-12-31"));
         assert_eq!(args.prioritize, DiscoveryPriority::Historical);
+        assert_eq!(args.limit, 9);
+    }
+
+    #[test]
+    fn discover_parses_openalex_and_biorxiv_primitives() {
+        for (source, expected) in [
+            ("openalex", LitSource::Openalex),
+            ("biorxiv", LitSource::Biorxiv),
+        ] {
+            let cli = Cli::try_parse_from(["orx", "discover", source, "protein folding"])
+                .expect("source discovery should parse");
+            let Some(Command::Discover(DiscoverArgs { command })) = cli.command else {
+                panic!("expected discover command");
+            };
+            let actual = match command {
+                DiscoverCommand::Openalex(_) => LitSource::Openalex,
+                DiscoverCommand::Biorxiv(_) => LitSource::Biorxiv,
+                _ => panic!("expected non-alphaXiv discovery source"),
+            };
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]

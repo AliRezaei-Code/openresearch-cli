@@ -20,17 +20,16 @@ const LIT_REVIEW_TEMPLATE: &str = r#"Perform a multi-hop literature review acros
 
 Topic: {args}
 
-Load the `orx-lit` skill and follow its main-agent alphaXiv retrieval loop. Call
-`orx discover keyword` and `orx discover embedding` yourself; do not delegate
-the loop or replace it with `orx lit`. Use `orx paper <id>` only when the requested
+Load the `orx-lit` skill and follow its main-agent cross-corpus retrieval loop;
+do not delegate it. The initial round must call `orx discover keyword`,
+`embedding`, `openalex`, and `biorxiv`. In later rounds, choose only the sources
+suited to the concrete coverage gap. Use `orx paper <id>` only when the requested
 review needs claim-level synthesis, methodological details, or comparison.
-For materially relevant non-arXiv coverage, supplement with `orx lit --source
-openalex` or `orx lit --source biorxiv`.
 
 Method:
-1. Complete the skill's retrieval loop first, including its exact difficulty-to-round budget, initial parallel calls, acronym recovery, inherited date/ranking controls, stopping rule, and ranked 5-15 candidate set. A follow-up budget counts rounds, not primitive calls: one round may call both retrieval strategies for the same concrete missing angle.
+1. Complete the skill's retrieval loop first, including its exact difficulty-to-round budget, all-source initial parallel calls, acronym recovery, inherited date/ranking controls, stopping rule, and ranked 5-15 candidate set. A follow-up budget counts rounds, not primitive calls: one round may call multiple selected sources for the same concrete missing angle.
 2. For a set-of-papers or reading-list request, return the ranked discovery results without reading papers. When the request needs claim-level synthesis, methodological details, or comparison, only after retrieval is complete read the 3-5 most load-bearing candidates with `orx paper <id>`. Track papers already seen so you do not re-read them.
-3. For biomed or cross-field topics, supplement with OpenAlex or bioRxiv only when that corpus is materially relevant. Keep this separate from the faithful alphaXiv retrieval loop.
+3. Deduplicate overlaps across sources. Prefer alphaXiv for an arXiv duplicate because it supports full-text reading; use OpenAlex and bioRxiv to retain genuinely additional coverage.
 
 Then write the review:
 - Organize by theme, not by paper.

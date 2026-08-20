@@ -412,6 +412,15 @@ pub struct PaperDiscoveryOptions<'a> {
     pub prioritize: &'a str,
 }
 
+#[derive(Clone, Copy)]
+pub struct OpenAlexDiscoveryOptions<'a> {
+    pub limit: u32,
+    pub published_after: Option<&'a str>,
+    pub published_before: Option<&'a str>,
+    pub prioritize: &'a str,
+    pub source_filter: Option<&'a str>,
+}
+
 fn paper_discovery_url(
     base: &str,
     strategy: &str,
@@ -502,7 +511,7 @@ pub async fn search_papers(query: &str, limit: u32) -> Result<Vec<PaperHit>> {
 }
 
 /// `2401.12345v2` → `2401.12345`; alphaXiv lookups want the versionless id.
-fn versionless_id(paper_id: &str) -> &str {
+pub(crate) fn versionless_id(paper_id: &str) -> &str {
     paper_id
         .rfind('v')
         .filter(|&i| i > 0 && !paper_id[i + 1..].is_empty())
@@ -922,31 +931,75 @@ impl OpenAlexWork {
 const OPENALEX_SELECT: &str =
     "id,doi,title,publication_date,cited_by_count,abstract_inverted_index";
 
-/// Search OpenAlex works by relevance, capped at `limit`. When `source_filter`
-/// is set (an OpenAlex source id like [`BIORXIV_SOURCE_ID`]), results are
-/// restricted to that venue. Hits come back already mapped to [`LitHit`].
-pub async fn search_openalex(
+fn openalex_discovery_url(
+    base: &str,
     query: &str,
-    limit: u32,
-    source_filter: Option<&str>,
+    mailto: &str,
+    options: OpenAlexDiscoveryOptions<'_>,
+) -> Result<reqwest::Url> {
+    // Preserve relevance by reranking a broader page instead of sorting the whole corpus by date.
+    let fetch_limit = if options.prioritize == "default" {
+        options.limit
+    } else {
+        options.limit.saturating_mul(4).max(50)
+    };
+    let mut url = reqwest::Url::parse(&format!("{base}/works"))?;
+    {
+        let mut params = url.query_pairs_mut();
+        params.append_pair("search", query);
+        params.append_pair("per_page", &fetch_limit.clamp(1, 200).to_string());
+        params.append_pair("mailto", mailto);
+        params.append_pair("select", OPENALEX_SELECT);
+
+        let mut filters = Vec::new();
+        if let Some(source) = options.source_filter {
+            filters.push(format!("primary_location.source.id:{source}"));
+        }
+        if let Some(date) = options.published_after {
+            filters.push(format!("from_publication_date:{date}"));
+        }
+        if let Some(date) = options.published_before {
+            filters.push(format!("to_publication_date:{date}"));
+        }
+        if !filters.is_empty() {
+            params.append_pair("filter", &filters.join(","));
+        }
+    }
+    Ok(url)
+}
+
+fn rerank_openalex_works(works: &mut [OpenAlexWork], prioritize: &str) {
+    match prioritize {
+        "recency" => works.sort_by(|a, b| match (&a.publication_date, &b.publication_date) {
+            (Some(a), Some(b)) => b.cmp(a),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }),
+        "historical" => works.sort_by(|a, b| match (&a.publication_date, &b.publication_date) {
+            (Some(a), Some(b)) => a.cmp(b),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }),
+        "popular" => works.sort_by(|a, b| {
+            b.cited_by_count
+                .unwrap_or_default()
+                .cmp(&a.cited_by_count.unwrap_or_default())
+        }),
+        _ => {}
+    }
+}
+
+/// Search OpenAlex works, optionally restricted to a source such as bioRxiv.
+pub async fn discover_openalex(
+    query: &str,
+    options: OpenAlexDiscoveryOptions<'_>,
 ) -> Result<Vec<LitHit>> {
     let base = crate::config::openalex_api_url();
-    // OpenAlex rejects per_page outside 1..=200 with a 400.
-    let per_page = limit.clamp(1, 200);
-    let mut url = format!(
-        "{}/works?search={}&per_page={}&mailto={}&select={}",
-        base,
-        urlencoding::encode(query),
-        per_page,
-        urlencoding::encode(&crate::config::openalex_mailto()),
-        OPENALEX_SELECT,
-    );
-    if let Some(sid) = source_filter {
-        url.push_str("&filter=primary_location.source.id:");
-        url.push_str(sid);
-    }
+    let url = openalex_discovery_url(&base, query, &crate::config::openalex_mailto(), options)?;
     let res = http()
-        .get(&url)
+        .get(url)
         .header("user-agent", ALPHAXIV_UA)
         .send()
         .await
@@ -966,13 +1019,34 @@ pub async fn search_openalex(
         #[serde(default)]
         results: Vec<OpenAlexWork>,
     }
-    let biorxiv = source_filter == Some(BIORXIV_SOURCE_ID);
-    let body = res.json::<WorksResponse>().await?;
+    let biorxiv = options.source_filter == Some(BIORXIV_SOURCE_ID);
+    let mut body = res.json::<WorksResponse>().await?;
+    rerank_openalex_works(&mut body.results, options.prioritize);
     Ok(body
         .results
         .into_iter()
+        .take(options.limit as usize)
         .map(|w| w.into_lit_hit(biorxiv))
         .collect())
+}
+
+/// Compatibility wrapper for the deprecated `orx lit` command.
+pub async fn search_openalex(
+    query: &str,
+    limit: u32,
+    source_filter: Option<&str>,
+) -> Result<Vec<LitHit>> {
+    discover_openalex(
+        query,
+        OpenAlexDiscoveryOptions {
+            limit,
+            published_after: None,
+            published_before: None,
+            prioritize: "default",
+            source_filter,
+        },
+    )
+    .await
 }
 
 /// The `/works/{id}` selector for a work fetched by id or DOI. A DOI (bare,
@@ -1077,9 +1151,10 @@ pub async fn fetch_biorxiv(doi: &str) -> Result<Option<BiorxivDetail>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        openalex_selector, paper_discovery_url, reconstruct_abstract, CreateSandboxBody,
-        ListCatalog, ListCpuCatalog, LitHit, OpenAlexWork, PaperDiscoveryOptions, PaperHit,
-        SandboxEnvelope, SandboxTarget, BIORXIV_SOURCE_ID,
+        openalex_discovery_url, openalex_selector, paper_discovery_url, reconstruct_abstract,
+        rerank_openalex_works, CreateSandboxBody, ListCatalog, ListCpuCatalog, LitHit,
+        OpenAlexDiscoveryOptions, OpenAlexWork, PaperDiscoveryOptions, PaperHit, SandboxEnvelope,
+        SandboxTarget, BIORXIV_SOURCE_ID,
     };
     use serde_json::json;
 
@@ -1117,6 +1192,64 @@ mod tests {
             params.get("prioritize").map(|value| value.as_ref()),
             Some("historical")
         );
+    }
+
+    #[test]
+    fn openalex_discovery_url_encodes_source_dates_and_priority() {
+        let url = openalex_discovery_url(
+            "https://api.openalex.org",
+            "protein folding & agents",
+            "dev@example.org",
+            OpenAlexDiscoveryOptions {
+                limit: 15,
+                published_after: Some("2024-01-01"),
+                published_before: Some("2026-01-31"),
+                prioritize: "popular",
+                source_filter: Some(BIORXIV_SOURCE_ID),
+            },
+        )
+        .expect("valid OpenAlex URL");
+        let params = url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(
+            params.get("search").map(|value| value.as_ref()),
+            Some("protein folding & agents")
+        );
+        assert_eq!(
+            params.get("per_page").map(|value| value.as_ref()),
+            Some("60")
+        );
+        assert_eq!(params.get("sort"), None);
+        assert_eq!(
+            params.get("filter").map(|value| value.as_ref()),
+            Some("primary_location.source.id:S4306402567,from_publication_date:2024-01-01,to_publication_date:2026-01-31")
+        );
+    }
+
+    #[test]
+    fn reranks_only_the_relevant_openalex_result_pool() {
+        let json = r#"[
+            {"title":"middle","publication_date":"2020-01-01","cited_by_count":5},
+            {"title":"new","publication_date":"2025-01-01","cited_by_count":1},
+            {"title":"old","publication_date":"2010-01-01","cited_by_count":20},
+            {"title":"unknown","publication_date":null,"cited_by_count":2}
+        ]"#;
+        let works = || serde_json::from_str::<Vec<OpenAlexWork>>(json).expect("valid works");
+
+        let mut recency = works();
+        rerank_openalex_works(&mut recency, "recency");
+        assert_eq!(recency[0].title.as_deref(), Some("new"));
+
+        let mut historical = works();
+        rerank_openalex_works(&mut historical, "historical");
+        assert_eq!(historical[0].title.as_deref(), Some("old"));
+        assert_eq!(historical[3].title.as_deref(), Some("unknown"));
+
+        let mut popular = works();
+        rerank_openalex_works(&mut popular, "popular");
+        assert_eq!(popular[0].title.as_deref(), Some("old"));
     }
 
     #[test]

@@ -1572,12 +1572,20 @@ function toolActivity(part: ChatPart): ToolActivity {
         if (litCall) break;
       }
       if (litCall) {
+        const discoveryLabel = litCall.kind === "discover"
+          ? {
+              keyword: "Searched alphaXiv full text",
+              embedding: "Searched alphaXiv semantically",
+              openalex: "Searched OpenAlex",
+              biorxiv: "Searched bioRxiv",
+            }[litCall.strategy]
+          : null;
         const label = litCall.kind === "lit"
           ? litCall.query ? `Searched for “${litCall.query}”` : "Searched the literature"
           : litCall.kind === "discover"
             ? litCall.query
-              ? `${litCall.strategy === "keyword" ? "Searched full text" : "Searched semantically"} for “${litCall.query}”`
-              : litCall.strategy === "keyword" ? "Searched full text" : "Searched semantically"
+              ? `${discoveryLabel} for “${litCall.query}”`
+              : discoveryLabel ?? "Searched the literature"
             : litCall.id ? `Read ${litCall.id}` : "Read a paper";
         return { kind: litCall.kind === "paper" ? "read" : "search", label, litCall };
       }

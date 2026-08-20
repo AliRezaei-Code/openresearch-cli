@@ -86,7 +86,7 @@ const S_GIT: AgentSkill = AgentSkill {
 };
 const S_LIT: AgentSkill = AgentSkill {
     name: "orx-lit",
-    description: "Search and read research papers. For alphaXiv discovery, the main agent directly calls independent keyword and embedding retrieval primitives, ranks their candidates, and decides any focused follow-up calls itself. Use for literature reviews, related work, prior art, papers, authors, methods, benchmarks, or research claims; never delegate the retrieval loop to a sub-agent.",
+    description: "Search and read research papers. The main agent calls alphaXiv, OpenAlex, and bioRxiv discovery primitives, ranks the combined candidates, and chooses sources for focused follow-ups. Use for literature reviews, related work, prior art, papers, authors, methods, benchmarks, or research claims; never delegate the retrieval loop to a sub-agent.",
     content: LIT,
 };
 const S_CREATE: AgentSkill = AgentSkill {

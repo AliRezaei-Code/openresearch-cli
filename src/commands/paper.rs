@@ -15,8 +15,8 @@
 //! points you at the PDF.
 
 use crate::client::{
-    fetch_biorxiv, fetch_openalex_work, fetch_paper_github, fetch_paper_markdown, BiorxivDetail,
-    OpenAlexWork,
+    fetch_biorxiv, fetch_openalex_work, fetch_paper_github, fetch_paper_markdown, versionless_id,
+    BiorxivDetail, OpenAlexWork,
 };
 use crate::error::{anyhow, Result};
 use crate::LitSource;
@@ -90,7 +90,7 @@ async fn run_openalex(raw: &str, full: bool) -> Result<()> {
             Ok(())
         }
         None => Err(anyhow!(
-            "No OpenAlex work found for {raw:?}. Check the id/DOI, or search with `orx lit --source openalex`."
+            "No OpenAlex work found for {raw:?}. Check the id/DOI, or search with `orx discover openalex <query>`."
         )),
     }
 }
@@ -103,7 +103,7 @@ async fn run_biorxiv(raw: &str, full: bool) -> Result<()> {
             Ok(())
         }
         None => Err(anyhow!(
-            "No bioRxiv preprint found for {doi}. If it's a medRxiv or non-bioRxiv DOI, try `orx paper {doi} --source openalex`; or search with `orx lit --source biorxiv`."
+            "No bioRxiv preprint found for {doi}. If it's a medRxiv or non-bioRxiv DOI, try `orx paper {doi} --source openalex`; or search with `orx discover biorxiv <query>`."
         )),
     }
 }
@@ -279,15 +279,7 @@ pub(crate) fn parse_paper_id(input: &str) -> String {
 }
 
 fn alphaxiv_paper_url(id: &str) -> String {
-    let versionless = match id.rsplit_once('v') {
-        Some((base, version))
-            if !version.is_empty() && version.chars().all(|c| c.is_ascii_digit()) =>
-        {
-            base
-        }
-        _ => id,
-    };
-    format!("https://www.alphaxiv.org/abs/{versionless}")
+    format!("https://www.alphaxiv.org/abs/{}", versionless_id(id))
 }
 
 #[cfg(test)]
@@ -333,6 +325,7 @@ mod tests {
             alphaxiv_paper_url("2401.12345"),
             "https://www.alphaxiv.org/abs/2401.12345"
         );
+        assert_eq!(alphaxiv_paper_url("v2"), "https://www.alphaxiv.org/abs/v2");
     }
 
     #[test]

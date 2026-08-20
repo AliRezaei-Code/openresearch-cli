@@ -5,8 +5,8 @@ export type OrxLitCall =
   | { kind: "paper"; source: LitSource; id?: string }
   | {
       kind: "discover";
-      source: "alphaxiv";
-      strategy: "keyword" | "embedding";
+      source: LitSource;
+      strategy: "keyword" | "embedding" | "openalex" | "biorxiv";
       query?: string;
     };
 
@@ -109,6 +109,7 @@ export function orxArgv(command: string): string[] | null {
 export function orxArgsMatch(command: string, args: string): boolean {
   const argv = orxArgv(command);
   if (argv === null) return false;
+  // Each `\s+`-separated fragment is one argv-token regex, never a literal space.
   const patterns = args.split("\\s+");
   return patterns.every(
     (pattern, index) => argv[index] !== undefined && new RegExp(`^(?:${pattern})$`, "i").test(argv[index]),
@@ -161,6 +162,14 @@ export function parseOrxLit(command: string): OrxLitCall | null {
   }
 
   const strategy = positionals[0];
-  if (strategy !== "keyword" && strategy !== "embedding") return null;
-  return { kind, source: "alphaxiv", strategy, query: positionals[1] };
+  if (
+    strategy !== "keyword" &&
+    strategy !== "embedding" &&
+    strategy !== "openalex" &&
+    strategy !== "biorxiv"
+  ) return null;
+  const discoverSource = strategy === "openalex" || strategy === "biorxiv"
+    ? strategy
+    : "alphaxiv";
+  return { kind, source: discoverSource, strategy, query: positionals[1] };
 }

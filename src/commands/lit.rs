@@ -11,6 +11,9 @@ use crate::error::{anyhow, Result};
 use crate::LitSource;
 
 pub async fn run(args: crate::LitArgs) -> Result<()> {
+    eprintln!(
+        "warning: `orx lit` is deprecated; use `orx discover keyword|embedding|openalex|biorxiv`."
+    );
     let limit = args.limit.unwrap_or(5);
     let source = resolve_lit_source(args.source, &crate::config::disabled_lit_sources())?;
     // When no --source was given and the default (alphaXiv) is disabled, say which
