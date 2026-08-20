@@ -164,7 +164,7 @@ preferences.
 | `orx exp wake <expId>` | Resume this local chat after the experiment's latest run succeeds or fails. Cancelled runs do not wake the chat. |
 | `orx runs {id} [--experiment <expId>]` | Run table, newest first. Run ids come from here. |
 | `orx logs <runId> [--head] [--bytes <n>] [--range <s>:<e>]` | Read a run's log (tail by default). |
-| `orx lit "<query>" [--source alphaxiv\|openalex\|biorxiv] [--published-after YYYY-MM-DD] [--published-before YYYY-MM-DD]` / `orx paper <id\|url>` | Literature search across alphaXiv, OpenAlex, and bioRxiv (public, no login): **`orx-lit`** skill. alphaXiv defaults to the past three months; change the bounds for broader or historical questions. |
+| `orx lit "<question>" [--keyword <term>]… [--prioritize default\|recency\|historical\|popular] [--published-after YYYY-MM-DD] [--published-before YYYY-MM-DD]` / `orx paper <id\|url>` | Agent-ranked literature retrieval across alphaXiv, OpenAlex, and bioRxiv (public, no login): **`orx-lit`** skill. The main agent ranks keyword and semantic candidates and makes only focused follow-ups. |
 
 ## The auto-research loop
 

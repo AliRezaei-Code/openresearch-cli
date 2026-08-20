@@ -405,39 +405,47 @@ pub struct PaperSnippet {
     pub snippet: String,
 }
 
+#[derive(Clone, Copy)]
+pub struct PaperSearchOptions<'a> {
+    pub limit: u32,
+    pub published_after: Option<&'a str>,
+    pub published_before: Option<&'a str>,
+    pub prioritize: Option<&'a str>,
+}
+
 fn paper_search_url(
     base: &str,
+    path: &str,
     query: &str,
-    limit: u32,
-    published_after: Option<&str>,
-    published_before: Option<&str>,
+    options: PaperSearchOptions<'_>,
 ) -> Result<reqwest::Url> {
-    let mut url = reqwest::Url::parse(&format!("{base}/search/v2/paper/full-text"))?;
+    // Absent bounds intentionally inherit alphaXiv's tool-specific default window.
+    let mut url = reqwest::Url::parse(&format!("{base}{path}"))?;
     {
         let mut params = url.query_pairs_mut();
         params.append_pair("q", query);
-        params.append_pair("limit", &limit.to_string());
-        if let Some(date) = published_after {
+        params.append_pair("limit", &options.limit.to_string());
+        if let Some(date) = options.published_after {
             params.append_pair("publishedAfter", date);
         }
-        if let Some(date) = published_before {
+        if let Some(date) = options.published_before {
             params.append_pair("publishedBefore", date);
+        }
+        if let Some(priority) = options.prioritize {
+            params.append_pair("prioritize", priority);
         }
     }
     Ok(url)
 }
 
-/// Full-text literature search across alphaXiv. Returns the hits in relevance
-/// order (most relevant first), capped at `limit`.
-pub async fn search_papers(
+async fn search_alphaxiv_papers(
+    path: &str,
+    label: &str,
     query: &str,
-    limit: u32,
-    published_after: Option<&str>,
-    published_before: Option<&str>,
+    options: PaperSearchOptions<'_>,
 ) -> Result<Vec<PaperHit>> {
     let base = crate::config::alphaxiv_api_url();
-    // Omitting both bounds delegates the default three-month window to alphaXiv.
-    let url = paper_search_url(&base, query, limit, published_after, published_before)?;
+    let url = paper_search_url(&base, path, query, options)?;
     let res = http()
         .get(url)
         .header("user-agent", ALPHAXIV_UA)
@@ -448,12 +456,27 @@ pub async fn search_papers(
     if !status.is_success() {
         let reason = status.canonical_reason().unwrap_or("");
         return Err(anyhow!(
-            "alphaXiv search failed ({} {})",
+            "alphaXiv {} search failed ({} {})",
+            label,
             status.as_u16(),
             reason
         ));
     }
     Ok(res.json::<Vec<PaperHit>>().await?)
+}
+
+/// Full-text literature search across alphaXiv, ordered and date-bounded by the
+/// requested options.
+pub async fn search_papers(query: &str, options: PaperSearchOptions<'_>) -> Result<Vec<PaperHit>> {
+    search_alphaxiv_papers("/search/v2/paper/full-text", "keyword", query, options).await
+}
+
+/// Semantic literature search across alphaXiv titles and abstracts.
+pub async fn search_papers_semantic(
+    query: &str,
+    options: PaperSearchOptions<'_>,
+) -> Result<Vec<PaperHit>> {
+    search_alphaxiv_papers("/search/v2/paper/semantic", "semantic", query, options).await
 }
 
 /// `2401.12345v2` → `2401.12345`; alphaXiv lookups want the versionless id.
@@ -1033,8 +1056,8 @@ pub async fn fetch_biorxiv(doi: &str) -> Result<Option<BiorxivDetail>> {
 mod tests {
     use super::{
         openalex_selector, paper_search_url, reconstruct_abstract, CreateSandboxBody, ListCatalog,
-        ListCpuCatalog, LitHit, OpenAlexWork, PaperHit, SandboxEnvelope, SandboxTarget,
-        BIORXIV_SOURCE_ID,
+        ListCpuCatalog, LitHit, OpenAlexWork, PaperHit, PaperSearchOptions, SandboxEnvelope,
+        SandboxTarget, BIORXIV_SOURCE_ID,
     };
     use serde_json::json;
 
@@ -1042,10 +1065,14 @@ mod tests {
     fn paper_search_url_includes_explicit_date_bounds() {
         let url = paper_search_url(
             "https://api.alphaxiv.org",
+            "/search/v2/paper/full-text",
             "attention & memory",
-            8,
-            Some("2024-01-01"),
-            Some("2024-12-31"),
+            PaperSearchOptions {
+                limit: 8,
+                published_after: Some("2024-01-01"),
+                published_before: Some("2024-12-31"),
+                prioritize: Some("historical"),
+            },
         )
         .expect("valid alphaXiv URL");
         let params = url
@@ -1065,16 +1092,24 @@ mod tests {
             params.get("publishedBefore").map(|value| value.as_ref()),
             Some("2024-12-31")
         );
+        assert_eq!(
+            params.get("prioritize").map(|value| value.as_ref()),
+            Some("historical")
+        );
     }
 
     #[test]
     fn paper_search_url_leaves_defaulting_to_alphaxiv() {
         let url = paper_search_url(
             "https://api.alphaxiv.org",
+            "/search/v2/paper/semantic",
             "attention",
-            8,
-            None,
-            Some("2012-01-01"),
+            PaperSearchOptions {
+                limit: 8,
+                published_after: None,
+                published_before: Some("2012-01-01"),
+                prioritize: None,
+            },
         )
         .expect("valid alphaXiv URL");
         let params = url
@@ -1086,6 +1121,7 @@ mod tests {
             params.get("publishedBefore").map(|value| value.as_ref()),
             Some("2012-01-01")
         );
+        assert_eq!(url.path(), "/search/v2/paper/semantic");
     }
 
     #[test]
