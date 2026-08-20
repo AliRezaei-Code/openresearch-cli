@@ -68,7 +68,7 @@ test("forks are counted where the replies diverge, not at the reply's tail", () 
     { id: "ap2", role: "assistant", parentId: "u1" },
   ];
   const path = activePath(carded, "am");
-  // Controls sit on `am`, the tail, but it pages across the whole reply's forks.
+  // Helper-level: an assistant bearer anchors to its user turn, not to its own tail.
   assert.deepEqual(forkPositions(carded, path, [at(carded, "am")], never).get("am"), {
     count: 2,
     index: 0,
