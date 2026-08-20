@@ -128,6 +128,9 @@ pub struct HarnessInfo {
     pub agent_ready: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_note: Option<String>,
+    /// Whether a running turn accepts further user input, which is what lets
+    /// the composer steer instead of parking the message until the turn ends.
+    pub supports_steering: bool,
     pub models: Vec<ModelInfo>,
     /// Composer toggle vocabulary (permission modes, reasoning levels).
     pub options: super::HarnessOptions,
@@ -149,6 +152,7 @@ impl HarnessInfo {
             plan: None,
             agent_ready: false,
             agent_note: None,
+            supports_steering: false,
             models: Vec::new(),
             options: super::HarnessOptions::none(),
         }

@@ -18,7 +18,7 @@ orx up
 ```
 
 Prefer an existing implementation over starting from a blank repository. For a
-paper, use `orx paper <id>` and `orx lit <query>` to find the authors' or best
+paper, use `orx paper <id>` and the `orx-lit-review` retrieval workflow to find the authors' or best
 community implementation, clone it, then import that checkout in `orx up`.
 
 Set the project's run command once before launching experiments:

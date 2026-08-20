@@ -1,12 +1,20 @@
 // Inline source editor: a transparent <textarea> layered over the same
-// refractor-highlighted <pre> + gutter that CodeView renders read-only, so
-// syntax colors stay live while typing. It IS the view for editable files —
-// there's no separate mode, you just click and type. The textarea owns input,
-// caret and selection; the highlighted pre and gutter are scroll-synced to it.
+// refractor-highlighted lines CodeView renders read-only, so syntax colors stay
+// live while typing. It IS the view for editable files — there's no separate
+// mode, you just click and type. The textarea owns input, caret and selection;
+// the highlighted overlay is scroll-synced to it. Line numbers are absolutely
+// positioned out of the overlay's line boxes: anything in flow there is a wrap
+// opportunity the textarea doesn't have, which desyncs the two layers.
 // Token colors apply under a `.file-view` ancestor (see CodeView).
 import { useLayoutEffect, useMemo, useRef } from "react";
+import {
+  CODE_GUTTER_CLASS_NAME,
+  CODE_TEXT_CLASS_NAME,
+  CODE_WRAP_CLASS_NAME,
+  codeGutter,
+} from "../codeLayout";
 import { detectSyntaxLanguageFromFilePath } from "../syntaxLanguage";
-import { highlight } from "../syntaxHighlight";
+import { highlightLines, isBlankLine } from "../syntaxHighlight";
 
 export function CodeEditor({
   value,
@@ -32,46 +40,42 @@ export function CodeEditor({
   scrollRequest?: number;
   onScrollRequestHandled?: () => void;
 }) {
-  const rendered = useMemo(
-    () => highlight(value, detectSyntaxLanguageFromFilePath(path)),
+  // A trailing newline opens a new (empty) line the caret can sit on, so unlike
+  // the read-only view every "\n" gets a row.
+  const lines = useMemo(
+    () => highlightLines(value, detectSyntaxLanguageFromFilePath(path)),
     [value, path],
   );
-  // A trailing newline opens a new (empty) line the caret can sit on, so unlike
-  // the read-only view every "\n" counts toward the gutter.
-  const lineCount = value ? value.split("\n").length : 1;
+  const { ruleCh, codeCh } = codeGutter(lines.length);
 
   const taRef = useRef<HTMLTextAreaElement>(null);
-  const preRef = useRef<HTMLPreElement>(null);
-  const gutterRef = useRef<HTMLPreElement>(null);
+  const overlayRef = useRef<HTMLDivElement>(null);
 
-  // Keep the highlighted layer and the gutter pinned to the textarea's scroll.
+  // Keep the highlighted layer pinned to the textarea's scroll.
   const syncScroll = () => {
     const ta = taRef.current;
-    if (!ta) return;
-    if (preRef.current) {
-      preRef.current.scrollTop = ta.scrollTop;
-      preRef.current.scrollLeft = ta.scrollLeft;
-    }
-    if (gutterRef.current) gutterRef.current.scrollTop = ta.scrollTop;
+    if (ta && overlayRef.current) overlayRef.current.scrollTop = ta.scrollTop;
   };
   // Re-sync after content changes relayout (e.g. a newline shifts scrollHeight).
   useLayoutEffect(syncScroll, [value]);
 
   // On open via a `file:line` chip, park the caret on that line and center it.
   // Re-runs when the file changes (path) or a new chip targets the open file
-  // (scrollRequest), mirroring CodeView's re-navigation.
+  // (scrollRequest) — which is also what makes it land: the first run sees the
+  // draft before FileViewer's passive effect has seeded it, and clearing the
+  // request re-runs this against real content.
   useLayoutEffect(() => {
     const ta = taRef.current;
     if (!ta || !highlightLine) return;
-    const cs = getComputedStyle(ta);
-    const padTop = Number.parseFloat(cs.paddingTop) || 0;
-    const lineH = Number.parseFloat(cs.lineHeight) || 0;
-    const target = Math.min(Math.max(Math.trunc(highlightLine), 1), lineCount);
-    const lines = value.split("\n");
+    const text = value.split("\n");
+    const target = Math.min(Math.max(Math.trunc(highlightLine), 1), text.length);
     let caret = 0;
-    for (let i = 0; i < target - 1; i++) caret += lines[i].length + 1;
+    for (let i = 0; i < target - 1; i++) caret += text[i].length + 1;
     ta.setSelectionRange(caret, caret);
-    if (lineH) ta.scrollTop = Math.max(0, padTop + (target - 1) * lineH - ta.clientHeight / 2);
+    // The overlay wraps exactly like the textarea, so its row is where the line
+    // actually sits — line-height arithmetic would miss by every wrap.
+    const row = overlayRef.current?.querySelector<HTMLElement>(`[data-line="${target}"]`);
+    if (row) ta.scrollTop = Math.max(0, row.offsetTop - ta.clientHeight / 2);
     syncScroll();
     onScrollRequestHandled?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -96,38 +100,55 @@ export function CodeEditor({
     }
   };
 
+  // Both layers must reserve the scrollbar, or the textarea is narrower than the
+  // overlay on classic-scrollbar platforms and the two wrap at different columns.
+  const layerClassName = `absolute inset-0 m-0 py-3.5 pr-4 ${CODE_TEXT_CLASS_NAME} ${CODE_WRAP_CLASS_NAME} [scrollbar-gutter:stable]`;
+
   return (
-    <div className="file-view-editwrap flex items-stretch h-full min-h-0 relative">
-      <pre
-        ref={gutterRef}
-        className="file-view-gutter m-0 pt-3.5 pb-3.5 font-mono text-sm leading-[1.55] pl-3.5 pr-2.5 text-right text-muted select-none bg-background border-r border-r-border-variant shrink-0 overflow-hidden"
+    <div className={`file-view-editwrap relative h-full min-h-0 ${CODE_TEXT_CLASS_NAME}`}>
+      <div
+        className="absolute left-0 top-0 bottom-0 border-r border-r-border-variant pointer-events-none"
+        style={{ width: `${ruleCh}ch` }}
+        aria-hidden="true"
+      />
+      <div
+        ref={overlayRef}
+        className={`file-view-code ${layerClassName} overflow-hidden pointer-events-none`}
         aria-hidden="true"
       >
-        {Array.from({ length: lineCount }, (_, i) => i + 1).join("\n")}
-      </pre>
-      <div className="relative flex-1 min-w-0">
-        <pre
-          ref={preRef}
-          className="file-view-code absolute inset-0 m-0 pt-3.5 pb-3.5 font-mono text-sm leading-[1.55] pl-4 pr-4 [tab-size:4] whitespace-pre overflow-hidden pointer-events-none"
-          aria-hidden="true"
-        >
-          <code>{rendered}</code>
-        </pre>
-        <textarea
-          ref={taRef}
-          className="file-view-editarea absolute inset-0 m-0 pt-3.5 pb-3.5 font-mono text-sm leading-[1.55] pl-4 pr-4 [tab-size:4] whitespace-pre overflow-auto resize-none border-0 bg-transparent text-transparent caret-[var(--text)] outline-none"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          onScroll={syncScroll}
-          onKeyDown={onKeyDown}
-          onBlur={onBlur}
-          spellCheck={false}
-          autoComplete="off"
-          autoCorrect="off"
-          autoCapitalize="off"
-          wrap="off"
-        />
+        {lines.map((line, i) => (
+          <div
+            key={i}
+            /* The scroll target for `file:line` — measured, so it's on the row. */
+            data-line={i + 1}
+            className="relative"
+            style={{ paddingLeft: `${codeCh}ch` }}
+          >
+            <span
+              className={`${CODE_GUTTER_CLASS_NAME} absolute left-0 pr-[1ch]`}
+              style={{ width: `${ruleCh}ch` }}
+            >
+              {i + 1}
+            </span>
+            {/* Out-of-flow numbers leave a blank line with no line box at all. */}
+            {isBlankLine(line) ? <br /> : line}
+          </div>
+        ))}
       </div>
+      <textarea
+        ref={taRef}
+        className={`file-view-editarea ${layerClassName} overflow-y-auto overflow-x-hidden resize-none border-0 bg-transparent text-transparent caret-[var(--text)] outline-none`}
+        style={{ paddingLeft: `${codeCh}ch` }}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onScroll={syncScroll}
+        onKeyDown={onKeyDown}
+        onBlur={onBlur}
+        spellCheck={false}
+        autoComplete="off"
+        autoCorrect="off"
+        autoCapitalize="off"
+      />
     </div>
   );
 }

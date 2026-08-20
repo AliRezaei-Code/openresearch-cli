@@ -35,7 +35,7 @@ pub fn alphaxiv_web_url() -> String {
 }
 
 /// Base URL for the OpenAlex REST API (scholarly works search). Public, no
-/// token. Backs `orx lit --source openalex|biorxiv`. Override with `OPENALEX_API_URL`.
+/// token. Backs OpenAlex and bioRxiv discovery. Override with `OPENALEX_API_URL`.
 pub fn openalex_api_url() -> String {
     std::env::var("OPENALEX_API_URL").unwrap_or_else(|_| "https://api.openalex.org".to_string())
 }
@@ -163,8 +163,8 @@ pub fn set_compute_default(backend: Option<String>, flavor: Option<String>) -> R
 }
 
 /// Literature sources the user disabled in Settings (their `LitSource::as_str()`
-/// names). Lives in the telemetry-owned `settings.json`; enforced by `orx lit`
-/// and `orx paper`. Empty = all enabled.
+/// names). Lives in the telemetry-owned `settings.json`; enforced by discovery,
+/// `orx discover`, and `orx paper`. Empty = all enabled.
 pub fn disabled_lit_sources() -> Vec<String> {
     crate::telemetry::disabled_lit_sources()
 }

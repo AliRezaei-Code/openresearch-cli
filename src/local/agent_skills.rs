@@ -35,6 +35,8 @@ pub struct AgentSkill {
     pub content: &'static str,
 }
 
+pub const RETIRED_SKILL_NAMES: &[&str] = &["orx-lit"];
+
 /// Which module set to serve. Both sets use the same canonical module bodies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkillSet {
@@ -50,7 +52,7 @@ const COMPUTE: &str = include_str!("../../agent-skills/orx-compute/SKILL.md");
 const COMPUTE_K8S: &str = include_str!("../../agent-skills/orx-compute-k8s/SKILL.md");
 const EXPERIMENT_TREE: &str = include_str!("../../agent-skills/orx-experiment-tree/SKILL.md");
 const GIT: &str = include_str!("../../agent-skills/orx-git/SKILL.md");
-const LIT: &str = include_str!("../../agent-skills/orx-lit/SKILL.md");
+const LIT: &str = include_str!("../../agent-skills/orx-lit-review/SKILL.md");
 const CREATE: &str = include_str!("../../agent-skills/orx-create/SKILL.md");
 const REPORTS: &str = include_str!("../../agent-skills/orx-reports/SKILL.md");
 const EVIDENCE: &str = include_str!("../../agent-skills/orx-evidence/SKILL.md");
@@ -85,8 +87,8 @@ const S_GIT: AgentSkill = AgentSkill {
     content: GIT,
 };
 const S_LIT: AgentSkill = AgentSkill {
-    name: "orx-lit",
-    description: "Search literature and read papers via alphaXiv, OpenAlex, and bioRxiv (`orx lit` / `orx paper`) — the preferred tool for literature search on any academic topic across CS/ML and biomed: a paper, author, blog post, or model release. Start here, not a web search: find related work, baselines, and code to seed from. Often the corpus answers outright and no web search is needed.",
+    name: "orx-lit-review",
+    description: "Search and read research papers. The main agent calls alphaXiv, OpenAlex, and bioRxiv discovery primitives, ranks the combined candidates, and chooses sources for focused follow-ups. Use for literature reviews, related work, prior art, papers, authors, methods, benchmarks, or research claims; never delegate the retrieval loop to a sub-agent.",
     content: LIT,
 };
 const S_CREATE: AgentSkill = AgentSkill {
@@ -147,6 +149,16 @@ pub fn find(name: &str, set: SkillSet) -> Option<&'static AgentSkill> {
 /// treats it like a playbook-write error.
 pub fn ensure_session_skills(worktree: &Path, skills_dir_rel: &str) -> Result<()> {
     let base = worktree.join(skills_dir_rel);
+    for name in RETIRED_SKILL_NAMES {
+        let dir = base.join(name);
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(anyhow!("Could not remove {}: {}", dir.display(), error));
+            }
+        }
+    }
     for skill in skills(SkillSet::Local) {
         let dir = base.join(skill.name);
         std::fs::create_dir_all(&dir)
@@ -196,6 +208,22 @@ mod tests {
                     "{:?}: duplicate name {:?}",
                     set,
                     s.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retired_names_are_prefixed_and_not_current() {
+        for name in RETIRED_SKILL_NAMES {
+            assert!(
+                name.starts_with("orx-"),
+                "unsafe retired skill name: {name}"
+            );
+            for set in [SkillSet::Local, SkillSet::Full] {
+                assert!(
+                    skills(set).iter().all(|skill| skill.name != *name),
+                    "{name} is both retired and current"
                 );
             }
         }
@@ -316,7 +344,11 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let rel = ".claude/skills";
+        let retired = tmp.join(rel).join(RETIRED_SKILL_NAMES[0]);
+        std::fs::create_dir_all(&retired).unwrap();
+        std::fs::write(retired.join("SKILL.md"), "stale").unwrap();
         ensure_session_skills(&tmp, rel).unwrap();
+        assert!(!retired.exists(), "retired bundled skill was pruned");
 
         let base = tmp.join(rel);
         let expected: HashSet<&str> = skills(SkillSet::Local).iter().map(|s| s.name).collect();

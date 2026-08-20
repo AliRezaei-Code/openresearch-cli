@@ -129,6 +129,7 @@ export interface OrxEventHandlers {
   onRun: (run: Run) => void;
   onExperiment: (experiment: Experiment) => void;
   onProject: (project: Project) => void;
+  onReconnect?: () => void;
   /** The project's artifacts changed on disk — refetch the listing. */
   onArtifacts?: (projectId: string) => void;
 }
@@ -153,6 +154,7 @@ export function useOrxEvents(handlers: OrxEventHandlers) {
       if (needsRepair) {
         emitChat({ type: "reconnected" });
         emitHarnessAuth({ harness: "*", authState: "unknown" });
+        ref.current.onReconnect?.();
       }
       // Every open after this one follows a drop by definition.
       needsRepair = true;

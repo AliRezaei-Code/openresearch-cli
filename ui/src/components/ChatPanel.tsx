@@ -23,7 +23,6 @@ import {
   Package,
   Pencil,
   Plus,
-  RotateCcw,
   Search,
   SlidersHorizontal,
   SquareTerminal,
@@ -82,6 +81,7 @@ import {
 import { activePath, forkPositions } from "../transcriptTree";
 import { onChatEvent } from "../events";
 import { recoveryTurnOptions } from "../chatRecovery";
+import { orxArgsMatch, orxArgv, shellWords, unwrapShellBody } from "../orxCommand";
 import { LitSourceLogo, parseOrxLit, paperUrl } from "./LitSourceLogo";
 import { LitSourcesList } from "./LitSourcesPicker";
 import { Md } from "./Md";
@@ -934,6 +934,8 @@ interface ToolActivity {
   litCall?: NonNullable<ReturnType<typeof parseOrxLit>>;
   runIds?: string[];
   experimentIds?: string[];
+  /** Chat sessions `orx agent spawn` created in this tool call. */
+  spawnedSessionIds?: string[];
 }
 
 type OpenTranscriptFile = (path: string, line?: number, exp?: string, ref?: string) => void;
@@ -1012,10 +1014,7 @@ function meaningfulCommand(command: string): string {
   const trimmed = command.trim();
   const wrapped = trimmed.match(/^\/bin\/(?:ba|z)?sh\s+-lc\s+([\s\S]+)$/);
   let body = (wrapped?.[1] ?? trimmed).trim();
-  const first = body[0];
-  if ((first === "\"" || first === "'") && body[body.length - 1] === first) {
-    body = body.slice(1, -1);
-  }
+  body = unwrapShellBody(body);
   return stripHeredocBodies(body).replace(/[\t\r ]+/g, " ").trim();
 }
 
@@ -1072,42 +1071,6 @@ function stripHeredocBodies(command: string): string {
     marker = heredocMarker(line);
   }
   return kept.join("\n");
-}
-
-function shellWords(input: string): string[] {
-  const words: string[] = [];
-  let word = "";
-  let quote: "\"" | "'" | null = null;
-  let escaped = false;
-  const push = () => {
-    if (word) words.push(word);
-    word = "";
-  };
-
-  for (const char of input) {
-    if (escaped) {
-      word += char;
-      escaped = false;
-      continue;
-    }
-    if (char === "\\" && quote !== "'") {
-      escaped = true;
-      continue;
-    }
-    if (quote) {
-      if (char === quote) quote = null;
-      else word += char;
-      continue;
-    }
-    if (char === "\"" || char === "'") {
-      quote = char;
-      continue;
-    }
-    if (/\s/.test(char)) push();
-    else word += char;
-  }
-  push();
-  return words;
 }
 
 function validReadTarget(value: string | undefined): string | null {
@@ -1251,6 +1214,9 @@ function commandFilePath(
 }
 
 const UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+/** Session ids as `orx agent spawn` prints them, so the spawn card can link to
+ * the session it started. The id is only in the output — never the command. */
+const SPAWNED_SESSION_PATTERN = new RegExp(`\\bchat_(${UUID_PATTERN})\\b`, "gi");
 const RUN_TARGET_PATTERN = `(?:${UUID_PATTERN}|[0-9a-f]{8})`;
 
 interface ShellCommandSegment {
@@ -1369,13 +1335,21 @@ function shellCommandSegments(command: string): ShellCommandSegment[] {
 }
 
 function orxCommandSegments(command: string, args: string): ShellCommandSegment[] {
-  const invocation = new RegExp(`(?:^|\\b(?:do|then|else|if|while|until)\\s+)(?:[A-Za-z_][A-Za-z0-9_]*=[^\\s]+\\s+)*orx\\s+${args}\\b`, "i");
-  return shellCommandSegments(command).filter((segment) => invocation.test(segment.code));
+  return shellCommandSegments(command).filter((segment) => orxArgsMatch(segment.raw, args));
 }
 
 function commandInvokesOrx(command: string, args: string): boolean {
-  if (orxCommandSegments(command, args).length > 0) return true;
-  return new RegExp(`(?:^|[\\s($;])orx\\s+${args}\\b`, "i").test(command);
+  return orxCommandSegments(command, args).length > 0;
+}
+
+function spawnedSessionIds(output: string | undefined): string[] {
+  if (!output) return [];
+  const ids = new Set<string>();
+  for (const match of output.slice(0, TOOL_OUTPUT_SCAN_LIMIT).matchAll(SPAWNED_SESSION_PATTERN)) {
+    ids.add(match[0].toLowerCase());
+    if (ids.size >= TOOL_TARGET_LIMIT) break;
+  }
+  return [...ids];
 }
 
 function idsFromToolOutput(output: string | undefined, resource: "runs" | "experiments"): string[] {
@@ -1459,9 +1433,9 @@ function commandRunIds(command: string, output?: string, preservedIds: string[] 
   }
   let hasUnresolvedTarget = false;
   for (const { invocation, offset } of invocationOffsets(command, invocations)) {
-    const logs = /\borx\s+logs\b/i.exec(invocation.raw);
-    if (!logs) continue;
-    const words = shellWords(invocation.raw.slice(logs.index + logs[0].length));
+    const argv = orxArgv(invocation.raw);
+    if (argv?.[0] !== "logs") continue;
+    const words = argv.slice(1);
     let target: string | null = null;
     for (let index = 0; index < words.length; index++) {
       const word = words[index];
@@ -1511,14 +1485,18 @@ function commandExperimentIds(command: string, output?: string, preservedIds: st
   const ids = new Set<string>();
   let hasUnresolvedTarget = false;
   for (const { invocation, offset } of invocationOffsets(command, invocations)) {
+    const argv = orxArgv(invocation.raw);
+    const target = argv?.[0] === "exp" && (argv[1] === "status" || argv[1] === "desc")
+      ? argv[2]
+      : null;
     let resolved = false;
-    for (const match of invocation.raw.matchAll(new RegExp(`\\borx\\s+exp\\s+(?:status|desc)\\s+["']?(${RUN_TARGET_PATTERN})`, "gi"))) {
-      ids.add(match[1]);
+    if (target && new RegExp(`^${RUN_TARGET_PATTERN}$`, "i").test(target)) {
+      ids.add(target);
       resolved = true;
     }
-    const match = /\borx\s+exp\s+(?:status|desc)\s+["']?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/.exec(invocation.raw);
-    if (match) {
-      const variable = match[1];
+    const variableMatch = target ? /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(target) : null;
+    if (variableMatch) {
+      const variable = variableMatch[1];
       const assignmentIds = assignedIdsBefore(command, variable, offset, RUN_TARGET_PATTERN);
       if (assignmentIds.length > 0) {
         for (const id of assignmentIds) ids.add(id);
@@ -1590,22 +1568,50 @@ function toolActivity(part: ChatPart): ToolActivity {
     case "bash": {
       if (!rawCommand) return { kind: "command", label: "Ran a command" };
       const command = meaningfulCommand(rawCommand);
-      const litSegment = orxCommandSegments(command, "(?:lit|paper)")[0];
-      const litCall = litSegment ? parseOrxLit(litSegment.raw) : null;
-      if (litCall) {
-        const label = litCall.kind === "lit"
-          ? litCall.query ? `Searched for “${litCall.query}”` : "Searched the literature"
-          : litCall.id ? `Read ${litCall.id}` : "Read a paper";
-        return { kind: litCall.kind === "lit" ? "search" : "read", label, litCall };
+      const shellSegments = shellCommandSegments(command);
+      let litCall: ReturnType<typeof parseOrxLit> = null;
+      for (const segment of shellSegments) {
+        litCall = parseOrxLit(segment.raw);
+        if (litCall) break;
+      }
+      const hasNonLiteratureOrx = shellSegments.some((segment) => {
+        const argv = orxArgv(segment.raw);
+        return argv !== null && argv[0] !== "discover" && argv[0] !== "paper";
+      });
+      if (litCall && !hasNonLiteratureOrx) {
+        const discoveryLabel = litCall.kind === "discover"
+          ? {
+              keyword: "Searched alphaXiv full text",
+              embedding: "Searched alphaXiv semantically",
+              openalex: "Searched OpenAlex",
+              biorxiv: "Searched bioRxiv",
+            }[litCall.strategy]
+          : null;
+        const label = litCall.kind === "discover"
+            ? litCall.query
+              ? `${discoveryLabel} for “${litCall.query}”`
+              : discoveryLabel ?? "Searched the literature"
+            : litCall.id ? `Read ${litCall.id}` : "Read a paper";
+        return { kind: litCall.kind === "paper" ? "read" : "search", label, litCall };
       }
 
-      const shellSegments = shellCommandSegments(command);
+      if (commandInvokesOrx(command, "agent\\s+spawn")) {
+        return {
+          kind: "agent",
+          label: "Delegated a task to a new agent",
+          spawnedSessionIds: spawnedSessionIds(toolOutput),
+          litCall: litCall ?? undefined,
+        };
+      }
       const shellInvocations = shellSegments.map((segment) => shellInvocation(segment.raw));
       const readsExperimentStatus = commandInvokesOrx(command, "exp\\s+status");
       const readsExperimentNotes = commandInvokesOrx(command, "exp\\s+desc");
-      const updatesExperimentNotes = orxCommandSegments(command, "exp\\s+desc").some((segment) =>
-        /(?:^|\s)--(?:set(?:=|\s)|stdin\b)/.test(segment.raw),
-      );
+      const updatesExperimentNotes = orxCommandSegments(command, "exp\\s+desc").some((segment) => {
+        const argv = orxArgv(segment.raw) ?? [];
+        return argv.some(
+          (token) => token === "--set" || token.startsWith("--set=") || token === "--stdin",
+        );
+      });
       const notesLabel = updatesExperimentNotes ? "Updated experiment notes" : "Read experiment notes";
       const combinedLabel = updatesExperimentNotes
         ? "Checked experiment status and updated notes"
@@ -1613,16 +1619,16 @@ function toolActivity(part: ChatPart): ToolActivity {
       if (commandInvokesOrx(command, "logs")) {
         const runIds = commandRunIds(command, toolOutput, resourceRunIds, legacyTargetIds);
         const label = runIds.length === 1 ? "Reviewed run log" : "Reviewed run logs";
-        return { kind: "project", label, runIds };
+        return { kind: "project", label, runIds, litCall: litCall ?? undefined };
       }
       if (commandInvokesOrx(command, "exp\\s+run")) {
-        return { kind: "project", label: "Started an experiment run" };
+        return { kind: "project", label: "Started an experiment run", litCall: litCall ?? undefined };
       }
       if (commandInvokesOrx(command, "exp\\s+wait")) {
-        return { kind: "project", label: "Waited for an experiment run" };
+        return { kind: "project", label: "Waited for an experiment run", litCall: litCall ?? undefined };
       }
       if (commandInvokesOrx(command, "exp\\s+cancel")) {
-        return { kind: "project", label: "Cancelled an experiment run" };
+        return { kind: "project", label: "Cancelled an experiment run", litCall: litCall ?? undefined };
       }
       const readsProject = commandInvokesOrx(command, "project\\s+view");
       if (readsProject && readsExperimentStatus && readsExperimentNotes) {
@@ -1630,6 +1636,7 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "project",
           label: combinedLabel,
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (readsProject && readsExperimentNotes) {
@@ -1637,6 +1644,7 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "project",
           label: notesLabel,
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (readsProject && readsExperimentStatus) {
@@ -1644,16 +1652,18 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "project",
           label: "Checked experiment status",
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (readsProject) {
-        return { kind: "project", label: "Read project details" };
+        return { kind: "project", label: "Read project details", litCall: litCall ?? undefined };
       }
       if (readsExperimentStatus && readsExperimentNotes) {
         return {
           kind: "project",
           label: combinedLabel,
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (readsExperimentStatus) {
@@ -1661,6 +1671,7 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "project",
           label: "Checked experiment status",
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (readsExperimentNotes) {
@@ -1668,10 +1679,14 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "project",
           label: notesLabel,
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (commandInvokesOrx(command, "runs?")) {
-        return { kind: "project", label: "Listed project runs" };
+        return { kind: "project", label: "Listed project runs", litCall: litCall ?? undefined };
+      }
+      if (commandInvokesOrx(command, "projects")) {
+        return { kind: "project", label: "Listed projects", litCall: litCall ?? undefined };
       }
 
       const gitShowTarget = shellInvocations
@@ -1797,6 +1812,8 @@ function toolActivity(part: ChatPart): ToolActivity {
       return { kind: "web", label: url ? `Read ${url}` : description ?? "Read a web page" };
     }
     case "task":
+      // Always the task description — the row is the sub-agent's identity;
+      // liveness is the shimmer, and the current step lives in its tab.
       return { kind: "agent", label: description ?? "Ran a subagent" };
     case "subagent":
       return { kind: "agent", label: subagentLine(normalizedInput) };
@@ -1812,32 +1829,43 @@ function toolActivity(part: ChatPart): ToolActivity {
 }
 
 /** Readable one-liner for a Codex sub-agent spawn/activity row, from the
- * collab item fields the backend put in `state.input`. */
+ * collab item fields the backend put in `state.input`. The model-assigned
+ * agent name (`nickname`) is the row's identity when present — matching how
+ * Claude rows show the task description — with the generic verb phrasing as
+ * the fallback. */
 function subagentLine(input: Record<string, unknown>): string {
   const trim = (s: string) => (s.length > 60 ? `${s.slice(0, 60)}…` : s);
   const prompt = typeof input.prompt === "string" && input.prompt ? ` — “${trim(input.prompt)}”` : "";
+  const nickname = typeof input.nickname === "string" && input.nickname
+    ? input.nickname.replace(/[_-]+/g, " ")
+    : "";
+  // Sentence-cased for label-initial use; the bare snake_case name stays
+  // lowercase when composed mid-sentence ("Sent input to audit experiments").
+  const nickLabel = nickname && nickname.charAt(0).toUpperCase() + nickname.slice(1);
   // collabAgentToolCall carries `tool`; subAgentActivity carries `kind`.
   switch (typeof input.tool === "string" ? input.tool : "") {
     case "spawnAgent":
-      return `Spawned agent${prompt}`;
+      return nickLabel || `Spawned agent${prompt}`;
     case "sendInput":
-      return `Sent input to agent${prompt}`;
+      return nickname ? `Sent input to ${nickname}` : `Sent input to agent${prompt}`;
     case "resumeAgent":
-      return "Resumed agent";
+      return nickname ? `Resumed ${nickname}` : "Resumed agent";
     case "wait":
-      return "Waiting on agent";
+      return `Waiting on ${nickname || "agent"}`;
     case "closeAgent":
-      return "Closed agent";
+      return `Closed ${nickname || "agent"}`;
   }
   switch (typeof input.kind === "string" ? input.kind : "") {
     case "started":
-      return "Sub-agent started";
+      return nickLabel || "Sub-agent started";
     case "interacted":
-      return "Sub-agent activity";
+      // Codex's cross-agent interaction marker — in practice, the agent
+      // handing its report up when it finishes.
+      return nickname ? `${nickLabel} reported back` : "Agent reported back";
     case "interrupted":
-      return "Sub-agent interrupted";
+      return nickname ? `${nickLabel} interrupted` : "Sub-agent interrupted";
   }
-  return "Sub-agent";
+  return nickLabel || "Sub-agent";
 }
 
 function ToolActivityIcon({ activity, className = "" }: { activity: ToolActivity; className?: string }) {
@@ -1928,6 +1956,7 @@ function ToolActivityLabel({
   activity,
   onOpenFile,
   onOpenRun,
+  onOpenSpawnedSession,
   runExperimentName,
   onOpenExperiment,
   experimentName,
@@ -1935,6 +1964,7 @@ function ToolActivityLabel({
   activity: ToolActivity;
   onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
+  onOpenSpawnedSession?: (sessionId: string) => void;
   runExperimentName?: (runId: string) => string;
   onOpenExperiment?: (experimentId: string) => void;
   experimentName?: (experimentId: string) => string;
@@ -1986,6 +2016,42 @@ function ToolActivityLabel({
         >
           {activity.labelTarget}
         </button>
+      </>
+    );
+  }
+  if (activity.spawnedSessionIds?.length && onOpenSpawnedSession) {
+    const sessionIds = activity.spawnedSessionIds;
+    const single = sessionIds.length === 1;
+    const visibleSessionIds = sessionIds.slice(0, 3);
+    const hiddenSessions = sessionIds.slice(visibleSessionIds.length).map((sessionId, index) => ({
+      id: sessionId,
+      label: `agent ${visibleSessionIds.length + index + 1}`,
+    }));
+    return (
+      <>
+        {single ? "Delegated a task to " : "Delegated tasks to "}
+        {visibleSessionIds.map((sessionId, index) => (
+          <span key={sessionId}>
+            {index > 0 && ", "}
+            <button
+              className="tool-target"
+              title="Open the session this agent spawned"
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                onOpenSpawnedSession(sessionId);
+              }}
+            >
+              {single ? "a new agent" : `agent ${index + 1}`}
+            </button>
+          </span>
+        ))}
+        {hiddenSessions.length > 0 && (
+          <>
+            {", "}
+            <ToolTargetOverflow items={hiddenSessions} onOpen={onOpenSpawnedSession} targetType="agent sessions" />
+          </>
+        )}
       </>
     );
   }
@@ -2079,8 +2145,10 @@ function ToolActivityLabel({
 function summarizeToolGroup(activities: ToolActivity[]): string {
   const count = (kind: ToolActivityKind) => activities.filter((activity) => activity.kind === kind).length;
   const clauses: string[] = [];
-  const reads = count("read");
-  const searches = count("search");
+  const paperReads = activities.filter((activity) => activity.litCall?.kind === "paper").length;
+  const literatureSearches = activities.filter((activity) => activity.litCall?.kind === "discover").length;
+  const reads = activities.filter((activity) => activity.kind === "read" && activity.litCall?.kind !== "paper").length;
+  const searches = activities.filter((activity) => activity.kind === "search" && activity.litCall?.kind !== "discover").length;
   const edits = count("edit");
   const projects = count("project");
   const web = count("web");
@@ -2088,7 +2156,9 @@ function summarizeToolGroup(activities: ToolActivity[]): string {
   const agents = count("agent");
 
   if (reads) clauses.push(reads === 1 ? "Read a file" : "Read files");
+  if (paperReads) clauses.push(paperReads === 1 ? "read a paper" : "read papers");
   if (searches) clauses.push("searched code");
+  if (literatureSearches) clauses.push("searched literature");
   if (edits) clauses.push(edits === 1 ? "edited a file" : "edited files");
   if (projects) clauses.push("reviewed project data");
   if (web) clauses.push("browsed the web");
@@ -2115,6 +2185,7 @@ function activityInProgress(activity: ToolActivity): ToolActivity {
     [/^Checked /, "Checking "],
     [/^Built /, "Building "],
     [/^Cancelled /, "Cancelling "],
+    [/^Delegated /, "Delegating "],
   ];
   let label = activity.label;
   for (const [pattern, replacement] of replacements) {
@@ -2140,6 +2211,7 @@ function permissionActivityLabel(tool: string | undefined, input: Record<string,
     [/^Updated /, "Update "],
     [/^Created /, "Create "],
     [/^Deleted /, "Delete "],
+    [/^Delegated /, "Delegate "],
     [/^Ran /, "Run "],
     [/^Started /, "Start "],
     [/^Waited /, "Wait "],
@@ -2174,6 +2246,54 @@ function resolvedActivityLabel(
     return `${activity.label} for ${summarizedNames(names)}`;
   }
   return activity.label;
+}
+
+function emptyToolInput(input: unknown): boolean {
+  if (input == null) return true;
+  return typeof input === "object" && !Array.isArray(input) && Object.keys(input).length === 0;
+}
+
+const TOOL_LABEL_DWELL_MS = 250;
+
+/** Hold each in-progress tool label on screen for a minimum dwell before
+ * swapping to the next, so a burst of sub-second calls reads as a steady
+ * sequence instead of a flicker. Activation and deactivation are immediate —
+ * only label→label swaps are paced — and the swap always lands on the latest
+ * activity, skipping intermediates that expired within one dwell. */
+function useDwelledActivity(activity: ToolActivity | null, provisional: boolean): ToolActivity | null {
+  const [shown, setShown] = useState<ToolActivity | null>(activity);
+  const shownAt = useRef(Date.now());
+  const latest = useRef(activity);
+  useEffect(() => {
+    // Updated in the effect (not during render) so discarded concurrent
+    // renders can't leak into the pending swap's timer.
+    latest.current = activity;
+    if (activity?.label === shown?.label) return;
+    // A provisional activity (its call not yet classifiable) never replaces a
+    // real label — hold the previous one until the call resolves. It still
+    // paints when there is nothing better to show.
+    if (provisional && activity != null && shown != null) return;
+    if (activity == null || shown == null) {
+      shownAt.current = Date.now();
+      setShown(activity);
+      return;
+    }
+    const remaining = TOOL_LABEL_DWELL_MS - (Date.now() - shownAt.current);
+    if (remaining <= 0) {
+      shownAt.current = Date.now();
+      setShown(activity);
+      return;
+    }
+    const timeout = window.setTimeout(() => {
+      shownAt.current = Date.now();
+      setShown(latest.current);
+    }, remaining);
+    return () => window.clearTimeout(timeout);
+  }, [activity, shown, provisional]);
+  // Same-label activities pass through fresh: the dwell paces label swaps
+  // only, so metadata that resolves later (run ids, file refs) isn't held
+  // back with a stale copy.
+  return activity != null && activity.label === shown?.label ? activity : shown;
 }
 
 const TOOL_TAIL_SHIMMER_DELAY_MS = 160;
@@ -2220,6 +2340,7 @@ function squashableToolPartKey(part: ChatPart): string | null {
     activity.litCall?.kind === "paper" ? activity.litCall.id ?? null : null,
     activity.runIds ?? null,
     activity.experimentIds ?? null,
+    activity.spawnedSessionIds ?? null,
   ]);
 }
 
@@ -2293,6 +2414,7 @@ function ToolRow({
   repeatCount = 1,
   onOpenFile,
   onOpenRun,
+  onOpenSpawnedSession,
   runExperimentName,
   onOpenExperiment,
   experimentName,
@@ -2301,6 +2423,7 @@ function ToolRow({
   repeatCount?: number;
   onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
+  onOpenSpawnedSession?: (sessionId: string) => void;
   runExperimentName?: (runId: string) => string;
   onOpenExperiment?: (experimentId: string) => void;
   experimentName?: (experimentId: string) => string;
@@ -2325,6 +2448,7 @@ function ToolRow({
           activity={activity}
           onOpenFile={onOpenFile}
           onOpenRun={onOpenRun}
+          onOpenSpawnedSession={onOpenSpawnedSession}
           runExperimentName={runExperimentName}
           onOpenExperiment={onOpenExperiment}
           experimentName={experimentName}
@@ -2375,6 +2499,7 @@ function ToolGroup({
   pendingTail,
   onOpenFile,
   onOpenRun,
+  onOpenSpawnedSession,
   runExperimentName,
   onOpenExperiment,
   experimentName,
@@ -2383,6 +2508,7 @@ function ToolGroup({
   pendingTail?: boolean;
   onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
+  onOpenSpawnedSession?: (sessionId: string) => void;
   runExperimentName?: (runId: string) => string;
   onOpenExperiment?: (experimentId: string) => void;
   experimentName?: (experimentId: string) => string;
@@ -2391,9 +2517,15 @@ function ToolGroup({
   const displayParts = squashToolParts(parts);
   const activities = displayParts.map(({ part }) => toolActivity(part));
   const tailPart = pendingTail ? parts.at(-1) : undefined;
-  const pendingActivity = tailPart?.state?.status !== "error"
-    ? tailPart && activityInProgress(toolActivity(tailPart))
+  const rawPending = tailPart?.state?.status !== "error"
+    ? (tailPart && activityInProgress(toolActivity(tailPart))) ?? null
     : null;
+  // A running call is unclassified while its input hasn't streamed in (or its
+  // command is still blank) — its label would be a generic "Running a command"
+  // that re-resolves moments later, so the header holds the prior label instead.
+  const tailUnclassified = !!tailPart && tailPart.state?.status === "running" &&
+    (emptyToolInput(tailPart.state?.input) || rawPending?.label === "Running a command");
+  const pendingActivity = useDwelledActivity(rawPending, tailUnclassified);
   const shimmering = useDelayedToolShimmer(pendingActivity != null);
   const summary = summarizeToolGroup(activities);
   const iconActivity = pendingActivity ?? groupIconActivity(activities);
@@ -2414,6 +2546,7 @@ function ToolGroup({
                 activity={pendingActivity}
                 onOpenFile={onOpenFile}
                 onOpenRun={onOpenRun}
+                onOpenSpawnedSession={onOpenSpawnedSession}
                 runExperimentName={runExperimentName}
                 onOpenExperiment={onOpenExperiment}
                 experimentName={experimentName}
@@ -2429,6 +2562,7 @@ function ToolGroup({
           part={parts[0]}
           onOpenFile={onOpenFile}
           onOpenRun={onOpenRun}
+          onOpenSpawnedSession={onOpenSpawnedSession}
           runExperimentName={runExperimentName}
           onOpenExperiment={onOpenExperiment}
           experimentName={experimentName}
@@ -2451,6 +2585,7 @@ function ToolGroup({
               activity={pendingActivity}
               onOpenFile={onOpenFile}
               onOpenRun={onOpenRun}
+              onOpenSpawnedSession={onOpenSpawnedSession}
               runExperimentName={runExperimentName}
               onOpenExperiment={onOpenExperiment}
               experimentName={experimentName}
@@ -2490,6 +2625,7 @@ function ToolGroup({
                 repeatCount={count}
                 onOpenFile={onOpenFile}
                 onOpenRun={onOpenRun}
+                onOpenSpawnedSession={onOpenSpawnedSession}
                 runExperimentName={runExperimentName}
                 onOpenExperiment={onOpenExperiment}
                 experimentName={experimentName}
@@ -2732,10 +2868,10 @@ function PromptCard({
 }
 
 /** Whether a part paints anything in the transcript. The single source of
- * truth for "invisible": empty text/reasoning (encrypted-thinking models
- * stored these before the harness-side skip existed) and resolved permission
- * cards (which leave no trace). Shared by `messageHasVisibleContent` and
- * `renderParts` so the two can't drift. */
+ * truth for "invisible": ALL reasoning (deliberately never rendered — see the
+ * comment inside), empty text, and resolved permission cards (which leave no
+ * trace). Shared by `messageHasVisibleContent`, the stream-tail computation,
+ * and `renderParts` so they can't drift. */
 function partIsVisible(part: ChatPart, activePermissionId?: string | null): boolean {
   if (part.type === "prompt") {
     if (!part.prompt) return false;
@@ -2745,7 +2881,11 @@ function partIsVisible(part: ChatPart, activePermissionId?: string | null): bool
     }
     return true;
   }
-  if (part.type === "text" || part.type === "reasoning") return !!part.text;
+  // Reasoning is stored but never rendered, so it is invisible to every layout
+  // decision too — in particular a sub-second thinking burst between tool calls
+  // must not steal the stream tail and flash the group shimmer off.
+  if (part.type === "reasoning") return false;
+  if (part.type === "text") return !!part.text;
   return true; // tool, image, …
 }
 
@@ -2789,8 +2929,8 @@ const FORK_BUTTON_CLASS_NAME = [
   "[&:disabled:hover]:bg-transparent [&:disabled:hover]:text-subtext",
 ].join(" ");
 
-/** The pager stays visible once a turn has more than one fork — hiding it would
- * leave no sign that the other replies exist. */
+/** The pager stays visible once a prompt has more than one version — hiding it
+ * would leave no sign that the other versions exist. */
 function ForkControls({
   count,
   index,
@@ -2798,10 +2938,8 @@ function ForkControls({
   nextId,
   onSelect,
   pagerDisabled,
-  actionLabel,
-  icon,
-  onAction,
-  disabled,
+  onEdit,
+  editDisabled,
 }: {
   count: number;
   index: number;
@@ -2809,10 +2947,8 @@ function ForkControls({
   nextId?: string;
   onSelect: (leafId: string) => void;
   pagerDisabled: boolean;
-  actionLabel: string;
-  icon: React.ReactNode;
-  onAction: () => void;
-  disabled: boolean;
+  onEdit: () => void;
+  editDisabled: boolean;
 }) {
   const many = count > 1;
   return (
@@ -2848,12 +2984,12 @@ function ForkControls({
       )}
       <button
         className={FORK_BUTTON_CLASS_NAME}
-        title={actionLabel}
-        aria-label={actionLabel}
-        disabled={disabled}
-        onClick={onAction}
+        title="Edit and re-send"
+        aria-label="Edit and re-send"
+        disabled={editDisabled}
+        onClick={onEdit}
       >
-        {icon}
+        <Pencil size={13} />
       </button>
     </div>
   );
@@ -2865,6 +3001,7 @@ const Message = memo(function Message({
   pendingTailToolId,
   onOpenFile,
   onOpenRun,
+  onOpenSpawnedSession,
   runExperimentName,
   onOpenExperiment,
   experimentName,
@@ -2890,6 +3027,7 @@ const Message = memo(function Message({
   pendingTailToolId?: string | null;
   onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
+  onOpenSpawnedSession?: (sessionId: string) => void;
   runExperimentName?: (runId: string) => string;
   onOpenExperiment?: (experimentId: string) => void;
   experimentName?: (experimentId: string) => string;
@@ -2897,23 +3035,23 @@ const Message = memo(function Message({
   /** Open a plan's full markdown in the right pane (plan cards/strip). */
   onOpenPlan?: (plan: string, promptId: string) => void;
   /** Open a sub-agent's transcript in the right pane (spawn-row "view"). */
-  onOpenSubagent?: (spawnPartId: string) => void;
+  onOpenSubagent?: (spawnPartId: string, label?: string) => void;
   busy?: boolean;
   recoveringTurnId?: string | null;
   onRecover?: (turnId: string, action: "retry" | "continue") => void;
   /** Known slash-skills, for rendering a leading `/name` as a command chip. */
   skills?: SkillInfo[];
   predictTextTail?: boolean;
-  /** Set only on the one message of a turn that carries its fork controls. */
+  /** Set only on a user message, the one bearer of the fork controls. */
   forkCount?: number;
   forkIndex?: number;
   forkPrevId?: string;
   forkNextId?: string;
   forkDisabled: boolean;
   /** Paging between forks is a read-only pointer move, so it stays available
-   * when re-sampling does not (an unavailable harness still has replies to read). */
+   * when editing does not (an unavailable harness still has branches to read). */
   branchDisabled: boolean;
-  onFork: (messageId: string, text?: string) => void;
+  onFork: (messageId: string, text: string) => void;
   onSelectFork: (leafId: string) => void;
 }) {
   // Editing re-asks as a new fork rather than rewriting history, so the original
@@ -3026,10 +3164,8 @@ const Message = memo(function Message({
             nextId={forkNextId}
             onSelect={onSelectFork}
             pagerDisabled={branchDisabled}
-            actionLabel="Edit and re-send"
-            icon={<Pencil size={13} />}
-            onAction={() => setEditDraft(text)}
-            disabled={forkDisabled}
+            onEdit={() => setEditDraft(text)}
+            editDisabled={forkDisabled}
           />
         )}
       </div>
@@ -3048,6 +3184,7 @@ const Message = memo(function Message({
         pendingTailToolId,
         onOpenFile,
         onOpenRun,
+        onOpenSpawnedSession,
         runExperimentName,
         onOpenExperiment,
         experimentName,
@@ -3064,29 +3201,16 @@ const Message = memo(function Message({
           onRecover={onRecover}
         />
       )}
-      {forkCount !== undefined && (
-        <ForkControls
-          count={forkCount}
-          index={forkIndex}
-          prevId={forkPrevId}
-          nextId={forkNextId}
-          onSelect={onSelectFork}
-          pagerDisabled={branchDisabled}
-          actionLabel="Try another response"
-          icon={<RotateCcw size={13} />}
-          onAction={() => onFork(message.id)}
-          disabled={forkDisabled}
-        />
-      )}
     </div>
   );
 });
 
 /** Shared assistant-parts renderer, reused for a message body and (recursively)
  * for a sub-agent's nested transcript. Coalesces consecutive tool parts into one
- * collapsed group (Claude-desktop style); text / reasoning / prompt parts break
- * a run and render inline. A sub-agent spawn part (tool `subagent`) also breaks
- * the run and renders as its own nested block. */
+ * collapsed group (Claude-desktop style); text / prompt parts break a run and
+ * render inline, while reasoning parts are never rendered. A sub-agent spawn
+ * part (tool `subagent`) also breaks the run and renders as its own nested
+ * block. */
 function renderParts(
   parts: ChatPart[],
   opts: {
@@ -3094,12 +3218,13 @@ function renderParts(
     pendingTailToolId?: string | null;
     onOpenFile?: OpenTranscriptFile;
     onOpenRun?: (runId: string) => void;
+    onOpenSpawnedSession?: (sessionId: string) => void;
     runExperimentName?: (runId: string) => string;
     onOpenExperiment?: (experimentId: string) => void;
     experimentName?: (experimentId: string) => string;
     onRespond?: (answer: PromptAnswer) => void;
     onOpenPlan?: (plan: string, promptId: string) => void;
-    onOpenSubagent?: (spawnPartId: string) => void;
+    onOpenSubagent?: (spawnPartId: string, label?: string) => void;
     predictTextTail?: boolean;
   },
 ): React.ReactNode[] {
@@ -3108,6 +3233,7 @@ function renderParts(
     pendingTailToolId,
     onOpenFile,
     onOpenRun,
+    onOpenSpawnedSession,
     runExperimentName,
     onOpenExperiment,
     experimentName,
@@ -3116,7 +3242,11 @@ function renderParts(
     onOpenSubagent,
     predictTextTail = false,
   } = opts;
-  const visibleTail = parts.filter((part) => partIsVisible(part, activePermissionId)).at(-1);
+  // A steer never becomes the tail — the streaming caret belongs on the
+  // assistant text it interrupted.
+  const visibleTail = parts
+    .filter((part) => part.type !== "steer" && partIsVisible(part, activePermissionId))
+    .at(-1);
   const rendered: React.ReactNode[] = [];
   let toolRun: ChatPart[] = [];
   const flushTools = () => {
@@ -3128,6 +3258,7 @@ function renderParts(
         pendingTail={toolRun.some((part) => part.id === pendingTailToolId)}
         onOpenFile={onOpenFile}
         onOpenRun={onOpenRun}
+        onOpenSpawnedSession={onOpenSpawnedSession}
         runExperimentName={runExperimentName}
         onOpenExperiment={onOpenExperiment}
         experimentName={experimentName}
@@ -3143,16 +3274,24 @@ function renderParts(
     // consecutive tools into single-row groups.
     if (!partIsVisible(part, activePermissionId)) continue;
     // A sub-agent spawn part streams its own transcript in `children` — render
-    // it as a standalone nested block, not folded into a tool run. The signal is
-    // harness-agnostic: Codex tags the row `subagent`, while Claude's `Task` /
-    // OpenCode's `task` rows are spawns whenever they carry children.
-    if (part.type === "tool" && (part.tool === "subagent" || (part.children?.length ?? 0) > 0)) {
+    // it as a standalone nested block, not folded into a tool run. Codex tags
+    // its rows `subagent`; Claude's `Task`/`Agent` and OpenCode's `task` are
+    // spawn tools by name (a prose-only agent may have zero children yet still
+    // carry a final report); anything else with children streamed into it is a
+    // spawn too.
+    if (
+      part.type === "tool" &&
+      (isSpawnTool(part.tool) || (part.children?.length ?? 0) > 0)
+    ) {
       flushTools();
       rendered.push(
         <SubagentBlock
           key={part.id}
           part={part}
-          pendingTail={part.id === pendingTailToolId}
+          // A spawn row runs in parallel with whatever streams after it, so its
+          // shimmer follows its own status while the turn is live — the shared
+          // tail-tool id only ever points at one row and would freeze the rest.
+          pendingTail={(predictTextTail && part.state?.status === "running") || part.id === pendingTailToolId}
           onOpenSubagent={onOpenSubagent}
         />,
       );
@@ -3163,8 +3302,8 @@ function renderParts(
       continue;
     }
     flushTools();
-    // The visibility skip above guarantees text/reasoning parts here are
-    // non-empty.
+    // The visibility skip above guarantees text parts here are non-empty and
+    // that reasoning parts never reach this point.
     if (part.type === "text")
       rendered.push(
         <Md
@@ -3175,12 +3314,18 @@ function renderParts(
           predict={predictTextTail && part.id === visibleTail?.id}
         />,
       );
-    else if (part.type === "reasoning")
+    else if (part.type === "steer")
+      // A message the user sent into this turn while it ran — the same bubble a
+      // user message gets, sitting where the agent received it.
       rendered.push(
-        <details key={part.id} className="reasoning text-muted text-md my-0.5 mx-0 [&_summary]:cursor-pointer [&_summary]:list-none [&_summary]:select-none [&_summary]:font-semibold [&[open]]:whitespace-pre-wrap">
-          <summary>thinking…</summary>
+        <div
+          key={part.id}
+          role="note"
+          aria-label="You, mid-task"
+          className="msg-steer my-2 ml-auto w-fit max-w-[88%] bg-surface rounded-[16px] py-2.5 px-[15px] text-base whitespace-pre-wrap wrap-anywhere"
+        >
           {part.text}
-        </details>,
+        </div>,
       );
     else if (part.type === "prompt" && part.prompt)
       rendered.push(
@@ -3195,6 +3340,27 @@ function renderParts(
   }
   flushTools();
   return rendered;
+}
+
+/** A sub-agent spawn row's display title — what its tab is named. */
+export function spawnRowTitle(part: ChatPart): string {
+  return toolActivity(part).label;
+}
+
+/** Whether a tool name is a sub-agent spawn: codex tags rows `subagent`,
+ * Claude spawns via `Task`/`Agent`, OpenCode via `task`. */
+function isSpawnTool(tool: string | undefined): boolean {
+  const name = (tool ?? "").toLowerCase();
+  return name === "subagent" || name === "task" || name === "agent";
+}
+
+/** The spawn tool result that stands in for a prose-less sub-agent transcript
+ * (a sync Claude agent's final report is delivered as the tool output). The
+ * async-launch acknowledgement is internal metadata, not a report — newly
+ * stored parts omit it, and the prefix guard covers older transcripts. */
+function spawnFinalReport(part: ChatPart): string {
+  const output = part.state?.status === "completed" ? (part.state?.output ?? "") : "";
+  return output.startsWith("Async agent launched") ? "" : output;
 }
 
 /** Find a part by id anywhere in a parts tree (depth-first). Used by the
@@ -3226,7 +3392,7 @@ export function SubagentTranscript({
   runExperimentName?: (runId: string) => string;
   onOpenExperiment?: (experimentId: string) => void;
   experimentName?: (experimentId: string) => string;
-  onOpenSubagent?: (spawnPartId: string) => void;
+  onOpenSubagent?: (spawnPartId: string, label?: string) => void;
 }) {
   const parts = spawn.children ?? [];
   const running = spawn.state?.status === "running";
@@ -3244,38 +3410,40 @@ export function SubagentTranscript({
     experimentName,
     onOpenSubagent,
     predictTextTail: running,
+    // Same contract as the main transcript's streamTailTool: while the
+    // sub-agent runs, its tail tool (completed or not) keeps the group lit.
+    pendingTailToolId: running ? partsTailToolId(parts) : null,
   });
-  const spawnActivity = running ? activityInProgress(toolActivity(spawn)) : toolActivity(spawn);
+  // Claude Code forwards a sub-agent's tool activity but never its text/thinking
+  // blocks — the final report only exists as the spawn tool's result. When the
+  // streamed transcript carries no prose of its own, close it with that report.
+  const hasProseChild = parts.some((p) => p.type === "text" && !!p.text);
+  const finalReport = hasProseChild ? "" : spawnFinalReport(spawn);
   return (
     <div className="msg-assistant text-lg leading-[1.62] text-text min-w-0">
-      <div className="subagent-tab-header flex items-center gap-2 pb-2 mb-2 border-b border-b-border-variant">
-        {errored && <span className="sr-only">Failed: </span>}
-        {errored ? (
-          <CircleX size={16} strokeWidth={1.75} className="tool-kind-icon shrink-0 text-accent-red" aria-hidden="true" />
-        ) : (
-          <ToolActivityIcon activity={spawnActivity} className={running ? "tool-running-shimmer-icon" : "text-muted"} />
-        )}
-        <span className={`${TOOL_LINE_CLASS_NAME} ${running ? "tool-running-shimmer" : errored ? "text-accent-red" : ""}`}>{spawnActivity.label}</span>
-      </div>
+      {errored && <span className="sr-only">Failed: </span>}
       {errorMessage && (
         <div className="tool-output py-1.5 px-2.5 font-mono text-xs text-subtext whitespace-pre-wrap wrap-anywhere max-h-65 overflow-y-auto bg-background border border-border-variant rounded-sm">
           {errorMessage.slice(0, 20000)}
         </div>
       )}
-      {rendered.length === 0 && !errorMessage ? (
+      {rendered.length === 0 && !finalReport && !errorMessage ? (
         <div className="subagent-empty py-[3px] px-1 text-md text-muted">{running ? "Working…" : "No activity"}</div>
       ) : (
-        rendered
+        <>
+          {rendered}
+          {finalReport && <Md text={finalReport} onOpenFile={onOpenFile} onOpenRun={onOpenRun} />}
+        </>
       )}
     </div>
   );
 }
 
-/** A Codex/Claude/OpenCode sub-agent spawn row. A single clickable line — a
- * status dot + label — that opens the sub-agent's full transcript in the
- * right-side panel (like the Claude/Codex desktop apps). The transcript is
- * never expanded inline; the row stays a one-liner whether the sub-agent is
- * running (pulsing dot) or done. */
+/** A Codex/Claude/OpenCode sub-agent spawn row: a one-liner (icon + label)
+ * whether the agent is running (shimmer) or done. Click-to-open — the
+ * transcript shows in a right-side panel tab, never inline — when there is
+ * anything to open (streamed children, a final report, or an error); a pure
+ * interaction marker renders as an inert status line instead. */
 function SubagentBlock({
   part,
   pendingTail,
@@ -3283,7 +3451,7 @@ function SubagentBlock({
 }: {
   part: ChatPart;
   pendingTail?: boolean;
-  onOpenSubagent?: (spawnPartId: string) => void;
+  onOpenSubagent?: (spawnPartId: string, label?: string) => void;
 }) {
   const errored = part.state?.status === "error";
   const errorMessage = cleanToolError(part.state?.error || part.state?.output || "");
@@ -3291,24 +3459,43 @@ function SubagentBlock({
     ? activityInProgress(toolActivity(part))
     : toolActivity(part);
   const shimmering = useDelayedToolShimmer(Boolean(pendingTail && !errored));
-  return (
+  // Openable when there is anything to show in the tab: streamed children, a
+  // final report standing in for them, or an error. Only a pure interaction
+  // marker (codex's "reported back" rows) is inert.
+  const inert = (part.children?.length ?? 0) === 0 && !errored && !spawnFinalReport(part);
+  const line = (
     <>
-      <button
-        className="subagent-row flex items-center gap-2 w-full my-3.5 mx-0 py-[3px] px-1 cursor-pointer text-text text-lg text-left rounded-sm [&:hover:not(:disabled)]:bg-surface [&:disabled]:cursor-default [&_.tool-line]:text-lg"
-        title={errored && errorMessage ? errorMessage : "Open sub-agent transcript"}
-        onClick={() => onOpenSubagent?.(part.id)}
-        disabled={!onOpenSubagent}
-      >
-        {errored && <span className="sr-only">Failed: </span>}
-        {errored ? (
-          <CircleX size={16} strokeWidth={1.75} className="subagent-icon shrink-0 text-accent-red" aria-hidden="true" />
-        ) : (
-          <ToolActivityIcon activity={activity} className={`subagent-icon shrink-0 ${shimmering ? "tool-running-shimmer-icon" : "text-muted"}`} />
-        )}
-        <span className={`${TOOL_LINE_CLASS_NAME} ${shimmering ? "tool-running-shimmer" : errored ? "text-accent-red" : "text-text"}`}>{activity.label}</span>
-        <ChevronRight size={12} className="subagent-row-chevron shrink-0 text-muted" />
-      </button>
+      {errored && <span className="sr-only">Failed: </span>}
+      {errored ? (
+        <CircleX size={16} strokeWidth={1.75} className="subagent-icon shrink-0 text-accent-red" aria-hidden="true" />
+      ) : (
+        <ToolActivityIcon activity={activity} className={`subagent-icon shrink-0 ${shimmering ? "tool-running-shimmer-icon" : "text-muted"}`} />
+      )}
+      {/* Spawn rows read as activity, not prose — gray like the tool rows
+          around them. */}
+      <span className={`${TOOL_LINE_CLASS_NAME} ${shimmering ? "tool-running-shimmer" : errored ? "text-accent-red" : "text-subtext"}`}>{activity.label}</span>
     </>
+  );
+  // Only a row that actually owns a transcript is click-to-open. Codex's
+  // interaction markers (and a spawn row before any activity arrived) have no
+  // children — offering a transcript there opens an empty pane.
+  if (inert) {
+    return (
+      <div className="subagent-row flex items-center gap-2 w-full my-3.5 mx-0 py-[3px] px-1 text-text text-lg text-left rounded-sm [&_.tool-line]:text-lg">
+        {line}
+      </div>
+    );
+  }
+  return (
+    <button
+      className="subagent-row flex items-center gap-2 w-full my-3.5 mx-0 py-[3px] px-1 cursor-pointer text-text text-lg text-left rounded-sm [&:hover:not(:disabled)]:bg-surface [&:disabled]:cursor-default [&_.tool-line]:text-lg"
+      title={errored && errorMessage ? errorMessage : "Open sub-agent transcript"}
+      onClick={() => onOpenSubagent?.(part.id, activity.label)}
+      disabled={!onOpenSubagent}
+    >
+      {line}
+      <ChevronRight size={12} className="subagent-row-chevron shrink-0 text-muted" />
+    </button>
   );
 }
 
@@ -3431,16 +3618,26 @@ function useTranscriptAnnouncement(messages: ChatMessage[]): TranscriptAnnouncem
   return announcement;
 }
 
+/** The tail tool of a parts list: the last *visible* part, iff it is a
+ * non-errored tool — completed still counts, so the shimmer holds steady in the
+ * gap between consecutive calls. Shared by the main transcript
+ * (`streamTailTool`) and the sub-agent tab so the two can't drift. */
+function partsTailToolId(parts: ChatPart[]): string | null {
+  for (let index = parts.length - 1; index >= 0; index--) {
+    const part = parts[index];
+    // A steer lands at the tail without ending the tool that is still running.
+    if (part.type === "steer" || !partIsVisible(part)) continue;
+    if (part.type !== "tool" || part.state?.status === "error") return null;
+    return part.id;
+  }
+  return null;
+}
+
 function streamTailTool(messages: ChatMessage[]): { messageId: string; toolId: string } | null {
   const message = messages.at(-1);
   if (message?.role !== "assistant") return null;
-  for (let index = message.parts.length - 1; index >= 0; index--) {
-    const part = message.parts[index];
-    if (!partIsVisible(part)) continue;
-    if (part.type !== "tool" || part.state?.status === "error") return null;
-    return { messageId: message.id, toolId: part.id };
-  }
-  return null;
+  const toolId = partsTailToolId(message.parts);
+  return toolId ? { messageId: message.id, toolId } : null;
 }
 
 const Transcript = memo(function Transcript({
@@ -3452,6 +3649,7 @@ const Transcript = memo(function Transcript({
   busy,
   onOpenFile,
   onOpenRun,
+  onOpenSpawnedSession,
   runExperimentName,
   onOpenExperiment,
   experimentName,
@@ -3466,19 +3664,20 @@ const Transcript = memo(function Transcript({
   messages: ChatMessage[];
   /** Every branch, for counting the forks of each turn. */
   allMessages: ChatMessage[];
-  /** False greys out the re-sample controls (busy turn, harness not ready). */
+  /** False greys out the edit control (busy turn, harness not ready). */
   canFork: boolean;
-  onFork: (messageId: string, text?: string) => void;
+  onFork: (messageId: string, text: string) => void;
   onSelectFork: (leafId: string) => void;
   busy: boolean;
   onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
+  onOpenSpawnedSession?: (sessionId: string) => void;
   runExperimentName?: (runId: string) => string;
   onOpenExperiment?: (experimentId: string) => void;
   experimentName?: (experimentId: string) => string;
   onRespond?: (answer: PromptAnswer) => void;
   onOpenPlan?: (plan: string, promptId: string) => void;
-  onOpenSubagent?: (spawnPartId: string) => void;
+  onOpenSubagent?: (spawnPartId: string, label?: string) => void;
   recoveringTurnId?: string | null;
   onRecover?: (turnId: string, action: "retry" | "continue") => void;
   skills?: SkillInfo[];
@@ -3488,15 +3687,10 @@ const Transcript = memo(function Transcript({
     () => messages.filter((message) => messageHasVisibleContent(message, activePermissionId)),
     [messages, activePermissionId],
   );
-  // A trailing local-only bubble is not part of the reply, so it must not take
-  // the controls off the reply above it.
+  // forkPositions indexes only non-local ids, so a local bearer would page as 0/1.
   const positions = useMemo(() => {
-    const persisted = visibleMessages.filter((m) => !m.id.startsWith(LOCAL_PREFIX));
-    const bearers = persisted.filter(
-      (message, i) =>
-        message.role === "user" ||
-        !persisted[i + 1] ||
-        persisted[i + 1].role === "user",
+    const bearers = visibleMessages.filter(
+      (m) => m.role === "user" && !m.id.startsWith(LOCAL_PREFIX),
     );
     return forkPositions(allMessages, messages, bearers, (id) => id.startsWith(LOCAL_PREFIX));
   }, [messages, visibleMessages, allMessages]);
@@ -3524,6 +3718,7 @@ const Transcript = memo(function Transcript({
           pendingTailToolId={pendingTailTool?.messageId === m.id ? pendingTailTool.toolId : null}
           onOpenFile={onOpenFile}
           onOpenRun={onOpenRun}
+          onOpenSpawnedSession={onOpenSpawnedSession}
           runExperimentName={runExperimentName}
           onOpenExperiment={onOpenExperiment}
           experimentName={experimentName}
@@ -3705,7 +3900,9 @@ function SessionRow({
       className={`session-row relative flex items-center gap-2 w-full text-left py-[7px] px-2.5 rounded-md text-md text-text cursor-pointer select-none [&:hover]:bg-surface [&.active]:bg-surface [&.active]:font-medium [&_.session-dot]:w-3.5 [&_.session-dot]:inline-flex [&_.session-dot]:items-center [&_.session-dot]:justify-center [&_.session-dot]:shrink-0 [&_.session-title]:flex-1 [&_.session-title]:min-w-0 [&_.session-title]:overflow-hidden [&_.session-title]:text-ellipsis [&_.session-title]:whitespace-nowrap [&.unread_.session-title]:font-semibold [&_.session-time]:text-2xs [&_.session-time]:text-muted [&_.session-time]:shrink-0 [&_.session-menu-btn]:hidden [&_.session-menu-btn]:items-center [&_.session-menu-btn]:justify-center [&_.session-menu-btn]:w-4 [&_.session-menu-btn]:h-4 [&_.session-menu-btn]:-my-0.5 [&_.session-menu-btn]:mx-0 [&_.session-menu-btn]:rounded-sm [&_.session-menu-btn]:text-muted [&_.session-menu-btn]:shrink-0 [&_.session-menu-btn:hover]:text-text [&_.session-menu-btn:hover]:bg-panel [&:hover_.session-menu-btn]:inline-flex [&:focus-within_.session-menu-btn]:inline-flex [&.menu-open_.session-menu-btn]:inline-flex [&:hover_.session-time]:hidden [&:focus-within_.session-time]:hidden [&.menu-open_.session-time]:hidden [&_.busy-dot]:w-[7px] [&_.busy-dot]:h-[7px] [&_.busy-dot]:rounded-full [&_.busy-dot]:bg-primary [&_.busy-dot]:animate-[or-pulse_1.2s_infinite] [&_.busy-dot]:shrink-0 [&_.unread-dot]:w-[7px] [&_.unread-dot]:h-[7px] [&_.unread-dot]:rounded-full [&_.unread-dot]:bg-primary [&_.unread-dot]:shrink-0 [&_.busy-dot.waiting]:animate-none [&_.session-title-input]:flex-1 [&_.session-title-input]:min-w-0 [&_.session-title-input]:py-px [&_.session-title-input]:px-[5px] [&_.session-title-input]:-my-0.5 [&_.session-title-input]:mx-0 [&_.session-title-input]:[font:inherit] [&_.session-title-input]:text-text [&_.session-title-input]:bg-background [&_.session-title-input]:border [&_.session-title-input]:border-primary [&_.session-title-input]:rounded-sm [&_.session-title-input]:outline-none [&.editing]:bg-surface [&.editing]:cursor-default [&.editing_.session-menu-btn]:hidden [&.editing_.session-time]:hidden ${active ? "active" : ""}  ${unread ? "unread" : ""}  ${open ? "menu-open" : ""}  ${
         editing ? "editing" : ""
       }`}
-      title={`${HARNESS_LABELS[session.harness]}${session.model ? ` · ${session.model}` : ""}`}
+      title={`${HARNESS_LABELS[session.harness]}${session.model ? ` · ${session.model}` : ""}${
+        session.parentSessionId ? " · Spawned by another agent" : ""
+      }`}
       onClick={() => {
         // While editing, a body click is a no-op; blur/Enter/Esc drive it.
         if (editing) return;
@@ -3735,6 +3932,9 @@ function SessionRow({
           unread && <span className="unread-dot" />
         )}
       </span>
+      {session.parentSessionId && !editing && (
+        <Users className="text-muted shrink-0" size={12} aria-hidden />
+      )}
       {editing ? (
         <input
           ref={inputRef}
@@ -3879,7 +4079,7 @@ export function ChatPanel({
   onOpenPlan?: (plan: string, sessionId: string, promptId: string) => void;
   /** Open a sub-agent's transcript as a right-pane tab (spawn-row "view").
    * `sessionId` is the chat session; `spawnPartId` locates the spawn part. */
-  onOpenSubagent?: (sessionId: string, spawnPartId: string) => void;
+  onOpenSubagent?: (sessionId: string, spawnPartId: string, label?: string) => void;
   /** Open the pinned Files home for the active session. */
   onOpenWorktree: () => void;
   /** Reopen the demo welcome modal from the chat header. */
@@ -4652,6 +4852,20 @@ export function ChatPanel({
     if (!stillBusy || replaced) setRevising(null);
   }, [revising, pendingPlan, state.busySessions, activeId]);
 
+  const pendingPermission = useMemo(() => firstPendingPermission(messages), [messages]);
+  // Enter hands the message to the running turn. Attachments still park (only
+  // a full turn builds their on-disk preamble), and a pending card owns typed
+  // text — there the card is the affordance, not a steer.
+  const steering =
+    busy &&
+    !!activeHarness?.supportsSteering &&
+    !!activeHarness?.agentReady &&
+    !pendingPlan &&
+    !pendingQuestion &&
+    !pendingPermission &&
+    attachments.length === 0 &&
+    annotations.length === 0;
+
   // Plan opens are stamped with the session like file opens are. Memoized
   // (along with openFileInSession and respond below) so the memoized Message
   // rows don't all re-render on every streaming tick.
@@ -4666,7 +4880,7 @@ export function ChatPanel({
   const openSubagent = useMemo(
     () =>
       onOpenSubagent && activeId
-        ? (spawnPartId: string) => onOpenSubagent(activeId, spawnPartId)
+        ? (spawnPartId: string, label?: string) => onOpenSubagent(activeId, spawnPartId, label)
         : undefined,
     [onOpenSubagent, activeId],
   );
@@ -4730,7 +4944,8 @@ export function ChatPanel({
     return () => ro.disconnect();
   }, [threadMounted]);
 
-  async function send() {
+  /** `queue` (the ⌘/Ctrl+Enter chord) parks the message even on a harness that steers. */
+  async function send({ queue = false }: { queue?: boolean } = {}) {
     const args = draft.trim();
     // Reassemble the picked skill chip into the plain `/name args` wire form —
     // the backend's slash expansion and the transcript both see only text.
@@ -4846,10 +5061,11 @@ export function ChatPanel({
       : `ct_${crypto.randomUUID()}`;
     pendingClientTurn.current = { signature: turnSignature, id: clientTurnId };
     if (busy) {
-      // A turn is already running: park this message (Claude-desktop steering)
-      // so it runs when the turn ends, instead of dropping it. The server
-      // enqueues it and echoes chat.queued to render the chip — no optimistic
-      // transcript bubble, since it hasn't run yet.
+      // A turn is already running. Steering hands the message to it now, and
+      // the delivered text comes back inline on the assistant message. Parking
+      // (no steering support, or the queue chord) instead runs it when the turn
+      // ends: the server enqueues it and echoes chat.queued to render the chip
+      // — no optimistic transcript bubble, since it hasn't run yet.
       if (!activeId || !activeHarness?.agentReady) {
         clearFailedPlanCommand();
         return;
@@ -4860,11 +5076,21 @@ export function ChatPanel({
       setAttachments([]);
       setAnnotations([]);
       setAttachError(null);
+      // Always send the composer's settings, steer or not: a permission or
+      // plan change persists itself before this message, so the server's
+      // comparison against the *running* turn is the only thing that catches
+      // it — and a mismatch parks the message, which also persists the change.
       const turnOpts = effective
         ? {
             model: effective.model,
             permissionMode: effective.permissionMode,
-            planMode: independentPlanMode,
+            // The composer's plan state, not just an unpersisted toggle: a
+            // toggle that already persisted would otherwise reach the server
+            // as "no change" and steer into a turn still running without it.
+            planMode:
+              opts?.planActivation === "command"
+                ? (independentPlanMode ?? openSession?.planMode)
+                : independentPlanMode,
             reasoningLevel: effective.reasoningLevel,
           }
         : {};
@@ -4875,7 +5101,7 @@ export function ChatPanel({
         name: a.name,
       }));
       try {
-        const sendQueued = () =>
+        const sendBusy = () =>
           sendChatMessage(
             sid,
             text,
@@ -4883,13 +5109,14 @@ export function ChatPanel({
             images.length ? images : undefined,
             wireAnnotations,
             clientTurnId,
+            steering && !queue && !planRequested ? "steer" : undefined,
           );
-        const response = await queueSessionMutation(sendQueued);
-        if (response.turn.existing) await reseedSession(sid);
+        const response = await queueSessionMutation(sendBusy);
+        if (response.turn?.existing) await reseedSession(sid);
         setRecoveryOverrides({});
         if (pendingClientTurn.current?.id === clientTurnId) pendingClientTurn.current = null;
       } catch {
-        // Never reached the queue — restore the composer so a retry is one keypress.
+        // Never reached the turn — restore the composer so a retry is one keypress.
         clearFailedPlanCommand();
         restoreComposer();
       }
@@ -4968,7 +5195,7 @@ export function ChatPanel({
           clientTurnId,
         );
       const response = await queueSessionMutation(sendTurn);
-      if (response.turn.existing) await reseedSession(targetSessionId);
+      if (response.turn?.existing) await reseedSession(targetSessionId);
       setRecoveryOverrides({});
       if (pendingClientTurn.current?.id === clientTurnId) pendingClientTurn.current = null;
     } catch (err) {
@@ -5034,7 +5261,7 @@ export function ChatPanel({
   // Durable cancellation wins before the chip disappears. If persistence
   // fails, leave it visible so a restart cannot surprise the user by sending it.
   const forkTurn = useCallback(
-    (messageId: string, text?: string) => {
+    (messageId: string, text: string) => {
       if (!activeId || busy || !activeHarness?.agentReady) return;
       const sid = activeId;
       dispatch({ type: "busy", sessionId: sid, busy: true });
@@ -5042,7 +5269,7 @@ export function ChatPanel({
       void queueSessionMutation(() => forkChatTurn(sid, messageId, text)).catch((err) => {
         dispatch({ type: "busy", sessionId: sid, busy: false });
         const detail = err instanceof Error ? err.message : String(err);
-        dispatch({ type: "localError", sessionId: sid, text: `Could not re-sample: ${detail}` });
+        dispatch({ type: "localError", sessionId: sid, text: `Could not re-send: ${detail}` });
       });
     },
     [activeId, busy, activeHarness?.agentReady, queueSessionMutation],
@@ -5215,14 +5442,27 @@ export function ChatPanel({
   );
 
   const visibleSessions = sessions.filter((s) => matchesFilter(sessionFilter, s.archived));
-  const newTaskShortcut = /Mac|iPhone|iPad/.test(navigator.platform)
-    ? "⌘ ⇧ Enter"
-    : "Ctrl + Shift + Enter";
+  const isApple = /Mac|iPhone|iPad/.test(navigator.platform);
+  const newTaskShortcut = isApple ? "⌘ ⇧ Enter" : "Ctrl + Shift + Enter";
+  const queueChord = isApple ? "⌘ Enter" : "Ctrl + Enter";
   const startNewTask = useCallback(() => {
     setSessionFilter("active");
     setActiveId(null);
     onSelectMainView("chat");
   }, [onSelectMainView]);
+
+  /** Follow a spawn card into the session it started. Spawned sessions are
+   * ordinary top-level sessions, so this is just a switch in the rail — via
+   * "All", because selecting a row the active filter hides would leave the
+   * thread keyed to a session with no row (see `setArchived`). */
+  const openSpawnedSession = useCallback(
+    (sessionId: string) => {
+      setSessionFilter("all");
+      setActiveId(sessionId);
+      onSelectMainView("chat");
+    },
+    [onSelectMainView],
+  );
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -5247,13 +5487,6 @@ export function ChatPanel({
       {/* Workspace tools open beside chat; settings sections replace the middle pane. */}
       <nav className="rail-nav flex flex-col gap-0.5 p-2 shrink-0">
         <button
-          className={`rail-nav-item flex items-center gap-2.5 py-[7px] px-2.5 text-base text-text rounded-md text-left [&:hover]:bg-surface [&.active]:bg-panel [&.active]:font-semibold ${experimentsActive ? "active" : ""}`}
-          onClick={onOpenExperiments}
-        >
-          <FlaskConical size={15} />
-          Experiments
-        </button>
-        <button
           className={`rail-nav-item flex items-center gap-2.5 py-[7px] px-2.5 text-base text-text rounded-md text-left [&:hover]:bg-surface [&.active]:bg-panel [&.active]:font-semibold ${filesActive ? "active" : ""}`}
           onClick={onOpenWorktree}
         >
@@ -5267,6 +5500,13 @@ export function ChatPanel({
         >
           <Package size={15} />
           Artifacts
+        </button>
+        <button
+          className={`rail-nav-item flex items-center gap-2.5 py-[7px] px-2.5 text-base text-text rounded-md text-left [&:hover]:bg-surface [&.active]:bg-panel [&.active]:font-semibold ${experimentsActive ? "active" : ""}`}
+          onClick={onOpenExperiments}
+        >
+          <FlaskConical size={15} />
+          Experiments
         </button>
         <button
           className={`rail-nav-item flex items-center gap-2.5 py-[7px] px-2.5 text-base text-text rounded-md text-left [&:hover]:bg-surface [&.active]:bg-panel [&.active]:font-semibold ${mainView === "skills" ? "active" : ""}`}
@@ -5504,6 +5744,7 @@ export function ChatPanel({
               busy={busy}
               onOpenFile={openFileInSession}
               onOpenRun={onOpenRun}
+              onOpenSpawnedSession={openSpawnedSession}
               runExperimentName={runExperimentName}
               onOpenExperiment={onOpenExperiment}
               experimentName={experimentName}
@@ -5695,6 +5936,9 @@ export function ChatPanel({
                 // the paper-reproduction skills with a paper attached, both parts
                 // are optional — paper defaults to it, compute to the configured
                 // target — so the hint just states the defaults.
+                // While a steerable turn runs, Enter goes to that turn, so name
+                // the gesture and its queue chord — the send button is a Stop
+                // button for the whole busy stretch.
                 // Otherwise follow `composerSelection` so the name tracks the
                 // picker for a new session and the open session once one exists.
                 pendingQuestion
@@ -5704,6 +5948,8 @@ export function ChatPanel({
                       paperId
                       ? `[optional — defaults to ${paperId} on your default compute]`
                       : pickedSkill.argHint
+                    : steering && activeHarness
+                      ? `Steer ${HARNESS_LABELS[activeHarness.id]}… (${queueChord} to queue)`
                     : composerSelection
                       ? activeHarness?.agentReady
                         ? `Message ${HARNESS_LABELS[composerSelection.harness]}… ( / for commands)`
@@ -5792,7 +6038,7 @@ export function ChatPanel({
                 }
                 if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                   e.preventDefault();
-                  void send();
+                  void send({ queue: e.metaKey || e.ctrlKey });
                 }
               }}
             />

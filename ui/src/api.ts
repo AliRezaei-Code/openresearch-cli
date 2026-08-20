@@ -881,7 +881,7 @@ export const getProfile = () => get<Profile>("/api/settings/profile");
 
 export const setProfile = (body: Profile) => post<Profile>("/api/settings/profile", body);
 
-/** Which literature sources `orx lit`/`orx paper` may use (settings.json). */
+/** Which literature sources discovery and paper reading may use (settings.json). */
 export interface LitSourcesSettings {
   alphaxiv: boolean;
   openalex: boolean;
@@ -1098,6 +1098,9 @@ export interface Harness {
   plan?: string;
   agentReady: boolean;
   agentNote?: string;
+  /** A running turn takes further input, so the composer steers instead of
+   * queueing. Narrowed per installation (codex's legacy exec path can't). */
+  supportsSteering: boolean;
   models: HarnessModel[];
   options: HarnessOptions;
 }
@@ -1252,7 +1255,7 @@ export interface ChatPrompt {
 
 export interface ChatPart {
   id: string;
-  type: string; // text | reasoning | tool | prompt | image
+  type: string; // text | reasoning | tool | prompt | image | steer
   text?: string;
   /** Original file name for an `image` (attachment) part, when known. */
   name?: string;
@@ -1286,7 +1289,8 @@ export interface ChatSession {
   harness: HarnessId;
   title: string | null;
   /** Who wrote `title`: `"fallback"` (first-line placeholder), `"generated"`
-   * (harness auto-title), `"user"` (rename). Null on legacy sessions. */
+   * (harness auto-title), `"user"` (explicitly chosen — a rename, or an agent's
+   * `orx agent spawn --title`). Null on legacy sessions. */
   titleSource?: string | null;
   model: string | null;
   permissionMode: string | null;
@@ -1295,6 +1299,9 @@ export interface ChatSession {
   reasoningLevel: string | null;
   /** Hidden from the default Recents list, but fully intact and resumable. */
   archived: boolean;
+  /** Session whose agent spawned this one with `orx agent spawn`; null for
+   * sessions the user started themselves. */
+  parentSessionId?: string | null;
   createdAt: number;
   updatedAt: number;
   busy: boolean;
@@ -1400,8 +1407,9 @@ export const sendChatMessage = (
   images?: ChatImageAttachment[],
   annotations?: ChatTextAnnotation[],
   clientTurnId?: string,
+  mode?: "steer",
 ) =>
-  post<{ ok: boolean; turn: ChatTurnResult }>(`/api/chat/sessions/${sessionId}/message`, {
+  post<{ ok: boolean; turn?: ChatTurnResult }>(`/api/chat/sessions/${sessionId}/message`, {
     text,
     clientTurnId,
     model: opts.model,
@@ -1410,6 +1418,7 @@ export const sendChatMessage = (
     reasoningLevel: opts.reasoningLevel,
     images,
     annotations,
+    mode,
   });
 
 export interface ChatTurnResult {

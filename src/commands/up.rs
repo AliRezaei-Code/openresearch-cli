@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,6 +62,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
     let agent = Arc::new(AgentHost::new(args.model.clone()));
     let codex = Arc::new(local::codex::CodexHost::new());
     let claude = Arc::new(local::claude::ClaudeHost::new());
+    claude.start_reaper();
     let state = AppState {
         agent: agent.clone(),
         chat: Arc::new(ChatHost::new(agent.clone(), codex.clone(), claude.clone())),
@@ -4592,6 +4594,7 @@ async fn create_chat_session(
         context_usage_json: None,
         bootstrap_context: None,
         active_leaf_id: None,
+        parent_session_id: None,
         created_at: now_ms(),
         updated_at: now_ms(),
     };
@@ -4690,6 +4693,15 @@ struct SendChatReq {
     images: Vec<local::chat::ImageAttachment>,
     #[serde(default)]
     annotations: Vec<local::chat::TextAnnotation>,
+    /// `"steer"` hands the message to a turn already running; omitted (an
+    /// older client) keeps the parked-queue path.
+    mode: Option<SendMode>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SendMode {
+    Steer,
 }
 
 async fn send_chat_message(
@@ -4716,25 +4728,36 @@ async fn send_chat_message(
         reasoning_level: req.reasoning_level,
     };
     // The turn runs in the background; progress streams over /api/events.
-    let result = state
-        .chat
-        .send_message(
-            &id,
-            text,
-            overrides,
-            req.images,
-            annotations,
-            req.client_turn_id,
-        )
-        .await
-        .map_err(|error| {
-            if error.to_string().contains("clientTurnId was already used") {
-                ApiError(StatusCode::CONFLICT, error.to_string())
-            } else {
-                bad_request(error)
-            }
-        })?;
-    Ok(Json(json!({ "ok": true, "turn": result })))
+    let response = if matches!(req.mode, Some(SendMode::Steer)) {
+        state
+            .chat
+            .steer_message(&id, text, overrides, req.images, annotations)
+            .await
+            .map_err(bad_request)?;
+        json!({ "ok": true })
+    } else {
+        let result = state
+            .chat
+            .send_message(
+                &id,
+                text,
+                overrides,
+                req.images,
+                annotations,
+                req.client_turn_id,
+            )
+            .await
+            .map_err(|error| {
+                if error.to_string().contains("clientTurnId was already used") {
+                    ApiError(StatusCode::CONFLICT, error.to_string())
+                } else {
+                    bad_request(error)
+                }
+            })?;
+        json!({ "ok": true, "turn": result })
+    };
+    crate::telemetry::capture_chat_message_sent();
+    Ok(Json(response))
 }
 
 #[derive(Deserialize)]
@@ -4789,10 +4812,10 @@ async fn fork_chat_turn(
     Json(req): Json<ForkChatReq>,
 ) -> ApiResult {
     reject_if_moving(&state)?;
-    let kind = match req.text {
-        Some(text) if !text.trim().is_empty() => local::chat::ForkKind::Edit(text),
+    let (kind, is_edited_resubmission) = match req.text {
+        Some(text) if !text.trim().is_empty() => (local::chat::ForkKind::Edit(text), true),
         Some(_) => return Err(bad_request("text is required")),
-        None => local::chat::ForkKind::Retry,
+        None => (local::chat::ForkKind::Retry, false),
     };
     // A fork re-samples under the session's current settings, so it takes no
     // overrides — the turn runs in the background and streams over /api/events.
@@ -4801,6 +4824,9 @@ async fn fork_chat_turn(
         .fork_turn(&id, &req.message_id, kind)
         .await
         .map_err(bad_request)?;
+    if is_edited_resubmission {
+        crate::telemetry::capture_chat_message_sent();
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -4982,10 +5008,40 @@ async fn events(
             }
         }
     });
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|ev| (Ok(ev), rx))
+    // The guard rides the stream state, so the count drops when the response
+    // body is dropped — i.e. when the tab closes or navigates away.
+    let guard = DashboardClientGuard::new();
+    let stream = futures::stream::unfold((rx, guard), |(mut rx, guard)| async move {
+        rx.recv().await.map(|ev| (Ok(ev), (rx, guard)))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Whether a dashboard is open somewhere — macOS app mode asks on a Dock click,
+/// where a live tab means "raise the browser" rather than "open the URL again".
+/// Any `/api/events` consumer counts, and a connection that vanished without a
+/// FIN lingers until a keep-alive write fails.
+// Un-gated so CI's Linux runner still type-checks it; only macOS has a caller.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn has_live_dashboard_clients() -> bool {
+    LIVE_DASHBOARD_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
+static LIVE_DASHBOARD_CLIENTS: AtomicUsize = AtomicUsize::new(0);
+
+struct DashboardClientGuard;
+
+impl DashboardClientGuard {
+    fn new() -> Self {
+        LIVE_DASHBOARD_CLIENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for DashboardClientGuard {
+    fn drop(&mut self) {
+        LIVE_DASHBOARD_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Diff state for one SSE subscriber.

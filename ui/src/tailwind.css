@@ -388,6 +388,10 @@ textarea::placeholder {
 .tool-group-disclosure-inner {
   min-height: 0;
   overflow: hidden;
+  /* Containing block for absolutely-positioned descendants: `sr-only` spans in
+     error rows would otherwise anchor to the scroll pane and stretch its
+     scrollHeight far past the collapsed group (phantom scrollbar). */
+  position: relative;
 }
 
 .tool-target-reveal {
