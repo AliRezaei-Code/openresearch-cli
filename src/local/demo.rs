@@ -330,6 +330,7 @@ fn seed_at(
         context_usage_json: None,
         bootstrap_context: Some(BOOTSTRAP_CONTEXT.into()),
         active_leaf_id: Some(ASSISTANT_MESSAGE_ID.into()),
+        parent_session_id: None,
         created_at: 1_785_824_322_614,
         updated_at: 1_785_879_263_859,
     };
@@ -369,6 +370,7 @@ fn seed_at(
         context_usage_json: None,
         bootstrap_context: Some(FIGURE_BOOTSTRAP_CONTEXT.into()),
         active_leaf_id: Some(FIGURE_ASSISTANT_MESSAGE_ID.into()),
+        parent_session_id: None,
         created_at: 1_785_824_322_630,
         updated_at: 1_785_879_263_858,
     };
@@ -411,6 +413,7 @@ fn seed_at(
         context_usage_json: None,
         bootstrap_context: Some(LITERATURE_BOOTSTRAP_CONTEXT.into()),
         active_leaf_id: Some(LITERATURE_ASSISTANT_MESSAGE_ID.into()),
+        parent_session_id: None,
         created_at: 1_785_824_322_634,
         updated_at: 1_785_879_263_857,
     };

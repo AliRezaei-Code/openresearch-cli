@@ -931,6 +931,8 @@ interface ToolActivity {
   litCall?: NonNullable<ReturnType<typeof parseOrxLit>>;
   runIds?: string[];
   experimentIds?: string[];
+  /** Chat sessions `orx agent spawn` created in this tool call. */
+  spawnedSessionIds?: string[];
 }
 
 type OpenTranscriptFile = (path: string, line?: number, exp?: string, ref?: string) => void;
@@ -1245,6 +1247,9 @@ function commandFilePath(
 }
 
 const UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+/** Session ids as `orx agent spawn` prints them, so the spawn card can link to
+ * the session it started. The id is only in the output — never the command. */
+const SPAWNED_SESSION_PATTERN = new RegExp(`\\bchat_(${UUID_PATTERN})\\b`, "gi");
 const RUN_TARGET_PATTERN = `(?:${UUID_PATTERN}|[0-9a-f]{8})`;
 
 interface ShellCommandSegment {
@@ -1369,6 +1374,16 @@ function orxCommandSegments(command: string, args: string): ShellCommandSegment[
 function commandInvokesOrx(command: string, args: string): boolean {
   if (orxCommandSegments(command, args).length > 0) return true;
   return new RegExp(`(?:^|[\\s($;])orx\\s+${args}\\b`, "i").test(command);
+}
+
+function spawnedSessionIds(output: string | undefined): string[] {
+  if (!output) return [];
+  const ids = new Set<string>();
+  for (const match of output.slice(0, TOOL_OUTPUT_SCAN_LIMIT).matchAll(SPAWNED_SESSION_PATTERN)) {
+    ids.add(match[0].toLowerCase());
+    if (ids.size >= TOOL_TARGET_LIMIT) break;
+  }
+  return [...ids];
 }
 
 function idsFromToolOutput(output: string | undefined, resource: "runs" | "experiments"): string[] {
@@ -1604,6 +1619,13 @@ function toolActivity(part: ChatPart): ToolActivity {
         return { kind: litCall.kind === "paper" ? "read" : "search", label, litCall };
       }
 
+      if (commandInvokesOrx(command, "agent\\s+spawn")) {
+        return {
+          kind: "agent",
+          label: "Delegated a task to a new agent",
+          spawnedSessionIds: spawnedSessionIds(toolOutput),
+        };
+      }
       const shellInvocations = shellSegments.map((segment) => shellInvocation(segment.raw));
       const readsExperimentStatus = commandInvokesOrx(command, "exp\\s+status");
       const readsExperimentNotes = commandInvokesOrx(command, "exp\\s+desc");
@@ -1948,6 +1970,7 @@ function ToolActivityLabel({
   activity,
   onOpenFile,
   onOpenRun,
+  onOpenSpawnedSession,
   runExperimentName,
   onOpenExperiment,
   experimentName,
@@ -1955,6 +1978,7 @@ function ToolActivityLabel({
   activity: ToolActivity;
   onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
+  onOpenSpawnedSession?: (sessionId: string) => void;
   runExperimentName?: (runId: string) => string;
   onOpenExperiment?: (experimentId: string) => void;
   experimentName?: (experimentId: string) => string;
@@ -2006,6 +2030,42 @@ function ToolActivityLabel({
         >
           {activity.labelTarget}
         </button>
+      </>
+    );
+  }
+  if (activity.spawnedSessionIds?.length && onOpenSpawnedSession) {
+    const sessionIds = activity.spawnedSessionIds;
+    const single = sessionIds.length === 1;
+    const visibleSessionIds = sessionIds.slice(0, 3);
+    const hiddenSessions = sessionIds.slice(visibleSessionIds.length).map((sessionId, index) => ({
+      id: sessionId,
+      label: `agent ${visibleSessionIds.length + index + 1}`,
+    }));
+    return (
+      <>
+        {single ? "Delegated a task to " : "Delegated tasks to "}
+        {visibleSessionIds.map((sessionId, index) => (
+          <span key={sessionId}>
+            {index > 0 && ", "}
+            <button
+              className="tool-target"
+              title="Open the session this agent spawned"
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                onOpenSpawnedSession(sessionId);
+              }}
+            >
+              {single ? "a new agent" : `agent ${index + 1}`}
+            </button>
+          </span>
+        ))}
+        {hiddenSessions.length > 0 && (
+          <>
+            {", "}
+            <ToolTargetOverflow items={hiddenSessions} onOpen={onOpenSpawnedSession} targetType="agent sessions" />
+          </>
+        )}
       </>
     );
   }
@@ -2135,6 +2195,7 @@ function activityInProgress(activity: ToolActivity): ToolActivity {
     [/^Checked /, "Checking "],
     [/^Built /, "Building "],
     [/^Cancelled /, "Cancelling "],
+    [/^Delegated /, "Delegating "],
   ];
   let label = activity.label;
   for (const [pattern, replacement] of replacements) {
@@ -2160,6 +2221,7 @@ function permissionActivityLabel(tool: string | undefined, input: Record<string,
     [/^Updated /, "Update "],
     [/^Created /, "Create "],
     [/^Deleted /, "Delete "],
+    [/^Delegated /, "Delegate "],
     [/^Ran /, "Run "],
     [/^Started /, "Start "],
     [/^Waited /, "Wait "],
@@ -2288,6 +2350,7 @@ function squashableToolPartKey(part: ChatPart): string | null {
     activity.litCall?.kind === "paper" ? activity.litCall.id ?? null : null,
     activity.runIds ?? null,
     activity.experimentIds ?? null,
+    activity.spawnedSessionIds ?? null,
   ]);
 }
 
@@ -2312,6 +2375,7 @@ function ToolRow({
   repeatCount = 1,
   onOpenFile,
   onOpenRun,
+  onOpenSpawnedSession,
   runExperimentName,
   onOpenExperiment,
   experimentName,
@@ -2320,6 +2384,7 @@ function ToolRow({
   repeatCount?: number;
   onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
+  onOpenSpawnedSession?: (sessionId: string) => void;
   runExperimentName?: (runId: string) => string;
   onOpenExperiment?: (experimentId: string) => void;
   experimentName?: (experimentId: string) => string;
@@ -2344,6 +2409,7 @@ function ToolRow({
           activity={activity}
           onOpenFile={onOpenFile}
           onOpenRun={onOpenRun}
+          onOpenSpawnedSession={onOpenSpawnedSession}
           runExperimentName={runExperimentName}
           onOpenExperiment={onOpenExperiment}
           experimentName={experimentName}
@@ -2394,6 +2460,7 @@ function ToolGroup({
   pendingTail,
   onOpenFile,
   onOpenRun,
+  onOpenSpawnedSession,
   runExperimentName,
   onOpenExperiment,
   experimentName,
@@ -2402,6 +2469,7 @@ function ToolGroup({
   pendingTail?: boolean;
   onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
+  onOpenSpawnedSession?: (sessionId: string) => void;
   runExperimentName?: (runId: string) => string;
   onOpenExperiment?: (experimentId: string) => void;
   experimentName?: (experimentId: string) => string;
@@ -2439,6 +2507,7 @@ function ToolGroup({
                 activity={pendingActivity}
                 onOpenFile={onOpenFile}
                 onOpenRun={onOpenRun}
+                onOpenSpawnedSession={onOpenSpawnedSession}
                 runExperimentName={runExperimentName}
                 onOpenExperiment={onOpenExperiment}
                 experimentName={experimentName}
@@ -2454,6 +2523,7 @@ function ToolGroup({
           part={parts[0]}
           onOpenFile={onOpenFile}
           onOpenRun={onOpenRun}
+          onOpenSpawnedSession={onOpenSpawnedSession}
           runExperimentName={runExperimentName}
           onOpenExperiment={onOpenExperiment}
           experimentName={experimentName}
@@ -2476,6 +2546,7 @@ function ToolGroup({
               activity={pendingActivity}
               onOpenFile={onOpenFile}
               onOpenRun={onOpenRun}
+              onOpenSpawnedSession={onOpenSpawnedSession}
               runExperimentName={runExperimentName}
               onOpenExperiment={onOpenExperiment}
               experimentName={experimentName}
@@ -2515,6 +2586,7 @@ function ToolGroup({
                 repeatCount={count}
                 onOpenFile={onOpenFile}
                 onOpenRun={onOpenRun}
+                onOpenSpawnedSession={onOpenSpawnedSession}
                 runExperimentName={runExperimentName}
                 onOpenExperiment={onOpenExperiment}
                 experimentName={experimentName}
@@ -2890,6 +2962,7 @@ const Message = memo(function Message({
   pendingTailToolId,
   onOpenFile,
   onOpenRun,
+  onOpenSpawnedSession,
   runExperimentName,
   onOpenExperiment,
   experimentName,
@@ -2912,6 +2985,7 @@ const Message = memo(function Message({
   pendingTailToolId?: string | null;
   onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
+  onOpenSpawnedSession?: (sessionId: string) => void;
   runExperimentName?: (runId: string) => string;
   onOpenExperiment?: (experimentId: string) => void;
   experimentName?: (experimentId: string) => string;
@@ -3059,6 +3133,7 @@ const Message = memo(function Message({
         pendingTailToolId,
         onOpenFile,
         onOpenRun,
+        onOpenSpawnedSession,
         runExperimentName,
         onOpenExperiment,
         experimentName,
@@ -3084,6 +3159,7 @@ function renderParts(
     pendingTailToolId?: string | null;
     onOpenFile?: OpenTranscriptFile;
     onOpenRun?: (runId: string) => void;
+    onOpenSpawnedSession?: (sessionId: string) => void;
     runExperimentName?: (runId: string) => string;
     onOpenExperiment?: (experimentId: string) => void;
     experimentName?: (experimentId: string) => string;
@@ -3098,6 +3174,7 @@ function renderParts(
     pendingTailToolId,
     onOpenFile,
     onOpenRun,
+    onOpenSpawnedSession,
     runExperimentName,
     onOpenExperiment,
     experimentName,
@@ -3122,6 +3199,7 @@ function renderParts(
         pendingTail={toolRun.some((part) => part.id === pendingTailToolId)}
         onOpenFile={onOpenFile}
         onOpenRun={onOpenRun}
+        onOpenSpawnedSession={onOpenSpawnedSession}
         runExperimentName={runExperimentName}
         onOpenExperiment={onOpenExperiment}
         experimentName={experimentName}
@@ -3512,6 +3590,7 @@ const Transcript = memo(function Transcript({
   busy,
   onOpenFile,
   onOpenRun,
+  onOpenSpawnedSession,
   runExperimentName,
   onOpenExperiment,
   experimentName,
@@ -3531,6 +3610,7 @@ const Transcript = memo(function Transcript({
   busy: boolean;
   onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
+  onOpenSpawnedSession?: (sessionId: string) => void;
   runExperimentName?: (runId: string) => string;
   onOpenExperiment?: (experimentId: string) => void;
   experimentName?: (experimentId: string) => string;
@@ -3575,6 +3655,7 @@ const Transcript = memo(function Transcript({
           pendingTailToolId={pendingTailTool?.messageId === m.id ? pendingTailTool.toolId : null}
           onOpenFile={onOpenFile}
           onOpenRun={onOpenRun}
+          onOpenSpawnedSession={onOpenSpawnedSession}
           runExperimentName={runExperimentName}
           onOpenExperiment={onOpenExperiment}
           experimentName={experimentName}
@@ -3753,7 +3834,9 @@ function SessionRow({
       className={`session-row relative flex items-center gap-2 w-full text-left py-[7px] px-2.5 rounded-md text-md text-text cursor-pointer select-none [&:hover]:bg-surface [&.active]:bg-surface [&.active]:font-medium [&_.session-dot]:w-3.5 [&_.session-dot]:inline-flex [&_.session-dot]:items-center [&_.session-dot]:justify-center [&_.session-dot]:shrink-0 [&_.session-title]:flex-1 [&_.session-title]:min-w-0 [&_.session-title]:overflow-hidden [&_.session-title]:text-ellipsis [&_.session-title]:whitespace-nowrap [&.unread_.session-title]:font-semibold [&_.session-time]:text-2xs [&_.session-time]:text-muted [&_.session-time]:shrink-0 [&_.session-menu-btn]:hidden [&_.session-menu-btn]:items-center [&_.session-menu-btn]:justify-center [&_.session-menu-btn]:w-4 [&_.session-menu-btn]:h-4 [&_.session-menu-btn]:-my-0.5 [&_.session-menu-btn]:mx-0 [&_.session-menu-btn]:rounded-sm [&_.session-menu-btn]:text-muted [&_.session-menu-btn]:shrink-0 [&_.session-menu-btn:hover]:text-text [&_.session-menu-btn:hover]:bg-panel [&:hover_.session-menu-btn]:inline-flex [&:focus-within_.session-menu-btn]:inline-flex [&.menu-open_.session-menu-btn]:inline-flex [&:hover_.session-time]:hidden [&:focus-within_.session-time]:hidden [&.menu-open_.session-time]:hidden [&_.busy-dot]:w-[7px] [&_.busy-dot]:h-[7px] [&_.busy-dot]:rounded-full [&_.busy-dot]:bg-primary [&_.busy-dot]:animate-[or-pulse_1.2s_infinite] [&_.busy-dot]:shrink-0 [&_.unread-dot]:w-[7px] [&_.unread-dot]:h-[7px] [&_.unread-dot]:rounded-full [&_.unread-dot]:bg-primary [&_.unread-dot]:shrink-0 [&_.busy-dot.waiting]:animate-none [&_.session-title-input]:flex-1 [&_.session-title-input]:min-w-0 [&_.session-title-input]:py-px [&_.session-title-input]:px-[5px] [&_.session-title-input]:-my-0.5 [&_.session-title-input]:mx-0 [&_.session-title-input]:[font:inherit] [&_.session-title-input]:text-text [&_.session-title-input]:bg-background [&_.session-title-input]:border [&_.session-title-input]:border-primary [&_.session-title-input]:rounded-sm [&_.session-title-input]:outline-none [&.editing]:bg-surface [&.editing]:cursor-default [&.editing_.session-menu-btn]:hidden [&.editing_.session-time]:hidden ${active ? "active" : ""}  ${unread ? "unread" : ""}  ${open ? "menu-open" : ""}  ${
         editing ? "editing" : ""
       }`}
-      title={`${HARNESS_LABELS[session.harness]}${session.model ? ` · ${session.model}` : ""}`}
+      title={`${HARNESS_LABELS[session.harness]}${session.model ? ` · ${session.model}` : ""}${
+        session.parentSessionId ? " · Spawned by another agent" : ""
+      }`}
       onClick={() => {
         // While editing, a body click is a no-op; blur/Enter/Esc drive it.
         if (editing) return;
@@ -3783,6 +3866,9 @@ function SessionRow({
           unread && <span className="unread-dot" />
         )}
       </span>
+      {session.parentSessionId && !editing && (
+        <Users className="text-muted shrink-0" size={12} aria-hidden />
+      )}
       {editing ? (
         <input
           ref={inputRef}
@@ -5205,6 +5291,19 @@ export function ChatPanel({
     onSelectMainView("chat");
   }, [onSelectMainView]);
 
+  /** Follow a spawn card into the session it started. Spawned sessions are
+   * ordinary top-level sessions, so this is just a switch in the rail — via
+   * "All", because selecting a row the active filter hides would leave the
+   * thread keyed to a session with no row (see `setArchived`). */
+  const openSpawnedSession = useCallback(
+    (sessionId: string) => {
+      setSessionFilter("all");
+      setActiveId(sessionId);
+      onSelectMainView("chat");
+    },
+    [onSelectMainView],
+  );
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (
@@ -5485,6 +5584,7 @@ export function ChatPanel({
               busy={busy}
               onOpenFile={openFileInSession}
               onOpenRun={onOpenRun}
+              onOpenSpawnedSession={openSpawnedSession}
               runExperimentName={runExperimentName}
               onOpenExperiment={onOpenExperiment}
               experimentName={experimentName}
