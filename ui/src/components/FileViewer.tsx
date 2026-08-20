@@ -53,6 +53,7 @@ export function FileViewer({
   onScrollPositionChange,
   lineScrollRequest,
   onLineScrollRequestHandled,
+  onEdit,
 }: {
   projectId: string;
   path: string;
@@ -77,6 +78,9 @@ export function FileViewer({
   onScrollPositionChange?: (position: FileScrollPosition) => void;
   lineScrollRequest?: number;
   onLineScrollRequestHandled?: () => void;
+  /** Typing in the editor — the commitment that takes a preview tab out of
+   * preview mode. */
+  onEdit?: () => void;
 }) {
   const [loaded, setLoaded] = useState<LoadedFile | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -421,6 +425,7 @@ export function FileViewer({
             value={draft}
             onChange={(next) => {
               setDraft(next);
+              onEdit?.();
               if (saveError) setSaveError(null);
             }}
             onSave={() => void save()}
