@@ -157,14 +157,8 @@ export function parseOrxLit(command: string): OrxLitCall | null {
       source = asSource(t.slice("--source=".length));
       continue;
     }
-    // Value flags may precede the question; skip their value so it is not read as positional.
-    if (
-      t === "--limit" ||
-      t === "--keyword" ||
-      t === "--published-after" ||
-      t === "--published-before" ||
-      t === "--prioritize"
-    ) {
+    // Value flags may precede the query; skip their value so it is not read as the positional.
+    if (t === "--limit" || t === "--published-after" || t === "--published-before") {
       i++;
       continue;
     }

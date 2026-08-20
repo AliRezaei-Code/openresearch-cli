@@ -1,46 +1,18 @@
 ---
 name: orx-lit
-description: "Run agent-ranked literature retrieval and read papers via alphaXiv, OpenAlex, and bioRxiv (`orx lit` / `orx paper`). Use for academic topics across CS/ML and biomed. The main agent inspects keyword and semantic candidates, makes only focused follow-ups, and does not delegate the retrieval loop to a sub-agent."
+description: "Search literature and read papers via alphaXiv, OpenAlex, and bioRxiv (`orx lit` / `orx paper`) — the preferred tool for literature search on any academic topic across CS/ML and biomed: a paper, author, blog post, or model release. Start here, not a web search: find related work, baselines, and code to seed from. Often the corpus answers outright and no web search is needed."
 ---
 
 **The preferred literature tool.** For anything academic or research-related —
 papers, authors, blog posts, model releases — start with `orx lit`, not a web
-search. You are the retrieval ranker: call the tool, inspect its candidates,
-decide whether one focused follow-up is needed, and return the papers that best
-answer the user's question. Do not delegate this loop to a sub-agent.
-
-For alphaXiv, one `orx lit` call runs a full-text keyword search and a semantic
-title/abstract search concurrently. It prints the two candidate sets separately;
-the CLI does not merge their scores or use an LLM to choose for you. When a mix
-of short acronyms and other terms could bury an overloaded acronym, it also runs
-an acronym-only keyword search in that same round.
-
-## Retrieval loop
-
-1. Make one broad initial call. The positional argument is the semantic question.
-   Pass each exact method name, acronym, benchmark, author, or title phrase with
-   a repeatable `--keyword`. Use only terms the user wrote or that appeared in a
-   prior result; never guess an acronym's expansion.
-2. Read both result sets and rank 5-15 papers by topical fit. The ordering within
-   each set already accounts for the selected freshness/popularity preference.
-3. Stop when the candidates cover the question. For an easy query this should be
-   the first call. Make one follow-up call only for a concrete missing acronym,
-   method, benchmark, organization, or subtopic; exceptionally broad or ambiguous
-   work may earn a second. Never run exploratory or overlapping follow-ups.
-4. Preserve the same date bounds and `--prioritize` value on follow-ups. Those
-   constraints came from the user's request; silently widening them answers a
-   different question.
-
-```sh
-orx lit "How do GRPO and DAPO differ?" --keyword GRPO --keyword DAPO
-orx lit "work applying test-time compute to theorem proving" \
-  --keyword "test-time compute" --keyword "theorem proving"
-```
+search: disambiguate the author or work and pull the prior art. The corpus often
+answers the question outright; reach for web search only if something is
+genuinely missing from it.
 
 `orx lit --source` picks the corpus (all need **no `orx login`**; public hosts,
 not the OpenResearch API):
 - **`alphaxiv`** (default) — 2.5M+ arXiv papers (CS, math, physics, stats,
-  q-bio/fin, EE). Parallel keyword and semantic retrieval for agent ranking.
+  q-bio/fin, EE). Full-text ranked search with a structured per-paper report.
 - **`openalex`** — the OpenAlex scholarly graph (250M+ works, every discipline,
   incl. published journal articles). Ranked by relevance; hits carry citation counts.
 - **`biorxiv`** — biology preprints. bioRxiv has no search API, so this searches
@@ -48,9 +20,9 @@ not the OpenResearch API):
   preprint from bioRxiv itself. Use for biomed, where alphaXiv is thin.
 
 ```sh
-orx lit "speculative decoding for LLMs" --keyword "speculative decoding"
-orx lit "new work on KV cache compression" --keyword "KV cache" --prioritize recency
-orx lit "transformer optimization" --keyword transformers --published-after 2024-01-01
+orx lit "speculative decoding for LLMs"                   # alphaXiv (default): id, title, date, votes, abstract
+orx lit "rotary position embeddings" --limit 10           # widen the result set (default 5)
+orx lit "transformer optimization" --published-after 2024-01-01 # widen alphaXiv's default three-month window
 orx lit "neural networks before AlexNet" --published-before 2012-01-01 # historical alphaXiv search
 orx lit "graph neural networks" --source openalex         # OpenAlex: cross-discipline, citation counts
 orx lit "spike protein binding affinity" --source biorxiv # biology preprints via bioRxiv
@@ -61,14 +33,11 @@ orx paper 10.1038/nature14539                             # OpenAlex metadata + 
 orx paper 2401.12345v2 --full                             # alphaXiv full extracted text (fallback)
 ```
 
-- **`orx lit`** prints alphaXiv keyword and semantic candidate sections with
-  `[ID=...]`, title, date, votes, abstract, and matching full-text snippets where
-  available. OpenAlex/bioRxiv print a single ranked list with citation counts. The
+- **`orx lit`** prints, per hit: `<id>  <title>`, then `<date> · <metric>` (votes
+  on alphaXiv, citations on OpenAlex/bioRxiv), then a truncated abstract. The
   **`id`** is what you feed to `orx paper` — an arXiv id (alphaXiv), a DOI
   (bioRxiv/OpenAlex), or an OpenAlex `W…` id. Results are relevance-ranked, capped
-  at `--limit` per retrieval strategy (default 15 for alphaXiv, 5 for other
-  sources). `--json` emits a deduplicated uniform hit array in keyword-first
-  strategy order, not a single cross-strategy ranking (`source`, `id`,
+  at `--limit` (default 5). `--json` emits a uniform hit shape (`source`, `id`,
   `title`, `abstract`, `publicationDate`, and `votes`/`citations`/`snippets` where
   they apply) for piping.
 - **alphaXiv searches default to papers from the past three months.** This keeps
@@ -77,11 +46,6 @@ orx paper 2401.12345v2 --full                             # alphaXiv full extrac
   question calls for older, seminal, or historical work. An upper bound without
   a lower bound removes the default lower cutoff. These flags apply only to
   `--source alphaxiv`.
-- **`--prioritize default|recency|historical|popular`** changes alphaXiv's
-  ranking after topical relevance. Use `recency` for what is new, `historical`
-  for seminal/foundational work (and widen the date window), and `popular` only
-  when the user explicitly asks about votes, popularity, or community standing.
-  “Best” alone does not mean most upvoted.
 - **`orx paper <id>`** writes to **stdout** (pipe/redirect-friendly) and
   **auto-detects the source** from the id (override with `--source`):
   arXiv id/URL → alphaXiv report; `10.1101/…` DOI → bioRxiv; any other DOI or a
@@ -127,6 +91,6 @@ you're about to vary, pull the most relevant report, and let it inform the chang
 write into a child's description:
 
 ```sh
-orx lit "learning rate warmup schedules for transformers" --keyword "learning rate warmup"
+orx lit "learning rate warmup schedules transformers" --limit 5
 orx paper <bestPaperId>          # read its report; cite the idea in the child's --description
 ```

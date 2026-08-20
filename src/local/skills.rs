@@ -21,14 +21,14 @@ const LIT_REVIEW_TEMPLATE: &str = r#"Perform a multi-hop literature review acros
 Topic: {args}
 
 Use the `orx` CLI (already installed; public endpoints, no login needed):
-- `orx lit "<question>" [--keyword <term>]... [--prioritize default|recency|historical|popular] [--source alphaxiv|openalex|biorxiv] [--published-after YYYY-MM-DD] [--published-before YYYY-MM-DD]` — alphaXiv runs keyword and semantic retrieval concurrently and returns candidates for you to rank. Exact keywords are repeatable; use only user terms or terms found in results. The default date window is three months, so change it before searching when the question needs older work. OpenAlex and bioRxiv remain single-list searches.
+- `orx lit "<query>" [--source alphaxiv|openalex|biorxiv] [--published-after YYYY-MM-DD] [--published-before YYYY-MM-DD]` — full-text search; alphaXiv defaults to papers from the past three months. Change the date bounds when the question calls for older, seminal, or historical work. `--source` picks the corpus (default alphaxiv for CS/ML; openalex for cross-discipline + citation counts; biorxiv for biology preprints). Returns ids, titles, abstracts (`--json` for machine-readable output).
 - `orx paper <id>` — for an alphaXiv id, its structured overview report (~10 KB), `--full` for raw text; for a DOI or OpenAlex `W…` id, title/authors/date/citations + abstract. Source auto-detected from the id.
 
-Method — you own the retrieval loop; do not delegate it to a sub-agent:
-1. Run one broad `orx lit` call, using the user's question as the positional query and repeatable `--keyword` flags for exact methods, acronyms, benchmarks, authors, or title phrases. For biomed or cross-field topics, also query `--source openalex` (and `--source biorxiv` for biology) when that corpus is materially relevant. Inspect the keyword and semantic candidate sets and pick the 3-5 most relevant papers.
+Method — iterate; do not stop after one search:
+1. Hop 1: run `orx lit` with 2-3 distinct phrasings of the topic. For biomed or cross-field topics, also query `--source openalex` (and `--source biorxiv` for biology) so you don't miss non-arXiv work. Skim titles/abstracts/snippets and pick the 3-5 most relevant papers.
 2. Read them: `orx paper <id>` for each pick.
-3. From those reports, identify a concrete missing cited paper, author, benchmark, method, or subtopic. Run one focused follow-up only when such a gap exists; exceptionally broad reviews may earn a second. Preserve the original date bounds and priority.
-4. Stop when a follow-up surfaces nothing materially new. Track which papers you have already seen so you don't re-read them.
+3. Next hop: from those reports, extract cited papers, author names, benchmark/method names, and field terminology you did not start with. Turn these into new `orx lit` queries and search again.
+4. Repeat until a hop surfaces nothing relevantly new (typically 2-4 hops). Track which papers you have already seen so you don't re-read them.
 
 Then write the review:
 - Organize by theme, not by paper.

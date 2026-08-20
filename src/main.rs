@@ -103,7 +103,8 @@ enum Command {
     #[command(name = "install-skills")]
     InstallSkills(InstallSkillsArgs),
 
-    /// Retrieve literature candidates for the calling agent to rank and refine.
+    /// Search literature by full-text query across alphaXiv, OpenAlex, or
+    /// bioRxiv (`--source`; no login required).
     Lit(LitArgs),
 
     /// Fetch a paper: alphaXiv report/full-text, or OpenAlex/bioRxiv metadata.
@@ -604,40 +605,12 @@ impl LitSource {
     pub const ALL: [LitSource; 3] = [LitSource::Alphaxiv, LitSource::Openalex, LitSource::Biorxiv];
 }
 
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-#[value(rename_all = "lower")]
-pub enum LitPriority {
-    /// Balance topical relevance with votes and freshness.
-    Default,
-    /// Favor the newest topically relevant work.
-    Recency,
-    /// Let older, foundational work rank strongly.
-    Historical,
-    /// Give alphaXiv community votes the dominant weight.
-    Popular,
-}
-
-impl LitPriority {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            LitPriority::Default => "default",
-            LitPriority::Recency => "recency",
-            LitPriority::Historical => "historical",
-            LitPriority::Popular => "popular",
-        }
-    }
-}
-
 #[derive(Args, Debug)]
 pub struct LitArgs {
-    /// The research question used for semantic search.
-    #[arg(value_name = "QUESTION")]
+    /// Full-text search query.
     pub query: String,
-    /// Exact keyword or phrase for full-text search. Repeat for multiple terms.
-    #[arg(long = "keyword", value_name = "TERM")]
-    pub keywords: Vec<String>,
-    /// Max candidates per retrieval strategy (default 15 for alphaXiv, 5 otherwise).
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    /// Max results (default 5).
+    #[arg(long)]
     pub limit: Option<u32>,
     /// Inclusive publication-date lower bound for alphaXiv (YYYY-MM-DD).
     /// Omitted alphaXiv searches default to the past three months.
@@ -646,9 +619,6 @@ pub struct LitArgs {
     /// Inclusive publication-date upper bound for alphaXiv (YYYY-MM-DD).
     #[arg(long, value_name = "YYYY-MM-DD")]
     pub published_before: Option<String>,
-    /// How alphaXiv should rank candidates after topical relevance.
-    #[arg(long, value_enum)]
-    pub prioritize: Option<LitPriority>,
     /// Corpus to search. Omitted = the first source enabled in Settings
     /// (alphaxiv unless it's disabled).
     #[arg(long, value_enum)]
@@ -925,12 +895,6 @@ mod cli_tests {
             "2024-01-01",
             "--published-before",
             "2024-12-31",
-            "--keyword",
-            "attention",
-            "--keyword",
-            "memory",
-            "--prioritize",
-            "historical",
         ])
         .expect("literature date bounds should parse");
         let Some(Command::Lit(args)) = cli.command else {
@@ -939,8 +903,6 @@ mod cli_tests {
 
         assert_eq!(args.published_after.as_deref(), Some("2024-01-01"));
         assert_eq!(args.published_before.as_deref(), Some("2024-12-31"));
-        assert_eq!(args.keywords, ["attention", "memory"]);
-        assert_eq!(args.prioritize, Some(LitPriority::Historical));
     }
 
     #[test]
