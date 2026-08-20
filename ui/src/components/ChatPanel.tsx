@@ -23,7 +23,6 @@ import {
   Package,
   Pencil,
   Plus,
-  RotateCcw,
   Search,
   SlidersHorizontal,
   SquareTerminal,
@@ -2808,8 +2807,8 @@ const FORK_BUTTON_CLASS_NAME = [
   "[&:disabled:hover]:bg-transparent [&:disabled:hover]:text-subtext",
 ].join(" ");
 
-/** The pager stays visible once a turn has more than one fork — hiding it would
- * leave no sign that the other replies exist. */
+/** The pager stays visible once a prompt has more than one version — hiding it
+ * would leave no sign that the other versions exist. */
 function ForkControls({
   count,
   index,
@@ -2817,10 +2816,8 @@ function ForkControls({
   nextId,
   onSelect,
   pagerDisabled,
-  actionLabel,
-  icon,
-  onAction,
-  disabled,
+  onEdit,
+  editDisabled,
 }: {
   count: number;
   index: number;
@@ -2828,10 +2825,8 @@ function ForkControls({
   nextId?: string;
   onSelect: (leafId: string) => void;
   pagerDisabled: boolean;
-  actionLabel: string;
-  icon: React.ReactNode;
-  onAction: () => void;
-  disabled: boolean;
+  onEdit: () => void;
+  editDisabled: boolean;
 }) {
   const many = count > 1;
   return (
@@ -2867,12 +2862,12 @@ function ForkControls({
       )}
       <button
         className={FORK_BUTTON_CLASS_NAME}
-        title={actionLabel}
-        aria-label={actionLabel}
-        disabled={disabled}
-        onClick={onAction}
+        title="Edit and re-send"
+        aria-label="Edit and re-send"
+        disabled={editDisabled}
+        onClick={onEdit}
       >
-        {icon}
+        <Pencil size={13} />
       </button>
     </div>
   );
@@ -2917,16 +2912,16 @@ const Message = memo(function Message({
   /** Known slash-skills, for rendering a leading `/name` as a command chip. */
   skills?: SkillInfo[];
   predictTextTail?: boolean;
-  /** Set only on the one message of a turn that carries its fork controls. */
+  /** Set only on a user message, the one bearer of the fork controls. */
   forkCount?: number;
   forkIndex?: number;
   forkPrevId?: string;
   forkNextId?: string;
   forkDisabled: boolean;
   /** Paging between forks is a read-only pointer move, so it stays available
-   * when re-sampling does not (an unavailable harness still has replies to read). */
+   * when editing does not (an unavailable harness still has branches to read). */
   branchDisabled: boolean;
-  onFork: (messageId: string, text?: string) => void;
+  onFork: (messageId: string, text: string) => void;
   onSelectFork: (leafId: string) => void;
 }) {
   // Editing re-asks as a new fork rather than rewriting history, so the original
@@ -3039,17 +3034,15 @@ const Message = memo(function Message({
             nextId={forkNextId}
             onSelect={onSelectFork}
             pagerDisabled={branchDisabled}
-            actionLabel="Edit and re-send"
-            icon={<Pencil size={13} />}
-            onAction={() => setEditDraft(text)}
-            disabled={forkDisabled}
+            onEdit={() => setEditDraft(text)}
+            editDisabled={forkDisabled}
           />
         )}
       </div>
     );
   }
   return (
-    <div className="msg-assistant group/turn text-lg leading-[1.62] text-text min-w-0">
+    <div className="msg-assistant text-lg leading-[1.62] text-text min-w-0">
       {renderParts(message.parts, {
         activePermissionId,
         pendingTailToolId,
@@ -3063,20 +3056,6 @@ const Message = memo(function Message({
         onOpenSubagent,
         predictTextTail,
       })}
-      {forkCount !== undefined && (
-        <ForkControls
-          count={forkCount}
-          index={forkIndex}
-          prevId={forkPrevId}
-          nextId={forkNextId}
-          onSelect={onSelectFork}
-          pagerDisabled={branchDisabled}
-          actionLabel="Try another response"
-          icon={<RotateCcw size={13} />}
-          onAction={() => onFork(message.id)}
-          disabled={forkDisabled}
-        />
-      )}
     </div>
   );
 });
@@ -3534,9 +3513,9 @@ const Transcript = memo(function Transcript({
   messages: ChatMessage[];
   /** Every branch, for counting the forks of each turn. */
   allMessages: ChatMessage[];
-  /** False greys out the re-sample controls (busy turn, harness not ready). */
+  /** False greys out the edit control (busy turn, harness not ready). */
   canFork: boolean;
-  onFork: (messageId: string, text?: string) => void;
+  onFork: (messageId: string, text: string) => void;
   onSelectFork: (leafId: string) => void;
   busy: boolean;
   onOpenFile?: OpenTranscriptFile;
@@ -3554,15 +3533,10 @@ const Transcript = memo(function Transcript({
     () => messages.filter((message) => messageHasVisibleContent(message, activePermissionId)),
     [messages, activePermissionId],
   );
-  // A trailing local-only bubble is not part of the reply, so it must not take
-  // the controls off the reply above it.
+  // forkPositions indexes only non-local ids, so a local bearer would page as 0/1.
   const positions = useMemo(() => {
-    const persisted = visibleMessages.filter((m) => !m.id.startsWith(LOCAL_PREFIX));
-    const bearers = persisted.filter(
-      (message, i) =>
-        message.role === "user" ||
-        !persisted[i + 1] ||
-        persisted[i + 1].role === "user",
+    const bearers = visibleMessages.filter(
+      (m) => m.role === "user" && !m.id.startsWith(LOCAL_PREFIX),
     );
     return forkPositions(allMessages, messages, bearers, (id) => id.startsWith(LOCAL_PREFIX));
   }, [messages, visibleMessages, allMessages]);
@@ -5032,7 +5006,7 @@ export function ChatPanel({
   }
 
   const forkTurn = useCallback(
-    (messageId: string, text?: string) => {
+    (messageId: string, text: string) => {
       if (!activeId || busy || !activeHarness?.agentReady) return;
       const sid = activeId;
       dispatch({ type: "busy", sessionId: sid, busy: true });
@@ -5040,7 +5014,7 @@ export function ChatPanel({
       void queueSessionMutation(() => forkChatTurn(sid, messageId, text)).catch((err) => {
         dispatch({ type: "busy", sessionId: sid, busy: false });
         const detail = err instanceof Error ? err.message : String(err);
-        dispatch({ type: "localError", sessionId: sid, text: `Could not re-sample: ${detail}` });
+        dispatch({ type: "localError", sessionId: sid, text: `Could not re-send: ${detail}` });
       });
     },
     [activeId, busy, activeHarness?.agentReady, queueSessionMutation],
