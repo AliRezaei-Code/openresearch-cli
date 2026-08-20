@@ -79,7 +79,7 @@ import {
 } from "../api";
 import { activePath, forkPositions } from "../transcriptTree";
 import { onChatEvent } from "../events";
-import { orxArgsMatch, orxArgv, unwrapShellBody } from "../orxCommand";
+import { orxArgsMatch, orxArgv, shellWords, unwrapShellBody } from "../orxCommand";
 import { LitSourceLogo, parseOrxLit, paperUrl } from "./LitSourceLogo";
 import { LitSourcesList } from "./LitSourcesPicker";
 import { Md } from "./Md";
@@ -1070,42 +1070,6 @@ function stripHeredocBodies(command: string): string {
   return kept.join("\n");
 }
 
-function shellWords(input: string): string[] {
-  const words: string[] = [];
-  let word = "";
-  let quote: "\"" | "'" | null = null;
-  let escaped = false;
-  const push = () => {
-    if (word) words.push(word);
-    word = "";
-  };
-
-  for (const char of input) {
-    if (escaped) {
-      word += char;
-      escaped = false;
-      continue;
-    }
-    if (char === "\\" && quote !== "'") {
-      escaped = true;
-      continue;
-    }
-    if (quote) {
-      if (char === quote) quote = null;
-      else word += char;
-      continue;
-    }
-    if (char === "\"" || char === "'") {
-      quote = char;
-      continue;
-    }
-    if (/\s/.test(char)) push();
-    else word += char;
-  }
-  push();
-  return words;
-}
-
 function validReadTarget(value: string | undefined): string | null {
   const target = value?.replace(/[)'\"]+$/, "");
   if (!target || target === "-" || /^\d+$/.test(target) || /[$`]/.test(target)) return null;
@@ -1372,8 +1336,7 @@ function orxCommandSegments(command: string, args: string): ShellCommandSegment[
 }
 
 function commandInvokesOrx(command: string, args: string): boolean {
-  if (orxCommandSegments(command, args).length > 0) return true;
-  return new RegExp(`(?:^|[\\s($;])orx\\s+${args}\\b`, "i").test(command);
+  return orxCommandSegments(command, args).length > 0;
 }
 
 function spawnedSessionIds(output: string | undefined): string[] {
@@ -1629,9 +1592,12 @@ function toolActivity(part: ChatPart): ToolActivity {
       const shellInvocations = shellSegments.map((segment) => shellInvocation(segment.raw));
       const readsExperimentStatus = commandInvokesOrx(command, "exp\\s+status");
       const readsExperimentNotes = commandInvokesOrx(command, "exp\\s+desc");
-      const updatesExperimentNotes = orxCommandSegments(command, "exp\\s+desc").some((segment) =>
-        /(?:^|\s)--(?:set(?:=|\s)|stdin\b)/.test(segment.raw),
-      );
+      const updatesExperimentNotes = orxCommandSegments(command, "exp\\s+desc").some((segment) => {
+        const argv = orxArgv(segment.raw) ?? [];
+        return argv.some(
+          (token) => token === "--set" || token.startsWith("--set=") || token === "--stdin",
+        );
+      });
       const notesLabel = updatesExperimentNotes ? "Updated experiment notes" : "Read experiment notes";
       const combinedLabel = updatesExperimentNotes
         ? "Checked experiment status and updated notes"

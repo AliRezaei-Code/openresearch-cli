@@ -112,10 +112,13 @@ third or fourth loop, run it in shallow mode: initial searches only, with zero
 follow-up rounds. This degradation is a backstop, not permission to plan extra
 loops. Refuse a fifth loop and answer from the papers already found.
 
-After retrieval is complete, read the 3–5 most load-bearing candidates with
-`orx paper <paperId>` (or the number the user requested) and synthesize the
-answer. Do not narrow to 3–5 papers before the retrieval loop has produced its
-ranked 5–15 candidate set.
+For a set-of-papers request such as “find papers,” “top papers,” “what is out
+there,” or “what should I read,” return the ranked discovery results and stop.
+Depth on individual papers is not part of the discovery loop. When the request
+instead needs claim-level synthesis, methodological details, or comparison,
+finish retrieval first and then read the 3–5 most load-bearing candidates with
+`orx paper <paperId>` (or the number the user requested). Do not narrow to 3–5
+papers before retrieval has produced its ranked 5–15 candidate set.
 
 In the final answer, link every alphaXiv/arXiv paper title or paper ID to
 `https://www.alphaxiv.org/abs/<versionless-paperId>`. Never return an
@@ -126,14 +129,16 @@ papers from those respective sources.
 
 `orx paper` auto-detects an arXiv id/URL, bioRxiv DOI, other DOI, or OpenAlex
 `W…` id. For alphaXiv it returns a compact structured report; use `--full` only
-when that report omits a needed detail. If the report is not generated yet, the
-command tells you to retry with `--full`; if extracted text is unavailable, use
-the alphaXiv paper link it returns.
+when you explicitly need raw text even if a report exists. Without `--full`, a
+missing report automatically falls back to extracted full text in the same
+command. `--full` skips the report entirely rather than acting as a superset of
+the default. If extracted text is also unavailable, use the alphaXiv paper link
+it returns.
 
-When alphaXiv has an associated repository, `orx paper` prints `GitHub: <url>`
-first. It is the most-starred associated repository and can be a framework
-rather than the paper's own code, so sanity-check it before treating it as the
-implementation.
+`orx paper` prints the alphaXiv link before the content. When alphaXiv has an
+associated repository, it then prints `GitHub: <url>`. This is the most-starred
+associated repository and can be a framework rather than the paper's own code,
+so sanity-check it before treating it as the implementation.
 
 For non-arXiv or biomedical coverage, `orx lit --source openalex` and `orx lit
 --source biorxiv` remain supplemental corpus searches. All discovery and paper

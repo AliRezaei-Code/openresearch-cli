@@ -18,14 +18,24 @@ test("quoted Codex argv is tokenized as a normal command", () => {
   assert.equal(orxArgsMatch('"orx" "runs" "d81084a9-589e-4c8f-9384-2c0003517216"', "runs?"), true);
   assert.equal(orxArgsMatch('which "orx" "projects"', "projects"), false);
   assert.equal(orxArgsMatch('ORX_DATA_DIR=/tmp "orx" "projects"', "projects"), true);
+  assert.equal(orxArgsMatch('orx lit "exp status"', "exp\\s+status"), false);
+  assert.deepEqual(shellWords('orx lit ""'), ["orx", "lit", ""]);
   assert.deepEqual(orxArgv('"orx" "logs" "d81084a9-589e-4c8f-9384-2c0003517216"'), [
     "logs",
     "d81084a9-589e-4c8f-9384-2c0003517216",
+  ]);
+  assert.deepEqual(orxArgv('"orx" "exp" "desc" "experiment-id" "--set" "note"'), [
+    "exp",
+    "desc",
+    "experiment-id",
+    "--set",
+    "note",
   ]);
 });
 
 test("outer shell quotes do not consume quoted argv", () => {
   assert.equal(unwrapShellBody("'orx projects'"), "orx projects");
+  assert.equal(unwrapShellBody('"orx" "projects"'), '"orx" "projects"');
   const command = unwrapShellBody('"orx" "discover" "keyword" "biology agent benchmark"');
   assert.deepEqual(parseOrxLit(command), {
     kind: "discover",

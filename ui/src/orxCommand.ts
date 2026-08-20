@@ -108,7 +108,11 @@ export function orxArgv(command: string): string[] | null {
 /** Match an `orx` argv prefix regardless of whether Codex quoted every token. */
 export function orxArgsMatch(command: string, args: string): boolean {
   const argv = orxArgv(command);
-  return argv !== null && new RegExp(`^(?:${args})(?:\\s|$)`, "i").test(argv.join(" "));
+  if (argv === null) return false;
+  const patterns = args.split("\\s+");
+  return patterns.every(
+    (pattern, index) => argv[index] !== undefined && new RegExp(`^(?:${pattern})$`, "i").test(argv[index]),
+  );
 }
 
 /** Parse the first literature command from a shell segment. */
@@ -122,7 +126,6 @@ export function parseOrxLit(command: string): OrxLitCall | null {
   const positionals: string[] = [];
   const valueFlags = new Set([
     "--limit",
-    "--source",
     "--published-after",
     "--published-before",
     "--prioritize",
@@ -138,7 +141,7 @@ export function parseOrxLit(command: string): OrxLitCall | null {
       continue;
     }
     if (valueFlags.has(token)) {
-      index++;
+      if (!argv[index + 1]?.startsWith("--")) index++;
       continue;
     }
     if (token.startsWith("--")) continue;

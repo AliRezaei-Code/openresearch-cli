@@ -104,7 +104,7 @@ Use before any web search for academic/research queries (paper, author, blog, mo
 |---|---|
 | `orx discover keyword "<query>"` | Call the alphaXiv full-text retrieval primitive with match snippets. |
 | `orx discover embedding "<query>"` | Call the alphaXiv semantic retrieval primitive. The main agent calls both, ranks candidates, and decides focused follow-ups; see `orx-lit`. |
-| `orx paper <id\|url> [--source ...] [--full]` | Fetch a paper: alphaXiv report/`--full` text, or OpenAlex/bioRxiv metadata+abstract. Source auto-detected from the id. |
+| `orx paper <id\|url> [--source ...] [--full]` | Fetch a paper: alphaXiv report with automatic full-text fallback (`--full` forces raw text), or OpenAlex/bioRxiv metadata+abstract. Source auto-detected from the id. |
 | `orx lit "<query>" --source openalex\|biorxiv` | Supplemental non-ArXiv corpus search. It is not the alphaXiv orchestration loop. |
 
 ### Meta

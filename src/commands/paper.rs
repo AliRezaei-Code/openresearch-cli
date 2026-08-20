@@ -3,8 +3,9 @@
 //! Public endpoints, no token required. The source is auto-detected from the id
 //! (override with `--source`):
 //!   - **alphaXiv** (arXiv id / URL): a machine-readable report (default, ≈10 KB)
-//!     or the full extracted text (`--full`). Markdown to stdout. If alphaXiv has
-//!     a GitHub repo linked, a `GitHub: <url>` line is printed first.
+//!     with automatic fallback to extracted text, or raw text directly (`--full`).
+//!     Markdown to stdout. If alphaXiv has a GitHub repo linked, a `GitHub: <url>`
+//!     line is printed before the body.
 //!   - **bioRxiv** (`10.1101/…` DOI): title/authors/date + abstract, with links
 //!     to the DOI and full-text PDF.
 //!   - **OpenAlex** (`W…` id or any other DOI): title/authors/date/citations +
@@ -47,17 +48,22 @@ async fn run_alphaxiv(args: &crate::PaperArgs) -> Result<()> {
     let paper_url = alphaxiv_paper_url(&id);
     let kind = if args.full { "abs" } else { "overview" };
 
-    let (md, github) = tokio::join!(fetch_paper_markdown(kind, &id), fetch_paper_github(&id));
+    let (primary, github) = tokio::join!(fetch_paper_markdown(kind, &id), fetch_paper_github(&id));
+    let primary = primary?;
+    // Fetch full text only after a report miss so the common path does not double API traffic.
+    let md = match fallback_markdown_kind(args.full, primary.is_some()) {
+        Some(fallback_kind) => fetch_paper_markdown(fallback_kind, &id).await?,
+        None => primary,
+    };
 
-    // Best-effort: the GitHub link is useful context, never a reason to fail.
-    println!("alphaXiv: {paper_url}");
-    if let Ok(Some(url)) = github {
-        println!("GitHub: {}", url);
-    }
-    println!();
-
-    match md? {
+    match md {
         Some(md) => {
+            println!("alphaXiv: {paper_url}");
+            // Best-effort: the GitHub link is useful context, never a reason to fail.
+            if let Ok(Some(url)) = github {
+                println!("GitHub: {}", url);
+            }
+            println!();
             println!("{}", md);
             Ok(())
         }
@@ -65,8 +71,15 @@ async fn run_alphaxiv(args: &crate::PaperArgs) -> Result<()> {
             "No full text extracted for {id} yet. Open the paper on alphaXiv: {paper_url}"
         )),
         None => Err(anyhow!(
-            "No report generated for {id} yet. Try `orx paper {id} --full` for the raw extracted text."
+            "No report or extracted text available for {id} yet. Open the paper on alphaXiv: {paper_url}"
         )),
+    }
+}
+
+fn fallback_markdown_kind(full: bool, primary_found: bool) -> Option<&'static str> {
+    match (full, primary_found) {
+        (false, false) => Some("abs"),
+        _ => None,
     }
 }
 
@@ -281,7 +294,7 @@ fn alphaxiv_paper_url(id: &str) -> String {
 mod tests {
     use super::{
         alphaxiv_paper_url, biorxiv_doi, detect_source, ensure_source_enabled, extract_doi,
-        parse_paper_id,
+        fallback_markdown_kind, parse_paper_id,
     };
     use crate::LitSource;
 
@@ -320,6 +333,13 @@ mod tests {
             alphaxiv_paper_url("2401.12345"),
             "https://www.alphaxiv.org/abs/2401.12345"
         );
+    }
+
+    #[test]
+    fn falls_back_only_when_the_default_report_is_missing() {
+        assert_eq!(fallback_markdown_kind(false, false), Some("abs"));
+        assert_eq!(fallback_markdown_kind(false, true), None);
+        assert_eq!(fallback_markdown_kind(true, false), None);
     }
 
     #[test]
