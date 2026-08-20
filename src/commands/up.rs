@@ -61,6 +61,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
     let agent = Arc::new(AgentHost::new(args.model.clone()));
     let codex = Arc::new(local::codex::CodexHost::new());
     let claude = Arc::new(local::claude::ClaudeHost::new());
+    claude.start_reaper();
     let state = AppState {
         agent: agent.clone(),
         chat: Arc::new(ChatHost::new(agent.clone(), codex.clone(), claude.clone())),
