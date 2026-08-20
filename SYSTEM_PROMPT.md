@@ -120,21 +120,31 @@ creates a **new top-level session** in this project — visible to the user in
 the sidebar, on its own worktree, with its own transcript — and hands it the
 task. This chat is resumed with the helper's closing reply when it finishes
 (pass `--no-wake` if you don't need to hear back). Use `--stdin` for a brief
-too long to fit on a command line.
+too long for a command line. You may have {max_spawns} helpers in flight at once, and a
+session that was itself spawned cannot spawn its own — if `orx agent spawn`
+tells you that, do the task here instead.
 
-Delegate when a task is genuinely separable and you'd otherwise serialize it:
-a literature sweep next to an implementation, an independent second attempt at
-a hard node, a long refactor while you keep the research loop moving. Do the
-work yourself when it's a step in the loop you're already running — the round
-trip costs more than the step.
+Delegate work that is genuinely **separate from the node you are on**: a
+literature sweep, a survey of an unfamiliar codebase, a write-up of results you
+already have. Do it yourself when it is a step in the loop you are running —
+the round trip costs more than the step.
+
+Two rules make a helper safe to start:
+
+- **Never hand it a branch this session holds.** One branch, one owner (above)
+  applies across spawned sessions too, and a frozen node may not be edited by
+  anyone (cardinal rule 1). If the helper needs to change code, tell it to
+  create its own node with `orx create-experiment {id} --parent <expId>` and
+  work there.
+- **Say whether it may spend compute.** The helper reads this same playbook, so
+  it will otherwise assume the full research loop is open to it and may launch
+  paid runs you never see. Write either "do not run `orx exp run`" or the exact
+  budget it may use.
 
 The helper starts with an **empty transcript and cannot see this conversation**,
-so the task text has to stand alone: name the project, the experiment id, the
-branch, the metric, and what "done" looks like. Its edits land in its own
-worktree, and the wake-up tells you where; nothing merges into yours by itself.
-
-Spawned agents cannot spawn further agents — the delegation stops one level
-down, with you.
+so the brief must stand alone: name the project, the experiment id, the branch,
+the metric, and what "done" looks like. Its commits land on its own branch in
+its own worktree; the wake-up names where. Nothing merges into yours by itself.
 
 ## Cardinal rules
 

@@ -276,6 +276,10 @@ fn playbook_md(project: &LocalProject) -> String {
         .replace("{run_guidance}", run_guidance)
         .replace("{compute_guidance}", compute_guidance)
         .replace("{skills_scope}", skills_scope)
+        .replace(
+            "{max_spawns}",
+            &crate::commands::agent::MAX_LIVE_SPAWNS.to_string(),
+        )
 }
 
 /// Keep the files we drop into the checkout out of `git status` / accidental
@@ -688,26 +692,22 @@ mod tests {
     #[test]
     fn playbook_has_no_unresolved_placeholders() {
         let md = sample_playbook();
-        // Every current token must be substituted — a typo'd or newly added
-        // token that playbook_md doesn't know about fails here.
-        for token in [
-            "{name}",
-            "{id}",
-            "{repo}",
-            "{baseline}",
-            "{paper_line}",
-            "{compute_bullet}",
-            "{artifacts}",
-            "{skills_list}",
-            "{launch_step}",
-            "{backends_intro}",
-            "{run_invocation}",
-            "{run_guidance}",
-            "{compute_guidance}",
-            "{skills_scope}",
-        ] {
-            assert!(!md.contains(token), "unresolved placeholder {token}");
-        }
+        // Scanned, not listed: a NEWLY ADDED token playbook_md doesn't know
+        // about is exactly the case a hardcoded list cannot catch, and the
+        // agent would read the literal `{token}` as instruction.
+        let leftover: Vec<&str> = md
+            .lines()
+            .flat_map(|line| {
+                line.match_indices('{').filter_map(move |(i, _)| {
+                    let rest = &line[i + 1..];
+                    let end = rest.find('}')?;
+                    let token = &rest[..end];
+                    (!token.is_empty() && token.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+                        .then_some(&line[i..=i + end + 1])
+                })
+            })
+            .collect();
+        assert!(leftover.is_empty(), "unresolved placeholders: {leftover:?}");
         for retired in ["{files}", "{memory}"] {
             assert!(!md.contains(retired), "retired placeholder {retired}");
         }

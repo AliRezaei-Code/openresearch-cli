@@ -1610,6 +1610,14 @@ function toolActivity(part: ChatPart): ToolActivity {
         return { kind: litCall.kind === "lit" ? "search" : "read", label, litCall };
       }
 
+      if (commandInvokesOrx(command, "agent\\s+spawn")) {
+        return {
+          kind: "agent",
+          label: "Delegated a task to a new agent",
+          spawnedSessionIds: spawnedSessionIds(toolOutput),
+        };
+      }
+
       const shellSegments = shellCommandSegments(command);
       const shellInvocations = shellSegments.map((segment) => shellInvocation(segment.raw));
       const readsExperimentStatus = commandInvokesOrx(command, "exp\\s+status");
@@ -1621,13 +1629,6 @@ function toolActivity(part: ChatPart): ToolActivity {
       const combinedLabel = updatesExperimentNotes
         ? "Checked experiment status and updated notes"
         : "Reviewed experiment status and notes";
-      if (commandInvokesOrx(command, "agent\\s+spawn")) {
-        return {
-          kind: "agent",
-          label: "Delegated a task to a new agent",
-          spawnedSessionIds: spawnedSessionIds(toolOutput),
-        };
-      }
       if (commandInvokesOrx(command, "logs")) {
         const runIds = commandRunIds(command, toolOutput, resourceRunIds, legacyTargetIds);
         const label = runIds.length === 1 ? "Reviewed run log" : "Reviewed run logs";
@@ -2025,10 +2026,15 @@ function ToolActivityLabel({
   if (activity.spawnedSessionIds?.length && onOpenSpawnedSession) {
     const sessionIds = activity.spawnedSessionIds;
     const single = sessionIds.length === 1;
+    const visibleSessionIds = sessionIds.slice(0, 3);
+    const hiddenSessions = sessionIds.slice(visibleSessionIds.length).map((sessionId, index) => ({
+      id: sessionId,
+      label: `agent ${visibleSessionIds.length + index + 1}`,
+    }));
     return (
       <>
         {single ? "Delegated a task to " : "Delegated tasks to "}
-        {sessionIds.map((sessionId, index) => (
+        {visibleSessionIds.map((sessionId, index) => (
           <span key={sessionId}>
             {index > 0 && ", "}
             <button
@@ -2044,6 +2050,12 @@ function ToolActivityLabel({
             </button>
           </span>
         ))}
+        {hiddenSessions.length > 0 && (
+          <>
+            {", "}
+            <ToolTargetOverflow items={hiddenSessions} onOpen={onOpenSpawnedSession} targetType="agent sessions" />
+          </>
+        )}
       </>
     );
   }
@@ -2173,6 +2185,7 @@ function activityInProgress(activity: ToolActivity): ToolActivity {
     [/^Checked /, "Checking "],
     [/^Built /, "Building "],
     [/^Cancelled /, "Cancelling "],
+    [/^Delegated /, "Delegating "],
   ];
   let label = activity.label;
   for (const [pattern, replacement] of replacements) {
@@ -2198,6 +2211,7 @@ function permissionActivityLabel(tool: string | undefined, input: Record<string,
     [/^Updated /, "Update "],
     [/^Created /, "Create "],
     [/^Deleted /, "Delete "],
+    [/^Delegated /, "Delegate "],
     [/^Ran /, "Run "],
     [/^Started /, "Start "],
     [/^Waited /, "Wait "],
@@ -2326,6 +2340,7 @@ function squashableToolPartKey(part: ChatPart): string | null {
     activity.litCall?.kind === "paper" ? activity.litCall.id ?? null : null,
     activity.runIds ?? null,
     activity.experimentIds ?? null,
+    activity.spawnedSessionIds ?? null,
   ]);
 }
 
@@ -3297,7 +3312,6 @@ export function SubagentTranscript({
   spawn,
   onOpenFile,
   onOpenRun,
-  onOpenSpawnedSession,
   runExperimentName,
   onOpenExperiment,
   experimentName,
@@ -3306,7 +3320,6 @@ export function SubagentTranscript({
   spawn: ChatPart;
   onOpenFile?: OpenTranscriptFile;
   onOpenRun?: (runId: string) => void;
-  onOpenSpawnedSession?: (sessionId: string) => void;
   runExperimentName?: (runId: string) => string;
   onOpenExperiment?: (experimentId: string) => void;
   experimentName?: (experimentId: string) => string;
@@ -3323,7 +3336,6 @@ export function SubagentTranscript({
   const rendered = renderParts(parts, {
     onOpenFile,
     onOpenRun,
-    onOpenSpawnedSession,
     runExperimentName,
     onOpenExperiment,
     experimentName,
@@ -3845,7 +3857,7 @@ function SessionRow({
         )}
       </span>
       {session.parentSessionId && !editing && (
-        <Users className="session-spawned text-muted shrink-0" size={12} aria-label="Spawned by another agent" />
+        <Users className="text-muted shrink-0" size={12} aria-hidden />
       )}
       {editing ? (
         <input
@@ -5270,11 +5282,12 @@ export function ChatPanel({
   }, [onSelectMainView]);
 
   /** Follow a spawn card into the session it started. Spawned sessions are
-   * ordinary top-level sessions, so this is just a switch in the rail — but
-   * the filter has to come off it, or an archived target isn't listed. */
+   * ordinary top-level sessions, so this is just a switch in the rail — via
+   * "All", because selecting a row the active filter hides would leave the
+   * thread keyed to a session with no row (see `setArchived`). */
   const openSpawnedSession = useCallback(
     (sessionId: string) => {
-      setSessionFilter("active");
+      setSessionFilter("all");
       setActiveId(sessionId);
       onSelectMainView("chat");
     },

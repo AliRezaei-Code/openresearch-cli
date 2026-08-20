@@ -2,21 +2,28 @@
 //!
 //!   orx agent spawn "<task>"   start a helper agent on its own top-level session
 //!
-//! Only meaningful inside a local `orx up` agent session, which exports
-//! `ORX_CHAT_SESSION_ID` (see `local::chat::set_chat_session_env`) — that env
-//! var is how this subprocess knows which session is doing the spawning.
+//! Only meaningful inside a local `orx up` agent session. `ORX_LOCAL_SESSION`
+//! marks the process as one; `ORX_CHAT_SESSION_ID` names the session doing the
+//! spawning (see `local::chat::set_chat_session_env`). Both are needed — the
+//! cloud opencode plugin exports the session id too, for run attribution.
 //!
 //! This command only writes the child's session row and a `chat_spawns` record;
 //! it never runs the child itself. The resident `orx up` picks the record up,
-//! starts the child's first turn, and (unless `--no-wake`) wakes the parent when
-//! the child is done. Same store-and-watcher split as `orx exp wake`, and for
+//! starts the helper's first turn, and (unless `--no-wake`) wakes the parent
+//! when the helper is done. Same store-and-watcher split as `orx exp wake`, and for
 //! the same reason: the CLI is a short-lived subprocess with no harness of its
 //! own to run a turn on.
 
 use std::io::Read;
 
 use crate::error::{anyhow, Result};
+use crate::local::harness::PermissionMode;
 use crate::store::{now_ms, ChatSpawn, ChatSpawnState, Store, StoredChatSession};
+
+/// Helpers one session may have in flight at once. Depth is capped at one level
+/// below; without a breadth cap a parent that loops turns a single request into
+/// as many paid sessions and git worktrees as it cares to ask for.
+pub(crate) const MAX_LIVE_SPAWNS: i64 = 5;
 use crate::AgentCommand;
 
 pub async fn run(args: crate::AgentArgs) -> Result<()> {
@@ -61,6 +68,26 @@ fn non_empty(text: String) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
+/// Why this session may not spawn right now, if it may not. Depth and breadth
+/// are the two ways one request becomes an unbounded tree of paid sessions, and
+/// nothing downstream of here bounds either.
+fn spawn_refusal(parent: &StoredChatSession, live: i64) -> Option<String> {
+    if parent.parent_session_id.is_some() {
+        return Some(
+            "This session was itself spawned by another agent, and spawned agents cannot spawn \
+             their own. Do the task here, or report back so the session that spawned you can \
+             delegate it."
+                .to_string(),
+        );
+    }
+    (live >= MAX_LIVE_SPAWNS).then(|| {
+        format!(
+            "You already have {live} agents in flight, the most one session may run at once. \
+             Wait for one to report back before spawning another."
+        )
+    })
+}
+
 fn spawn(
     store: &Store,
     task: Option<String>,
@@ -68,7 +95,7 @@ fn spawn(
     title: Option<String>,
     harness: Option<String>,
     model: Option<String>,
-    notify_parent: bool,
+    wake_parent: bool,
 ) -> Result<()> {
     if !crate::local::chat::in_local_session() {
         return Err(anyhow!(
@@ -80,23 +107,24 @@ fn spawn(
     let parent = store
         .get_chat_session(&parent_id)?
         .ok_or_else(|| anyhow!("The current chat session no longer exists."))?;
-    // One level only. A helper that can spawn helpers turns a single request
-    // into an unbounded tree of paid sessions, and nothing downstream bounds it.
-    if parent.parent_session_id.is_some() {
-        return Err(anyhow!(
-            "This session was itself spawned by another agent, and spawned agents cannot spawn \
-             their own. Do the task here, or report back so the session that spawned you can \
-             delegate it."
-        ));
-    }
     let prompt = task_text(task, stdin)?;
+    if let Some(refusal) = spawn_refusal(&parent, store.count_live_chat_spawns(&parent_id)?) {
+        return Err(anyhow!(refusal));
+    }
     let harness = harness.unwrap_or_else(|| parent.harness.clone());
     if !crate::local::harness::is_chat_harness(&harness) {
-        return Err(anyhow!("Unknown harness: {harness}"));
+        return Err(anyhow!(
+            "Unknown harness: {harness}. Valid harnesses are claude-code, codex, and opencode."
+        ));
     }
     // Settings only carry over when the child runs the same harness; a model or
     // permission-mode id from one CLI is meaningless to another.
     let inherits = harness == parent.harness;
+    // Claude activates Plan through its permission mode rather than the plan
+    // axis, so clearing `plan_mode` alone would still hand a planning parent's
+    // helper a mode that only ever produces a plan.
+    let plan_permission =
+        crate::local::harness::permission_id_for_mode(&harness, PermissionMode::Plan);
     let title = title
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
@@ -105,12 +133,16 @@ fn spawn(
         project_id: parent.project_id.clone(),
         harness,
         native_session_id: None,
-        title_source: title.as_ref().map(|_| "user".to_string()),
+        // "user" = explicitly chosen, so auto-titling leaves it alone.
+        title_source: title.is_some().then(|| "user".to_string()),
         title,
         model: model.or_else(|| inherits.then(|| parent.model.clone()).flatten()),
-        permission_mode: inherits.then(|| parent.permission_mode.clone()).flatten(),
-        // A helper agent is spawned to *do* the task, so it never starts gated
-        // behind Plan even when the parent is planning.
+        permission_mode: inherits
+            .then(|| parent.permission_mode.clone())
+            .flatten()
+            .filter(|mode| Some(mode) != plan_permission.as_ref()),
+        // A helper is spawned to *do* the task, so it never starts in Plan even
+        // when the parent is planning.
         plan_mode: false,
         plan_reset_pending: false,
         reasoning_level: inherits.then(|| parent.reasoning_level.clone()).flatten(),
@@ -122,25 +154,73 @@ fn spawn(
         created_at: now_ms(),
         updated_at: now_ms(),
     };
+    // One transaction: a session row without its spawn row is an empty session
+    // in the user's sidebar that nothing will ever start.
+    let tx = store.begin()?;
     store.create_chat_session(&session)?;
     store.create_chat_spawn(&ChatSpawn {
         session_id: session.id.clone(),
         parent_session_id: parent_id,
         prompt,
-        notify_parent,
+        wake_parent,
         state: ChatSpawnState::Pending,
+        finished_at: None,
     })?;
+    tx.commit()?;
     println!("Spawned agent session {}.", session.id);
     println!("It starts within a few seconds and works in its own git worktree.");
-    if notify_parent {
+    if wake_parent {
         println!("This chat will be resumed with its result when it finishes.");
+    } else {
+        println!("You will NOT be told when it finishes; check its session yourself.");
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::task_text;
+    use super::{spawn_refusal, task_text, MAX_LIVE_SPAWNS};
+    use crate::store::StoredChatSession;
+
+    fn parent(parent_session_id: Option<&str>) -> StoredChatSession {
+        StoredChatSession {
+            id: "chat_parent".into(),
+            project_id: "p1".into(),
+            harness: "codex".into(),
+            native_session_id: None,
+            title: None,
+            title_source: None,
+            model: None,
+            permission_mode: None,
+            plan_mode: false,
+            plan_reset_pending: false,
+            reasoning_level: None,
+            archived: false,
+            context_usage_json: None,
+            bootstrap_context: None,
+            active_leaf_id: None,
+            parent_session_id: parent_session_id.map(str::to_string),
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn a_spawned_session_may_not_spawn_its_own() {
+        let refusal = spawn_refusal(&parent(Some("chat_grandparent")), 0)
+            .expect("a spawned session must be refused");
+        assert!(refusal.contains("cannot spawn"), "{refusal}");
+        // Depth is refused regardless of how few helpers are in flight.
+        assert!(spawn_refusal(&parent(None), 0).is_none());
+    }
+
+    #[test]
+    fn one_session_may_only_run_so_many_helpers_at_once() {
+        assert!(spawn_refusal(&parent(None), MAX_LIVE_SPAWNS - 1).is_none());
+        let refusal =
+            spawn_refusal(&parent(None), MAX_LIVE_SPAWNS).expect("the cap must refuse one more");
+        assert!(refusal.contains("in flight"), "{refusal}");
+    }
 
     #[test]
     fn a_task_is_required_and_comes_from_one_place() {

@@ -2738,10 +2738,13 @@ impl ChatHost {
     /// Deliver a spawned helper's brief as the opening message of its session.
     /// Visible, unlike a wake-up: the brief *is* that transcript's starting
     /// point, and hiding it would leave the helper apparently working unbidden.
+    /// `record_brief` is false on a retry, where it is already in the
+    /// transcript — this persists the bubble before it can report a failure.
     async fn send_spawn_task(
         self: &Arc<Self>,
         session_id: &str,
         text: String,
+        record_brief: bool,
         guard: TurnGuard,
     ) -> Result<TurnSubmission> {
         self.send_message_showing(
@@ -2753,7 +2756,7 @@ impl ChatHost {
             TranscriptDisplay {
                 text: Some(text),
                 annotations: None,
-                record_user_message: true,
+                record_user_message: record_brief,
             },
             TurnOverrides::default(),
             TurnAttachments::Uploaded(Vec::new()),
@@ -3236,6 +3239,10 @@ impl ChatHost {
         self.cancel_pending_permissions(session_id);
         let session = if let Ok(store) = Store::open() {
             let _ = store.touch_chat_session(session_id);
+            // Stamps only a spawned helper's row; a no-op for every other
+            // session. Without it a crash mid-turn is indistinguishable from a
+            // completed one once the turn lease lapses.
+            let _ = store.mark_chat_spawn_finished(session_id);
             store.get_chat_session(session_id).ok().flatten()
         } else {
             None
@@ -4775,42 +4782,85 @@ async fn process_run_wakeups(
 
 // --- spawned agents -------------------------------------------------------------
 
-/// How much of a helper agent's closing reply rides back to the parent. The
-/// parent can open the child's session for the rest, so this only has to carry
-/// the answer, not the transcript.
+/// How much of a helper's closing reply, and of the brief echoed back with it,
+/// rides into the parent's context. Both are agent-authored and unbounded; the
+/// user can open the helper's session for the rest.
 const SPAWN_REPORT_LIMIT: usize = 4000;
+const SPAWN_BRIEF_LIMIT: usize = 500;
 
-/// The helper's own last words on the active branch — what the parent actually
-/// wants. Empty when it produced no text (interrupted, or tool calls only).
-fn spawn_report_reply(store: &Store, session_id: &str) -> Result<String> {
-    let messages = store.list_chat_messages(session_id)?;
-    let leaf = store
-        .get_chat_session(session_id)?
-        .and_then(|session| session.active_leaf_id);
-    let mut reply = active_path(&messages, leaf.as_deref())
-        .iter()
-        .rev()
-        .find(|m| m.role == "assistant")
-        .map(|m| serde_json::from_str::<Vec<WirePart>>(&m.parts_json).unwrap_or_default())
-        .unwrap_or_default()
-        .iter()
-        .filter(|part| part.kind == "text")
-        .filter_map(|part| part.text.as_deref())
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    if reply.chars().count() > SPAWN_REPORT_LIMIT {
-        reply = reply.chars().take(SPAWN_REPORT_LIMIT).collect::<String>();
-        reply.push_str("\n\n… (truncated — open the session for the rest)");
+/// Give up starting a helper after this many failed attempts, so a permanently
+/// failing spawn reports once instead of retrying every tick forever.
+const SPAWN_START_ATTEMPTS: i64 = 3;
+
+fn truncated(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
     }
-    if reply.is_empty() {
-        reply = "It ended its turn without a written reply.".to_string();
-    }
-    Ok(reply)
+    text.chars().take(limit).collect::<String>() + "… (truncated)"
 }
 
-fn spawn_report_text(store: &Store, spawn: &crate::store::ChatSpawn) -> Result<String> {
+/// What the helper left behind on the branch on screen.
+enum SpawnOutcome {
+    Reply(String),
+    Failed(String),
+    Silent,
+}
+
+/// Read the helper's closing words. Walks back from the tip rather than reading
+/// only the last assistant row: an answered prompt card rides its own
+/// text-less assistant message and would otherwise mask the real reply.
+fn spawn_outcome(store: &Store, session: &StoredChatSession) -> Result<SpawnOutcome> {
+    let messages = store.list_chat_messages(&session.id)?;
+    let path = active_path(&messages, session.active_leaf_id.as_deref());
+    let mut failure = None;
+    for message in path.iter().rev().filter(|m| m.role == "assistant") {
+        let parts: Vec<WirePart> = serde_json::from_str(&message.parts_json)?;
+        let text = parts
+            .iter()
+            .filter(|part| part.kind == "text")
+            .filter_map(|part| part.text.as_deref())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if !text.is_empty() {
+            return Ok(SpawnOutcome::Reply(truncated(&text, SPAWN_REPORT_LIMIT)));
+        }
+        // Keep the newest error, but keep looking: a harness that errors after
+        // answering should still hand the answer back.
+        if failure.is_none() {
+            failure = parts
+                .iter()
+                .find(|part| part.tool.as_deref() == Some("error"))
+                .and_then(|part| part.state.as_ref())
+                .and_then(|state| state.error.clone().or_else(|| state.output.clone()));
+        }
+    }
+    Ok(match failure {
+        Some(error) => SpawnOutcome::Failed(truncated(error.trim(), SPAWN_REPORT_LIMIT)),
+        None => SpawnOutcome::Silent,
+    })
+}
+
+/// Where the helper's work actually is. Branches are shared between worktrees,
+/// so the branch is the handoff; the path is only for reading it in place.
+fn spawn_workspace(store: &Store, session: &StoredChatSession) -> String {
+    let Ok(Some(project)) = store.get_local_project(&session.project_id) else {
+        return String::new();
+    };
+    let path = crate::local::git::existing_session_worktree_path(&project, &session.id);
+    format!(
+        "\n\nIts commits are on its own branch, in its own worktree at `{}` — `git branch -a` \
+         lists them. Nothing was merged into yours.",
+        path.display()
+    )
+}
+
+fn spawn_report_text(
+    store: &Store,
+    spawn: &crate::store::ChatSpawn,
+    interrupted: bool,
+) -> Result<String> {
     let child = store
         .get_chat_session(&spawn.session_id)?
         .ok_or_else(|| anyhow!("spawned session disappeared"))?;
@@ -4819,31 +4869,43 @@ fn spawn_report_text(store: &Store, spawn: &crate::store::ChatSpawn) -> Result<S
         .as_deref()
         .map(|title| format!(" (\"{title}\")"))
         .unwrap_or_default();
-    let worktree = store
-        .get_local_project(&child.project_id)?
-        .map(|project| {
-            crate::local::git::existing_session_worktree_path(&project, &child.id)
-                .to_string_lossy()
-                .into_owned()
-        })
-        .map(|path| {
-            format!(
-                "\n\nIts edits are in its own worktree at `{path}` — read them from there; \
-                 they are not in yours."
-            )
-        })
-        .unwrap_or_default();
+    let brief = truncated(spawn.prompt.trim(), SPAWN_BRIEF_LIMIT);
+    let (headline, closing) = match spawn_outcome(store, &child)? {
+        _ if interrupted => (
+            "was interrupted before it finished",
+            "Its session holds however far it got. Re-delegate it if you still need the task done."
+                .to_string(),
+        ),
+        SpawnOutcome::Reply(reply) => ("has finished", format!("Its closing reply:\n\n{reply}")),
+        SpawnOutcome::Failed(error) => (
+            "failed",
+            format!("It ended on an error and did NOT do the task:\n\n{error}"),
+        ),
+        SpawnOutcome::Silent => (
+            "has finished",
+            "It wrote no reply, so treat the task as unconfirmed and check its session."
+                .to_string(),
+        ),
+    };
     Ok(format!(
-        "[orx] The agent you spawned for `{}`{named} has finished.\n\nIt was asked to: {}\n\n\
-         Its closing reply:\n\n{}{worktree}",
+        "[orx] The agent you spawned for `{}`{named} {headline}.\n\nIt was asked to: {brief}\n\n\
+         {closing}{}",
         spawn.session_id,
-        spawn.prompt.trim(),
-        spawn_report_reply(store, &spawn.session_id)?,
+        spawn_workspace(store, &child),
     ))
 }
 
-/// Start the first turn of every freshly spawned agent, then report finished
-/// ones back to the parent that asked for them.
+fn spawn_start_failure_text(spawn: &crate::store::ChatSpawn) -> String {
+    format!(
+        "[orx] The agent you spawned for `{}` could NOT be started, so the task was not done. \
+         It was asked to: {}\n\nDo the task here, or delegate it again.",
+        spawn.session_id,
+        truncated(spawn.prompt.trim(), SPAWN_BRIEF_LIMIT),
+    )
+}
+
+/// Start the first turn of every freshly spawned helper, then wake the parent
+/// that asked for each finished one.
 ///
 /// Both halves are claim-guarded in the store rather than in memory: the CLI
 /// that wrote the row is long gone, and a crash between claiming and delivering
@@ -4880,90 +4942,127 @@ async fn process_chat_spawns(
         // dashboard's Recents as it starts working, not after its first flush.
         chat.emit_session(store.get_chat_session(&spawn.session_id)?)
             .await;
+        // A retry must not re-record the brief: `send_message_showing` persists
+        // the user message before it can report the turn didn't start.
+        let record_brief = store.list_chat_messages(&spawn.session_id)?.is_empty();
         let started = chat
-            .send_spawn_task(&spawn.session_id, spawn.prompt.clone(), guard)
+            .send_spawn_task(&spawn.session_id, spawn.prompt.clone(), record_brief, guard)
             .await;
         let next = match started {
-            // Nothing to report back for a fire-and-forget spawn, so it retires
-            // the moment its turn is running.
-            Ok(TurnSubmission::Started) if spawn.notify_parent => ChatSpawnState::Running,
+            // Nothing to wake the parent for on a fire-and-forget spawn, so it
+            // retires the moment its turn is running.
+            Ok(TurnSubmission::Started) if spawn.wake_parent => ChatSpawnState::Running,
             Ok(TurnSubmission::Started) => ChatSpawnState::Done,
-            Ok(_) => ChatSpawnState::Pending,
-            Err(err) => {
-                eprintln!(
-                    "orx up: could not start spawned agent {}: {err}",
-                    spawn.session_id
-                );
-                ChatSpawnState::Pending
+            outcome => {
+                if let Err(err) = &outcome {
+                    eprintln!(
+                        "orx up: could not start spawned agent {}: {err}",
+                        spawn.session_id
+                    );
+                }
+                if store.record_chat_spawn_attempt(&spawn.session_id)? < SPAWN_START_ATTEMPTS {
+                    ChatSpawnState::Pending
+                } else {
+                    // Out of retries. The CLI promised the parent a wake-up, so
+                    // tell it the helper never ran rather than going quiet.
+                    if spawn.wake_parent {
+                        wake_parent(
+                            chat,
+                            &spawn.parent_session_id,
+                            spawn_start_failure_text(&spawn),
+                        )
+                        .await;
+                    }
+                    ChatSpawnState::Done
+                }
             }
         };
-        store.settle_chat_spawn(&spawn.session_id, &token, ChatSpawnState::Starting, next)?;
+        store.settle_chat_spawn(&spawn.session_id, &token, next)?;
     }
     for spawn in store.list_chat_spawns(ChatSpawnState::Running)? {
         if moving() {
             return Ok(());
         }
-        if chat.is_busy(&spawn.session_id).await {
+        // The durable lease, not just this process's turn map: a helper running
+        // under another `orx up` (or under one that has since restarted) is
+        // still working, and reporting it finished would abandon the task.
+        if chat.is_busy(&spawn.session_id).await || store.chat_turn_leased(&spawn.session_id)? {
             continue;
         }
+        // Idle with no lease and no completion stamp: the `orx up` running it
+        // died mid-turn.
+        let interrupted = spawn.finished_at.is_none();
+        if store.get_chat_session(&spawn.parent_session_id)?.is_none() {
+            // A deleted parent has nobody to tell; the helper's session stays.
+            let Some(token) = store.claim_chat_spawn(
+                &spawn.session_id,
+                ChatSpawnState::Running,
+                ChatSpawnState::Waking,
+            )?
+            else {
+                continue;
+            };
+            store.settle_chat_spawn(&spawn.session_id, &token, ChatSpawnState::Done)?;
+            continue;
+        }
+        // Claim the parent's turn slot first: while the parent is busy — the
+        // common case, since it delegated in order to keep working — this loop
+        // would otherwise re-read the helper's whole transcript every tick.
+        let Some(guard) = TurnGuard::claim_hidden(chat, &spawn.parent_session_id).await else {
+            continue;
+        };
         let Some(token) = store.claim_chat_spawn(
             &spawn.session_id,
             ChatSpawnState::Running,
-            ChatSpawnState::Notifying,
+            ChatSpawnState::Waking,
         )?
         else {
+            drop(guard);
             continue;
         };
-        // A deleted parent has nobody to tell; the helper's own session stays.
-        if store.get_chat_session(&spawn.parent_session_id)?.is_none() {
-            store.settle_chat_spawn(
-                &spawn.session_id,
-                &token,
-                ChatSpawnState::Notifying,
-                ChatSpawnState::Done,
-            )?;
-            continue;
-        }
-        let text = match spawn_report_text(&store, &spawn) {
+        let text = match spawn_report_text(&store, &spawn, interrupted) {
             Ok(text) => text,
             Err(err) => {
                 eprintln!("orx up: could not summarize spawned agent: {err}");
-                store.settle_chat_spawn(
-                    &spawn.session_id,
-                    &token,
-                    ChatSpawnState::Notifying,
-                    ChatSpawnState::Done,
-                )?;
+                store.settle_chat_spawn(&spawn.session_id, &token, ChatSpawnState::Done)?;
                 continue;
             }
-        };
-        let Some(guard) = TurnGuard::claim_hidden(chat, &spawn.parent_session_id).await else {
-            // Parent is mid-turn. Hand the row back to Running so the next
-            // tick retries; the report is not lost, only deferred.
-            store.settle_chat_spawn(
-                &spawn.session_id,
-                &token,
-                ChatSpawnState::Notifying,
-                ChatSpawnState::Running,
-            )?;
-            continue;
         };
         let delivered = chat
             .send_hidden_message(&spawn.parent_session_id, text, guard)
             .await;
         let next = match delivered {
             Ok(TurnSubmission::Started) => ChatSpawnState::Done,
-            Ok(_) => ChatSpawnState::Running,
-            Err(err) => {
-                if !chat.is_busy(&spawn.parent_session_id).await {
-                    eprintln!("orx up: could not report a spawned agent's result: {err}");
+            outcome => {
+                if let Err(err) = &outcome {
+                    if !chat.is_busy(&spawn.parent_session_id).await {
+                        eprintln!("orx up: could not wake a spawned agent's parent: {err}");
+                    }
                 }
                 ChatSpawnState::Running
             }
         };
-        store.settle_chat_spawn(&spawn.session_id, &token, ChatSpawnState::Notifying, next)?;
+        if !store.settle_chat_spawn(&spawn.session_id, &token, next)? {
+            return Err(anyhow!(
+                "spawn claim expired before the parent wake-up was recorded"
+            ));
+        }
     }
     Ok(())
+}
+
+/// Deliver one wake-up to a parent that is free to take it. Best effort: the
+/// caller is already on a terminal path and has nothing left to retry with.
+async fn wake_parent(chat: &Arc<ChatHost>, parent_session_id: &str, text: String) {
+    let Some(guard) = TurnGuard::claim_hidden(chat, parent_session_id).await else {
+        return;
+    };
+    if let Err(err) = chat
+        .send_hidden_message(parent_session_id, text, guard)
+        .await
+    {
+        eprintln!("orx up: could not wake a spawned agent's parent: {err}");
+    }
 }
 
 /// Resume explicitly subscribed agent sessions after a run finishes. Busy and
@@ -6178,10 +6277,16 @@ with other project runs using `orx runs p1` and inspect this run's logs using `o
                 session_id: child.into(),
                 parent_session_id: parent.into(),
                 prompt: "Sweep the literature".into(),
-                notify_parent: true,
+                wake_parent: true,
                 state,
+                finished_at: None,
             })
             .unwrap();
+        // A row already in Running stands for a turn that reached `finish_turn`;
+        // the crash case is exercised directly in the report-text tests.
+        if matches!(state, ChatSpawnState::Running) {
+            store.mark_chat_spawn_finished(child).unwrap();
+        }
     }
 
     fn bare_host() -> Arc<ChatHost> {
@@ -6251,6 +6356,156 @@ with other project runs using `orx runs p1` and inspect this run's logs using `o
     }
 
     #[tokio::test]
+    async fn a_helper_still_running_under_another_orx_up_is_not_reported_finished() {
+        let (store, dir) = temp_store("spawn-leased");
+        session(&store, "child");
+        session(&store, "parent");
+        spawn_row(&store, "child", "parent", ChatSpawnState::Running);
+        // Another process holds the turn: this one's `turns` map knows nothing
+        // about it, so only the durable lease can stop a false completion.
+        store
+            .claim_chat_turn("child", "other-process-token")
+            .unwrap();
+        let host = bare_host();
+
+        drop(store);
+        process_chat_spawns(&host, Store::open_at(dir.clone()).unwrap(), None)
+            .await
+            .unwrap();
+
+        let store = Store::open_at(dir.clone()).unwrap();
+        assert_eq!(
+            store
+                .list_chat_spawns(ChatSpawnState::Running)
+                .unwrap()
+                .len(),
+            1,
+            "a leased helper must stay Running"
+        );
+        assert!(!host.is_busy("parent").await);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_interrupted_helper_is_not_reported_as_finished() {
+        let (store, dir) = temp_store("spawn-interrupted");
+        session(&store, "child");
+        store
+            .upsert_chat_message(&assistant_message("a1", None, "halfway through"))
+            .unwrap();
+        let spawn = crate::store::ChatSpawn {
+            session_id: "child".into(),
+            parent_session_id: "parent".into(),
+            prompt: "Sweep the literature".into(),
+            wake_parent: true,
+            state: ChatSpawnState::Running,
+            finished_at: None,
+        };
+
+        let text = spawn_report_text(&store, &spawn, true).unwrap();
+        assert!(
+            text.contains("was interrupted before it finished"),
+            "{text}"
+        );
+        assert!(!text.contains("has finished"), "{text}");
+        // The partial text must not be handed back as a closing answer.
+        assert!(!text.contains("halfway through"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_helper_that_errored_is_reported_as_failed_not_silent() {
+        let (store, dir) = temp_store("spawn-errored");
+        session(&store, "child");
+        // Exactly what `TurnCtx::push_error` writes.
+        let parts = vec![WirePart::tool(
+            "err-0",
+            "error",
+            "error",
+            Some("model 'gpt-5' is not supported".into()),
+        )];
+        store
+            .upsert_chat_message(&StoredChatMessage {
+                id: "a1".into(),
+                session_id: "child".into(),
+                role: "assistant".into(),
+                parts_json: serde_json::to_string(&parts).unwrap(),
+                created_at: 1,
+                parent_id: None,
+                base_native_session_id: None,
+                result_native_session_id: None,
+            })
+            .unwrap();
+
+        let child = store.get_chat_session("child").unwrap().unwrap();
+        let SpawnOutcome::Failed(error) = spawn_outcome(&store, &child).unwrap() else {
+            panic!("an error part must not read as a silent turn");
+        };
+        assert!(error.contains("not supported"), "{error}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_answered_prompt_card_does_not_mask_the_real_reply() {
+        let (store, dir) = temp_store("spawn-card");
+        session(&store, "child");
+        store
+            .upsert_chat_message(&assistant_message("a1", None, "the answer"))
+            .unwrap();
+        // A resolved card rides its own text-less assistant message and becomes
+        // the branch tip; reading only the tip would lose the answer above it.
+        store
+            .upsert_chat_message(&StoredChatMessage {
+                id: "a2".into(),
+                session_id: "child".into(),
+                role: "assistant".into(),
+                parts_json: "[]".into(),
+                created_at: 2,
+                parent_id: Some("a1".into()),
+                base_native_session_id: None,
+                result_native_session_id: None,
+            })
+            .unwrap();
+        store
+            .set_chat_session_active_leaf("child", Some("a2"))
+            .unwrap();
+
+        let child = store.get_chat_session("child").unwrap().unwrap();
+        let SpawnOutcome::Reply(reply) = spawn_outcome(&store, &child).unwrap() else {
+            panic!("expected the reply above the card");
+        };
+        assert_eq!(reply, "the answer");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_long_reply_and_a_long_brief_are_both_bounded() {
+        let (store, dir) = temp_store("spawn-truncate");
+        session(&store, "child");
+        store
+            .upsert_chat_message(&assistant_message("a1", None, &"x".repeat(9000)))
+            .unwrap();
+        let spawn = crate::store::ChatSpawn {
+            session_id: "child".into(),
+            parent_session_id: "parent".into(),
+            prompt: "y".repeat(9000),
+            wake_parent: true,
+            state: ChatSpawnState::Running,
+            finished_at: Some(1),
+        };
+
+        let text = spawn_report_text(&store, &spawn, false).unwrap();
+        assert_eq!(text.matches("… (truncated)").count(), 2, "{text}");
+        assert!(text.chars().count() < SPAWN_REPORT_LIMIT + SPAWN_BRIEF_LIMIT + 600);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn a_finished_helper_whose_parent_is_gone_retires_quietly() {
         let (store, dir) = temp_store("spawn-orphan");
         session(&store, "child");
@@ -6293,7 +6548,11 @@ with other project runs using `orx runs p1` and inspect this run's logs using `o
             .set_chat_session_active_leaf("child", Some("a2"))
             .unwrap();
 
-        assert_eq!(spawn_report_reply(&store, "child").unwrap(), "the answer");
+        let child = store.get_chat_session("child").unwrap().unwrap();
+        let SpawnOutcome::Reply(reply) = spawn_outcome(&store, &child).unwrap() else {
+            panic!("expected a written reply");
+        };
+        assert_eq!(reply, "the answer");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6330,10 +6589,11 @@ with other project runs using `orx runs p1` and inspect this run's logs using `o
             session_id: "child".into(),
             parent_session_id: "parent".into(),
             prompt: "Sweep the literature".into(),
-            notify_parent: true,
+            wake_parent: true,
             state: ChatSpawnState::Running,
+            finished_at: Some(1),
         };
-        let text = spawn_report_text(&store, &spawn).unwrap();
+        let text = spawn_report_text(&store, &spawn, false).unwrap();
         assert_eq!(
             text,
             "[orx] The agent you spawned for `child` (\"Lit sweep\") has finished.\n\n\
@@ -6347,7 +6607,7 @@ with other project runs using `orx runs p1` and inspect this run's logs using `o
         store
             .upsert_chat_message(&assistant_message("a1", None, "Rank 8 wins."))
             .unwrap();
-        assert!(spawn_report_text(&store, &spawn)
+        assert!(spawn_report_text(&store, &spawn, false)
             .unwrap()
             .starts_with("[orx] The agent you spawned for `child` has finished."));
 
@@ -6359,10 +6619,11 @@ with other project runs using `orx runs p1` and inspect this run's logs using `o
         let (store, dir) = temp_store("spawn-silent");
         session(&store, "child");
 
-        assert_eq!(
-            spawn_report_reply(&store, "child").unwrap(),
-            "It ended its turn without a written reply."
-        );
+        let child = store.get_chat_session("child").unwrap().unwrap();
+        assert!(matches!(
+            spawn_outcome(&store, &child).unwrap(),
+            SpawnOutcome::Silent
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
