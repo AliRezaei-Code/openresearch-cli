@@ -245,14 +245,15 @@ pub struct ChatSpawn {
     pub prompt: String,
     /// Whether the parent gets a wake-up once the helper finishes.
     pub wake_parent: bool,
-    pub state: ChatSpawnState,
+    /// Failed attempts to start the helper's first turn.
+    pub attempts: i64,
     /// Set by `finish_turn` when the helper's turn ends. Absent on a row whose
     /// turn is still running — or whose `orx up` died mid-turn, which is how a
     /// crash is told from a completion.
     pub finished_at: Option<i64>,
 }
 
-/// Lifecycle of a [`ChatSpawn`]: `Pending → Starting → Running → Notifying →
+/// Lifecycle of a [`ChatSpawn`]: `Pending → Starting → Running → Waking →
 /// Done`. The two `-ing` states are claims — one watcher owns the transition
 /// and holds a token, so a crash mid-step is reclaimable rather than lost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,17 +279,6 @@ impl ChatSpawnState {
             Self::Waking => "waking",
             Self::Done => "done",
         }
-    }
-
-    fn from_str(value: &str) -> Option<Self> {
-        Some(match value {
-            "pending" => Self::Pending,
-            "starting" => Self::Starting,
-            "running" => Self::Running,
-            "waking" => Self::Waking,
-            "done" => Self::Done,
-            _ => return None,
-        })
     }
 }
 
@@ -479,6 +469,9 @@ impl Store {
             "ALTER TABLE chat_messages ADD COLUMN result_native_session_id TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN active_leaf_id TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN parent_session_id TEXT",
+            "ALTER TABLE chat_spawns ADD COLUMN wake_parent INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE chat_spawns ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE chat_spawns ADD COLUMN finished_at INTEGER",
         ] {
             let _ = conn.execute(ddl, []);
         }
@@ -1013,13 +1006,12 @@ impl Store {
         self.conn.execute(
             "INSERT INTO chat_spawns
                  (session_id, parent_session_id, prompt, wake_parent, state, requested_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
             params![
                 spawn.session_id,
                 spawn.parent_session_id,
                 spawn.prompt,
                 spawn.wake_parent,
-                spawn.state.as_str(),
                 now_ms(),
             ],
         )?;
@@ -1028,13 +1020,14 @@ impl Store {
 
     /// Return abandoned claims to their prior state and drop rows whose child
     /// session is gone. A missing *parent* is not pruned here: the child keeps
-    /// working, and the notify step retires the row on its own.
+    /// working, and the wake step retires the row on its own.
     pub fn prune_chat_spawns(&self) -> Result<()> {
         self.clear_stale_data_dir_move_lease()?;
         let stale = now_ms() - CHAT_SPAWN_CLAIM_TTL_MS;
         self.conn.execute(
             "UPDATE chat_spawns
              SET state = CASE state WHEN 'starting' THEN 'pending' ELSE 'running' END,
+                 attempts = attempts + CASE state WHEN 'starting' THEN 1 ELSE 0 END,
                  claim_token = NULL, claimed_at = NULL
              WHERE state IN ('starting', 'waking') AND claimed_at < ?1
                AND NOT EXISTS (SELECT 1 FROM data_dir_move_lease WHERE id = 1)",
@@ -1054,11 +1047,20 @@ impl Store {
     /// Spawns sitting in one state, oldest request first.
     pub fn list_chat_spawns(&self, state: ChatSpawnState) -> Result<Vec<ChatSpawn>> {
         let mut stmt = self.conn.prepare(
-            "SELECT session_id, parent_session_id, prompt, wake_parent, state, finished_at
+            "SELECT session_id, parent_session_id, prompt, wake_parent, attempts, finished_at
              FROM chat_spawns WHERE state = ?1 ORDER BY requested_at, session_id",
         )?;
         let rows = stmt.query_map(params![state.as_str()], row_to_chat_spawn)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn get_chat_spawn(&self, session_id: &str) -> Result<Option<ChatSpawn>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, parent_session_id, prompt, wake_parent, attempts, finished_at
+             FROM chat_spawns WHERE session_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![session_id], row_to_chat_spawn)?;
+        Ok(rows.next().transpose()?)
     }
 
     /// Take ownership of a spawn's next step, moving it into the claimed state
@@ -2000,15 +2002,12 @@ const CHAT_SESSION_COLS: &str = "id, project_id, harness, native_session_id, tit
      created_at, updated_at, title_source, bootstrap_context, active_leaf_id, parent_session_id";
 
 fn row_to_chat_spawn(row: &rusqlite::Row<'_>) -> std::result::Result<ChatSpawn, rusqlite::Error> {
-    let state: String = row.get(4)?;
     Ok(ChatSpawn {
         session_id: row.get(0)?,
         parent_session_id: row.get(1)?,
         prompt: row.get(2)?,
         wake_parent: row.get(3)?,
-        state: ChatSpawnState::from_str(&state).ok_or_else(|| {
-            rusqlite::Error::InvalidColumnType(4, state, rusqlite::types::Type::Text)
-        })?,
+        attempts: row.get(4)?,
         finished_at: row.get(5)?,
     })
 }
@@ -2444,7 +2443,7 @@ mod tests {
             parent_session_id: parent.into(),
             prompt: "Sweep the literature for LoRA rank ablations".into(),
             wake_parent: true,
-            state: ChatSpawnState::Pending,
+            attempts: 0,
             finished_at: None,
         }
     }

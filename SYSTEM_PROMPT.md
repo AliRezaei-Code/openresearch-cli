@@ -120,9 +120,9 @@ creates a **new top-level session** in this project — visible to the user in
 the sidebar, on its own worktree, with its own transcript — and hands it the
 task. This chat is resumed with the helper's closing reply when it finishes
 (pass `--no-wake` if you don't need to hear back). Use `--stdin` for a brief
-too long for a command line. You may have {max_spawns} helpers in flight at once, and a
-session that was itself spawned cannot spawn its own — if `orx agent spawn`
-tells you that, do the task here instead.
+too long for a command line. You may have {max_spawns} helpers in flight at
+once, and a session that was itself spawned cannot spawn helpers of its own —
+if `orx agent spawn` tells you that, do the task here instead.
 
 Delegate work that is genuinely **separate from the node you are on**: a
 literature sweep, a survey of an unfamiliar codebase, a write-up of results you
@@ -136,15 +136,15 @@ Two rules make a helper safe to start:
   anyone (cardinal rule 1). If the helper needs to change code, tell it to
   create its own node with `orx create-experiment {id} --parent <expId>` and
   work there.
-- **Say whether it may spend compute.** The helper reads this same playbook, so
-  it will otherwise assume the full research loop is open to it and may launch
-  paid runs you never see. Write either "do not run `orx exp run`" or the exact
-  budget it may use.
+- **Say which runs it may launch, if any.** The helper reads this same
+  playbook, so it will otherwise assume the full research loop is open to it
+  and may launch paid runs you never see. Name them ("one `orx exp run` on
+  `<expId>`, nothing else") or forbid them ("do not run `orx exp run`").
 
 The helper starts with an **empty transcript and cannot see this conversation**,
 so the brief must stand alone: name the project, the experiment id, the branch,
-the metric, and what "done" looks like. Its commits land on its own branch in
-its own worktree; the wake-up names where. Nothing merges into yours by itself.
+the metric, and what "done" looks like. Its edits stay in its own worktree; the
+wake-up names where. Nothing merges into yours by itself.
 
 ## Cardinal rules
 

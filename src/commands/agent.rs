@@ -18,13 +18,12 @@ use std::io::Read;
 
 use crate::error::{anyhow, Result};
 use crate::local::harness::PermissionMode;
-use crate::store::{now_ms, ChatSpawn, ChatSpawnState, Store, StoredChatSession};
+use crate::store::{now_ms, ChatSpawn, Store, StoredChatSession};
 
-/// Helpers one session may have in flight at once. Depth is capped at one level
-/// below; without a breadth cap a parent that loops turns a single request into
-/// as many paid sessions and git worktrees as it cares to ask for.
-pub(crate) const MAX_LIVE_SPAWNS: i64 = 5;
 use crate::AgentCommand;
+
+/// Helpers one session may have in flight at once.
+pub(crate) const MAX_LIVE_SPAWNS: i64 = 5;
 
 pub async fn run(args: crate::AgentArgs) -> Result<()> {
     let store = Store::open()?;
@@ -113,16 +112,14 @@ fn spawn(
     }
     let harness = harness.unwrap_or_else(|| parent.harness.clone());
     if !crate::local::harness::is_chat_harness(&harness) {
-        return Err(anyhow!(
-            "Unknown harness: {harness}. Valid harnesses are claude-code, codex, and opencode."
-        ));
+        return Err(anyhow!("unknown harness: {harness}"));
     }
     // Settings only carry over when the child runs the same harness; a model or
     // permission-mode id from one CLI is meaningless to another.
     let inherits = harness == parent.harness;
-    // Claude activates Plan through its permission mode rather than the plan
-    // axis, so clearing `plan_mode` alone would still hand a planning parent's
-    // helper a mode that only ever produces a plan.
+    // Claude activates Plan through its permission mode, not the plan axis, so
+    // clearing `plan_mode` alone would still hand a planning parent's helper a
+    // mode that only ever produces a plan.
     let plan_permission =
         crate::local::harness::permission_id_for_mode(&harness, PermissionMode::Plan);
     let title = title
@@ -141,8 +138,6 @@ fn spawn(
             .then(|| parent.permission_mode.clone())
             .flatten()
             .filter(|mode| Some(mode) != plan_permission.as_ref()),
-        // A helper is spawned to *do* the task, so it never starts in Plan even
-        // when the parent is planning.
         plan_mode: false,
         plan_reset_pending: false,
         reasoning_level: inherits.then(|| parent.reasoning_level.clone()).flatten(),
@@ -163,7 +158,7 @@ fn spawn(
         parent_session_id: parent_id,
         prompt,
         wake_parent,
-        state: ChatSpawnState::Pending,
+        attempts: 0,
         finished_at: None,
     })?;
     tx.commit()?;
