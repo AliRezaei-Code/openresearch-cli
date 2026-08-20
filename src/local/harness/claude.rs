@@ -1669,12 +1669,11 @@ const FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(120);
 const BACKGROUND_RESUME_GRACE: Duration = Duration::from_secs(3);
 
 async fn run_attempt(ctx: &mut TurnCtx, spec: SpawnSpec) -> Result<(TurnState, u64)> {
-    let client = ctx.host.claude.ensure(spec).await?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let route = ctx.host.claude.acquire_turn(spec, tx).await?;
+    let client = route.client();
     let auth_generation = client.auth_generation();
     let bridge_active = client.config().bridge_active;
-
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let _route = client.register_turn(tx);
     if let Err(e) = client.send_user_message(&ctx.text).await {
         ctx.host.claude.kill_session(&ctx.session_id).await;
         return Err(anyhow!(
