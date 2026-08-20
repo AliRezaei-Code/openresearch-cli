@@ -89,7 +89,7 @@ Run `orx --help` (or `orx <command> --help`) for full usage. The highlights:
 | Experiments | `create-experiment`, `exp status/run/cancel/wait/wake` |
 | Runs & evidence | `runs`, `logs` |
 | Compute | `compute`, `instance create` |
-| Literature | `lit`, `paper` (full-text search across alphaXiv, OpenAlex, bioRxiv — no login required) |
+| Literature | `discover keyword/embedding`, `lit`, `paper` (independent alphaXiv retrieval, supplemental scholarly search, and paper reading — no login required) |
 | Agent integration | `install-skills`, `skill` |
 | Maintenance | `version`, `update`, `telemetry`, `delete database/cli/all` |
 

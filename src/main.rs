@@ -107,6 +107,9 @@ enum Command {
     /// bioRxiv (`--source`; no login required).
     Lit(LitArgs),
 
+    /// Call one alphaXiv paper-retrieval primitive; the caller owns the search loop.
+    Discover(DiscoverArgs),
+
     /// Fetch a paper: alphaXiv report/full-text, or OpenAlex/bioRxiv metadata.
     /// The source is auto-detected from the id (override with `--source`).
     Paper(PaperArgs),
@@ -622,6 +625,56 @@ pub struct LitArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct DiscoverArgs {
+    #[command(subcommand)]
+    pub command: DiscoverCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DiscoverCommand {
+    /// Full-text BM25 retrieval with match snippets.
+    Keyword(DiscoverySearchArgs),
+    /// Semantic title/abstract retrieval with similarity/popularity reranking.
+    Embedding(DiscoverySearchArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct DiscoverySearchArgs {
+    /// Exact keyword query or semantic description, depending on the strategy.
+    pub query: String,
+    /// Include papers first published on or after this date (YYYY-MM-DD).
+    #[arg(long = "published-after")]
+    pub published_after: Option<String>,
+    /// Include papers first published on or before this date (YYYY-MM-DD). Older
+    /// or narrow embedding windows can return a thin candidate set.
+    #[arg(long = "published-before")]
+    pub published_before: Option<String>,
+    /// Ranking policy after topical relevance is accounted for.
+    #[arg(long, value_enum, default_value = "default")]
+    pub prioritize: DiscoveryPriority,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[value(rename_all = "lower")]
+pub enum DiscoveryPriority {
+    Historical,
+    Default,
+    Recency,
+    Popular,
+}
+
+impl DiscoveryPriority {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Historical => "historical",
+            Self::Default => "default",
+            Self::Recency => "recency",
+            Self::Popular => "popular",
+        }
+    }
+}
+
+#[derive(Args, Debug)]
 pub struct VersionArgs {
     /// Print the embedded telemetry build channel.
     #[arg(long, hide = true, conflicts_with_all = ["check", "json"])]
@@ -795,6 +848,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Skill(_) => "skill",
         Command::InstallSkills(_) => "install-skills",
         Command::Lit(_) => "lit",
+        Command::Discover(_) => "discover",
         Command::Paper(_) => "paper",
         Command::Version(_) => "version",
         Command::Update(_) => "update",
@@ -838,6 +892,7 @@ async fn dispatch(command: Command) -> error::Result<()> {
         Command::Skill(args) => commands::skill::run(args).await,
         Command::InstallSkills(args) => commands::install_skills::run(args).await,
         Command::Lit(args) => commands::lit::run(args).await,
+        Command::Discover(args) => commands::discover::run(args).await,
         Command::Paper(args) => commands::paper::run(args).await,
         Command::Version(args) => commands::version::run(args).await,
         Command::Update(args) => commands::update::run(args).await,
@@ -864,6 +919,7 @@ fn command_uses_lifecycle_lock(command: &Command) -> bool {
             | Command::Logout
             | Command::InstallSkills(_)
             | Command::Lit(_)
+            | Command::Discover(_)
             | Command::Paper(_)
             | Command::Version(_)
             | Command::Delete(_)
@@ -877,6 +933,34 @@ fn command_uses_lifecycle_lock(command: &Command) -> bool {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn discover_parses_independent_retrieval_options() {
+        let cli = Cli::try_parse_from([
+            "orx",
+            "discover",
+            "embedding",
+            "test-time compute",
+            "--published-after",
+            "2024-01-01",
+            "--published-before",
+            "2025-12-31",
+            "--prioritize",
+            "historical",
+        ])
+        .expect("discover embedding should parse");
+
+        let Some(Command::Discover(DiscoverArgs {
+            command: DiscoverCommand::Embedding(args),
+        })) = cli.command
+        else {
+            panic!("expected discover embedding command");
+        };
+        assert_eq!(args.query, "test-time compute");
+        assert_eq!(args.published_after.as_deref(), Some("2024-01-01"));
+        assert_eq!(args.published_before.as_deref(), Some("2025-12-31"));
+        assert_eq!(args.prioritize, DiscoveryPriority::Historical);
+    }
 
     #[test]
     fn run_accepts_only_supervised_backend_flags() {

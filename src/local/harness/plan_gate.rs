@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 /// turn them into a write). Kept in lockstep with `main.rs`'s `Command` enum;
 /// `readonly_verbs_are_real_commands` guards against a rename.
 const WHOLE_VERB_READS: &[&str] = &[
-    "projects", "orgs", "runs", "logs", "compute", "lit", "paper", "skill", "version",
+    "projects", "orgs", "runs", "logs", "compute", "lit", "discover", "paper", "skill", "version",
 ];
 
 /// Shell no-ops allowed as glue between read-only segments in a batch —
@@ -435,6 +435,8 @@ mod tests {
             "orx compute",
             "orx orgs",
             "orx lit transformers",
+            "orx discover keyword transformers",
+            "orx discover embedding transformers --prioritize historical",
             "orx paper 2301.00001",
             "orx skill",
             "orx projects --json",

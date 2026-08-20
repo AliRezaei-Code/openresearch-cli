@@ -380,8 +380,8 @@ pub async fn create_ssh_key(
 /// Sent on external requests — some CDNs reject the default (empty) UA.
 const ALPHAXIV_UA: &str = concat!("openresearch-cli/", env!("CARGO_PKG_VERSION"));
 
-/// One full-text search hit (`GET /search/v2/paper/full-text`). Serialize is
-/// derived so `orx lit --json` can re-emit hits verbatim.
+/// One alphaXiv full-text or discovery search hit. Serialize is derived so the
+/// CLI can emit endpoint results verbatim.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaperHit {
@@ -403,6 +403,74 @@ pub struct PaperSnippet {
     #[serde(default)]
     pub page_number: i64,
     pub snippet: String,
+}
+
+#[derive(Clone, Copy)]
+pub struct PaperDiscoveryOptions<'a> {
+    pub published_after: Option<&'a str>,
+    pub published_before: Option<&'a str>,
+    pub prioritize: &'a str,
+}
+
+fn paper_discovery_url(
+    base: &str,
+    strategy: &str,
+    query: &str,
+    options: PaperDiscoveryOptions<'_>,
+) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(&format!("{base}/search/v2/paper/discover/{strategy}"))?;
+    {
+        let mut params = url.query_pairs_mut();
+        params.append_pair("q", query);
+        params.append_pair("prioritize", options.prioritize);
+        if let Some(date) = options.published_after {
+            params.append_pair("publishedAfter", date);
+        }
+        if let Some(date) = options.published_before {
+            params.append_pair("publishedBefore", date);
+        }
+    }
+    Ok(url)
+}
+
+async fn discover_papers(
+    strategy: &str,
+    query: &str,
+    options: PaperDiscoveryOptions<'_>,
+) -> Result<Vec<PaperHit>> {
+    let base = crate::config::alphaxiv_api_url();
+    let url = paper_discovery_url(&base, strategy, query, options)?;
+    let res = http()
+        .get(url)
+        .header("user-agent", ALPHAXIV_UA)
+        .send()
+        .await
+        .map_err(|e| anyhow!("Could not reach alphaXiv at {}: {}", base, e))?;
+    let status = res.status();
+    if !status.is_success() {
+        let reason = status.canonical_reason().unwrap_or("");
+        return Err(anyhow!(
+            "alphaXiv {} retrieval failed ({} {})",
+            strategy,
+            status.as_u16(),
+            reason
+        ));
+    }
+    Ok(res.json::<Vec<PaperHit>>().await?)
+}
+
+pub async fn discover_papers_by_keyword(
+    query: &str,
+    options: PaperDiscoveryOptions<'_>,
+) -> Result<Vec<PaperHit>> {
+    discover_papers("keyword", query, options).await
+}
+
+pub async fn discover_papers_by_embedding(
+    query: &str,
+    options: PaperDiscoveryOptions<'_>,
+) -> Result<Vec<PaperHit>> {
+    discover_papers("embedding", query, options).await
 }
 
 /// Full-text literature search across alphaXiv. Returns the hits in relevance
@@ -1009,10 +1077,47 @@ pub async fn fetch_biorxiv(doi: &str) -> Result<Option<BiorxivDetail>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        openalex_selector, reconstruct_abstract, CreateSandboxBody, ListCatalog, ListCpuCatalog,
-        LitHit, OpenAlexWork, PaperHit, SandboxEnvelope, SandboxTarget, BIORXIV_SOURCE_ID,
+        openalex_selector, paper_discovery_url, reconstruct_abstract, CreateSandboxBody,
+        ListCatalog, ListCpuCatalog, LitHit, OpenAlexWork, PaperDiscoveryOptions, PaperHit,
+        SandboxEnvelope, SandboxTarget, BIORXIV_SOURCE_ID,
     };
     use serde_json::json;
+
+    #[test]
+    fn paper_discovery_url_encodes_strategy_and_controls() {
+        let url = paper_discovery_url(
+            "https://api.alphaxiv.org",
+            "keyword",
+            "attention & memory",
+            PaperDiscoveryOptions {
+                published_after: Some("2024-01-01"),
+                published_before: Some("2025-12-31"),
+                prioritize: "historical",
+            },
+        )
+        .expect("valid discovery URL");
+        let params = url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(url.path(), "/search/v2/paper/discover/keyword");
+        assert_eq!(
+            params.get("q").map(|value| value.as_ref()),
+            Some("attention & memory")
+        );
+        assert_eq!(
+            params.get("publishedAfter").map(|value| value.as_ref()),
+            Some("2024-01-01")
+        );
+        assert_eq!(
+            params.get("publishedBefore").map(|value| value.as_ref()),
+            Some("2025-12-31")
+        );
+        assert_eq!(
+            params.get("prioritize").map(|value| value.as_ref()),
+            Some("historical")
+        );
+    }
 
     #[test]
     fn openresearch_client_contains_only_account_and_compute_paths() {

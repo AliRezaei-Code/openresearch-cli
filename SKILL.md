@@ -102,8 +102,10 @@ Git in the local session worktree. See the `orx-git` module.
 Use before any web search for academic/research queries (paper, author, blog, model release).
 | Command | What it does |
 |---|---|
-| `orx lit "<query>" [--source alphaxiv\|openalex\|biorxiv] [--limit <n>] [--json]` | Full-text search; `--source` picks the corpus (default alphaxiv; openalex = all fields, biorxiv = biology preprints). |
+| `orx discover keyword "<query>"` | Call the alphaXiv full-text retrieval primitive with match snippets. |
+| `orx discover embedding "<query>"` | Call the alphaXiv semantic retrieval primitive. The main agent calls both, ranks candidates, and decides focused follow-ups; see `orx-lit`. |
 | `orx paper <id\|url> [--source ...] [--full]` | Fetch a paper: alphaXiv report/`--full` text, or OpenAlex/bioRxiv metadata+abstract. Source auto-detected from the id. |
+| `orx lit "<query>" --source openalex\|biorxiv` | Supplemental non-ArXiv corpus search. It is not the alphaXiv orchestration loop. |
 
 ### Meta
 | Command | What it does |
@@ -121,7 +123,7 @@ list, with one-line descriptions, is printed at the end of `orx skill` output):
 - **orx-git** — read, edit, and diff a node's code with plain git.
 - **orx-evidence** — capture and inspect experiment results through run logs.
 - **orx-reports** — write durable research outputs into the project's artifacts directory.
-- **orx-lit** — literature search and paper content; the preferred starting point for academic/research queries (not web search).
+- **orx-lit** — main-agent alphaXiv retrieval, focused follow-up policy, and paper content; the preferred starting point for academic/research queries.
 
 ## Typical workflow
 

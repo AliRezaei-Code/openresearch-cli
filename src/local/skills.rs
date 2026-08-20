@@ -20,15 +20,16 @@ const LIT_REVIEW_TEMPLATE: &str = r#"Perform a multi-hop literature review acros
 
 Topic: {args}
 
-Use the `orx` CLI (already installed; public endpoints, no login needed):
-- `orx lit "<query>" [--source alphaxiv|openalex|biorxiv]` — full-text search; `--source` picks the corpus (default alphaxiv for CS/ML; openalex for cross-discipline + citation counts; biorxiv for biology preprints). Returns ids, titles, abstracts (`--json` for machine-readable output).
-- `orx paper <id>` — for an alphaXiv id, its structured overview report (~10 KB), `--full` for raw text; for a DOI or OpenAlex `W…` id, title/authors/date/citations + abstract. Source auto-detected from the id.
+Load the `orx-lit` skill and follow its main-agent alphaXiv retrieval loop. Call
+`orx discover keyword` and `orx discover embedding` yourself; do not delegate
+the loop or replace it with `orx lit`. Use `orx paper <id>` to read selected papers.
+For materially relevant non-arXiv coverage, supplement with `orx lit --source
+openalex` or `orx lit --source biorxiv`.
 
-Method — iterate; do not stop after one search:
-1. Hop 1: run `orx lit` with 2-3 distinct phrasings of the topic. For biomed or cross-field topics, also query `--source openalex` (and `--source biorxiv` for biology) so you don't miss non-arXiv work. Skim titles/abstracts/snippets and pick the 3-5 most relevant papers.
+Method:
+1. First round: call both alphaXiv retrieval primitives with focused keyword terms and the user's semantic question. Inspect titles, abstracts, and match snippets; rank the 3-5 most relevant papers yourself. For biomed or cross-field topics, supplement with OpenAlex or bioRxiv when that corpus is materially relevant.
 2. Read them: `orx paper <id>` for each pick.
-3. Next hop: from those reports, extract cited papers, author names, benchmark/method names, and field terminology you did not start with. Turn these into new `orx lit` queries and search again.
-4. Repeat until a hop surfaces nothing relevantly new (typically 2-4 hops). Track which papers you have already seen so you don't re-read them.
+3. From those reports, extract cited papers, author names, benchmark/method names, and field terminology you did not start with. Make at most two focused follow-up primitive calls for genuinely missing angles, stopping earlier when the evidence is sufficient. Track papers already seen so you do not re-read them.
 
 Then write the review:
 - Organize by theme, not by paper.
@@ -70,7 +71,7 @@ Paper and compute: {args}
 
 Before running anything:
 1. Confirm the compute. The user should name where runs execute — a configured `~/.ssh/config` host alias (`orx exp run --backend ssh --host <alias>`), another `orx` backend (`hf` or `modal` with a flavor, `k8s` with a committed manifest), or the local machine. If unspecified, use the configured default compute target when one is set (omit `--backend` to launch there); otherwise ask before launching anything.
-2. Read the paper. If the args name no paper, infer it from the current repository — read the README, docs, and code, and if the repo clearly corresponds to an identifiable paper, reproduce that one; only ask the user if none can be identified. If it's on alphaXiv, `orx paper <id>` gives a structured report (`--full` for raw text); `orx lit "<query>"` can find it. Otherwise ask the user for a PDF or link.
+2. Read the paper. If the args name no paper, infer it from the current repository — read the README, docs, and code, and if the repo clearly corresponds to an identifiable paper, reproduce that one; only ask the user if none can be identified. If it's on alphaXiv, `orx paper <id>` gives a structured report (`--full` for raw text); use the `orx-lit` retrieval workflow to find it. Otherwise ask the user for a PDF or link.
 3. Plan to the user's compute window. When the caller supplies an absolute deadline and available accelerator capacity, treat both as authoritative: keep the available GPUs occupied with scientifically useful parallel variants, seeds, ablations, controls, or profiling runs; refill freed capacity after each completion; and stop early when the target claims are adequately evaluated. Interpret capacity by total GPUs across in-flight runs, not by raw run count. Do not invent or maintain a GPU-hour ledger unless the user explicitly asks for one. For vague small-budget language such as "for a little bit," prefer published-checkpoint evaluation and targeted checks. Larger windows may support broader sweeps, added seeds, fine-tuning, or retraining, but they make training eligible, not mandatory.
 4. Optional tracking: if the user wants metrics logged, prefer Weights & Biases — check `wandb login` / `WANDB_API_KEY` and log each run to a project named after the paper. Don't require it.
 
@@ -114,7 +115,7 @@ The final deliverable is:
 Before running anything:
 1. Inspect the project with `orx projects`, `orx runs <project-id>`, `git branch -a`, and relevant `orx exp desc <experiment-id>` entries so you extend existing work instead of duplicating it.
 2. Confirm the compute if the user did not specify it: the configured default compute target when one is set (omit `--backend` to launch there), or an explicit backend — `hf` or `modal` with a flavor, `k8s` with a committed manifest, or `ssh` with a host alias. Formal reproduction runs must use `orx exp run`; molab's GPU is for the notebook's short teaching experiment, not untracked reproduction runs.
-3. Read the paper. If the args name no paper, infer it from the current repository — read the README, docs, and code, and if the repo clearly corresponds to an identifiable paper, use that one; only ask the user if none can be identified. For alphaXiv papers use `orx paper <id>` and use `--full` when the structured report omits an important detail. Use `orx lit "<query>"` to locate related work or public implementations.
+3. Read the paper. If the args name no paper, infer it from the current repository — read the README, docs, and code, and if the repo clearly corresponds to an identifiable paper, use that one; only ask the user if none can be identified. For alphaXiv papers use `orx paper <id>` and use `--full` when the structured report omits an important detail. Use the `orx-lit` retrieval workflow to locate related work or public implementations.
 4. Enumerate the main empirical claims, prioritizing the headline table or figure. Unless the user asks for broader coverage, select the single claim that makes the clearest illustrative tutorial.
 5. Inspect repository visibility and history before publication. Molab's GitHub opener requires a public repository. If the repository is private and the user has not already authorized a visibility change, explain this requirement, ask permission to make it public, and stop until the user approves. After approval, scan the complete Git history for credentials or private artifacts, change visibility with `gh`, and continue the workflow; do not make the user perform the change manually.
 
@@ -329,7 +330,7 @@ mod tests {
     fn expands_known_skill_with_args() {
         let out = expand("/lit-review sparse autoencoders").unwrap();
         assert!(out.contains("Topic: sparse autoencoders"));
-        assert!(out.contains("orx lit"));
+        assert!(out.contains("orx discover"));
     }
 
     #[test]

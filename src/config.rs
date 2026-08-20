@@ -163,8 +163,8 @@ pub fn set_compute_default(backend: Option<String>, flavor: Option<String>) -> R
 }
 
 /// Literature sources the user disabled in Settings (their `LitSource::as_str()`
-/// names). Lives in the telemetry-owned `settings.json`; enforced by `orx lit`
-/// and `orx paper`. Empty = all enabled.
+/// names). Lives in the telemetry-owned `settings.json`; enforced by `orx lit`,
+/// `orx discover`, and `orx paper`. Empty = all enabled.
 pub fn disabled_lit_sources() -> Vec<String> {
     crate::telemetry::disabled_lit_sources()
 }
