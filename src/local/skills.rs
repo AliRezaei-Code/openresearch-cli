@@ -16,29 +16,12 @@ pub struct Skill {
     pub no_args: &'static str,
 }
 
-const LIT_REVIEW_TEMPLATE: &str = r#"Perform a multi-hop literature review across alphaXiv, OpenAlex, and bioRxiv.
+const LIT_REVIEW_TEMPLATE: &str = r#"Perform a literature review on:
 
-Topic: {args}
+{args}
 
-Load the `orx-lit-review` skill and follow its main-agent cross-corpus retrieval
-loop; do not delegate it. Choose the initial sources that fit the topic, using
-multiple sources when the question is interdisciplinary or corpus coverage is
-uncertain, and call the selected `orx discover` primitives directly. In later
-rounds, choose only the sources suited to the concrete coverage gap. Use
-`orx paper <id>` only when the requested review needs claim-level synthesis,
-methodological details, or comparison.
-
-Method:
-1. Complete the skill's retrieval loop first, including its exact difficulty-to-round budget, query-appropriate initial calls, acronym recovery, inherited date/ranking controls, stopping rule, and ranked 5-15 candidate set. A follow-up budget counts rounds, not primitive calls: one round may call multiple selected sources for the same concrete missing angle.
-2. For a set-of-papers or reading-list request, return the ranked discovery results without reading papers. When the request needs claim-level synthesis, methodological details, or comparison, only after retrieval is complete read the 3-5 most load-bearing candidates with `orx paper <id>`. Track papers already seen so you do not re-read them.
-3. Deduplicate overlaps across sources. Prefer alphaXiv for an arXiv duplicate because it supports full-text reading; use OpenAlex and bioRxiv to retain genuinely additional coverage.
-
-Then write the review:
-- Organize by theme, not by paper.
-- For each theme: the key papers (id + title), what they claim, where they agree and disagree.
-- Note open problems / gaps you noticed.
-- Cite every claim with a Markdown link whose title or paper id points to `https://www.alphaxiv.org/abs/<versionless-paperId>`. Never return an `arxiv.org` link for an alphaXiv/arXiv paper.
-- End with a short "start here" reading list of the 3-5 most load-bearing papers.
+Load and follow the `orx-lit-review` skill. Keep the retrieval loop in the main
+agent and return the requested review.
 "#;
 
 const ICML_REPRO_TEMPLATE: &str = r#"Reproduce an ICML 2026 paper for the agent reproduction challenge and publish a Trackio logbook.
@@ -331,8 +314,8 @@ mod tests {
     #[test]
     fn expands_known_skill_with_args() {
         let out = expand("/lit-review sparse autoencoders").unwrap();
-        assert!(out.contains("Topic: sparse autoencoders"));
-        assert!(out.contains("orx discover"));
+        assert!(out.contains("sparse autoencoders"));
+        assert!(out.contains("`orx-lit-review` skill"));
     }
 
     #[test]
