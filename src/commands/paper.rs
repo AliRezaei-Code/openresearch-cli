@@ -44,15 +44,17 @@ fn ensure_source_enabled(source: LitSource, disabled: &[String]) -> Result<()> {
 
 async fn run_alphaxiv(args: &crate::PaperArgs) -> Result<()> {
     let id = parse_paper_id(&args.id);
+    let paper_url = alphaxiv_paper_url(&id);
     let kind = if args.full { "abs" } else { "overview" };
 
     let (md, github) = tokio::join!(fetch_paper_markdown(kind, &id), fetch_paper_github(&id));
 
     // Best-effort: the GitHub link is useful context, never a reason to fail.
+    println!("alphaXiv: {paper_url}");
     if let Ok(Some(url)) = github {
         println!("GitHub: {}", url);
-        println!();
     }
+    println!();
 
     match md? {
         Some(md) => {
@@ -60,7 +62,7 @@ async fn run_alphaxiv(args: &crate::PaperArgs) -> Result<()> {
             Ok(())
         }
         None if args.full => Err(anyhow!(
-            "No full text extracted for {id} yet. Last resort — the PDF: https://arxiv.org/pdf/{id}"
+            "No full text extracted for {id} yet. Open the paper on alphaXiv: {paper_url}"
         )),
         None => Err(anyhow!(
             "No report generated for {id} yet. Try `orx paper {id} --full` for the raw extracted text."
@@ -263,9 +265,24 @@ pub(crate) fn parse_paper_id(input: &str) -> String {
         .to_string()
 }
 
+fn alphaxiv_paper_url(id: &str) -> String {
+    let versionless = match id.rsplit_once('v') {
+        Some((base, version))
+            if !version.is_empty() && version.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            base
+        }
+        _ => id,
+    };
+    format!("https://www.alphaxiv.org/abs/{versionless}")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{biorxiv_doi, detect_source, ensure_source_enabled, extract_doi, parse_paper_id};
+    use super::{
+        alphaxiv_paper_url, biorxiv_doi, detect_source, ensure_source_enabled, extract_doi,
+        parse_paper_id,
+    };
     use crate::LitSource;
 
     #[test]
@@ -291,6 +308,18 @@ mod tests {
         for (input, want) in cases {
             assert_eq!(parse_paper_id(input), want, "input: {input}");
         }
+    }
+
+    #[test]
+    fn builds_versionless_alphaxiv_links() {
+        assert_eq!(
+            alphaxiv_paper_url("2401.12345v2"),
+            "https://www.alphaxiv.org/abs/2401.12345"
+        );
+        assert_eq!(
+            alphaxiv_paper_url("2401.12345"),
+            "https://www.alphaxiv.org/abs/2401.12345"
+        );
     }
 
     #[test]

@@ -35,7 +35,7 @@ Then write the review:
 - Organize by theme, not by paper.
 - For each theme: the key papers (id + title), what they claim, where they agree and disagree.
 - Note open problems / gaps you noticed.
-- Cite every claim with its paper id (e.g. 2401.12345) so the user can pull it with `orx paper`.
+- Cite every claim with a Markdown link whose title or paper id points to `https://www.alphaxiv.org/abs/<versionless-paperId>`. Never return an `arxiv.org` link for an alphaXiv/arXiv paper.
 - End with a short "start here" reading list of the 3-5 most load-bearing papers.
 "#;
 

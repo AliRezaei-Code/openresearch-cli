@@ -117,13 +117,18 @@ After retrieval is complete, read the 3–5 most load-bearing candidates with
 answer. Do not narrow to 3–5 papers before the retrieval loop has produced its
 ranked 5–15 candidate set.
 
+In the final answer, link every alphaXiv/arXiv paper title or paper ID to
+`https://www.alphaxiv.org/abs/<versionless-paperId>`. Never return an
+`arxiv.org` link for those papers. Keep DOI, bioRxiv, and OpenAlex links for
+papers from those respective sources.
+
 ## Reading selected papers
 
 `orx paper` auto-detects an arXiv id/URL, bioRxiv DOI, other DOI, or OpenAlex
 `W…` id. For alphaXiv it returns a compact structured report; use `--full` only
 when that report omits a needed detail. If the report is not generated yet, the
 command tells you to retry with `--full`; if extracted text is unavailable, use
-the PDF link it returns.
+the alphaXiv paper link it returns.
 
 When alphaXiv has an associated repository, `orx paper` prints `GitHub: <url>`
 first. It is the most-starred associated repository and can be a framework
