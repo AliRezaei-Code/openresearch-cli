@@ -4575,6 +4575,7 @@ async fn create_chat_session(
         context_usage_json: None,
         bootstrap_context: None,
         active_leaf_id: None,
+        parent_session_id: None,
         created_at: now_ms(),
         updated_at: now_ms(),
     };

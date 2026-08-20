@@ -1277,7 +1277,8 @@ export interface ChatSession {
   harness: HarnessId;
   title: string | null;
   /** Who wrote `title`: `"fallback"` (first-line placeholder), `"generated"`
-   * (harness auto-title), `"user"` (rename). Null on legacy sessions. */
+   * (harness auto-title), `"user"` (explicitly chosen — a rename, or an agent's
+   * `orx agent spawn --title`). Null on legacy sessions. */
   titleSource?: string | null;
   model: string | null;
   permissionMode: string | null;
@@ -1286,6 +1287,9 @@ export interface ChatSession {
   reasoningLevel: string | null;
   /** Hidden from the default Recents list, but fully intact and resumable. */
   archived: boolean;
+  /** Session whose agent spawned this one with `orx agent spawn`; null for
+   * sessions the user started themselves. */
+  parentSessionId?: string | null;
   createdAt: number;
   updatedAt: number;
   busy: boolean;
