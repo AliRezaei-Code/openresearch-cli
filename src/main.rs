@@ -73,6 +73,9 @@ enum Command {
     /// Operate on one local project.
     Project(ProjectArgs),
 
+    /// Delegate a task to a second agent session.
+    Agent(AgentArgs),
+
     /// List a project's runs.
     Runs(RunsArgs),
 
@@ -368,6 +371,37 @@ pub struct InstanceListArgs {
 pub struct InstanceDeleteArgs {
     /// The instance (sandbox) id to terminate.
     pub sandbox_id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentArgs {
+    #[command(subcommand)]
+    pub command: AgentCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AgentCommand {
+    /// Hand a task to a helper agent running in its own top-level session.
+    Spawn {
+        /// What the helper agent should do. Write it as a self-contained brief:
+        /// the helper starts with an empty transcript and cannot see this chat.
+        task: Option<String>,
+        /// Read the task from stdin instead, for long multi-paragraph briefs.
+        #[arg(long)]
+        stdin: bool,
+        /// Name the session in the sidebar. Defaults to an auto-generated title.
+        #[arg(long)]
+        title: Option<String>,
+        /// Harness for the helper (defaults to this session's).
+        #[arg(long)]
+        harness: Option<String>,
+        /// Model for the helper (defaults to this session's).
+        #[arg(long)]
+        model: Option<String>,
+        /// Do not resume this chat when the helper finishes.
+        #[arg(long)]
+        no_wake: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -785,6 +819,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Projects(_) => "projects",
         Command::Orgs(_) => "orgs",
         Command::Project(_) => "project",
+        Command::Agent(_) => "agent",
         Command::Runs(_) => "runs",
         Command::Logs(_) => "logs",
         Command::CreateExperiment(_) => "create-experiment",
@@ -825,6 +860,7 @@ async fn dispatch(command: Command) -> error::Result<()> {
         Command::Projects(args) => commands::projects::run(args).await,
         Command::Orgs(args) => commands::orgs::run(args).await,
         Command::Project(args) => commands::project::run(args).await,
+        Command::Agent(args) => commands::agent::run(args).await,
         Command::Runs(args) => commands::runs::run(args).await,
         Command::Logs(args) => commands::logs::run(args).await,
         Command::CreateExperiment(args) => commands::create_experiment::run(args).await,

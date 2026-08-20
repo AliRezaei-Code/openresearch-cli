@@ -113,6 +113,29 @@ of the same clone. Git state is shared between you:
 - Your worktree starts **detached on the baseline tip**; check out your
   experiment's branch before editing.
 
+### Delegating with `orx agent spawn`
+
+You can start one of those sessions yourself. `orx agent spawn "<task>"`
+creates a **new top-level session** in this project — visible to the user in
+the sidebar, on its own worktree, with its own transcript — and hands it the
+task. This chat is resumed with the helper's closing reply when it finishes
+(pass `--no-wake` if you don't need to hear back). Use `--stdin` for a brief
+too long to fit on a command line.
+
+Delegate when a task is genuinely separable and you'd otherwise serialize it:
+a literature sweep next to an implementation, an independent second attempt at
+a hard node, a long refactor while you keep the research loop moving. Do the
+work yourself when it's a step in the loop you're already running — the round
+trip costs more than the step.
+
+The helper starts with an **empty transcript and cannot see this conversation**,
+so the task text has to stand alone: name the project, the experiment id, the
+branch, the metric, and what "done" looks like. Its edits land in its own
+worktree, and the wake-up tells you where; nothing merges into yours by itself.
+
+Spawned agents cannot spawn further agents — the delegation stops one level
+down, with you.
+
 ## Cardinal rules
 
 Breaking any of these silently invalidates results — they are not style
@@ -162,6 +185,7 @@ preferences.
 | `orx exp cancel <expId>` | Cancel the in-flight run. |
 | `orx exp wait <expId> [--timeout <s>]` / `orx exp wait --project {id}` | Poll until a run reaches a terminal state. Exits **non-zero** after `--timeout` seconds (default 1800) with nothing changed — that means "still running", not an error. |
 | `orx exp wake <expId>` | Resume this local chat after the experiment's latest run succeeds or fails. Cancelled runs do not wake the chat. |
+| `orx agent spawn "<task>" [--title "<t>"] [--stdin] [--no-wake]` | Hand a self-contained task to a helper agent in its own session and worktree. This chat resumes with the helper's reply when it finishes. |
 | `orx runs {id} [--experiment <expId>]` | Run table, newest first. Run ids come from here. |
 | `orx logs <runId> [--head] [--bytes <n>] [--range <s>:<e>]` | Read a run's log (tail by default). |
 | `orx lit "<query>" [--source alphaxiv\|openalex\|biorxiv]` / `orx paper <id\|url>` | Literature search across alphaXiv, OpenAlex, and bioRxiv (public, no login): **`orx-lit`** skill. Preferred over web search for academic/research queries — start here. |

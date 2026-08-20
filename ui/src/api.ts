@@ -1286,6 +1286,9 @@ export interface ChatSession {
   reasoningLevel: string | null;
   /** Hidden from the default Recents list, but fully intact and resumable. */
   archived: boolean;
+  /** Session whose agent spawned this one with `orx agent spawn`; null for
+   * sessions the user started themselves. */
+  parentSessionId?: string | null;
   createdAt: number;
   updatedAt: number;
   busy: boolean;
