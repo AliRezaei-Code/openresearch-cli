@@ -32,9 +32,6 @@ use serde_json::json;
 /// Prefix stamped onto every event name by the single wire encoder.
 const EVENT_PREFIX: &str = "cli_";
 const ANALYTICS_PATH: &str = "/analytics/v1/cli-events";
-const SEND_ATTEMPTS: usize = 2;
-/// Covers fast failures that leave time inside the exit-time flush window.
-const SEND_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 const BUILD_CHANNEL: &str = env!("ORX_BUILD_CHANNEL");
 
@@ -579,10 +576,6 @@ fn is_ci() -> bool {
     std::env::var_os("CI").is_some()
 }
 
-fn is_retryable_status(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::REQUEST_TIMEOUT || status.is_server_error()
-}
-
 fn build_payload_with_id(
     event: &str,
     install_id: &str,
@@ -598,6 +591,7 @@ fn build_payload_with_id(
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
             "ci": is_ci(),
+            // Hosted cloud agents were retired; released CLI installs are human-driven.
             "installKind": "human",
         },
         "events": [{
@@ -663,24 +657,14 @@ async fn send_with_id(
 ) {
     let payload = build_payload_with_id(&event, &install_id, event_id, properties);
     let url = format!("{}{ANALYTICS_PATH}", telemetry_host());
-    // The stable event id makes a retry safe against the server's dedupe constraint.
-    for attempt in 0..SEND_ATTEMPTS {
-        let result = http()
-            .post(&url)
-            .timeout(Duration::from_secs(3))
-            .json(&payload)
-            .send()
-            .await;
-        let retryable = match result {
-            Ok(response) if response.status().is_success() => return,
-            Ok(response) => is_retryable_status(response.status()),
-            Err(_) => true,
-        };
-        if !retryable || attempt + 1 == SEND_ATTEMPTS {
-            return;
-        }
-        tokio::time::sleep(SEND_RETRY_DELAY).await;
-    }
+    // Bounded per-request timeout so a hung endpoint can't keep the background
+    // task alive indefinitely.
+    let _ = http()
+        .post(&url)
+        .timeout(Duration::from_secs(3))
+        .json(&payload)
+        .send()
+        .await;
 }
 
 /// Spawn a fire-and-forget send, returning its handle (or `None` when disabled).
@@ -867,7 +851,8 @@ impl TelemetrySession {
 /// - `kind`: `"create"` (a node was created) or `"run"` (a run was launched).
 /// - `local`: `true` when dispatched via the local `orx up` store path.
 ///   This is a dispatch axis, not a "runs on this machine" axis — for example,
-///   `target="openresearch"` provisions an ephemeral OpenResearch box.
+///   `target="openresearch"` provisions an ephemeral OpenResearch box. Every
+///   current dispatch uses the local store path, so callers pass `true` today.
 /// - `target`: for a run, a COARSE compute label — the backend/provider name
 ///   (`"hf"`, `"modal"`, `"k8s"`, `"ssh"`, `"slurm"`, `"ray"`, `"openresearch"`,
 ///   `"local"`) for local-mode runs. `None` for `create` (no compute).
@@ -890,7 +875,6 @@ pub(crate) fn capture_experiment_started(kind: &str, local: bool, target: Option
 mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // Serializes the telemetry tests below, which mutate the process-global
     // variables in OPT_VARS. IMPORTANT: this lock
@@ -1365,63 +1349,64 @@ mod tests {
     }
 
     #[test]
-    fn retry_payloads_reuse_the_client_event_id() {
+    fn payloads_reuse_the_supplied_client_event_id() {
         let _g = EnvGuard::new(OPT_VARS);
-        let dir = std::env::temp_dir().join(format!("orx-tel-retry-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("orx-tel-event-id-{}", uuid::Uuid::new_v4()));
         std::env::set_var("XDG_CONFIG_HOME", &dir);
         let event_id = uuid::Uuid::new_v4();
         let first = build_payload_with_id("command", "did", event_id, json!({ "command": "run" }));
-        let retry = build_payload_with_id("command", "did", event_id, json!({ "command": "run" }));
-        assert_eq!(first["events"][0]["eventId"], retry["events"][0]["eventId"]);
+        let second = build_payload_with_id("command", "did", event_id, json!({ "command": "run" }));
+        assert_eq!(
+            first["events"][0]["eventId"],
+            second["events"][0]["eventId"]
+        );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    async fn receive_request(listener: &tokio::net::TcpListener, response_status: &str) -> Vec<u8> {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut bytes = Vec::new();
-        let mut buffer = [0_u8; 4096];
-        loop {
-            let read = stream.read(&mut buffer).await.unwrap();
-            if read == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&buffer[..read]);
-            if let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-                let headers = String::from_utf8_lossy(&bytes[..header_end]);
-                let content_length = headers
-                    .lines()
-                    .find_map(|line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("content-length: ")
-                            .map(str::to_owned)
-                    })
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .unwrap();
-                if bytes.len() >= header_end + 4 + content_length {
-                    break;
-                }
-            }
-        }
-        let response =
-            format!("HTTP/1.1 {response_status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        stream.write_all(response.as_bytes()).await.unwrap();
-        bytes
-    }
-
-    fn request_payload(request: &[u8]) -> serde_json::Value {
-        let request = String::from_utf8(request.to_vec()).unwrap();
-        let body = request.split("\r\n\r\n").nth(1).unwrap();
-        serde_json::from_str(body).unwrap()
     }
 
     #[tokio::test]
     async fn sender_posts_the_first_party_endpoint() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         let _g = EnvGuard::new(OPT_VARS);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         std::env::set_var("ORX_TELEMETRY_HOST", format!("http://{address}"));
         let event_id = uuid::Uuid::new_v4();
-        let server = tokio::spawn(async move { receive_request(&listener, "202 Accepted").await });
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+                if let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(str::to_owned)
+                        })
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap();
+                    if bytes.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            bytes
+        });
 
         send_with_id(
             "command".to_string(),
@@ -1436,44 +1421,6 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(payload["events"][0]["eventId"], event_id.to_string());
         assert_eq!(payload["events"][0]["name"], "cli_command");
-    }
-
-    #[tokio::test]
-    async fn sender_retries_transient_responses_with_the_same_payload() {
-        let _g = EnvGuard::new(OPT_VARS);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        std::env::set_var("ORX_TELEMETRY_HOST", format!("http://{address}"));
-        let event_id = uuid::Uuid::new_v4();
-        let server = tokio::spawn(async move {
-            let first = receive_request(&listener, "503 Service Unavailable").await;
-            let second = receive_request(&listener, "202 Accepted").await;
-            [first, second]
-        });
-
-        send_with_id(
-            "command".to_string(),
-            "install".to_string(),
-            event_id,
-            json!({ "command": "run" }),
-        )
-        .await;
-        let [first, second] = server.await.unwrap();
-        assert_eq!(request_payload(&first), request_payload(&second));
-        assert_eq!(
-            request_payload(&second)["events"][0]["eventId"],
-            event_id.to_string()
-        );
-    }
-
-    #[test]
-    fn only_transient_http_statuses_are_retryable() {
-        for status in [408, 500, 503] {
-            let status = reqwest::StatusCode::from_u16(status).unwrap();
-            assert!(is_retryable_status(status));
-        }
-        assert!(!is_retryable_status(reqwest::StatusCode::BAD_REQUEST));
-        assert!(!is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
     }
 
     #[test]
