@@ -79,6 +79,7 @@ import {
 } from "../api";
 import { activePath, forkPositions } from "../transcriptTree";
 import { onChatEvent } from "../events";
+import { orxArgsMatch, orxArgv, shellWords, unwrapShellBody } from "../orxCommand";
 import { LitSourceLogo, parseOrxLit, paperUrl } from "./LitSourceLogo";
 import { LitSourcesList } from "./LitSourcesPicker";
 import { Md } from "./Md";
@@ -1010,10 +1011,7 @@ function meaningfulCommand(command: string): string {
   const trimmed = command.trim();
   const wrapped = trimmed.match(/^\/bin\/(?:ba|z)?sh\s+-lc\s+([\s\S]+)$/);
   let body = (wrapped?.[1] ?? trimmed).trim();
-  const first = body[0];
-  if ((first === "\"" || first === "'") && body[body.length - 1] === first) {
-    body = body.slice(1, -1);
-  }
+  body = unwrapShellBody(body);
   return stripHeredocBodies(body).replace(/[\t\r ]+/g, " ").trim();
 }
 
@@ -1070,42 +1068,6 @@ function stripHeredocBodies(command: string): string {
     marker = heredocMarker(line);
   }
   return kept.join("\n");
-}
-
-function shellWords(input: string): string[] {
-  const words: string[] = [];
-  let word = "";
-  let quote: "\"" | "'" | null = null;
-  let escaped = false;
-  const push = () => {
-    if (word) words.push(word);
-    word = "";
-  };
-
-  for (const char of input) {
-    if (escaped) {
-      word += char;
-      escaped = false;
-      continue;
-    }
-    if (char === "\\" && quote !== "'") {
-      escaped = true;
-      continue;
-    }
-    if (quote) {
-      if (char === quote) quote = null;
-      else word += char;
-      continue;
-    }
-    if (char === "\"" || char === "'") {
-      quote = char;
-      continue;
-    }
-    if (/\s/.test(char)) push();
-    else word += char;
-  }
-  push();
-  return words;
 }
 
 function validReadTarget(value: string | undefined): string | null {
@@ -1370,13 +1332,11 @@ function shellCommandSegments(command: string): ShellCommandSegment[] {
 }
 
 function orxCommandSegments(command: string, args: string): ShellCommandSegment[] {
-  const invocation = new RegExp(`(?:^|\\b(?:do|then|else|if|while|until)\\s+)(?:[A-Za-z_][A-Za-z0-9_]*=[^\\s]+\\s+)*orx\\s+${args}\\b`, "i");
-  return shellCommandSegments(command).filter((segment) => invocation.test(segment.code));
+  return shellCommandSegments(command).filter((segment) => orxArgsMatch(segment.raw, args));
 }
 
 function commandInvokesOrx(command: string, args: string): boolean {
-  if (orxCommandSegments(command, args).length > 0) return true;
-  return new RegExp(`(?:^|[\\s($;])orx\\s+${args}\\b`, "i").test(command);
+  return orxCommandSegments(command, args).length > 0;
 }
 
 function spawnedSessionIds(output: string | undefined): string[] {
@@ -1470,9 +1430,9 @@ function commandRunIds(command: string, output?: string, preservedIds: string[] 
   }
   let hasUnresolvedTarget = false;
   for (const { invocation, offset } of invocationOffsets(command, invocations)) {
-    const logs = /\borx\s+logs\b/i.exec(invocation.raw);
-    if (!logs) continue;
-    const words = shellWords(invocation.raw.slice(logs.index + logs[0].length));
+    const argv = orxArgv(invocation.raw);
+    if (argv?.[0] !== "logs") continue;
+    const words = argv.slice(1);
     let target: string | null = null;
     for (let index = 0; index < words.length; index++) {
       const word = words[index];
@@ -1522,14 +1482,18 @@ function commandExperimentIds(command: string, output?: string, preservedIds: st
   const ids = new Set<string>();
   let hasUnresolvedTarget = false;
   for (const { invocation, offset } of invocationOffsets(command, invocations)) {
+    const argv = orxArgv(invocation.raw);
+    const target = argv?.[0] === "exp" && (argv[1] === "status" || argv[1] === "desc")
+      ? argv[2]
+      : null;
     let resolved = false;
-    for (const match of invocation.raw.matchAll(new RegExp(`\\borx\\s+exp\\s+(?:status|desc)\\s+["']?(${RUN_TARGET_PATTERN})`, "gi"))) {
-      ids.add(match[1]);
+    if (target && new RegExp(`^${RUN_TARGET_PATTERN}$`, "i").test(target)) {
+      ids.add(target);
       resolved = true;
     }
-    const match = /\borx\s+exp\s+(?:status|desc)\s+["']?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/.exec(invocation.raw);
-    if (match) {
-      const variable = match[1];
+    const variableMatch = target ? /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(target) : null;
+    if (variableMatch) {
+      const variable = variableMatch[1];
       const assignmentIds = assignedIdsBefore(command, variable, offset, RUN_TARGET_PATTERN);
       if (assignmentIds.length > 0) {
         for (const id of assignmentIds) ids.add(id);
@@ -1601,13 +1565,31 @@ function toolActivity(part: ChatPart): ToolActivity {
     case "bash": {
       if (!rawCommand) return { kind: "command", label: "Ran a command" };
       const command = meaningfulCommand(rawCommand);
-      const litSegment = orxCommandSegments(command, "(?:lit|paper)")[0];
-      const litCall = litSegment ? parseOrxLit(litSegment.raw) : null;
-      if (litCall) {
-        const label = litCall.kind === "lit"
-          ? litCall.query ? `Searched for “${litCall.query}”` : "Searched the literature"
-          : litCall.id ? `Read ${litCall.id}` : "Read a paper";
-        return { kind: litCall.kind === "lit" ? "search" : "read", label, litCall };
+      const shellSegments = shellCommandSegments(command);
+      let litCall: ReturnType<typeof parseOrxLit> = null;
+      for (const segment of shellSegments) {
+        litCall = parseOrxLit(segment.raw);
+        if (litCall) break;
+      }
+      const hasNonLiteratureOrx = shellSegments.some((segment) => {
+        const argv = orxArgv(segment.raw);
+        return argv !== null && argv[0] !== "discover" && argv[0] !== "paper";
+      });
+      if (litCall && !hasNonLiteratureOrx) {
+        const discoveryLabel = litCall.kind === "discover"
+          ? {
+              keyword: "Searched alphaXiv full text",
+              embedding: "Searched alphaXiv semantically",
+              openalex: "Searched OpenAlex",
+              biorxiv: "Searched bioRxiv",
+            }[litCall.strategy]
+          : null;
+        const label = litCall.kind === "discover"
+            ? litCall.query
+              ? `${discoveryLabel} for “${litCall.query}”`
+              : discoveryLabel ?? "Searched the literature"
+            : litCall.id ? `Read ${litCall.id}` : "Read a paper";
+        return { kind: litCall.kind === "paper" ? "read" : "search", label, litCall };
       }
 
       if (commandInvokesOrx(command, "agent\\s+spawn")) {
@@ -1615,16 +1597,18 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "agent",
           label: "Delegated a task to a new agent",
           spawnedSessionIds: spawnedSessionIds(toolOutput),
+          litCall: litCall ?? undefined,
         };
       }
-
-      const shellSegments = shellCommandSegments(command);
       const shellInvocations = shellSegments.map((segment) => shellInvocation(segment.raw));
       const readsExperimentStatus = commandInvokesOrx(command, "exp\\s+status");
       const readsExperimentNotes = commandInvokesOrx(command, "exp\\s+desc");
-      const updatesExperimentNotes = orxCommandSegments(command, "exp\\s+desc").some((segment) =>
-        /(?:^|\s)--(?:set(?:=|\s)|stdin\b)/.test(segment.raw),
-      );
+      const updatesExperimentNotes = orxCommandSegments(command, "exp\\s+desc").some((segment) => {
+        const argv = orxArgv(segment.raw) ?? [];
+        return argv.some(
+          (token) => token === "--set" || token.startsWith("--set=") || token === "--stdin",
+        );
+      });
       const notesLabel = updatesExperimentNotes ? "Updated experiment notes" : "Read experiment notes";
       const combinedLabel = updatesExperimentNotes
         ? "Checked experiment status and updated notes"
@@ -1632,16 +1616,16 @@ function toolActivity(part: ChatPart): ToolActivity {
       if (commandInvokesOrx(command, "logs")) {
         const runIds = commandRunIds(command, toolOutput, resourceRunIds, legacyTargetIds);
         const label = runIds.length === 1 ? "Reviewed run log" : "Reviewed run logs";
-        return { kind: "project", label, runIds };
+        return { kind: "project", label, runIds, litCall: litCall ?? undefined };
       }
       if (commandInvokesOrx(command, "exp\\s+run")) {
-        return { kind: "project", label: "Started an experiment run" };
+        return { kind: "project", label: "Started an experiment run", litCall: litCall ?? undefined };
       }
       if (commandInvokesOrx(command, "exp\\s+wait")) {
-        return { kind: "project", label: "Waited for an experiment run" };
+        return { kind: "project", label: "Waited for an experiment run", litCall: litCall ?? undefined };
       }
       if (commandInvokesOrx(command, "exp\\s+cancel")) {
-        return { kind: "project", label: "Cancelled an experiment run" };
+        return { kind: "project", label: "Cancelled an experiment run", litCall: litCall ?? undefined };
       }
       const readsProject = commandInvokesOrx(command, "project\\s+view");
       if (readsProject && readsExperimentStatus && readsExperimentNotes) {
@@ -1649,6 +1633,7 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "project",
           label: combinedLabel,
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (readsProject && readsExperimentNotes) {
@@ -1656,6 +1641,7 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "project",
           label: notesLabel,
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (readsProject && readsExperimentStatus) {
@@ -1663,16 +1649,18 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "project",
           label: "Checked experiment status",
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (readsProject) {
-        return { kind: "project", label: "Read project details" };
+        return { kind: "project", label: "Read project details", litCall: litCall ?? undefined };
       }
       if (readsExperimentStatus && readsExperimentNotes) {
         return {
           kind: "project",
           label: combinedLabel,
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (readsExperimentStatus) {
@@ -1680,6 +1668,7 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "project",
           label: "Checked experiment status",
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (readsExperimentNotes) {
@@ -1687,10 +1676,14 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "project",
           label: notesLabel,
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (commandInvokesOrx(command, "runs?")) {
-        return { kind: "project", label: "Listed project runs" };
+        return { kind: "project", label: "Listed project runs", litCall: litCall ?? undefined };
+      }
+      if (commandInvokesOrx(command, "projects")) {
+        return { kind: "project", label: "Listed projects", litCall: litCall ?? undefined };
       }
 
       const gitShowTarget = shellInvocations
@@ -2149,8 +2142,10 @@ function ToolActivityLabel({
 function summarizeToolGroup(activities: ToolActivity[]): string {
   const count = (kind: ToolActivityKind) => activities.filter((activity) => activity.kind === kind).length;
   const clauses: string[] = [];
-  const reads = count("read");
-  const searches = count("search");
+  const paperReads = activities.filter((activity) => activity.litCall?.kind === "paper").length;
+  const literatureSearches = activities.filter((activity) => activity.litCall?.kind === "discover").length;
+  const reads = activities.filter((activity) => activity.kind === "read" && activity.litCall?.kind !== "paper").length;
+  const searches = activities.filter((activity) => activity.kind === "search" && activity.litCall?.kind !== "discover").length;
   const edits = count("edit");
   const projects = count("project");
   const web = count("web");
@@ -2158,7 +2153,9 @@ function summarizeToolGroup(activities: ToolActivity[]): string {
   const agents = count("agent");
 
   if (reads) clauses.push(reads === 1 ? "Read a file" : "Read files");
+  if (paperReads) clauses.push(paperReads === 1 ? "read a paper" : "read papers");
   if (searches) clauses.push("searched code");
+  if (literatureSearches) clauses.push("searched literature");
   if (edits) clauses.push(edits === 1 ? "edited a file" : "edited files");
   if (projects) clauses.push("reviewed project data");
   if (web) clauses.push("browsed the web");

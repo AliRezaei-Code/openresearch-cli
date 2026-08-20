@@ -98,12 +98,15 @@ group below has a module (`orx skill <name>`) with the full flags and rules.
 To **read or edit** a node's code—including diffing what a run changed—use plain
 Git in the local session worktree. See the `orx-git` module.
 
-### Literature & papers — alphaXiv / OpenAlex / bioRxiv (no login required) — module `orx-lit`
+### Literature & papers — alphaXiv / OpenAlex / bioRxiv (no login required) — module `orx-lit-review`
 Use before any web search for academic/research queries (paper, author, blog, model release).
 | Command | What it does |
 |---|---|
-| `orx lit "<query>" [--source alphaxiv\|openalex\|biorxiv] [--limit <n>] [--json]` | Full-text search; `--source` picks the corpus (default alphaxiv; openalex = all fields, biorxiv = biology preprints). |
-| `orx paper <id\|url> [--source ...] [--full]` | Fetch a paper: alphaXiv report/`--full` text, or OpenAlex/bioRxiv metadata+abstract. Source auto-detected from the id. |
+| `orx discover keyword "<query>"` | Call the alphaXiv full-text retrieval primitive with match snippets. |
+| `orx discover embedding "<query>"` | Call the alphaXiv semantic retrieval primitive. The main agent ranks candidates and decides focused follow-ups; see `orx-lit-review`. |
+| `orx discover openalex "<query>"` | Search the cross-disciplinary OpenAlex scholarly graph. |
+| `orx discover biorxiv "<query>"` | Search bioRxiv preprints through OpenAlex's bioRxiv index. |
+| `orx paper <id\|url> [--source ...] [--full]` | Fetch a paper: alphaXiv report with automatic full-text fallback (`--full` forces raw text), or OpenAlex/bioRxiv metadata+abstract. Source auto-detected from the id. |
 
 ### Meta
 | Command | What it does |
@@ -121,7 +124,7 @@ list, with one-line descriptions, is printed at the end of `orx skill` output):
 - **orx-git** — read, edit, and diff a node's code with plain git.
 - **orx-evidence** — capture and inspect experiment results through run logs.
 - **orx-reports** — write durable research outputs into the project's artifacts directory.
-- **orx-lit** — literature search and paper content; the preferred starting point for academic/research queries (not web search).
+- **orx-lit-review** — main-agent cross-corpus retrieval, source-selective follow-up policy, and paper content; the preferred starting point for academic/research queries.
 
 ## Typical workflow
 

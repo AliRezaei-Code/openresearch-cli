@@ -198,7 +198,7 @@ preferences.
 | `orx agent spawn "<task>" [--title "<t>"] [--stdin] [--no-wake]` | Hand a self-contained task to a helper agent in its own session and worktree. This chat resumes with the helper's reply when it finishes. |
 | `orx runs {id} [--experiment <expId>]` | Run table, newest first. Run ids come from here. |
 | `orx logs <runId> [--head] [--bytes <n>] [--range <s>:<e>]` | Read a run's log (tail by default). |
-| `orx lit "<query>" [--source alphaxiv\|openalex\|biorxiv]` / `orx paper <id\|url>` | Literature search across alphaXiv, OpenAlex, and bioRxiv (public, no login): **`orx-lit`** skill. Preferred over web search for academic/research queries — start here. |
+| `orx discover keyword\|embedding\|openalex\|biorxiv "<query>"` / `orx paper <id\|url>` | Cross-corpus retrieval primitives and paper reading. The main agent owns the loop: **`orx-lit-review`** skill. |
 
 ## The auto-research loop
 
