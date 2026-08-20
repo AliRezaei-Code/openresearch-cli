@@ -79,6 +79,7 @@ import {
 } from "../api";
 import { activePath, forkPositions } from "../transcriptTree";
 import { onChatEvent } from "../events";
+import { orxArgsMatch, orxArgv, unwrapShellBody } from "../orxCommand";
 import { LitSourceLogo, parseOrxLit, paperUrl } from "./LitSourceLogo";
 import { LitSourcesList } from "./LitSourcesPicker";
 import { Md } from "./Md";
@@ -1008,10 +1009,7 @@ function meaningfulCommand(command: string): string {
   const trimmed = command.trim();
   const wrapped = trimmed.match(/^\/bin\/(?:ba|z)?sh\s+-lc\s+([\s\S]+)$/);
   let body = (wrapped?.[1] ?? trimmed).trim();
-  const first = body[0];
-  if ((first === "\"" || first === "'") && body[body.length - 1] === first) {
-    body = body.slice(1, -1);
-  }
+  body = unwrapShellBody(body);
   return stripHeredocBodies(body).replace(/[\t\r ]+/g, " ").trim();
 }
 
@@ -1365,8 +1363,7 @@ function shellCommandSegments(command: string): ShellCommandSegment[] {
 }
 
 function orxCommandSegments(command: string, args: string): ShellCommandSegment[] {
-  const invocation = new RegExp(`(?:^|\\b(?:do|then|else|if|while|until)\\s+)(?:[A-Za-z_][A-Za-z0-9_]*=[^\\s]+\\s+)*orx\\s+${args}\\b`, "i");
-  return shellCommandSegments(command).filter((segment) => invocation.test(segment.code));
+  return shellCommandSegments(command).filter((segment) => orxArgsMatch(segment.raw, args));
 }
 
 function commandInvokesOrx(command: string, args: string): boolean {
@@ -1455,9 +1452,9 @@ function commandRunIds(command: string, output?: string, preservedIds: string[] 
   }
   let hasUnresolvedTarget = false;
   for (const { invocation, offset } of invocationOffsets(command, invocations)) {
-    const logs = /\borx\s+logs\b/i.exec(invocation.raw);
-    if (!logs) continue;
-    const words = shellWords(invocation.raw.slice(logs.index + logs[0].length));
+    const argv = orxArgv(invocation.raw);
+    if (argv?.[0] !== "logs") continue;
+    const words = argv.slice(1);
     let target: string | null = null;
     for (let index = 0; index < words.length; index++) {
       const word = words[index];
@@ -1507,14 +1504,18 @@ function commandExperimentIds(command: string, output?: string, preservedIds: st
   const ids = new Set<string>();
   let hasUnresolvedTarget = false;
   for (const { invocation, offset } of invocationOffsets(command, invocations)) {
+    const argv = orxArgv(invocation.raw);
+    const target = argv?.[0] === "exp" && (argv[1] === "status" || argv[1] === "desc")
+      ? argv[2]
+      : null;
     let resolved = false;
-    for (const match of invocation.raw.matchAll(new RegExp(`\\borx\\s+exp\\s+(?:status|desc)\\s+["']?(${RUN_TARGET_PATTERN})`, "gi"))) {
-      ids.add(match[1]);
+    if (target && new RegExp(`^${RUN_TARGET_PATTERN}$`, "i").test(target)) {
+      ids.add(target);
       resolved = true;
     }
-    const match = /\borx\s+exp\s+(?:status|desc)\s+["']?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/.exec(invocation.raw);
-    if (match) {
-      const variable = match[1];
+    const variableMatch = target ? /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(target) : null;
+    if (variableMatch) {
+      const variable = variableMatch[1];
       const assignmentIds = assignedIdsBefore(command, variable, offset, RUN_TARGET_PATTERN);
       if (assignmentIds.length > 0) {
         for (const id of assignmentIds) ids.add(id);
@@ -1586,16 +1587,23 @@ function toolActivity(part: ChatPart): ToolActivity {
     case "bash": {
       if (!rawCommand) return { kind: "command", label: "Ran a command" };
       const command = meaningfulCommand(rawCommand);
-      const litSegment = orxCommandSegments(command, "(?:lit|paper)")[0];
-      const litCall = litSegment ? parseOrxLit(litSegment.raw) : null;
+      const shellSegments = shellCommandSegments(command);
+      let litCall: ReturnType<typeof parseOrxLit> = null;
+      for (const segment of shellSegments) {
+        litCall = parseOrxLit(segment.raw);
+        if (litCall) break;
+      }
       if (litCall) {
         const label = litCall.kind === "lit"
           ? litCall.query ? `Searched for “${litCall.query}”` : "Searched the literature"
-          : litCall.id ? `Read ${litCall.id}` : "Read a paper";
-        return { kind: litCall.kind === "lit" ? "search" : "read", label, litCall };
+          : litCall.kind === "discover"
+            ? litCall.query
+              ? `${litCall.strategy === "keyword" ? "Searched full text" : "Searched semantically"} for “${litCall.query}”`
+              : litCall.strategy === "keyword" ? "Searched full text" : "Searched semantically"
+            : litCall.id ? `Read ${litCall.id}` : "Read a paper";
+        return { kind: litCall.kind === "paper" ? "read" : "search", label, litCall };
       }
 
-      const shellSegments = shellCommandSegments(command);
       const shellInvocations = shellSegments.map((segment) => shellInvocation(segment.raw));
       const readsExperimentStatus = commandInvokesOrx(command, "exp\\s+status");
       const readsExperimentNotes = commandInvokesOrx(command, "exp\\s+desc");
@@ -1668,6 +1676,9 @@ function toolActivity(part: ChatPart): ToolActivity {
       }
       if (commandInvokesOrx(command, "runs?")) {
         return { kind: "project", label: "Listed project runs" };
+      }
+      if (commandInvokesOrx(command, "projects")) {
+        return { kind: "project", label: "Listed projects" };
       }
 
       const gitShowTarget = shellInvocations

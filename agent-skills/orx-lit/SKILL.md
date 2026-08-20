@@ -51,24 +51,71 @@ orx discover embedding "<query>" --published-before 2012-01-01 --prioritize hist
 
 ## Main-agent retrieval loop
 
-1. For the first round, issue both primitive calls yourself (in parallel when
-   possible). The keyword query should contain focused exact terms; the
-   embedding query should express the full question in the user's language.
-2. If the exact terms mix one or more 2–10 character tokens containing at least
-   two capital letters with other words, also call `keyword` with only those
-   tokens. Treat this as initial acronym recovery, not a follow-up.
-3. Inspect every returned set. Rank papers by how directly they answer the
-   question, using match snippets as evidence rather than blindly trusting API
-   order. Deduplicate by `paperId`.
-4. Stop if the evidence is sufficient. Easy requests should normally make no
-   follow-up; medium requests may make one; difficult literature reviews may
-   make at most two. A follow-up must target a concrete ambiguity, missing
-   subtopic, author, method, or phrase learned from prior results—not merely
-   rephrase the same search.
-5. Read the best papers with `orx paper <paperId>`, then answer with the most
-   relevant 3–5 unless the user requests another number. A request for more
-   papers requires focused additional queries; the retrieval primitives have
-   fixed result counts rather than a `--limit` flag.
+You are the low-latency retrieval ranker. Run the loop below yourself.
+
+### Set up the retrieval query
+
+1. Build focused keyword terms using only wording from the user or prior tool
+   results. Never guess an acronym expansion. General-purpose padding reduces
+   result quality.
+2. Build one semantic question in the user's terms. A short faithful question
+   is better than a padded reformulation.
+3. Estimate retrieval difficulty from 1–10. This controls a budget of complete
+   follow-up rounds: difficulty 1–3 gets 0 rounds, 4–7 gets 1, and 8–10 gets 2.
+4. Resolve one publication window and priority for the request. Every initial
+   and follow-up call must inherit those exact controls; never widen a window or
+   change priority during the loop. Every returned candidate already satisfies
+   that window, so rank what is available instead of lamenting well-known work
+   that the user excluded.
+
+### Run and rank
+
+1. Run the initial keyword and embedding calls concurrently when possible. If
+   the keyword terms mix other terms with one or more 2–10 character tokens
+   that start with a letter, contain only letters, digits, or hyphens, and have
+   at least two uppercase letters, concurrently run one additional keyword call
+   whose query is exactly those acronym tokens joined by spaces and nothing
+   else. This recovery call is part of the initial round.
+2. Treat initial calls independently: retain every successful result set when
+   another call fails. If none returns results and follow-up budget remains,
+   use a round only when a focused recovery query is likely to work.
+3. Inspect and deduplicate every candidate by `paperId`. The API order already
+   blends topical relevance with the requested priority:
+   - With `recency`, freshness is already upranked and old accumulated votes
+     are damped. Reorder only for topical fit; do not exclude an older but much
+     better match.
+   - With `popular`, votes already dominate among topically plausible results.
+     Keep heavily voted relevant papers, but drop off-topic ones.
+   - Otherwise, topical relevance remains primary with freshness and votes
+     already nudging the order. Do not apply those preferences a second time.
+4. If the initial candidates provide solid topical coverage, stop immediately
+   and rank 5–15 IDs. Fast and slightly less complete is better than an
+   exploratory search. Prefer fewer strong papers over padding.
+5. Otherwise, spend at most the difficulty-derived number of follow-up rounds.
+   One round targets one concrete missing acronym, method, benchmark,
+   organization, title phrase, or subtopic and may run keyword search,
+   embedding search, or both. When both are useful for that same missing angle,
+   call both primitives and count them together as one round. Never spend a
+   round merely rephrasing an existing search. Re-evaluate after each round and
+   stop as soon as coverage is sufficient. The budget is a hard cap, not a
+   target: track the remaining rounds, and when none remain, rank what you have
+   even if coverage still feels incomplete.
+6. Drop each selected ID that did not appear in a successful initial or
+   follow-up result, retaining the surviving IDs in your chosen rank order. If
+   no selected ID survives, fall back to the first 15 unique IDs in observation
+   order, with initial results before follow-up results. Never invent or recall
+   an ID.
+
+Batch all facets into one broad retrieval loop and plan against a cap of two
+complete loops per user turn. If a genuinely distinct topic still forces a
+third or fourth loop, run it in shallow mode: initial searches only, with zero
+follow-up rounds. This degradation is a backstop, not permission to plan extra
+loops. Refuse a fifth loop and answer from the papers already found.
+
+After retrieval is complete, read the 3–5 most load-bearing candidates with
+`orx paper <paperId>` (or the number the user requested) and synthesize the
+answer. Do not narrow to 3–5 papers before the retrieval loop has produced its
+ranked 5–15 candidate set.
 
 ## Reading selected papers
 

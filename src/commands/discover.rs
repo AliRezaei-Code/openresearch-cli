@@ -30,7 +30,10 @@ fn options(args: &crate::DiscoverySearchArgs) -> PaperDiscoveryOptions<'_> {
 }
 
 fn ensure_alphaxiv_enabled(disabled: &[String]) -> Result<()> {
-    if disabled.iter().any(|source| source == "alphaxiv") {
+    if disabled
+        .iter()
+        .any(|source| source == crate::LitSource::Alphaxiv.as_str())
+    {
         return Err(anyhow!(
             "alphaXiv is disabled by your OpenResearch literature-source configuration. Re-enable it to discover alphaXiv papers."
         ));

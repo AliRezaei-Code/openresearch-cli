@@ -27,9 +27,9 @@ For materially relevant non-arXiv coverage, supplement with `orx lit --source
 openalex` or `orx lit --source biorxiv`.
 
 Method:
-1. First round: call both alphaXiv retrieval primitives with focused keyword terms and the user's semantic question. Inspect titles, abstracts, and match snippets; rank the 3-5 most relevant papers yourself. For biomed or cross-field topics, supplement with OpenAlex or bioRxiv when that corpus is materially relevant.
-2. Read them: `orx paper <id>` for each pick.
-3. From those reports, extract cited papers, author names, benchmark/method names, and field terminology you did not start with. Make at most two focused follow-up primitive calls for genuinely missing angles, stopping earlier when the evidence is sufficient. Track papers already seen so you do not re-read them.
+1. Complete the skill's retrieval loop first, including its exact difficulty-to-round budget, initial parallel calls, acronym recovery, inherited date/ranking controls, stopping rule, and ranked 5-15 candidate set. A follow-up budget counts rounds, not primitive calls: one round may call both retrieval strategies for the same concrete missing angle.
+2. Only after retrieval is complete, read the 3-5 most load-bearing candidates with `orx paper <id>`. Track papers already seen so you do not re-read them.
+3. For biomed or cross-field topics, supplement with OpenAlex or bioRxiv only when that corpus is materially relevant. Keep this separate from the faithful alphaXiv retrieval loop.
 
 Then write the review:
 - Organize by theme, not by paper.
