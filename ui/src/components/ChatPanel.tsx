@@ -2142,8 +2142,10 @@ function ToolActivityLabel({
 function summarizeToolGroup(activities: ToolActivity[]): string {
   const count = (kind: ToolActivityKind) => activities.filter((activity) => activity.kind === kind).length;
   const clauses: string[] = [];
-  const reads = count("read");
-  const searches = count("search");
+  const paperReads = activities.filter((activity) => activity.litCall?.kind === "paper").length;
+  const literatureSearches = activities.filter((activity) => activity.litCall?.kind === "discover").length;
+  const reads = activities.filter((activity) => activity.kind === "read" && activity.litCall?.kind !== "paper").length;
+  const searches = activities.filter((activity) => activity.kind === "search" && activity.litCall?.kind !== "discover").length;
   const edits = count("edit");
   const projects = count("project");
   const web = count("web");
@@ -2151,7 +2153,9 @@ function summarizeToolGroup(activities: ToolActivity[]): string {
   const agents = count("agent");
 
   if (reads) clauses.push(reads === 1 ? "Read a file" : "Read files");
+  if (paperReads) clauses.push(paperReads === 1 ? "read a paper" : "read papers");
   if (searches) clauses.push("searched code");
+  if (literatureSearches) clauses.push("searched literature");
   if (edits) clauses.push(edits === 1 ? "edited a file" : "edited files");
   if (projects) clauses.push("reviewed project data");
   if (web) clauses.push("browsed the web");
