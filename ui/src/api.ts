@@ -881,7 +881,7 @@ export const getProfile = () => get<Profile>("/api/settings/profile");
 
 export const setProfile = (body: Profile) => post<Profile>("/api/settings/profile", body);
 
-/** Which literature sources `orx lit`/`orx paper` may use (settings.json). */
+/** Which literature sources discovery and paper reading may use (settings.json). */
 export interface LitSourcesSettings {
   alphaxiv: boolean;
   openalex: boolean;

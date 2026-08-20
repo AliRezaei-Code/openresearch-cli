@@ -1571,7 +1571,11 @@ function toolActivity(part: ChatPart): ToolActivity {
         litCall = parseOrxLit(segment.raw);
         if (litCall) break;
       }
-      if (litCall) {
+      const hasNonLiteratureOrx = shellSegments.some((segment) => {
+        const argv = orxArgv(segment.raw);
+        return argv !== null && argv[0] !== "discover" && argv[0] !== "paper";
+      });
+      if (litCall && !hasNonLiteratureOrx) {
         const discoveryLabel = litCall.kind === "discover"
           ? {
               keyword: "Searched alphaXiv full text",
@@ -1580,9 +1584,7 @@ function toolActivity(part: ChatPart): ToolActivity {
               biorxiv: "Searched bioRxiv",
             }[litCall.strategy]
           : null;
-        const label = litCall.kind === "lit"
-          ? litCall.query ? `Searched for “${litCall.query}”` : "Searched the literature"
-          : litCall.kind === "discover"
+        const label = litCall.kind === "discover"
             ? litCall.query
               ? `${discoveryLabel} for “${litCall.query}”`
               : discoveryLabel ?? "Searched the literature"
@@ -1595,6 +1597,7 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "agent",
           label: "Delegated a task to a new agent",
           spawnedSessionIds: spawnedSessionIds(toolOutput),
+          litCall: litCall ?? undefined,
         };
       }
       const shellInvocations = shellSegments.map((segment) => shellInvocation(segment.raw));
@@ -1613,16 +1616,16 @@ function toolActivity(part: ChatPart): ToolActivity {
       if (commandInvokesOrx(command, "logs")) {
         const runIds = commandRunIds(command, toolOutput, resourceRunIds, legacyTargetIds);
         const label = runIds.length === 1 ? "Reviewed run log" : "Reviewed run logs";
-        return { kind: "project", label, runIds };
+        return { kind: "project", label, runIds, litCall: litCall ?? undefined };
       }
       if (commandInvokesOrx(command, "exp\\s+run")) {
-        return { kind: "project", label: "Started an experiment run" };
+        return { kind: "project", label: "Started an experiment run", litCall: litCall ?? undefined };
       }
       if (commandInvokesOrx(command, "exp\\s+wait")) {
-        return { kind: "project", label: "Waited for an experiment run" };
+        return { kind: "project", label: "Waited for an experiment run", litCall: litCall ?? undefined };
       }
       if (commandInvokesOrx(command, "exp\\s+cancel")) {
-        return { kind: "project", label: "Cancelled an experiment run" };
+        return { kind: "project", label: "Cancelled an experiment run", litCall: litCall ?? undefined };
       }
       const readsProject = commandInvokesOrx(command, "project\\s+view");
       if (readsProject && readsExperimentStatus && readsExperimentNotes) {
@@ -1630,6 +1633,7 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "project",
           label: combinedLabel,
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (readsProject && readsExperimentNotes) {
@@ -1637,6 +1641,7 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "project",
           label: notesLabel,
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (readsProject && readsExperimentStatus) {
@@ -1644,16 +1649,18 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "project",
           label: "Checked experiment status",
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (readsProject) {
-        return { kind: "project", label: "Read project details" };
+        return { kind: "project", label: "Read project details", litCall: litCall ?? undefined };
       }
       if (readsExperimentStatus && readsExperimentNotes) {
         return {
           kind: "project",
           label: combinedLabel,
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (readsExperimentStatus) {
@@ -1661,6 +1668,7 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "project",
           label: "Checked experiment status",
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (readsExperimentNotes) {
@@ -1668,13 +1676,14 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "project",
           label: notesLabel,
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (commandInvokesOrx(command, "runs?")) {
-        return { kind: "project", label: "Listed project runs" };
+        return { kind: "project", label: "Listed project runs", litCall: litCall ?? undefined };
       }
       if (commandInvokesOrx(command, "projects")) {
-        return { kind: "project", label: "Listed projects" };
+        return { kind: "project", label: "Listed projects", litCall: litCall ?? undefined };
       }
 
       const gitShowTarget = shellInvocations

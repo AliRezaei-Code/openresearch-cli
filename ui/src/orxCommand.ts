@@ -1,7 +1,6 @@
 export type LitSource = "alphaxiv" | "openalex" | "biorxiv";
 
 export type OrxLitCall =
-  | { kind: "lit"; source: LitSource; query?: string }
   | { kind: "paper"; source: LitSource; id?: string }
   | {
       kind: "discover";
@@ -121,7 +120,7 @@ export function parseOrxLit(command: string): OrxLitCall | null {
   const argv = orxArgv(command);
   if (!argv) return null;
   const kind = argv[0];
-  if (kind !== "lit" && kind !== "paper" && kind !== "discover") return null;
+  if (kind !== "paper" && kind !== "discover") return null;
 
   let source: LitSource | undefined;
   const positionals: string[] = [];
@@ -149,9 +148,6 @@ export function parseOrxLit(command: string): OrxLitCall | null {
     positionals.push(token);
   }
 
-  if (kind === "lit") {
-    return { kind, source: source ?? "alphaxiv", query: positionals[0] };
-  }
   if (kind === "paper") {
     const id = positionals[0];
     return {

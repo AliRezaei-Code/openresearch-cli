@@ -999,7 +999,7 @@ fn literature_assistant_parts(harness: &str) -> Vec<WirePart> {
     for (id, path, title) in [
         (
             "literature-skill",
-            ".agents/skills/orx-lit/SKILL.md",
+            ".agents/skills/orx-lit-review/SKILL.md",
             "Load literature search workflow",
         ),
         (

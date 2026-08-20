@@ -1,5 +1,5 @@
 ---
-name: orx-lit
+name: orx-lit-review
 description: "Search and read research papers. The main agent calls alphaXiv, OpenAlex, and bioRxiv discovery primitives, ranks the combined candidates, and chooses sources for focused follow-ups. Use for literature reviews, related work, prior art, papers, authors, methods, benchmarks, or research claims; never delegate the retrieval loop to a sub-agent."
 ---
 
@@ -71,11 +71,11 @@ You are the low-latency retrieval ranker. Run the loop below yourself.
 
 ### Set up the retrieval query
 
-1. Build focused keyword terms using only wording from the user or prior tool
-   results. Never guess an acronym expansion. General-purpose padding reduces
-   result quality.
-2. Build one semantic question in the user's terms. A short faithful question
-   is better than a padded reformulation.
+1. If using keyword retrieval, build focused terms using only wording from the
+   user or prior tool results. Never guess an acronym expansion. General-purpose
+   padding reduces result quality.
+2. For semantic or scholarly-graph retrieval, build one short faithful question
+   in the user's terms rather than a padded reformulation.
 3. Estimate retrieval difficulty from 1–10. This controls a budget of complete
    follow-up rounds: difficulty 1–3 gets 0 rounds, 4–7 gets 1, and 8–10 gets 2.
 4. Resolve one publication window and priority for the request. Every initial
@@ -86,9 +86,15 @@ You are the low-latency retrieval ranker. Run the loop below yourself.
 
 ### Run and rank
 
-1. Run **all four** initial calls concurrently when possible: alphaXiv keyword,
-   alphaXiv embedding, OpenAlex, and bioRxiv. A disabled source may fail; keep
-   the other result sets. If the keyword terms mix other terms with one or more 2–10 character tokens
+1. Choose the initial sources and strategies that fit the query. For arXiv-heavy
+   ML, CS, math, or physics questions, use alphaXiv keyword, embedding, or both
+   according to whether exact full-text evidence, semantic coverage, or both are
+   useful. Add OpenAlex for broader journal, conference, citation, or
+   cross-disciplinary coverage. Use bioRxiv for biology and adjacent
+   life-science preprints, not as a ritual call for unrelated topics. When the
+   corpus is genuinely ambiguous or interdisciplinary, query multiple relevant
+   sources concurrently. If the initial round includes alphaXiv keyword and its
+   terms mix other terms with one or more 2–10 character tokens
    that start with a letter, contain only letters, digits, or hyphens, and have
    at least two uppercase letters, concurrently run one additional keyword call
    whose query is exactly those acronym tokens joined by spaces and nothing
@@ -165,6 +171,5 @@ associated repository, it then prints `GitHub: <url>`. This is the most-starred
 associated repository and can be a framework rather than the paper's own code,
 so sanity-check it before treating it as the implementation.
 
-`orx lit` is deprecated; its source searches are integrated into `orx discover`.
 All discovery and paper commands honor the user's disabled literature-source
 settings; do not work around an error saying a source is disabled.

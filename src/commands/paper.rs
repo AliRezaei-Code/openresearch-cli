@@ -32,7 +32,7 @@ pub async fn run(args: crate::PaperArgs) -> Result<()> {
 }
 
 /// A source disabled by the user refuses to fetch too, so a
-/// source turned off is off everywhere — the same gate `orx lit` applies.
+/// source turned off is off everywhere, including discovery.
 fn ensure_source_enabled(source: LitSource, disabled: &[String]) -> Result<()> {
     if disabled.iter().any(|d| d == source.as_str()) {
         return Err(anyhow!(

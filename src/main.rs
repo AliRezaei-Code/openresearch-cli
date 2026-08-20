@@ -106,10 +106,6 @@ enum Command {
     #[command(name = "install-skills")]
     InstallSkills(InstallSkillsArgs),
 
-    /// Deprecated one-shot literature search. Use `orx discover` instead.
-    #[command(hide = true)]
-    Lit(LitArgs),
-
     /// Call one paper-retrieval primitive; the caller owns the search loop.
     Discover(DiscoverArgs),
 
@@ -636,26 +632,6 @@ impl LitSource {
             LitSource::Biorxiv => "bioRxiv",
         }
     }
-
-    /// All sources, in preference order (used to pick a default when `--source`
-    /// is omitted).
-    pub const ALL: [LitSource; 3] = [LitSource::Alphaxiv, LitSource::Openalex, LitSource::Biorxiv];
-}
-
-#[derive(Args, Debug)]
-pub struct LitArgs {
-    /// Full-text search query.
-    pub query: String,
-    /// Max results (default 5).
-    #[arg(long)]
-    pub limit: Option<u32>,
-    /// Corpus to search. Omitted = the first source enabled in Settings
-    /// (alphaxiv unless it's disabled).
-    #[arg(long, value_enum)]
-    pub source: Option<LitSource>,
-    /// Emit raw JSON instead of the formatted list.
-    #[arg(long)]
-    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -889,7 +865,6 @@ fn command_name(command: &Command) -> &'static str {
         Command::Exp(_) => "exp",
         Command::Skill(_) => "skill",
         Command::InstallSkills(_) => "install-skills",
-        Command::Lit(_) => "lit",
         Command::Discover(_) => "discover",
         Command::Paper(_) => "paper",
         Command::Version(_) => "version",
@@ -934,7 +909,6 @@ async fn dispatch(command: Command) -> error::Result<()> {
         Command::Exp(args) => commands::exp::run(args).await,
         Command::Skill(args) => commands::skill::run(args).await,
         Command::InstallSkills(args) => commands::install_skills::run(args).await,
-        Command::Lit(args) => commands::lit::run(args).await,
         Command::Discover(args) => commands::discover::run(args).await,
         Command::Paper(args) => commands::paper::run(args).await,
         Command::Version(args) => commands::version::run(args).await,
@@ -961,7 +935,6 @@ fn command_uses_lifecycle_lock(command: &Command) -> bool {
         Command::Login(_)
             | Command::Logout
             | Command::InstallSkills(_)
-            | Command::Lit(_)
             | Command::Discover(_)
             | Command::Paper(_)
             | Command::Version(_)

@@ -148,7 +148,7 @@ pub(crate) struct Settings {
     pub github_default_prompt_seen: Option<bool>,
     /// Literature sources the user turned off (Settings → Literature sources).
     /// Values are `LitSource::as_str()` names; empty = all sources enabled, so a
-    /// source added later defaults to enabled. Enforced by `orx lit`/`orx paper`.
+    /// source added later defaults to enabled. Enforced by discovery and paper reading.
     #[serde(default)]
     pub disabled_lit_sources: Vec<String>,
     /// Whether orx may install updates on its own (Settings → Updates). Absent =
@@ -249,7 +249,7 @@ pub(crate) fn set_profile(profile: ResearchProfile) -> std::io::Result<()> {
 }
 
 /// Literature sources the user has disabled (their `LitSource::as_str()` names).
-/// Read by `orx lit`/`orx paper`; `crate::config` re-exports this as
+/// Read by discovery and paper reading; `crate::config` re-exports this as
 /// `disabled_lit_sources`.
 pub(crate) fn disabled_lit_sources() -> Vec<String> {
     load_settings()

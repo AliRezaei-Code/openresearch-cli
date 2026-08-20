@@ -372,7 +372,7 @@ pub async fn create_ssh_key(
 // alphaXiv literature endpoints (public — no auth, different hosts).
 //
 // These do NOT go through `send_request`/`Credentials`: they hit alphaXiv's
-// public API/web hosts and require no token, so `orx lit` / `orx paper` work
+// public API/web hosts and require no token, so discovery and paper reading work
 // even without `orx login`. They keep their own (simpler) error semantics and
 // translate a 404 into `Ok(None)` where "not generated yet" is a normal answer.
 // ---------------------------------------------------------------------------
@@ -482,34 +482,6 @@ pub async fn discover_papers_by_embedding(
     discover_papers("embedding", query, options).await
 }
 
-/// Full-text literature search across alphaXiv. Returns the hits in relevance
-/// order (most relevant first), capped at `limit`.
-pub async fn search_papers(query: &str, limit: u32) -> Result<Vec<PaperHit>> {
-    let base = crate::config::alphaxiv_api_url();
-    let url = format!(
-        "{}/search/v2/paper/full-text?q={}&limit={}",
-        base,
-        urlencoding::encode(query),
-        limit
-    );
-    let res = http()
-        .get(&url)
-        .header("user-agent", ALPHAXIV_UA)
-        .send()
-        .await
-        .map_err(|e| anyhow!("Could not reach alphaXiv at {}: {}", base, e))?;
-    let status = res.status();
-    if !status.is_success() {
-        let reason = status.canonical_reason().unwrap_or("");
-        return Err(anyhow!(
-            "alphaXiv search failed ({} {})",
-            status.as_u16(),
-            reason
-        ));
-    }
-    Ok(res.json::<Vec<PaperHit>>().await?)
-}
-
 /// `2401.12345v2` → `2401.12345`; alphaXiv lookups want the versionless id.
 pub(crate) fn versionless_id(paper_id: &str) -> &str {
     paper_id
@@ -520,7 +492,7 @@ pub(crate) fn versionless_id(paper_id: &str) -> &str {
 }
 
 /// One hit from the fast (Google-backed) paper search — the endpoint built for
-/// title lookups, vs the BM25 full-text search `orx lit` uses.
+/// title lookups, versus the BM25 discovery primitive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FastPaperHit {
@@ -733,8 +705,8 @@ pub async fn fetch_paper_markdown(kind: &str, paper_id: &str) -> Result<Option<S
 // ---------------------------------------------------------------------------
 // Unified literature hit + OpenAlex / bioRxiv sources.
 //
-// `orx lit` searches one source per call and prints a uniform list; `orx paper`
-// fetches one paper. Like the alphaXiv block above, these hit public hosts with
+// Discovery returns a uniform list and `orx paper` fetches one paper. Like the
+// alphaXiv block above, these hit public hosts with
 // no token and keep their own light error semantics. bioRxiv has no search API,
 // so `--source biorxiv` searches OpenAlex filtered to bioRxiv's source and
 // bioRxiv's own API is used only to fetch a preprint by DOI.
@@ -743,9 +715,8 @@ pub async fn fetch_paper_markdown(kind: &str, paper_id: &str) -> Result<Option<S
 /// OpenAlex source id for the bioRxiv repository — `--source biorxiv` filters to it.
 pub const BIORXIV_SOURCE_ID: &str = "S4306402567";
 
-/// A single literature search hit, uniform across sources. `orx lit --json`
-/// emits these verbatim, so per-source-only fields (`votes`, `citations`,
-/// `snippets`) are omitted when empty.
+/// A single discovery hit, uniform across sources. Per-source-only fields
+/// (`votes`, `citations`, `snippets`) are omitted when empty.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LitHit {
@@ -1028,25 +999,6 @@ pub async fn discover_openalex(
         .take(options.limit as usize)
         .map(|w| w.into_lit_hit(biorxiv))
         .collect())
-}
-
-/// Compatibility wrapper for the deprecated `orx lit` command.
-pub async fn search_openalex(
-    query: &str,
-    limit: u32,
-    source_filter: Option<&str>,
-) -> Result<Vec<LitHit>> {
-    discover_openalex(
-        query,
-        OpenAlexDiscoveryOptions {
-            limit,
-            published_after: None,
-            published_before: None,
-            prioritize: "default",
-            source_filter,
-        },
-    )
-    .await
 }
 
 /// The `/works/{id}` selector for a work fetched by id or DOI. A DOI (bare,

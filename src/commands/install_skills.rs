@@ -127,12 +127,28 @@ fn global_skills_dir(harness: &dyn Harness) -> Option<PathBuf> {
 /// Write the full set of modular `orx` skills into the harness's global skills
 /// dir (`--full`). Overwrites in place; returns the `SKILL.md` paths written.
 async fn write_full_skills(harness: &dyn Harness) -> Result<Vec<PathBuf>> {
-    use crate::local::agent_skills::{skills, SkillSet};
+    use crate::local::agent_skills::SkillSet;
 
     let base = global_skills_dir(harness)
         .ok_or_else(|| anyhow!("{} has no global skills dir", harness.name()))?;
+    write_skill_set(&base, SkillSet::Full).await
+}
+
+async fn write_skill_set(
+    base: &Path,
+    set: crate::local::agent_skills::SkillSet,
+) -> Result<Vec<PathBuf>> {
+    use crate::local::agent_skills::{skills, RETIRED_SKILL_NAMES};
+
+    for name in RETIRED_SKILL_NAMES {
+        match fs::remove_dir_all(base.join(name)).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     let mut written = Vec::new();
-    for skill in skills(SkillSet::Full) {
+    for skill in skills(set) {
         let dir = base.join(skill.name);
         fs::create_dir_all(&dir).await?;
         let path = dir.join("SKILL.md");
@@ -316,5 +332,25 @@ mod tests {
                 dir.display()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn full_skill_sync_prunes_retired_bundled_skills() {
+        let tmp =
+            std::env::temp_dir().join(format!("orx-full-skills-test-{}", uuid::Uuid::new_v4()));
+        let retired = tmp.join(crate::local::agent_skills::RETIRED_SKILL_NAMES[0]);
+        fs::create_dir_all(&retired).await.unwrap();
+        fs::write(retired.join("SKILL.md"), "stale").await.unwrap();
+
+        let written = write_skill_set(&tmp, crate::local::agent_skills::SkillSet::Full)
+            .await
+            .unwrap();
+        assert!(!retired.exists(), "retired bundled skill was pruned");
+        assert_eq!(
+            written.len(),
+            crate::local::agent_skills::skills(crate::local::agent_skills::SkillSet::Full).len()
+        );
+
+        let _ = fs::remove_dir_all(&tmp).await;
     }
 }

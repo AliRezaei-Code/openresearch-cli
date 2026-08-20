@@ -1,5 +1,5 @@
 // Brand marks + command parsing for the literature sources, used to render
-// `orx lit` / `orx paper` tool calls in chat as a real search ("Searching
+// Discovery and `orx paper` tool calls in chat as a real search ("Searching
 // OpenAlex for …") instead of a raw shell line. The official SVGs are inlined
 // at build time via `?raw` (no external asset — the UI is rust-embedded and
 // CSP-locked) and shown in a small white tile so the black marks (OpenAlex,

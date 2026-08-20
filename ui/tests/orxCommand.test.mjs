@@ -18,8 +18,7 @@ test("quoted Codex argv is tokenized as a normal command", () => {
   assert.equal(orxArgsMatch('"orx" "runs" "d81084a9-589e-4c8f-9384-2c0003517216"', "runs?"), true);
   assert.equal(orxArgsMatch('which "orx" "projects"', "projects"), false);
   assert.equal(orxArgsMatch('ORX_DATA_DIR=/tmp "orx" "projects"', "projects"), true);
-  assert.equal(orxArgsMatch('orx lit "exp status"', "exp\\s+status"), false);
-  assert.deepEqual(shellWords('orx lit ""'), ["orx", "lit", ""]);
+  assert.equal(orxArgsMatch('orx discover keyword "exp status"', "exp\\s+status"), false);
   assert.deepEqual(orxArgv('"orx" "logs" "d81084a9-589e-4c8f-9384-2c0003517216"'), [
     "logs",
     "d81084a9-589e-4c8f-9384-2c0003517216",
@@ -82,12 +81,7 @@ test("paper discovery commands expose their strategy and query", () => {
   });
 });
 
-test("existing literature and paper parsing remains intact", () => {
-  assert.deepEqual(parseOrxLit('orx lit "protein folding" --source openalex'), {
-    kind: "lit",
-    source: "openalex",
-    query: "protein folding",
-  });
+test("paper parsing remains intact", () => {
   assert.deepEqual(parseOrxLit('"orx" "paper" "10.1101/2024.01.01.123456v2"'), {
     kind: "paper",
     source: "biorxiv",
