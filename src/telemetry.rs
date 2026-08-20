@@ -32,6 +32,9 @@ use serde_json::json;
 /// Prefix stamped onto every event name by the single wire encoder.
 const EVENT_PREFIX: &str = "cli_";
 const ANALYTICS_PATH: &str = "/analytics/v1/cli-events";
+const SEND_ATTEMPTS: usize = 2;
+/// Covers fast failures that leave time inside the exit-time flush window.
+const SEND_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 const BUILD_CHANNEL: &str = env!("ORX_BUILD_CHANNEL");
 
@@ -576,6 +579,10 @@ fn is_ci() -> bool {
     std::env::var_os("CI").is_some()
 }
 
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT || status.is_server_error()
+}
+
 fn build_payload_with_id(
     event: &str,
     install_id: &str,
@@ -591,6 +598,7 @@ fn build_payload_with_id(
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
             "ci": is_ci(),
+            "installKind": "human",
         },
         "events": [{
             "eventId": event_id.to_string(),
@@ -655,14 +663,24 @@ async fn send_with_id(
 ) {
     let payload = build_payload_with_id(&event, &install_id, event_id, properties);
     let url = format!("{}{ANALYTICS_PATH}", telemetry_host());
-    // Bounded per-request timeout so a hung endpoint can't keep the background
-    // task alive indefinitely.
-    let _ = http()
-        .post(&url)
-        .timeout(Duration::from_secs(3))
-        .json(&payload)
-        .send()
-        .await;
+    // The stable event id makes a retry safe against the server's dedupe constraint.
+    for attempt in 0..SEND_ATTEMPTS {
+        let result = http()
+            .post(&url)
+            .timeout(Duration::from_secs(3))
+            .json(&payload)
+            .send()
+            .await;
+        let retryable = match result {
+            Ok(response) if response.status().is_success() => return,
+            Ok(response) => is_retryable_status(response.status()),
+            Err(_) => true,
+        };
+        if !retryable || attempt + 1 == SEND_ATTEMPTS {
+            return;
+        }
+        tokio::time::sleep(SEND_RETRY_DELAY).await;
+    }
 }
 
 /// Spawn a fire-and-forget send, returning its handle (or `None` when disabled).
@@ -778,8 +796,8 @@ pub(crate) fn capture_onboarding_research_profile(profile: &ResearchProfile) {
     );
 }
 
-pub(crate) fn capture_project_created() {
-    capture("project_created", json!({}));
+pub(crate) fn capture_project_created(local: bool) {
+    capture("project_created", json!({ "local": local }));
 }
 
 pub(crate) fn capture_chat_session_started(harness: &str) {
@@ -847,15 +865,21 @@ impl TelemetrySession {
 /// The motivating key event. Fire only on success.
 ///
 /// - `kind`: `"create"` (a node was created) or `"run"` (a run was launched).
+/// - `local`: `true` when dispatched via the local `orx up` store path.
+///   This is a dispatch axis, not a "runs on this machine" axis — for example,
+///   `target="openresearch"` provisions an ephemeral OpenResearch box.
 /// - `target`: for a run, a COARSE compute label — the backend/provider name
 ///   (`"hf"`, `"modal"`, `"k8s"`, `"ssh"`, `"slurm"`, `"ray"`, `"openresearch"`,
-///   `"local"`). `None` for `create` (no compute).
+///   `"local"`) for local-mode runs. `None` for `create` (no compute).
 ///   Always a fixed enum label, never an id, name, or path.
+///
+/// One vocabulary axis per property: `target` is always "what compute", `local`
+/// is always "which dispatch path". `kind`+`local` tell you how to read `target`.
 ///
 /// Non-blocking: the send is spawned and registered for the exit-time flush, so
 /// this returns immediately and never delays the command's own success output.
-pub(crate) fn capture_experiment_started(kind: &str, target: Option<&str>) {
-    let mut extra = json!({ "kind": kind });
+pub(crate) fn capture_experiment_started(kind: &str, local: bool, target: Option<&str>) {
+    let mut extra = json!({ "kind": kind, "local": local });
     if let (Some(obj), Some(t)) = (extra.as_object_mut(), target) {
         obj.insert("computeTarget".to_string(), json!(t));
     }
@@ -866,6 +890,7 @@ pub(crate) fn capture_experiment_started(kind: &str, target: Option<&str>) {
 mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // Serializes the telemetry tests below, which mutate the process-global
     // variables in OPT_VARS. IMPORTANT: this lock
@@ -1220,7 +1245,7 @@ mod tests {
         let payload = build_payload(
             "experiment_started",
             "test-distinct-id",
-            json!({ "kind": "run", "computeTarget": "modal" }),
+            json!({ "kind": "run", "local": false, "computeTarget": "modal" }),
         );
 
         assert_eq!(payload["schemaVersion"], 1);
@@ -1234,9 +1259,11 @@ mod tests {
         assert!(context["os"].is_string());
         assert!(context["arch"].is_string());
         assert!(context["ci"].is_boolean());
+        assert_eq!(context["installKind"], "human");
         let props = &payload["events"][0]["properties"];
         // Event-specific coarse props.
         assert_eq!(props["kind"], "run");
+        assert_eq!(props["local"], false);
         assert_eq!(props["computeTarget"], "modal");
 
         assert!(payload["events"][0]["occurredAt"].is_string());
@@ -1349,50 +1376,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    async fn receive_request(listener: &tokio::net::TcpListener, response_status: &str) -> Vec<u8> {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+            if let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(str::to_owned)
+                    })
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap();
+                if bytes.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        let response =
+            format!("HTTP/1.1 {response_status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        stream.write_all(response.as_bytes()).await.unwrap();
+        bytes
+    }
+
+    fn request_payload(request: &[u8]) -> serde_json::Value {
+        let request = String::from_utf8(request.to_vec()).unwrap();
+        let body = request.split("\r\n\r\n").nth(1).unwrap();
+        serde_json::from_str(body).unwrap()
+    }
+
     #[tokio::test]
     async fn sender_posts_the_first_party_endpoint() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         let _g = EnvGuard::new(OPT_VARS);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         std::env::set_var("ORX_TELEMETRY_HOST", format!("http://{address}"));
         let event_id = uuid::Uuid::new_v4();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            let mut buffer = [0_u8; 4096];
-            loop {
-                let read = stream.read(&mut buffer).await.unwrap();
-                if read == 0 {
-                    break;
-                }
-                bytes.extend_from_slice(&buffer[..read]);
-                if let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
-                {
-                    let headers = String::from_utf8_lossy(&bytes[..header_end]);
-                    let content_length = headers
-                        .lines()
-                        .find_map(|line| {
-                            line.to_ascii_lowercase()
-                                .strip_prefix("content-length: ")
-                                .map(str::to_owned)
-                        })
-                        .and_then(|value| value.parse::<usize>().ok())
-                        .unwrap();
-                    if bytes.len() >= header_end + 4 + content_length {
-                        break;
-                    }
-                }
-            }
-            stream
-                .write_all(
-                    b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .await
-                .unwrap();
-            bytes
-        });
+        let server = tokio::spawn(async move { receive_request(&listener, "202 Accepted").await });
 
         send_with_id(
             "command".to_string(),
@@ -1407,6 +1436,44 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(payload["events"][0]["eventId"], event_id.to_string());
         assert_eq!(payload["events"][0]["name"], "cli_command");
+    }
+
+    #[tokio::test]
+    async fn sender_retries_transient_responses_with_the_same_payload() {
+        let _g = EnvGuard::new(OPT_VARS);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        std::env::set_var("ORX_TELEMETRY_HOST", format!("http://{address}"));
+        let event_id = uuid::Uuid::new_v4();
+        let server = tokio::spawn(async move {
+            let first = receive_request(&listener, "503 Service Unavailable").await;
+            let second = receive_request(&listener, "202 Accepted").await;
+            [first, second]
+        });
+
+        send_with_id(
+            "command".to_string(),
+            "install".to_string(),
+            event_id,
+            json!({ "command": "run" }),
+        )
+        .await;
+        let [first, second] = server.await.unwrap();
+        assert_eq!(request_payload(&first), request_payload(&second));
+        assert_eq!(
+            request_payload(&second)["events"][0]["eventId"],
+            event_id.to_string()
+        );
+    }
+
+    #[test]
+    fn only_transient_http_statuses_are_retryable() {
+        for status in [408, 500, 503] {
+            let status = reqwest::StatusCode::from_u16(status).unwrap();
+            assert!(is_retryable_status(status));
+        }
+        assert!(!is_retryable_status(reqwest::StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
     }
 
     #[test]
@@ -1465,9 +1532,10 @@ mod tests {
             assert!(!profile_text.contains(forbidden));
         }
 
-        let project = build_payload("project_created", "did", json!({}));
+        let project = build_payload("project_created", "did", json!({ "local": true }));
         assert_eq!(project["events"][0]["name"], "cli_project_created");
-        assert!(property_keys(&project).is_empty());
+        assert_eq!(project["events"][0]["properties"]["local"], true);
+        assert_eq!(property_keys(&project), vec!["local"]);
 
         let chat = build_payload("chat_session_started", "did", json!({ "harness": "codex" }));
         assert_eq!(chat["events"][0]["name"], "cli_chat_session_started");
@@ -1525,9 +1593,9 @@ mod tests {
         let session = TelemetrySession::start("up");
         capture_onboarding_completed();
         capture_onboarding_research_profile(&ResearchProfile::default());
-        capture_project_created();
+        capture_project_created(true);
         capture_chat_session_started("codex");
-        capture_experiment_started("run", Some("local"));
+        capture_experiment_started("run", true, Some("local"));
 
         assert!(pending().lock().unwrap().is_empty());
         session.finish(true).await;

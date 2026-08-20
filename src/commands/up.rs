@@ -1045,7 +1045,7 @@ async fn create_project(
     } else {
         (project, None)
     };
-    crate::telemetry::capture_project_created();
+    crate::telemetry::capture_project_created(true);
     Ok(Json(json!({
         "project": project_json(&project),
         "githubPublicationError": github_publication_error,
