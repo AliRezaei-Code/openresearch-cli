@@ -405,41 +405,18 @@ pub struct PaperSnippet {
     pub snippet: String,
 }
 
-fn paper_search_url(
-    base: &str,
-    query: &str,
-    limit: u32,
-    published_after: Option<&str>,
-    published_before: Option<&str>,
-) -> Result<reqwest::Url> {
-    let mut url = reqwest::Url::parse(&format!("{base}/search/v2/paper/full-text"))?;
-    {
-        let mut params = url.query_pairs_mut();
-        params.append_pair("q", query);
-        params.append_pair("limit", &limit.to_string());
-        if let Some(date) = published_after {
-            params.append_pair("publishedAfter", date);
-        }
-        if let Some(date) = published_before {
-            params.append_pair("publishedBefore", date);
-        }
-    }
-    Ok(url)
-}
-
 /// Full-text literature search across alphaXiv. Returns the hits in relevance
 /// order (most relevant first), capped at `limit`.
-pub async fn search_papers(
-    query: &str,
-    limit: u32,
-    published_after: Option<&str>,
-    published_before: Option<&str>,
-) -> Result<Vec<PaperHit>> {
+pub async fn search_papers(query: &str, limit: u32) -> Result<Vec<PaperHit>> {
     let base = crate::config::alphaxiv_api_url();
-    // Omitting both bounds delegates the default three-month window to alphaXiv.
-    let url = paper_search_url(&base, query, limit, published_after, published_before)?;
+    let url = format!(
+        "{}/search/v2/paper/full-text?q={}&limit={}",
+        base,
+        urlencoding::encode(query),
+        limit
+    );
     let res = http()
-        .get(url)
+        .get(&url)
         .header("user-agent", ALPHAXIV_UA)
         .send()
         .await
@@ -1032,61 +1009,10 @@ pub async fn fetch_biorxiv(doi: &str) -> Result<Option<BiorxivDetail>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        openalex_selector, paper_search_url, reconstruct_abstract, CreateSandboxBody, ListCatalog,
-        ListCpuCatalog, LitHit, OpenAlexWork, PaperHit, SandboxEnvelope, SandboxTarget,
-        BIORXIV_SOURCE_ID,
+        openalex_selector, reconstruct_abstract, CreateSandboxBody, ListCatalog, ListCpuCatalog,
+        LitHit, OpenAlexWork, PaperHit, SandboxEnvelope, SandboxTarget, BIORXIV_SOURCE_ID,
     };
     use serde_json::json;
-
-    #[test]
-    fn paper_search_url_includes_explicit_date_bounds() {
-        let url = paper_search_url(
-            "https://api.alphaxiv.org",
-            "attention & memory",
-            8,
-            Some("2024-01-01"),
-            Some("2024-12-31"),
-        )
-        .expect("valid alphaXiv URL");
-        let params = url
-            .query_pairs()
-            .collect::<std::collections::HashMap<_, _>>();
-
-        assert_eq!(
-            params.get("q").map(|value| value.as_ref()),
-            Some("attention & memory")
-        );
-        assert_eq!(params.get("limit").map(|value| value.as_ref()), Some("8"));
-        assert_eq!(
-            params.get("publishedAfter").map(|value| value.as_ref()),
-            Some("2024-01-01")
-        );
-        assert_eq!(
-            params.get("publishedBefore").map(|value| value.as_ref()),
-            Some("2024-12-31")
-        );
-    }
-
-    #[test]
-    fn paper_search_url_leaves_defaulting_to_alphaxiv() {
-        let url = paper_search_url(
-            "https://api.alphaxiv.org",
-            "attention",
-            8,
-            None,
-            Some("2012-01-01"),
-        )
-        .expect("valid alphaXiv URL");
-        let params = url
-            .query_pairs()
-            .collect::<std::collections::HashMap<_, _>>();
-
-        assert!(!params.contains_key("publishedAfter"));
-        assert_eq!(
-            params.get("publishedBefore").map(|value| value.as_ref()),
-            Some("2012-01-01")
-        );
-    }
 
     #[test]
     fn openresearch_client_contains_only_account_and_compute_paths() {

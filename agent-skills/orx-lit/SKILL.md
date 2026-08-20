@@ -22,8 +22,6 @@ not the OpenResearch API):
 ```sh
 orx lit "speculative decoding for LLMs"                   # alphaXiv (default): id, title, date, votes, abstract
 orx lit "rotary position embeddings" --limit 10           # widen the result set (default 5)
-orx lit "transformer optimization" --published-after 2024-01-01 # widen alphaXiv's default three-month window
-orx lit "neural networks before AlexNet" --published-before 2012-01-01 # historical alphaXiv search
 orx lit "graph neural networks" --source openalex         # OpenAlex: cross-discipline, citation counts
 orx lit "spike protein binding affinity" --source biorxiv # biology preprints via bioRxiv
 orx lit "kv cache compression" --json                     # raw JSON (uniform LitHit shape) for piping
@@ -40,12 +38,6 @@ orx paper 2401.12345v2 --full                             # alphaXiv full extrac
   at `--limit` (default 5). `--json` emits a uniform hit shape (`source`, `id`,
   `title`, `abstract`, `publicationDate`, and `votes`/`citations`/`snippets` where
   they apply) for piping.
-- **alphaXiv searches default to papers from the past three months.** This keeps
-  ordinary discovery current. Use `--published-after YYYY-MM-DD` and/or
-  `--published-before YYYY-MM-DD` whenever the user names another period or the
-  question calls for older, seminal, or historical work. An upper bound without
-  a lower bound removes the default lower cutoff. These flags apply only to
-  `--source alphaxiv`.
 - **`orx paper <id>`** writes to **stdout** (pipe/redirect-friendly) and
   **auto-detects the source** from the id (override with `--source`):
   arXiv id/URL → alphaXiv report; `10.1101/…` DOI → bioRxiv; any other DOI or a

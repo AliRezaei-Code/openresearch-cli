@@ -13,11 +13,6 @@ use crate::LitSource;
 pub async fn run(args: crate::LitArgs) -> Result<()> {
     let limit = args.limit.unwrap_or(5);
     let source = resolve_lit_source(args.source, &crate::config::disabled_lit_sources())?;
-    validate_date_bounds_source(
-        args.source,
-        source,
-        args.published_after.is_some() || args.published_before.is_some(),
-    )?;
     // When no --source was given and the default (alphaXiv) is disabled, say which
     // source we fell back to, so the caller doesn't assume alphaXiv results.
     if args.source.is_none() && source != LitSource::Alphaxiv {
@@ -27,16 +22,11 @@ pub async fn run(args: crate::LitArgs) -> Result<()> {
         );
     }
     let hits: Vec<LitHit> = match source {
-        LitSource::Alphaxiv => search_papers(
-            &args.query,
-            limit,
-            args.published_after.as_deref(),
-            args.published_before.as_deref(),
-        )
-        .await?
-        .into_iter()
-        .map(LitHit::from)
-        .collect(),
+        LitSource::Alphaxiv => search_papers(&args.query, limit)
+            .await?
+            .into_iter()
+            .map(LitHit::from)
+            .collect(),
         LitSource::Openalex => search_openalex(&args.query, limit, None).await?,
         LitSource::Biorxiv => search_openalex(&args.query, limit, Some(BIORXIV_SOURCE_ID)).await?,
     };
@@ -67,25 +57,6 @@ pub async fn run(args: crate::LitArgs) -> Result<()> {
     }
     eprintln!("Fetch a report with: orx paper <id>");
     Ok(())
-}
-
-fn validate_date_bounds_source(
-    explicit: Option<LitSource>,
-    resolved: LitSource,
-    has_date_bounds: bool,
-) -> Result<()> {
-    if !has_date_bounds || resolved == LitSource::Alphaxiv {
-        return Ok(());
-    }
-    if explicit.is_none() {
-        return Err(anyhow!(
-            "Publication date filters require alphaXiv, but alphaXiv is disabled in Settings. Re-enable it or remove the filters to search {}.",
-            resolved.display_name()
-        ));
-    }
-    Err(anyhow!(
-        "--published-after and --published-before are supported only for alphaXiv searches"
-    ))
 }
 
 /// Pick the source to search, honoring the Settings disable-set. An explicit
@@ -138,7 +109,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_lit_source, validate_date_bounds_source};
+    use super::resolve_lit_source;
     use crate::LitSource;
 
     fn disabled(names: &[&str]) -> Vec<String> {
@@ -172,20 +143,6 @@ mod tests {
         assert_eq!(
             resolve_lit_source(Some(LitSource::Alphaxiv), &disabled(&["ghost"])).unwrap(),
             LitSource::Alphaxiv
-        );
-    }
-
-    #[test]
-    fn date_bounds_explain_disabled_alphaxiv_fallback() {
-        let error = validate_date_bounds_source(None, LitSource::Openalex, true)
-            .expect_err("fallback with date bounds should fail");
-
-        assert!(error
-            .to_string()
-            .contains("alphaXiv is disabled in Settings"));
-        assert!(
-            validate_date_bounds_source(Some(LitSource::Alphaxiv), LitSource::Alphaxiv, true)
-                .is_ok()
         );
     }
 }

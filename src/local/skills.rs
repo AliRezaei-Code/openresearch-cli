@@ -21,7 +21,7 @@ const LIT_REVIEW_TEMPLATE: &str = r#"Perform a multi-hop literature review acros
 Topic: {args}
 
 Use the `orx` CLI (already installed; public endpoints, no login needed):
-- `orx lit "<query>" [--source alphaxiv|openalex|biorxiv] [--published-after YYYY-MM-DD] [--published-before YYYY-MM-DD]` — full-text search; alphaXiv defaults to papers from the past three months. Change the date bounds when the question calls for older, seminal, or historical work. `--source` picks the corpus (default alphaxiv for CS/ML; openalex for cross-discipline + citation counts; biorxiv for biology preprints). Returns ids, titles, abstracts (`--json` for machine-readable output).
+- `orx lit "<query>" [--source alphaxiv|openalex|biorxiv]` — full-text search; `--source` picks the corpus (default alphaxiv for CS/ML; openalex for cross-discipline + citation counts; biorxiv for biology preprints). Returns ids, titles, abstracts (`--json` for machine-readable output).
 - `orx paper <id>` — for an alphaXiv id, its structured overview report (~10 KB), `--full` for raw text; for a DOI or OpenAlex `W…` id, title/authors/date/citations + abstract. Source auto-detected from the id.
 
 Method — iterate; do not stop after one search:

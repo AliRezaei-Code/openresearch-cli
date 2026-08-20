@@ -612,13 +612,6 @@ pub struct LitArgs {
     /// Max results (default 5).
     #[arg(long)]
     pub limit: Option<u32>,
-    /// Inclusive publication-date lower bound for alphaXiv (YYYY-MM-DD).
-    /// Omitted alphaXiv searches default to the past three months.
-    #[arg(long, value_name = "YYYY-MM-DD")]
-    pub published_after: Option<String>,
-    /// Inclusive publication-date upper bound for alphaXiv (YYYY-MM-DD).
-    #[arg(long, value_name = "YYYY-MM-DD")]
-    pub published_before: Option<String>,
     /// Corpus to search. Omitted = the first source enabled in Settings
     /// (alphaxiv unless it's disabled).
     #[arg(long, value_enum)]
@@ -884,26 +877,6 @@ fn command_uses_lifecycle_lock(command: &Command) -> bool {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
-
-    #[test]
-    fn lit_accepts_publication_date_bounds() {
-        let cli = Cli::try_parse_from([
-            "orx",
-            "lit",
-            "attention",
-            "--published-after",
-            "2024-01-01",
-            "--published-before",
-            "2024-12-31",
-        ])
-        .expect("literature date bounds should parse");
-        let Some(Command::Lit(args)) = cli.command else {
-            panic!("expected lit command");
-        };
-
-        assert_eq!(args.published_after.as_deref(), Some("2024-01-01"));
-        assert_eq!(args.published_before.as_deref(), Some("2024-12-31"));
-    }
 
     #[test]
     fn run_accepts_only_supervised_backend_flags() {

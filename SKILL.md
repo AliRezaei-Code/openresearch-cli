@@ -102,7 +102,7 @@ Git in the local session worktree. See the `orx-git` module.
 Use before any web search for academic/research queries (paper, author, blog, model release).
 | Command | What it does |
 |---|---|
-| `orx lit "<query>" [--source alphaxiv\|openalex\|biorxiv] [--published-after YYYY-MM-DD] [--published-before YYYY-MM-DD] [--limit <n>] [--json]` | Full-text search; alphaXiv defaults to the past three months, with explicit bounds for broader or historical work. `--source` picks the corpus. |
+| `orx lit "<query>" [--source alphaxiv\|openalex\|biorxiv] [--limit <n>] [--json]` | Full-text search; `--source` picks the corpus (default alphaxiv; openalex = all fields, biorxiv = biology preprints). |
 | `orx paper <id\|url> [--source ...] [--full]` | Fetch a paper: alphaXiv report/`--full` text, or OpenAlex/bioRxiv metadata+abstract. Source auto-detected from the id. |
 
 ### Meta

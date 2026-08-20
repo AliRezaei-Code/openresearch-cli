@@ -157,12 +157,12 @@ export function parseOrxLit(command: string): OrxLitCall | null {
       source = asSource(t.slice("--source=".length));
       continue;
     }
-    // Value flags may precede the query; skip their value so it is not read as the positional.
-    if (t === "--limit" || t === "--published-after" || t === "--published-before") {
+    // `--limit` takes a value; skip it so the value isn't read as the query.
+    if (t === "--limit") {
       i++;
       continue;
     }
-    if (t.startsWith("--")) continue; // Flag-only and --flag=value forms.
+    if (t.startsWith("--")) continue; // --json / --full / --limit=N
     if (positional === undefined && t) positional = t;
   }
 
