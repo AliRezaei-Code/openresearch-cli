@@ -5644,7 +5644,7 @@ export function ChatPanel({
           onClick={() => onSelectMainView("skills")}
         >
           <Blocks size={15} />
-          Skills
+          Customize
         </button>
         {SETTINGS_NAV.map((item) => (
           <button

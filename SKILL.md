@@ -127,6 +127,7 @@ list, with one-line descriptions, is printed at the end of `orx skill` output):
 - **orx-agent-delegation** — delegate independent work to helper sessions safely.
 - **orx-evidence** — capture and inspect experiment results through run logs.
 - **orx-reports** — write durable research outputs into the project's artifacts directory.
+- **orx-paper** — draft a paper or preprint as LaTeX that renders and compiles to PDF.
 - **orx-lit-review** — main-agent cross-corpus retrieval, source-selective follow-up policy, and paper content; the preferred starting point for academic/research queries.
 
 ## Typical workflow

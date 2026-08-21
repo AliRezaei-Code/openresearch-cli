@@ -367,6 +367,46 @@ export const openFileInEditor = (
     sessionId: opts.sessionId,
   });
 
+export interface LatexEngine {
+  /** The engine that will run, or null when the machine has none. */
+  engine: string | null;
+  /** Install guidance, present only when `engine` is null. */
+  hint: string | null;
+  /** A paste-ready install command, where this platform has one. */
+  installCommand: string | null;
+}
+
+/** Whether the machine running `orx up` can compile LaTeX. */
+export const getLatexEngine = () => get<LatexEngine>("/api/latex/engine");
+
+export interface LatexCompileResult {
+  ok: boolean;
+  /** Checkout-relative path of the produced PDF, null when the run failed. */
+  pdfPath: string | null;
+  /** What ran: `latexmk (xelatex)`, `tectonic`, `pdflatex`. */
+  engine: string;
+  /** Set when the toolchain could not honour the document's `% !TeX program`. */
+  note: string | null;
+  /** The engine reported errors. With `ok` true the PDF exists anyway — TeX
+   * recovers from most of them — but the log is worth showing. */
+  hadErrors: boolean;
+  /** Tail of the engine's output — the only useful thing on a failure. */
+  log: string;
+}
+
+/** Compile a checkout `.tex` file to a PDF beside it, using whichever LaTeX
+ * engine is installed on the machine running `orx up`. Rejects with a message
+ * naming the install options when none is. */
+export const compileLatex = (
+  projectId: string,
+  path: string,
+  opts: { sessionId?: string } = {},
+) =>
+  post<LatexCompileResult>(`/api/projects/${projectId}/file/latex`, {
+    path,
+    sessionId: opts.sessionId,
+  });
+
 export interface CodeTree {
   root: CheckoutRoot;
   /** The listed branch (`ref` mode), else the checked-out branch, else null
@@ -1143,7 +1183,44 @@ export const getSkills = (projectId?: string) =>
 /** Where an uploaded skill applies. */
 export type SkillScope = "global" | "project";
 
-/** A user-uploaded agent skill (a SKILL.md folder), managed in the Skills tab. */
+/** A user-uploaded LaTeX template the paper skill follows, managed in the
+ * Customize tab. Global, or scoped to one project (which shadows a global). */
+export interface LatexTemplate {
+  name: string;
+  scope: SkillScope;
+  /** Relative path of the .tex the agent starts from. */
+  entry: string;
+  /** Class/style files shipped alongside it. */
+  supportFiles: string[];
+  bytes: number;
+  updatedAt: number;
+}
+
+export const listLatexTemplates = (projectId?: string) =>
+  get<{ templates: LatexTemplate[] }>(
+    `/api/latex-templates${projectId ? `?project=${encodeURIComponent(projectId)}` : ""}`,
+  ).then((r) => r.templates);
+
+export const uploadLatexTemplate = (body: {
+  scope: SkillScope;
+  projectId?: string;
+  filename: string;
+  contentBase64: string;
+}) => post<{ template: LatexTemplate }>("/api/latex-templates", body).then((r) => r.template);
+
+export const deleteLatexTemplate = (req: {
+  scope: SkillScope;
+  name: string;
+  projectId?: string;
+}) => {
+  const params = new URLSearchParams({ scope: req.scope, name: req.name });
+  if (req.projectId) params.set("project", req.projectId);
+  return fetch(`/api/latex-templates?${params.toString()}`, { method: "DELETE" }).then((r) =>
+    json<{ ok: boolean }>(r),
+  );
+};
+
+/** A user-uploaded agent skill (a SKILL.md folder), managed in the Customize tab. */
 export interface UserSkill {
   name: string;
   description: string;

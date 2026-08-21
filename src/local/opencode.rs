@@ -247,6 +247,7 @@ fn exclude_agent_files(hub: &Path) {
         ".claude/skills/",
         ".opencode/skills/",
         ".agents/skills/",
+        ".orx/latex-templates/",
     ]
     .into_iter()
     .filter(|entry| !existing.lines().any(|l| l.trim() == *entry))
@@ -302,6 +303,9 @@ pub fn ensure_playbook(
         // User-uploaded skills land beside the built-ins, same freshness.
         super::user_skills::write_into_session(&workdir, dir, &project.id)?;
     }
+    // LaTeX templates the agent copies from, written fresh for the same reason —
+    // and independent of the skills dir, since no harness owns them.
+    super::latex_templates::write_into_session(&workdir, &project.id)?;
     // One shared exclude covers every worktree.
     exclude_agent_files(Path::new(&project.repo_path));
     // The playbook points the agent at the artifacts dir — make sure it exists.
