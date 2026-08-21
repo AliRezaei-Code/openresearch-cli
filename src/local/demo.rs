@@ -999,7 +999,7 @@ fn literature_assistant_parts(harness: &str) -> Vec<WirePart> {
     for (id, path, title) in [
         (
             "literature-skill",
-            ".agents/skills/orx-lit/SKILL.md",
+            ".agents/skills/orx-lit-review/SKILL.md",
             "Load literature search workflow",
         ),
         (
@@ -1079,7 +1079,7 @@ fn literature_assistant_parts(harness: &str) -> Vec<WirePart> {
         parts.push(tool_part(
             &format!("literature-search-{index}"),
             shell_tool,
-            json!({ "command": format!("orx lit \"{query}\" --limit 8") }),
+            json!({ "command": format!("orx discover keyword \"{query}\" --limit 8") }),
             Some("Relevant papers and passages retrieved."),
             Some("Search the literature"),
         ));

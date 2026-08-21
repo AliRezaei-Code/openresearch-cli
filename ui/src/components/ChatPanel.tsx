@@ -58,8 +58,10 @@ import {
   interruptChat,
   listChatSessions,
   reasoningFor,
+  recoverChatTurn,
   reconcileReasoning,
   renameChatSession,
+  retryQueuedMessage,
   respondChat,
   selectChatBranch,
   sendChatMessage,
@@ -79,6 +81,13 @@ import {
 } from "../api";
 import { activePath, forkPositions } from "../transcriptTree";
 import { onChatEvent } from "../events";
+import {
+  queuedRetryLabel,
+  recoveryAction as parseRecoveryAction,
+  recoveryTurnOptions,
+  retryStatusLabel,
+} from "../chatRecovery";
+import { orxArgsMatch, orxArgv, shellWords, unwrapShellBody } from "../orxCommand";
 import { LitSourceLogo, parseOrxLit, paperUrl } from "./LitSourceLogo";
 import { LitSourcesList } from "./LitSourcesPicker";
 import { Md } from "./Md";
@@ -917,7 +926,20 @@ function baseName(path: string): string {
   return trimmed.slice(trimmed.lastIndexOf("/") + 1) || trimmed;
 }
 
-type ToolActivityKind = "read" | "search" | "edit" | "web" | "agent" | "project" | "command";
+function skillNameFromPath(path: string): string | null {
+  const parts = path.replace(/\\/g, "/").replace(/\/+$/, "").split("/").filter(Boolean);
+  if (parts.at(-1)?.toLowerCase() !== "skill.md") return null;
+  return parts.at(-2) ?? null;
+}
+
+function nativeOrxSkillPath(tool: string, skillName: string): string | null {
+  if (!/^orx-[a-z0-9]+(?:-[a-z0-9]+)*$/.test(skillName)) return null;
+  if (tool === "Skill") return `.claude/skills/${skillName}/SKILL.md`;
+  if (tool === "skill") return `.opencode/skills/${skillName}/SKILL.md`;
+  return null;
+}
+
+type ToolActivityKind = "skill" | "read" | "search" | "edit" | "web" | "agent" | "project" | "command";
 
 interface ToolActivity {
   kind: ToolActivityKind;
@@ -1010,10 +1032,7 @@ function meaningfulCommand(command: string): string {
   const trimmed = command.trim();
   const wrapped = trimmed.match(/^\/bin\/(?:ba|z)?sh\s+-lc\s+([\s\S]+)$/);
   let body = (wrapped?.[1] ?? trimmed).trim();
-  const first = body[0];
-  if ((first === "\"" || first === "'") && body[body.length - 1] === first) {
-    body = body.slice(1, -1);
-  }
+  body = unwrapShellBody(body);
   return stripHeredocBodies(body).replace(/[\t\r ]+/g, " ").trim();
 }
 
@@ -1070,42 +1089,6 @@ function stripHeredocBodies(command: string): string {
     marker = heredocMarker(line);
   }
   return kept.join("\n");
-}
-
-function shellWords(input: string): string[] {
-  const words: string[] = [];
-  let word = "";
-  let quote: "\"" | "'" | null = null;
-  let escaped = false;
-  const push = () => {
-    if (word) words.push(word);
-    word = "";
-  };
-
-  for (const char of input) {
-    if (escaped) {
-      word += char;
-      escaped = false;
-      continue;
-    }
-    if (char === "\\" && quote !== "'") {
-      escaped = true;
-      continue;
-    }
-    if (quote) {
-      if (char === quote) quote = null;
-      else word += char;
-      continue;
-    }
-    if (char === "\"" || char === "'") {
-      quote = char;
-      continue;
-    }
-    if (/\s/.test(char)) push();
-    else word += char;
-  }
-  push();
-  return words;
 }
 
 function validReadTarget(value: string | undefined): string | null {
@@ -1370,13 +1353,11 @@ function shellCommandSegments(command: string): ShellCommandSegment[] {
 }
 
 function orxCommandSegments(command: string, args: string): ShellCommandSegment[] {
-  const invocation = new RegExp(`(?:^|\\b(?:do|then|else|if|while|until)\\s+)(?:[A-Za-z_][A-Za-z0-9_]*=[^\\s]+\\s+)*orx\\s+${args}\\b`, "i");
-  return shellCommandSegments(command).filter((segment) => invocation.test(segment.code));
+  return shellCommandSegments(command).filter((segment) => orxArgsMatch(segment.raw, args));
 }
 
 function commandInvokesOrx(command: string, args: string): boolean {
-  if (orxCommandSegments(command, args).length > 0) return true;
-  return new RegExp(`(?:^|[\\s($;])orx\\s+${args}\\b`, "i").test(command);
+  return orxCommandSegments(command, args).length > 0;
 }
 
 function spawnedSessionIds(output: string | undefined): string[] {
@@ -1470,9 +1451,9 @@ function commandRunIds(command: string, output?: string, preservedIds: string[] 
   }
   let hasUnresolvedTarget = false;
   for (const { invocation, offset } of invocationOffsets(command, invocations)) {
-    const logs = /\borx\s+logs\b/i.exec(invocation.raw);
-    if (!logs) continue;
-    const words = shellWords(invocation.raw.slice(logs.index + logs[0].length));
+    const argv = orxArgv(invocation.raw);
+    if (argv?.[0] !== "logs") continue;
+    const words = argv.slice(1);
     let target: string | null = null;
     for (let index = 0; index < words.length; index++) {
       const word = words[index];
@@ -1522,14 +1503,18 @@ function commandExperimentIds(command: string, output?: string, preservedIds: st
   const ids = new Set<string>();
   let hasUnresolvedTarget = false;
   for (const { invocation, offset } of invocationOffsets(command, invocations)) {
+    const argv = orxArgv(invocation.raw);
+    const target = argv?.[0] === "exp" && (argv[1] === "status" || argv[1] === "desc")
+      ? argv[2]
+      : null;
     let resolved = false;
-    for (const match of invocation.raw.matchAll(new RegExp(`\\borx\\s+exp\\s+(?:status|desc)\\s+["']?(${RUN_TARGET_PATTERN})`, "gi"))) {
-      ids.add(match[1]);
+    if (target && new RegExp(`^${RUN_TARGET_PATTERN}$`, "i").test(target)) {
+      ids.add(target);
       resolved = true;
     }
-    const match = /\borx\s+exp\s+(?:status|desc)\s+["']?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/.exec(invocation.raw);
-    if (match) {
-      const variable = match[1];
+    const variableMatch = target ? /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(target) : null;
+    if (variableMatch) {
+      const variable = variableMatch[1];
       const assignmentIds = assignedIdsBefore(command, variable, offset, RUN_TARGET_PATTERN);
       if (assignmentIds.length > 0) {
         for (const id of assignmentIds) ids.add(id);
@@ -1601,13 +1586,31 @@ function toolActivity(part: ChatPart): ToolActivity {
     case "bash": {
       if (!rawCommand) return { kind: "command", label: "Ran a command" };
       const command = meaningfulCommand(rawCommand);
-      const litSegment = orxCommandSegments(command, "(?:lit|paper)")[0];
-      const litCall = litSegment ? parseOrxLit(litSegment.raw) : null;
-      if (litCall) {
-        const label = litCall.kind === "lit"
-          ? litCall.query ? `Searched for “${litCall.query}”` : "Searched the literature"
-          : litCall.id ? `Read ${litCall.id}` : "Read a paper";
-        return { kind: litCall.kind === "lit" ? "search" : "read", label, litCall };
+      const shellSegments = shellCommandSegments(command);
+      let litCall: ReturnType<typeof parseOrxLit> = null;
+      for (const segment of shellSegments) {
+        litCall = parseOrxLit(segment.raw);
+        if (litCall) break;
+      }
+      const hasNonLiteratureOrx = shellSegments.some((segment) => {
+        const argv = orxArgv(segment.raw);
+        return argv !== null && argv[0] !== "discover" && argv[0] !== "paper";
+      });
+      if (litCall && !hasNonLiteratureOrx) {
+        const discoveryLabel = litCall.kind === "discover"
+          ? {
+              keyword: "Searched alphaXiv full text",
+              embedding: "Searched alphaXiv semantically",
+              openalex: "Searched OpenAlex",
+              biorxiv: "Searched bioRxiv",
+            }[litCall.strategy]
+          : null;
+        const label = litCall.kind === "discover"
+            ? litCall.query
+              ? `${discoveryLabel} for “${litCall.query}”`
+              : discoveryLabel ?? "Searched the literature"
+            : litCall.id ? `Read ${litCall.id}` : "Read a paper";
+        return { kind: litCall.kind === "paper" ? "read" : "search", label, litCall };
       }
 
       if (commandInvokesOrx(command, "agent\\s+spawn")) {
@@ -1615,16 +1618,18 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "agent",
           label: "Delegated a task to a new agent",
           spawnedSessionIds: spawnedSessionIds(toolOutput),
+          litCall: litCall ?? undefined,
         };
       }
-
-      const shellSegments = shellCommandSegments(command);
       const shellInvocations = shellSegments.map((segment) => shellInvocation(segment.raw));
       const readsExperimentStatus = commandInvokesOrx(command, "exp\\s+status");
       const readsExperimentNotes = commandInvokesOrx(command, "exp\\s+desc");
-      const updatesExperimentNotes = orxCommandSegments(command, "exp\\s+desc").some((segment) =>
-        /(?:^|\s)--(?:set(?:=|\s)|stdin\b)/.test(segment.raw),
-      );
+      const updatesExperimentNotes = orxCommandSegments(command, "exp\\s+desc").some((segment) => {
+        const argv = orxArgv(segment.raw) ?? [];
+        return argv.some(
+          (token) => token === "--set" || token.startsWith("--set=") || token === "--stdin",
+        );
+      });
       const notesLabel = updatesExperimentNotes ? "Updated experiment notes" : "Read experiment notes";
       const combinedLabel = updatesExperimentNotes
         ? "Checked experiment status and updated notes"
@@ -1632,16 +1637,16 @@ function toolActivity(part: ChatPart): ToolActivity {
       if (commandInvokesOrx(command, "logs")) {
         const runIds = commandRunIds(command, toolOutput, resourceRunIds, legacyTargetIds);
         const label = runIds.length === 1 ? "Reviewed run log" : "Reviewed run logs";
-        return { kind: "project", label, runIds };
+        return { kind: "project", label, runIds, litCall: litCall ?? undefined };
       }
       if (commandInvokesOrx(command, "exp\\s+run")) {
-        return { kind: "project", label: "Started an experiment run" };
+        return { kind: "project", label: "Started an experiment run", litCall: litCall ?? undefined };
       }
       if (commandInvokesOrx(command, "exp\\s+wait")) {
-        return { kind: "project", label: "Waited for an experiment run" };
+        return { kind: "project", label: "Waited for an experiment run", litCall: litCall ?? undefined };
       }
       if (commandInvokesOrx(command, "exp\\s+cancel")) {
-        return { kind: "project", label: "Cancelled an experiment run" };
+        return { kind: "project", label: "Cancelled an experiment run", litCall: litCall ?? undefined };
       }
       const readsProject = commandInvokesOrx(command, "project\\s+view");
       if (readsProject && readsExperimentStatus && readsExperimentNotes) {
@@ -1649,6 +1654,7 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "project",
           label: combinedLabel,
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (readsProject && readsExperimentNotes) {
@@ -1656,6 +1662,7 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "project",
           label: notesLabel,
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (readsProject && readsExperimentStatus) {
@@ -1663,16 +1670,18 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "project",
           label: "Checked experiment status",
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (readsProject) {
-        return { kind: "project", label: "Read project details" };
+        return { kind: "project", label: "Read project details", litCall: litCall ?? undefined };
       }
       if (readsExperimentStatus && readsExperimentNotes) {
         return {
           kind: "project",
           label: combinedLabel,
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (readsExperimentStatus) {
@@ -1680,6 +1689,7 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "project",
           label: "Checked experiment status",
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (readsExperimentNotes) {
@@ -1687,23 +1697,31 @@ function toolActivity(part: ChatPart): ToolActivity {
           kind: "project",
           label: notesLabel,
           experimentIds: commandExperimentIds(command, toolOutput, resourceExperimentIds, legacyTargetIds),
+          litCall: litCall ?? undefined,
         };
       }
       if (commandInvokesOrx(command, "runs?")) {
-        return { kind: "project", label: "Listed project runs" };
+        return { kind: "project", label: "Listed project runs", litCall: litCall ?? undefined };
+      }
+      if (commandInvokesOrx(command, "projects")) {
+        return { kind: "project", label: "Listed projects", litCall: litCall ?? undefined };
+      }
+      if (commandInvokesOrx(command, "compute")) {
+        return { kind: "project", label: "Checked compute options", litCall: litCall ?? undefined };
       }
 
       const gitShowTarget = shellInvocations
         .map(commandGitShowTarget)
         .find((target) => target != null);
       if (gitShowTarget) {
+        const skillName = skillNameFromPath(gitShowTarget.path);
         return {
-          kind: "read",
-          label: `Read ${baseName(gitShowTarget.path)}`,
+          kind: skillName ? "skill" : "read",
+          label: skillName ? `Read ${skillName} skill` : `Read ${baseName(gitShowTarget.path)}`,
           filePath: gitShowTarget.path,
           fileRef: gitShowTarget.ref,
           labelPrefix: "Read ",
-          labelTarget: baseName(gitShowTarget.path),
+          labelTarget: skillName ? `${skillName} skill` : baseName(gitShowTarget.path),
         };
       }
 
@@ -1721,12 +1739,13 @@ function toolActivity(part: ChatPart): ToolActivity {
           )
         : null;
       if (readTarget && readPath) {
+        const skillName = skillNameFromPath(readPath);
         return {
-          kind: "read",
-          label: `Read ${baseName(readTarget)}`,
+          kind: skillName ? "skill" : "read",
+          label: skillName ? `Read ${skillName} skill` : `Read ${baseName(readTarget)}`,
           filePath: readPath,
           labelPrefix: "Read ",
-          labelTarget: baseName(readTarget),
+          labelTarget: skillName ? `${skillName} skill` : baseName(readTarget),
         };
       }
       if (shellInvocations.some((invocation) =>
@@ -1757,7 +1776,6 @@ function toolActivity(part: ChatPart): ToolActivity {
           searchPattern: pattern,
         };
       }
-      if (readInvocation) return { kind: "read", label: "Read a file" };
       if (gitAction === "status") return { kind: "command", label: "Checked Git status" };
       if (gitAction === "diff") return { kind: "command", label: "Reviewed code changes" };
       if (gitAction === "log") return { kind: "command", label: "Read Git history" };
@@ -1773,8 +1791,29 @@ function toolActivity(part: ChatPart): ToolActivity {
       if (packageAction("build")) return { kind: "command", label: "Built the project" };
       return { kind: "command", label: `Ran ${command}` };
     }
+    case "skill": {
+      const skillName = inputString(normalizedInput, "skill", "name");
+      const filePath = skillName ? nativeOrxSkillPath(tool, skillName) : null;
+      return {
+        kind: "skill",
+        label: skillName ? `Loaded ${skillName} skill` : "Loaded a skill",
+        filePath: filePath ?? undefined,
+        labelPrefix: filePath ? "Loaded " : undefined,
+        labelTarget: filePath && skillName ? `${skillName} skill` : undefined,
+      };
+    }
     case "read": {
       const target = filePath ? baseName(filePath) : null;
+      const skillName = filePath ? skillNameFromPath(filePath) : null;
+      if (skillName) {
+        return {
+          kind: "skill",
+          label: `Read ${skillName} skill`,
+          filePath: filePath ?? undefined,
+          labelPrefix: "Read ",
+          labelTarget: `${skillName} skill`,
+        };
+      }
       return target
         ? { kind: "read", label: `Read ${target}`, filePath: filePath ?? undefined, labelPrefix: "Read ", labelTarget: target }
         : { kind: "read", label: "Read a file" };
@@ -1878,6 +1917,8 @@ function ToolActivityIcon({ activity, className = "" }: { activity: ToolActivity
   }
   const props = { size: 16, strokeWidth: 1.75, className: `tool-kind-icon shrink-0 ${className}` };
   switch (activity.kind) {
+    case "skill":
+      return <Blocks {...props} />;
     case "read":
     case "project":
       return <BookOpen {...props} />;
@@ -2149,16 +2190,24 @@ function ToolActivityLabel({
 function summarizeToolGroup(activities: ToolActivity[]): string {
   const count = (kind: ToolActivityKind) => activities.filter((activity) => activity.kind === kind).length;
   const clauses: string[] = [];
-  const reads = count("read");
-  const searches = count("search");
+  const paperReads = activities.filter((activity) => activity.litCall?.kind === "paper").length;
+  const literatureSearches = activities.filter((activity) => activity.litCall?.kind === "discover").length;
+  const reads = activities.filter((activity) => activity.kind === "read" && activity.litCall?.kind !== "paper").length;
+  const searches = activities.filter((activity) => activity.kind === "search" && activity.litCall?.kind !== "discover").length;
   const edits = count("edit");
   const projects = count("project");
   const web = count("web");
   const commands = count("command");
   const agents = count("agent");
+  const skillActions = activities
+    .filter((activity) => activity.kind === "skill")
+    .map((activity) => `${activity.label[0].toLowerCase()}${activity.label.slice(1)}`);
 
-  if (reads) clauses.push(reads === 1 ? "Read a file" : "Read files");
+  if (skillActions.length) clauses.push(skillActions.join(skillActions.length === 2 ? " and " : ", "));
+  if (reads) clauses.push(reads === 1 ? "read a file" : "read files");
+  if (paperReads) clauses.push(paperReads === 1 ? "read a paper" : "read papers");
   if (searches) clauses.push("searched code");
+  if (literatureSearches) clauses.push("searched literature");
   if (edits) clauses.push(edits === 1 ? "edited a file" : "edited files");
   if (projects) clauses.push("reviewed project data");
   if (web) clauses.push("browsed the web");
@@ -2179,6 +2228,7 @@ function activityInProgress(activity: ToolActivity): ToolActivity {
     [/^Updated /, "Updating "],
     [/^Created /, "Creating "],
     [/^Deleted /, "Deleting "],
+    [/^Loaded /, "Loading "],
     [/^Ran /, "Running "],
     [/^Started /, "Starting "],
     [/^Waited /, "Waiting "],
@@ -2211,6 +2261,7 @@ function permissionActivityLabel(tool: string | undefined, input: Record<string,
     [/^Updated /, "Update "],
     [/^Created /, "Create "],
     [/^Deleted /, "Delete "],
+    [/^Loaded /, "Load "],
     [/^Delegated /, "Delegate "],
     [/^Ran /, "Run "],
     [/^Started /, "Start "],
@@ -2316,7 +2367,7 @@ function useDelayedToolShimmer(active: boolean): boolean {
 }
 
 function groupIconActivity(activities: ToolActivity[]): ToolActivity {
-  const priority: ToolActivityKind[] = ["read", "search", "edit", "project", "web", "command", "agent"];
+  const priority: ToolActivityKind[] = ["skill", "read", "search", "edit", "project", "web", "command", "agent"];
   for (const kind of priority) {
     const activity = activities.find((candidate) => candidate.kind === kind);
     if (activity) return activity;
@@ -2356,6 +2407,62 @@ function squashToolParts(parts: ChatPart[]): SquashedToolPart[] {
     }
   }
   return squashed;
+}
+
+function TurnStatusRow({
+  part,
+  busy,
+  recovering,
+  onRecover,
+}: {
+  part: ChatPart;
+  busy: boolean;
+  recovering: boolean;
+  onRecover?: (turnId: string, action: "retry" | "continue") => void;
+}) {
+  const input = part.state?.input;
+  const nextRetryAt = input?.nextRetryAt ?? null;
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (typeof nextRetryAt !== "number") return;
+    setNow(Date.now());
+    if (nextRetryAt <= Date.now()) return;
+    const timer = window.setInterval(() => {
+      const current = Date.now();
+      setNow(current);
+      if (current >= nextRetryAt) window.clearInterval(timer);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [nextRetryAt]);
+  if (part.id === "turn-retry") {
+    const label = retryStatusLabel(input ?? {}, now);
+    return (
+      <div className="turn-retry-row flex items-center gap-2 py-1 px-1 text-sm text-subtext">
+        <span className={SPINNER_CLASS_NAME} />
+        <span>{label}</span>
+      </div>
+    );
+  }
+  const action = parseRecoveryAction(input?.recoveryAction);
+  const turnId = input?.turnId;
+  if ((action !== "retry" && action !== "continue") || !turnId) return null;
+  const label = action === "retry" ? "Retry" : "Continue";
+  const errorMessage = cleanToolError(part.state?.error || "This turn did not finish.");
+  return (
+    <div className="turn-recovery-row flex items-center justify-between gap-2 py-1.5 px-2.5 border border-border rounded-md bg-background">
+      <span className="min-w-0 truncate text-sm text-accent-red" title={errorMessage}>
+        {errorMessage}
+      </span>
+      <button
+        type="button"
+        className="shrink-0 h-7 px-2.5 rounded-sm border border-border bg-background text-xs font-medium text-text disabled:opacity-50 [&:hover:not(:disabled)]:bg-surface"
+        disabled={busy || recovering}
+        onClick={() => onRecover?.(turnId, action)}
+      >
+        {recovering ? "Starting…" : label}
+      </button>
+    </div>
+  );
 }
 
 /** Routine successful calls are static activity rows. Only failures disclose
@@ -2840,6 +2947,10 @@ function partIsVisible(part: ChatPart, activePermissionId?: string | null): bool
   return true; // tool, image, …
 }
 
+function isTurnStatusPart(part: ChatPart): boolean {
+  return part.id === "turn-retry" || part.id === "turn-recovery";
+}
+
 /** Whether a message renders anything once resolved-permission cards vanish —
  * a bridge permission card rides its own message, so resolving it leaves the
  * message empty and it must drop out of the transcript entirely. */
@@ -2959,6 +3070,9 @@ const Message = memo(function Message({
   onRespond,
   onOpenPlan,
   onOpenSubagent,
+  busy = false,
+  recoveringTurnId,
+  onRecover,
   skills,
   predictTextTail = false,
   forkCount,
@@ -2984,6 +3098,9 @@ const Message = memo(function Message({
   onOpenPlan?: (plan: string, promptId: string) => void;
   /** Open a sub-agent's transcript in the right pane (spawn-row "view"). */
   onOpenSubagent?: (spawnPartId: string, label?: string) => void;
+  busy?: boolean;
+  recoveringTurnId?: string | null;
+  onRecover?: (turnId: string, action: "retry" | "continue") => void;
   /** Known slash-skills, for rendering a leading `/name` as a command chip. */
   skills?: SkillInfo[];
   predictTextTail?: boolean;
@@ -3116,9 +3233,13 @@ const Message = memo(function Message({
       </div>
     );
   }
+  const turnStatus = message.parts.find(isTurnStatusPart);
+  const regularParts = turnStatus
+    ? message.parts.filter((part) => part !== turnStatus)
+    : message.parts;
   return (
-    <div className="msg-assistant text-lg leading-[1.62] text-text min-w-0">
-      {renderParts(message.parts, {
+    <div className="msg-assistant group/turn text-lg leading-[1.62] text-text min-w-0">
+      {renderParts(regularParts, {
         activePermissionId,
         pendingTailToolId,
         onOpenFile,
@@ -3132,6 +3253,14 @@ const Message = memo(function Message({
         onOpenSubagent,
         predictTextTail,
       })}
+      {turnStatus && (
+        <TurnStatusRow
+          part={turnStatus}
+          busy={busy}
+          recovering={recoveringTurnId === turnStatus.state?.input?.turnId}
+          onRecover={onRecover}
+        />
+      )}
     </div>
   );
 });
@@ -3524,6 +3653,22 @@ function useTranscriptAnnouncement(messages: ChatMessage[]): TranscriptAnnouncem
       }));
       return;
     }
+    const turnStatus = changes.find(([, state]) => isTurnStatusPart(state.part))?.[1].part;
+    if (turnStatus?.id === "turn-recovery") {
+      const action = parseRecoveryAction(turnStatus.state?.input?.recoveryAction);
+      setAnnouncement((current) => ({
+        text: `Turn did not finish.${action ? ` ${action === "retry" ? "Retry" : "Continue"} is available.` : ""}`,
+        sequence: current.sequence + 1,
+      }));
+      return;
+    }
+    if (turnStatus?.id === "turn-retry") {
+      setAnnouncement((current) => ({
+        text: "The CLI is retrying the turn.",
+        sequence: current.sequence + 1,
+      }));
+      return;
+    }
     const failures = changes.filter(([, state]) => state.status === "error");
     if (failures.length > 0) {
       const labels = failures.slice(0, 2).map(([, state]) => toolActivity(state.part).label).join(", ");
@@ -3557,7 +3702,7 @@ function partsTailToolId(parts: ChatPart[]): string | null {
   for (let index = parts.length - 1; index >= 0; index--) {
     const part = parts[index];
     // A steer lands at the tail without ending the tool that is still running.
-    if (part.type === "steer" || !partIsVisible(part)) continue;
+    if (part.type === "steer" || isTurnStatusPart(part) || !partIsVisible(part)) continue;
     if (part.type !== "tool" || part.state?.status === "error") return null;
     return part.id;
   }
@@ -3587,6 +3732,8 @@ const Transcript = memo(function Transcript({
   onRespond,
   onOpenPlan,
   onOpenSubagent,
+  recoveringTurnId,
+  onRecover,
   skills,
 }: {
   /** The branch on screen, oldest first. */
@@ -3607,6 +3754,8 @@ const Transcript = memo(function Transcript({
   onRespond?: (answer: PromptAnswer) => void;
   onOpenPlan?: (plan: string, promptId: string) => void;
   onOpenSubagent?: (spawnPartId: string, label?: string) => void;
+  recoveringTurnId?: string | null;
+  onRecover?: (turnId: string, action: "retry" | "continue") => void;
   skills?: SkillInfo[];
 }) {
   const activePermissionId = firstPendingPermission(messages)?.id ?? null;
@@ -3629,33 +3778,43 @@ const Transcript = memo(function Transcript({
       <span className="sr-only" role="status" aria-live="polite">
         <span key={transcriptAnnouncement.sequence}>{transcriptAnnouncement.text}</span>
       </span>
-      {visibleMessages.map((m) => (
-        <Message
-          key={m.id}
-          message={m}
-          forkCount={positions.get(m.id)?.count}
-          forkIndex={positions.get(m.id)?.index}
-          forkPrevId={positions.get(m.id)?.prevId}
-          forkNextId={positions.get(m.id)?.nextId}
-          forkDisabled={!canFork}
-          branchDisabled={busy}
-          onFork={onFork}
-          onSelectFork={onSelectFork}
-          activePermissionId={activePermissionId}
-          pendingTailToolId={pendingTailTool?.messageId === m.id ? pendingTailTool.toolId : null}
-          onOpenFile={onOpenFile}
-          onOpenRun={onOpenRun}
-          onOpenSpawnedSession={onOpenSpawnedSession}
-          runExperimentName={runExperimentName}
-          onOpenExperiment={onOpenExperiment}
-          experimentName={experimentName}
-          onRespond={onRespond}
-          onOpenPlan={onOpenPlan}
-          onOpenSubagent={onOpenSubagent}
-          skills={skills}
-          predictTextTail={busy && m === activeMessage && m.role === "assistant"}
-        />
-      ))}
+      {visibleMessages.map((m) => {
+        const turnStatus = m.parts.find(isTurnStatusPart);
+        const turnId = turnStatus?.state?.input?.turnId;
+        // A session owns one turn slot, so one recovery disables every status
+        // card until its durable admission resolves.
+        const recoveryDisabled = turnStatus ? busy || recoveringTurnId !== null : false;
+        return (
+          <Message
+            key={m.id}
+            message={m}
+            forkCount={positions.get(m.id)?.count}
+            forkIndex={positions.get(m.id)?.index}
+            forkPrevId={positions.get(m.id)?.prevId}
+            forkNextId={positions.get(m.id)?.nextId}
+            forkDisabled={!canFork}
+            branchDisabled={busy}
+            onFork={onFork}
+            onSelectFork={onSelectFork}
+            activePermissionId={activePermissionId}
+            pendingTailToolId={pendingTailTool?.messageId === m.id ? pendingTailTool.toolId : null}
+            onOpenFile={onOpenFile}
+            onOpenRun={onOpenRun}
+            onOpenSpawnedSession={onOpenSpawnedSession}
+            runExperimentName={runExperimentName}
+            onOpenExperiment={onOpenExperiment}
+            experimentName={experimentName}
+            onRespond={onRespond}
+            onOpenPlan={onOpenPlan}
+            onOpenSubagent={onOpenSubagent}
+            busy={recoveryDisabled}
+            recoveringTurnId={turnId === recoveringTurnId ? recoveringTurnId : null}
+            onRecover={onRecover}
+            skills={skills}
+            predictTextTail={busy && m === activeMessage && m.role === "assistant"}
+          />
+        );
+      })}
     </>
   );
 });
@@ -4053,6 +4212,14 @@ export function ChatPanel({
   // active session changes. Distinct from `selection`, which is the sticky
   // global preference that seeds *new* sessions.
   const [sessionOverride, setSessionOverride] = useState<Partial<ModelSelection>>({});
+  const [recoveryOverrides, setRecoveryOverrides] = useState<
+    Partial<ModelSelection> & { planMode?: boolean }
+  >({});
+  const [recoveringTurnId, setRecoveringTurnId] = useState<string | null>(null);
+  const recoveringTurnRef = useRef(false);
+  const activeLeafRef = useRef<string | null>(null);
+  const [retryingQueuedId, setRetryingQueuedId] = useState<string | null>(null);
+  const pendingClientTurn = useRef<{ signature: string; id: string } | null>(null);
   // Sessions whose title was just replaced by a harness-generated one, mapped
   // to a nonce that bumps per reveal so a second retitle remounts the spans and
   // replays the animation instead of sitting on a finished one.
@@ -4277,6 +4444,19 @@ export function ChatPanel({
   const selectModel = (next: Partial<ModelSelection>) => {
     if (!composerSelection) return;
     const merged = { ...composerSelection, ...next };
+    const changed: Partial<ModelSelection> = {};
+    if (next.model !== undefined && next.model !== composerSelection.model) changed.model = next.model;
+    if (
+      next.permissionMode !== undefined &&
+      next.permissionMode !== composerSelection.permissionMode
+    )
+      changed.permissionMode = next.permissionMode;
+    if (
+      next.reasoningLevel !== undefined &&
+      next.reasoningLevel !== composerSelection.reasoningLevel
+    )
+      changed.reasoningLevel = next.reasoningLevel;
+    setRecoveryOverrides((current) => ({ ...current, ...changed }));
     setSelection(merged);
     void onPreferredAgentChange(merged).catch(() => {});
     if (openSession) {
@@ -4297,6 +4477,7 @@ export function ChatPanel({
     // Plan is session-scoped. Claude exposes it in the permission dropdown,
     // but it must not become the saved default for future sessions.
     if (id === "plan" && activeHarness?.id === "claude-code") {
+      setRecoveryOverrides((current) => ({ ...current, permissionMode: id }));
       setSessionOverride((current) => ({ ...current, permissionMode: id }));
     } else {
       setSessionOverride((current) => {
@@ -4346,6 +4527,7 @@ export function ChatPanel({
   }, [openSession?.planMode, planModeOverride]);
 
   async function setIndependentPlanMode(planMode: boolean) {
+    setRecoveryOverrides((current) => ({ ...current, planMode }));
     planModeOverrideRef.current = planMode;
     setPlanModeOverride(planMode);
     if (!openSession) return;
@@ -4460,6 +4642,29 @@ export function ChatPanel({
     }
   }, [projectId]);
 
+  const reseedSession = useCallback(
+    async (sessionId: string) => {
+      const leafBefore = composerScopeRef.current.activeId === sessionId
+        ? activeLeafRef.current
+        : undefined;
+      const [{ messages, queued, activeLeafId }] = await Promise.all([
+        getChatMessages(sessionId),
+        syncSessionList(),
+      ]);
+      const localLeafMoved = leafBefore !== undefined
+        && composerScopeRef.current.activeId === sessionId
+        && activeLeafRef.current !== leafBefore;
+      dispatch({
+        type: "seed",
+        sessionId,
+        messages,
+        queued,
+        activeLeafId: localLeafMoved ? activeLeafRef.current : activeLeafId,
+      });
+    },
+    [syncSessionList, dispatch],
+  );
+
   // Reset everything when the project changes.
   useEffect(() => {
     setSessions([]);
@@ -4501,6 +4706,11 @@ export function ChatPanel({
   }, [projectId, syncSessionList]);
 
   // Load message history when a session becomes active.
+  useEffect(() => {
+    setRecoveryOverrides({});
+    pendingClientTurn.current = null;
+  }, [activeId]);
+
   useEffect(() => {
     if (!activeId || loadedSessions.current.has(activeId)) return;
     loadedSessions.current.add(activeId);
@@ -4622,7 +4832,6 @@ export function ChatPanel({
   // the streaming tail, and the pending-permission lookup.
   const allMessages = activeId ? (state.messagesBySession[activeId] ?? NO_MESSAGES) : NO_MESSAGES;
   const activeLeafId = activeId ? (state.activeLeafBySession[activeId] ?? null) : null;
-  const activeLeafRef = useRef(activeLeafId);
   activeLeafRef.current = activeLeafId;
   const messages = useMemo(() => activePath(allMessages, activeLeafId), [allMessages, activeLeafId]);
   const busy = activeId ? state.busySessions.has(activeId) : false;
@@ -4631,6 +4840,24 @@ export function ChatPanel({
   // Messages the user parked behind the running turn (oldest first). Populated
   // by chat.queued events and the seed snapshot; each runs when its turn ends.
   const queued = activeId ? (state.queuedBySession[activeId] ?? []) : [];
+  const hasRetryingQueue = queued.some((item) => item.dispatchState === "retrying");
+  const firstBlockedQueueIndex = queued.findIndex((item) => item.dispatchState === "blocked");
+  const nextQueueRetryAt = queued.reduce<number | null>((latest, item) => {
+    if (item.dispatchState !== "retrying" || typeof item.nextRetryAt !== "number") return latest;
+    return latest === null ? item.nextRetryAt : Math.min(latest, item.nextRetryAt);
+  }, null);
+  const [queueClock, setQueueClock] = useState(() => Date.now());
+  useEffect(() => {
+    if (!hasRetryingQueue || nextQueueRetryAt === null) return;
+    setQueueClock(Date.now());
+    if (nextQueueRetryAt <= Date.now()) return;
+    const timer = window.setInterval(() => {
+      const current = Date.now();
+      setQueueClock(current);
+      if (current >= nextQueueRetryAt) window.clearInterval(timer);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [hasRetryingQueue, nextQueueRetryAt]);
   useEffect(() => {
     const queuedMode = queued.reduce<boolean | undefined>(
       (mode, item) => item.planMode ?? mode,
@@ -4926,6 +5153,27 @@ export function ChatPanel({
       });
       return;
     }
+    const turnSignature = JSON.stringify({
+      text,
+      images: pending.map((attachment) => ({
+        mediaType: attachment.mediaType,
+        name: attachment.name,
+        dataUrl: attachment.dataUrl,
+      })),
+      annotations: wireAnnotations,
+      settings: effective
+        ? {
+            model: effective.model,
+            permissionMode: effective.permissionMode,
+            planMode: independentPlanMode,
+            reasoningLevel: effective.reasoningLevel,
+          }
+        : null,
+    });
+    const clientTurnId = pendingClientTurn.current?.signature === turnSignature
+      ? pendingClientTurn.current.id
+      : `ct_${crypto.randomUUID()}`;
+    pendingClientTurn.current = { signature: turnSignature, id: clientTurnId };
     if (busy) {
       // A turn is already running. Steering hands the message to it now, and
       // the delivered text comes back inline on the assistant message. Parking
@@ -4974,9 +5222,13 @@ export function ChatPanel({
             turnOpts,
             images.length ? images : undefined,
             wireAnnotations,
+            clientTurnId,
             steering && !queue && !planRequested ? "steer" : undefined,
           );
-        await queueSessionMutation(sendBusy);
+        const response = await queueSessionMutation(sendBusy);
+        if (response.turn?.existing) await reseedSession(sid);
+        setRecoveryOverrides({});
+        if (pendingClientTurn.current?.id === clientTurnId) pendingClientTurn.current = null;
       } catch {
         // Never reached the turn — restore the composer so a retry is one keypress.
         clearFailedPlanCommand();
@@ -5054,8 +5306,12 @@ export function ChatPanel({
           turnOpts,
           images.length ? images : undefined,
           wireAnnotations,
+          clientTurnId,
         );
-      await queueSessionMutation(sendTurn);
+      const response = await queueSessionMutation(sendTurn);
+      if (response.turn?.existing) await reseedSession(targetSessionId);
+      setRecoveryOverrides({});
+      if (pendingClientTurn.current?.id === clientTurnId) pendingClientTurn.current = null;
     } catch (err) {
       // The message never reached a turn — put it back in the composer so a
       // retry is one keypress, whichever branch below applies.
@@ -5089,8 +5345,38 @@ export function ChatPanel({
   }
 
   function stop() {
-    if (activeId) void interruptChat(activeId);
+    if (!activeId) return;
+    void interruptChat(activeId).catch(() => {
+      setSettingsError("Could not stop the turn. Try again.");
+    });
   }
+
+  const recoverFailedTurn = useCallback(
+    async (turnId: string, action: "retry" | "continue") => {
+      if (!activeId || recoveringTurnRef.current) return;
+      recoveringTurnRef.current = true;
+      setSettingsError(null);
+      setRecoveringTurnId(turnId);
+      try {
+        const turnOpts = recoveryTurnOptions({
+          model: recoveryOverrides.model,
+          permissionMode: recoveryOverrides.permissionMode,
+          planMode: recoveryOverrides.planMode,
+          reasoningLevel: recoveryOverrides.reasoningLevel,
+        });
+        const sessionId = activeId;
+        const response = await recoverChatTurn(sessionId, turnId, action, turnOpts);
+        if (response.turn.existing) await reseedSession(sessionId);
+        setRecoveryOverrides({});
+      } catch {
+        setSettingsError("Could not recover this turn. Try again.");
+      } finally {
+        recoveringTurnRef.current = false;
+        setRecoveringTurnId(null);
+      }
+    },
+    [activeId, recoveryOverrides, reseedSession],
+  );
 
   const forkTurn = useCallback(
     (messageId: string, text: string) => {
@@ -5130,17 +5416,32 @@ export function ChatPanel({
     [activeId, busy, queueSessionMutation],
   );
 
-  // Optimistic: drop locally now; the server's chat.queued echo reconciles. A
-  // message that already started running server-side simply isn't found.
+  // Durable cancellation wins before the chip disappears. If persistence
+  // fails, leave it visible so a restart cannot surprise the user by sending it.
   function cancelQueued(itemId: string) {
     if (!activeId) return;
     const sid = activeId;
-    dispatch({
-      type: "setQueued",
-      sessionId: sid,
-      items: queued.filter((q) => q.id !== itemId),
-    });
-    void cancelQueuedMessage(sid, itemId).catch(() => {});
+    void cancelQueuedMessage(sid, itemId)
+      .then(({ removed }) => {
+        if (!removed) return;
+        return reseedSession(sid);
+      })
+      .catch(() => setSettingsError("Could not remove the queued message. Try again."));
+  }
+
+  async function retryQueued(itemId: string) {
+    if (!activeId || retryingQueuedId) return;
+    const sid = activeId;
+    setSettingsError(null);
+    setRetryingQueuedId(itemId);
+    try {
+      await retryQueuedMessage(sid, itemId);
+      await reseedSession(sid);
+    } catch {
+      setSettingsError("Could not retry the queued message. Try again.");
+    } finally {
+      setRetryingQueuedId(null);
+    }
   }
 
   // Escape stops the streaming turn and drops focus back into the composer,
@@ -5581,6 +5882,8 @@ export function ChatPanel({
               onRespond={respond}
               onOpenPlan={openPlan}
               onOpenSubagent={openSubagent}
+              recoveringTurnId={recoveringTurnId}
+              onRecover={recoverFailedTurn}
               skills={commands}
             />
             {busy &&
@@ -5651,25 +5954,59 @@ export function ChatPanel({
         )}
         {queued.length > 0 && (
           <div className="composer-queued flex flex-col gap-1 mb-1.5">
-            {queued.map((q) => (
+            {queued.map((q, index) => (
               <div
                 key={q.id}
-                className="queued-chip flex items-center gap-2 py-1.5 px-2.5 text-sm text-subtext bg-surface border border-border rounded-sm"
-                title={q.text}
+                className="queued-chip flex flex-wrap items-center gap-x-2 gap-y-1 py-1.5 px-2.5 text-sm text-subtext bg-background border border-border rounded-sm"
+                title={q.error ? `${q.text}\n\n${q.error}` : q.text}
               >
-                <Clock size={13} className="shrink-0 text-muted" />
-                <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
+                {q.dispatchState === "blocked"
+                  ? <TriangleAlert size={13} className="shrink-0 text-accent-amber" />
+                  : <Clock size={13} className="shrink-0 text-muted" />}
+                <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-text">
                   {q.text}
                 </span>
-                <span className="shrink-0 text-xs text-muted uppercase tracking-wide">Queued</span>
-                <button
-                  title="Cancel queued message"
-                  aria-label="Cancel queued message"
-                  onClick={() => cancelQueued(q.id)}
-                  className="shrink-0 inline-flex items-center justify-center w-4 h-4 p-0 border-0 rounded-full text-muted cursor-pointer [&:hover]:bg-text [&:hover]:text-background"
-                >
-                  <X size={11} />
-                </button>
+                {q.dispatchState !== "blocked" && (
+                  <span className="shrink-0 text-xs text-muted">
+                    {q.dispatchState === "retrying"
+                      ? queuedRetryLabel(q.nextRetryAt, queueClock)
+                      : "Queued"}
+                  </span>
+                )}
+                {q.dispatchState === "blocked" ? (
+                  <>
+                    <button
+                      onClick={() => void retryQueued(q.id)}
+                      aria-label={`Retry queued message: ${q.text}`}
+                      disabled={retryingQueuedId !== null}
+                      className="shrink-0 px-1.5 py-0.5 border border-border rounded-sm text-xs text-text bg-background cursor-pointer disabled:opacity-50 disabled:cursor-default [&:hover:not(:disabled)]:border-text"
+                    >
+                      {retryingQueuedId === q.id ? "Retrying…" : "Retry"}
+                    </button>
+                    <button
+                      onClick={() => cancelQueued(q.id)}
+                      aria-label={`Remove queued message: ${q.text}`}
+                      disabled={retryingQueuedId !== null}
+                      className="shrink-0 px-1.5 py-0.5 border-0 text-xs text-muted bg-transparent cursor-pointer disabled:opacity-50 disabled:cursor-default [&:hover:not(:disabled)]:text-text"
+                    >
+                      Remove
+                    </button>
+                    {index === firstBlockedQueueIndex && index < queued.length - 1 && (
+                      <span className="basis-full pl-5 text-xs text-muted">
+                        Later queued messages will wait until this is retried or removed.
+                      </span>
+                    )}
+                  </>
+                ) : (
+                  <button
+                    title="Remove queued message"
+                    aria-label="Remove queued message"
+                    onClick={() => cancelQueued(q.id)}
+                    className="shrink-0 inline-flex items-center justify-center w-4 h-4 p-0 border-0 rounded-full text-muted cursor-pointer [&:hover]:bg-text [&:hover]:text-background"
+                  >
+                    <X size={11} />
+                  </button>
+                )}
               </div>
             ))}
           </div>
