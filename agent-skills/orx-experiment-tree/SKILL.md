@@ -1,6 +1,6 @@
 ---
 name: orx-experiment-tree
-description: "The experiment-tree model and the auto-research loop: shape the tree (stacked bushes), branch/launch/wait/promote, and `orx exp desc` notes. Use before creating, planning, or reorganizing experiments, when deciding what to try next, when a round of runs finishes, or whenever you're unsure how work maps onto the tree."
+description: "Plan and drive the experiment tree: first-launch setup, fixed run contract, frozen nodes, stacked-bush tree shape, branch/launch/wait/promote, repair limits, notes, and turn summaries. Use before creating or changing experiments, launching a first run, deciding what to try next, handling a completed run, or reporting experiment progress."
 ---
 
 A project is a **tree of experiment nodes**. The root (**baseline**) holds the
@@ -10,6 +10,15 @@ evaluates the node and prints its results to the run log. Every other node is a
 rules this depends on — **never edit a node a run has answered** and
 **the run command + env is a fixed contract** — are the cardinal rules;
 everything below assumes them.
+
+## Before the first launch
+
+If the project has no completed runs, ask the user how they run the code before
+launching. Ask for the environment setup (conda, venv, uv, modules), dependency
+installation, the exact train or evaluation command they use today, and any
+compute-specific requirements. Do not reverse-engineer or guess this setup from
+the repository. Encode the durable recipe in the project's run command so later
+sessions do not need to ask again.
 
 ## Provisional until it answers — repair, don't branch
 
@@ -184,6 +193,11 @@ intended flow — do **not** edit a frozen node or rewrite the run command:
 Stop when the goal is met, or after ~3 consecutive failed or regressed runs.
 When you stop, write up the tree as a descriptively named project artifact — see
 the `orx-reports` skill for naming and optional folder guidance.
+
+Close any turn that ran or changed experiments with a short experiment summary:
+one line per relevant node with what it tested, its status, and the headline
+result. Use the evidence syntax from `orx-evidence`. Plain questions and turns
+that launch or change no experiments need no summary.
 
 ## Experiment description / notes — `orx exp desc`
 
