@@ -5911,13 +5911,13 @@ export function ChatPanel({
             {queued.map((q, index) => (
               <div
                 key={q.id}
-                className="queued-chip flex flex-wrap items-center gap-x-2 gap-y-1 py-1.5 px-2.5 text-sm text-subtext bg-surface border border-border rounded-sm"
+                className="queued-chip flex flex-wrap items-center gap-x-2 gap-y-1 py-1.5 px-2.5 text-sm text-subtext bg-background border border-border rounded-sm"
                 title={q.error ? `${q.text}\n\n${q.error}` : q.text}
               >
                 {q.dispatchState === "blocked"
                   ? <TriangleAlert size={13} className="shrink-0 text-accent-amber" />
                   : <Clock size={13} className="shrink-0 text-muted" />}
-                <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
+                <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-text">
                   {q.text}
                 </span>
                 {q.dispatchState !== "blocked" && (
