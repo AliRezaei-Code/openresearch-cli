@@ -246,6 +246,12 @@ body {
   background: var(--chat-annotation-highlight);
 }
 
+/* The editor stacks a transparent textarea over the highlighted code, so an
+   opaque selection would paint out the tokens underneath it. */
+.file-view-editarea::selection {
+  background: color-mix(in oklab, var(--primary) 22%, transparent);
+}
+
 button {
   font: inherit;
   color: inherit;
