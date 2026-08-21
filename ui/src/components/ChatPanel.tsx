@@ -926,7 +926,20 @@ function baseName(path: string): string {
   return trimmed.slice(trimmed.lastIndexOf("/") + 1) || trimmed;
 }
 
-type ToolActivityKind = "read" | "search" | "edit" | "web" | "agent" | "project" | "command";
+function skillNameFromPath(path: string): string | null {
+  const parts = path.replace(/\\/g, "/").replace(/\/+$/, "").split("/").filter(Boolean);
+  if (parts.at(-1)?.toLowerCase() !== "skill.md") return null;
+  return parts.at(-2) ?? null;
+}
+
+function nativeOrxSkillPath(tool: string, skillName: string): string | null {
+  if (!/^orx-[a-z0-9]+(?:-[a-z0-9]+)*$/.test(skillName)) return null;
+  if (tool === "Skill") return `.claude/skills/${skillName}/SKILL.md`;
+  if (tool === "skill") return `.opencode/skills/${skillName}/SKILL.md`;
+  return null;
+}
+
+type ToolActivityKind = "skill" | "read" | "search" | "edit" | "web" | "agent" | "project" | "command";
 
 interface ToolActivity {
   kind: ToolActivityKind;
@@ -1693,18 +1706,22 @@ function toolActivity(part: ChatPart): ToolActivity {
       if (commandInvokesOrx(command, "projects")) {
         return { kind: "project", label: "Listed projects", litCall: litCall ?? undefined };
       }
+      if (commandInvokesOrx(command, "compute")) {
+        return { kind: "project", label: "Checked compute options", litCall: litCall ?? undefined };
+      }
 
       const gitShowTarget = shellInvocations
         .map(commandGitShowTarget)
         .find((target) => target != null);
       if (gitShowTarget) {
+        const skillName = skillNameFromPath(gitShowTarget.path);
         return {
-          kind: "read",
-          label: `Read ${baseName(gitShowTarget.path)}`,
+          kind: skillName ? "skill" : "read",
+          label: skillName ? `Read ${skillName} skill` : `Read ${baseName(gitShowTarget.path)}`,
           filePath: gitShowTarget.path,
           fileRef: gitShowTarget.ref,
           labelPrefix: "Read ",
-          labelTarget: baseName(gitShowTarget.path),
+          labelTarget: skillName ? `${skillName} skill` : baseName(gitShowTarget.path),
         };
       }
 
@@ -1722,12 +1739,13 @@ function toolActivity(part: ChatPart): ToolActivity {
           )
         : null;
       if (readTarget && readPath) {
+        const skillName = skillNameFromPath(readPath);
         return {
-          kind: "read",
-          label: `Read ${baseName(readTarget)}`,
+          kind: skillName ? "skill" : "read",
+          label: skillName ? `Read ${skillName} skill` : `Read ${baseName(readTarget)}`,
           filePath: readPath,
           labelPrefix: "Read ",
-          labelTarget: baseName(readTarget),
+          labelTarget: skillName ? `${skillName} skill` : baseName(readTarget),
         };
       }
       if (shellInvocations.some((invocation) =>
@@ -1758,7 +1776,6 @@ function toolActivity(part: ChatPart): ToolActivity {
           searchPattern: pattern,
         };
       }
-      if (readInvocation) return { kind: "read", label: "Read a file" };
       if (gitAction === "status") return { kind: "command", label: "Checked Git status" };
       if (gitAction === "diff") return { kind: "command", label: "Reviewed code changes" };
       if (gitAction === "log") return { kind: "command", label: "Read Git history" };
@@ -1774,8 +1791,29 @@ function toolActivity(part: ChatPart): ToolActivity {
       if (packageAction("build")) return { kind: "command", label: "Built the project" };
       return { kind: "command", label: `Ran ${command}` };
     }
+    case "skill": {
+      const skillName = inputString(normalizedInput, "skill", "name");
+      const filePath = skillName ? nativeOrxSkillPath(tool, skillName) : null;
+      return {
+        kind: "skill",
+        label: skillName ? `Loaded ${skillName} skill` : "Loaded a skill",
+        filePath: filePath ?? undefined,
+        labelPrefix: filePath ? "Loaded " : undefined,
+        labelTarget: filePath && skillName ? `${skillName} skill` : undefined,
+      };
+    }
     case "read": {
       const target = filePath ? baseName(filePath) : null;
+      const skillName = filePath ? skillNameFromPath(filePath) : null;
+      if (skillName) {
+        return {
+          kind: "skill",
+          label: `Read ${skillName} skill`,
+          filePath: filePath ?? undefined,
+          labelPrefix: "Read ",
+          labelTarget: `${skillName} skill`,
+        };
+      }
       return target
         ? { kind: "read", label: `Read ${target}`, filePath: filePath ?? undefined, labelPrefix: "Read ", labelTarget: target }
         : { kind: "read", label: "Read a file" };
@@ -1879,6 +1917,8 @@ function ToolActivityIcon({ activity, className = "" }: { activity: ToolActivity
   }
   const props = { size: 16, strokeWidth: 1.75, className: `tool-kind-icon shrink-0 ${className}` };
   switch (activity.kind) {
+    case "skill":
+      return <Blocks {...props} />;
     case "read":
     case "project":
       return <BookOpen {...props} />;
@@ -2159,8 +2199,12 @@ function summarizeToolGroup(activities: ToolActivity[]): string {
   const web = count("web");
   const commands = count("command");
   const agents = count("agent");
+  const skillActions = activities
+    .filter((activity) => activity.kind === "skill")
+    .map((activity) => `${activity.label[0].toLowerCase()}${activity.label.slice(1)}`);
 
-  if (reads) clauses.push(reads === 1 ? "Read a file" : "Read files");
+  if (skillActions.length) clauses.push(skillActions.join(skillActions.length === 2 ? " and " : ", "));
+  if (reads) clauses.push(reads === 1 ? "read a file" : "read files");
   if (paperReads) clauses.push(paperReads === 1 ? "read a paper" : "read papers");
   if (searches) clauses.push("searched code");
   if (literatureSearches) clauses.push("searched literature");
@@ -2184,6 +2228,7 @@ function activityInProgress(activity: ToolActivity): ToolActivity {
     [/^Updated /, "Updating "],
     [/^Created /, "Creating "],
     [/^Deleted /, "Deleting "],
+    [/^Loaded /, "Loading "],
     [/^Ran /, "Running "],
     [/^Started /, "Starting "],
     [/^Waited /, "Waiting "],
@@ -2216,6 +2261,7 @@ function permissionActivityLabel(tool: string | undefined, input: Record<string,
     [/^Updated /, "Update "],
     [/^Created /, "Create "],
     [/^Deleted /, "Delete "],
+    [/^Loaded /, "Load "],
     [/^Delegated /, "Delegate "],
     [/^Ran /, "Run "],
     [/^Started /, "Start "],
@@ -2321,7 +2367,7 @@ function useDelayedToolShimmer(active: boolean): boolean {
 }
 
 function groupIconActivity(activities: ToolActivity[]): ToolActivity {
-  const priority: ToolActivityKind[] = ["read", "search", "edit", "project", "web", "command", "agent"];
+  const priority: ToolActivityKind[] = ["skill", "read", "search", "edit", "project", "web", "command", "agent"];
   for (const kind of priority) {
     const activity = activities.find((candidate) => candidate.kind === kind);
     if (activity) return activity;

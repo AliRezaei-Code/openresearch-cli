@@ -150,9 +150,22 @@ async fn write_skill_set(
     let mut written = Vec::new();
     for skill in skills(set) {
         let dir = base.join(skill.name);
+        match fs::remove_dir_all(&dir).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         fs::create_dir_all(&dir).await?;
         let path = dir.join("SKILL.md");
         fs::write(&path, skill.content).await?;
+        for resource in skill.resources {
+            let resource_path = dir.join(resource.path);
+            let parent = resource_path
+                .parent()
+                .ok_or_else(|| anyhow!("invalid skill resource path {}", resource.path))?;
+            fs::create_dir_all(parent).await?;
+            fs::write(&resource_path, resource.content).await?;
+        }
         written.push(path);
     }
     Ok(written)
