@@ -633,6 +633,67 @@ pub async fn resolve_paper(paper_id: &str) -> Result<ResolvedPaper> {
     Ok(resolved)
 }
 
+/// A declared length past this is not a paper; arXiv's own submission limit is
+/// far below it.
+const MAX_PAPER_PDF_BYTES: u64 = 64 * 1024 * 1024;
+
+/// `export.arxiv.org` is the host arXiv asks automated clients to use. Old-style
+/// ids (`hep-th/9901001`) carry a slash, so each segment is encoded separately.
+fn paper_pdf_url(paper_id: &str) -> String {
+    let path = versionless_id(paper_id)
+        .split('/')
+        .map(|segment| urlencoding::encode(segment).into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("https://export.arxiv.org/pdf/{path}")
+}
+
+/// Download a paper's PDF, for paper projects that start blank because the
+/// paper has no linked public code repository.
+pub async fn fetch_paper_pdf(paper_id: &str) -> Result<Vec<u8>> {
+    // The id reaches here straight from the request body; `..` would walk to
+    // another paper's PDF on the same host.
+    if paper_id
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return Err(anyhow!("{} is not an arXiv id", paper_id));
+    }
+    let url = paper_pdf_url(paper_id);
+    let res = http()
+        .get(&url)
+        .header("user-agent", ALPHAXIV_UA)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| anyhow!("Could not reach arXiv at {}: {}", url, e))?;
+    let status = res.status();
+    if !status.is_success() {
+        let reason = status.canonical_reason().unwrap_or("");
+        return Err(anyhow!(
+            "arXiv PDF download failed ({} {})",
+            status.as_u16(),
+            reason
+        ));
+    }
+    // arXiv answers some unknown ids with an HTML page rather than a 404.
+    let is_pdf = res
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/pdf"));
+    if !is_pdf {
+        return Err(anyhow!("{} did not return a PDF", url));
+    }
+    if res
+        .content_length()
+        .is_some_and(|len| len > MAX_PAPER_PDF_BYTES)
+    {
+        return Err(anyhow!("{} is too large to download", url));
+    }
+    Ok(res.bytes().await?.to_vec())
+}
+
 /// Look up a paper's linked GitHub repository (the most-starred repo associated
 /// with it on alphaXiv). Returns `Ok(None)` when the paper has no linked repo or
 /// isn't known to alphaXiv. Best-effort metadata — callers shouldn't fail on it.
@@ -1109,6 +1170,18 @@ mod tests {
         SandboxTarget, BIORXIV_SOURCE_ID,
     };
     use serde_json::json;
+
+    #[test]
+    fn paper_pdf_url_drops_the_version_and_keeps_legacy_id_slashes() {
+        assert_eq!(
+            super::paper_pdf_url("2401.12345v2"),
+            "https://export.arxiv.org/pdf/2401.12345"
+        );
+        assert_eq!(
+            super::paper_pdf_url("hep-th/9901001"),
+            "https://export.arxiv.org/pdf/hep-th/9901001"
+        );
+    }
 
     #[test]
     fn paper_discovery_url_encodes_strategy_and_controls() {
