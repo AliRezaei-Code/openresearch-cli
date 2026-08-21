@@ -1,3 +1,5 @@
+import type { TurnOptions } from "./api";
+
 export interface RetryMetadata {
   retryOwner?: "native" | "orx";
   attempt?: number;
@@ -14,11 +16,19 @@ export function retryStatusLabel(input: RetryMetadata, now: number): string {
   }
   return [
     "Retrying",
-    typeof input.attempt === "number" && typeof input.maximum === "number"
-      ? `attempt ${input.attempt}/${input.maximum}`
+    typeof input.attempt === "number"
+      ? typeof input.maximum === "number"
+        ? `attempt ${input.attempt}/${input.maximum}`
+        : `attempt ${input.attempt}`
       : null,
     seconds == null ? null : `next attempt in ${seconds}s`,
   ].filter(Boolean).join(" · ");
+}
+
+export function queuedRetryLabel(nextRetryAt: number | null | undefined, now: number): string {
+  if (typeof nextRetryAt !== "number") return "Sending again…";
+  const seconds = Math.max(0, Math.ceil((nextRetryAt - now) / 1000));
+  return `Sending again in ${seconds}s…`;
 }
 
 export function recoveryAction(
@@ -27,15 +37,11 @@ export function recoveryAction(
   return action === "retry" || action === "continue" ? action : null;
 }
 
-export interface RecoveryOverrides {
-  model?: string;
-  permissionMode?: string;
-  planMode?: boolean;
-  reasoningLevel?: string;
-}
-
-export function recoveryTurnOptions(overrides: RecoveryOverrides): RecoveryOverrides {
-  return Object.fromEntries(
-    Object.entries(overrides).filter(([, value]) => value !== undefined),
-  );
+export function recoveryTurnOptions(overrides: TurnOptions): TurnOptions {
+  const options: TurnOptions = {};
+  if (overrides.model !== undefined) options.model = overrides.model;
+  if (overrides.permissionMode !== undefined) options.permissionMode = overrides.permissionMode;
+  if (overrides.planMode !== undefined) options.planMode = overrides.planMode;
+  if (overrides.reasoningLevel !== undefined) options.reasoningLevel = overrides.reasoningLevel;
+  return options;
 }

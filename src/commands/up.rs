@@ -79,11 +79,20 @@ pub async fn run(args: UpArgs) -> Result<()> {
     state.chat.resume_persisted_queues();
     {
         let chat = state.chat.clone();
+        let moving = state.data_dir_move_in_progress.clone();
+        let gate = state.data_dir_gate.clone();
         tokio::spawn(async move {
             let interval =
                 Duration::from_millis((crate::store::CHAT_TURN_LEASE_TTL_MS + 1_000) as u64);
             loop {
                 tokio::time::sleep(interval).await;
+                if moving.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
+                let _gate = gate.lock().await;
+                if moving.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
                 if let Err(err) = chat.reconcile_expired_turn_leases() {
                     eprintln!("orx up: could not reconcile expired chat turns: {err}");
                 }
@@ -444,7 +453,7 @@ fn router(state: AppState) -> Router {
         .route("/api/chat/sessions/{id}/interrupt", post(interrupt_chat))
         .route(
             "/api/chat/sessions/{id}/queue/{itemId}",
-            axum::routing::delete(cancel_queued_chat),
+            axum::routing::delete(cancel_queued_chat).post(retry_queued_chat),
         )
         .route("/api/chat/sessions/{id}/respond", post(respond_chat))
         // Internal: the `orx mcp-gate` permission bridge's long-poll (plan
@@ -4729,12 +4738,28 @@ async fn send_chat_message(
     };
     // The turn runs in the background; progress streams over /api/events.
     let response = if matches!(req.mode, Some(SendMode::Steer)) {
-        state
+        let result = state
             .chat
-            .steer_message(&id, text, overrides, req.images, annotations)
+            .steer_message(
+                &id,
+                text,
+                overrides,
+                req.images,
+                annotations,
+                req.client_turn_id,
+            )
             .await
-            .map_err(bad_request)?;
-        json!({ "ok": true })
+            .map_err(|error| {
+                if local::chat::is_client_turn_conflict(&error) {
+                    ApiError(StatusCode::CONFLICT, error.to_string())
+                } else {
+                    bad_request(error)
+                }
+            })?;
+        match result {
+            Some(turn) => json!({ "ok": true, "turn": turn }),
+            None => json!({ "ok": true, "steered": true }),
+        }
     } else {
         let result = state
             .chat
@@ -4748,7 +4773,7 @@ async fn send_chat_message(
             )
             .await
             .map_err(|error| {
-                if error.to_string().contains("clientTurnId was already used") {
+                if local::chat::is_client_turn_conflict(&error) {
                     ApiError(StatusCode::CONFLICT, error.to_string())
                 } else {
                     bad_request(error)
@@ -4764,10 +4789,22 @@ async fn send_chat_message(
 #[serde(rename_all = "camelCase")]
 struct RecoverChatReq {
     action: String,
-    model: Option<String>,
-    permission_mode: Option<String>,
+    #[serde(default, deserialize_with = "present_nullable_string")]
+    model: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present_nullable_string")]
+    permission_mode: Option<Option<String>>,
     plan_mode: Option<bool>,
-    reasoning_level: Option<String>,
+    #[serde(default, deserialize_with = "present_nullable_string")]
+    reasoning_level: Option<Option<String>>,
+}
+
+fn present_nullable_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 async fn recover_chat_turn(
@@ -4782,12 +4819,10 @@ async fn recover_chat_turn(
             &id,
             &turn_id,
             &req.action,
-            local::chat::TurnOverrides {
+            local::chat::RecoveryOverrides {
                 model: req.model,
                 permission_mode: req.permission_mode,
-                permission_revision: None,
                 plan_mode: req.plan_mode,
-                plan_revision: None,
                 reasoning_level: req.reasoning_level,
             },
         )
@@ -4901,6 +4936,22 @@ async fn cancel_queued_chat(
 ) -> ApiResult {
     let removed = state.chat.cancel_queued(&id, &item_id)?;
     Ok(Json(json!({ "ok": true, "removed": removed })))
+}
+
+/// Retry one queued message after its safe delivery budget was exhausted.
+async fn retry_queued_chat(
+    State(state): State<AppState>,
+    Path((id, item_id)): Path<(String, String)>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    let retried = state.chat.retry_queued(&id, &item_id)?;
+    if !retried {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "queued message is no longer available for retry".into(),
+        ));
+    }
+    Ok(Json(json!({ "ok": true, "retried": retried })))
 }
 
 #[derive(Deserialize)]

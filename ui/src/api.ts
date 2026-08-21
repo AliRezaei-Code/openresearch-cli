@@ -1377,11 +1377,17 @@ export const getChatMessages = (sessionId: string) =>
     activeLeafId: r.activeLeafId ?? null,
   }));
 
-/** Cancel a still-parked message (the ✕ on a queued chip). */
+/** Remove a still-parked message. */
 export const cancelQueuedMessage = (sessionId: string, itemId: string) =>
   fetch(`/api/chat/sessions/${sessionId}/queue/${encodeURIComponent(itemId)}`, {
     method: "DELETE",
   }).then((r) => json<{ ok: boolean; removed: boolean }>(r));
+
+/** Retry the same parked message after safe queue delivery was exhausted. */
+export const retryQueuedMessage = (sessionId: string, itemId: string) =>
+  post<{ ok: boolean; retried: boolean }>(
+    `/api/chat/sessions/${sessionId}/queue/${encodeURIComponent(itemId)}`,
+  );
 
 /** A pasted image or uploaded file riding a chat message. */
 export interface ChatImageAttachment {
@@ -1409,7 +1415,8 @@ export const sendChatMessage = (
   clientTurnId?: string,
   mode?: "steer",
 ) =>
-  post<{ ok: boolean; turn?: ChatTurnResult }>(`/api/chat/sessions/${sessionId}/message`, {
+  post<{ ok: boolean; turn?: ChatTurnResult; steered?: boolean }>(
+    `/api/chat/sessions/${sessionId}/message`, {
     text,
     clientTurnId,
     model: opts.model,
@@ -1418,8 +1425,9 @@ export const sendChatMessage = (
     reasoningLevel: opts.reasoningLevel,
     images,
     annotations,
-    mode,
-  });
+      mode,
+    },
+  );
 
 export interface ChatTurnResult {
   turnId: string;

@@ -3000,7 +3000,9 @@ async fn steer_turn(
     steer: SteerMessage,
 ) {
     let Some(turn_id) = turn_id else {
-        ctx.host.park_steer(&ctx.session_id, steer);
+        if let Err(error) = ctx.host.park_steer(&ctx.session_id, steer) {
+            ctx.push_error(format!("Could not preserve steering message: {error}"));
+        }
         return;
     };
     let answered = client
@@ -3016,7 +3018,11 @@ async fn steer_turn(
         .await;
     match answered {
         Ok(Ok(_)) => ctx.record_steer(&steer.display),
-        Ok(Err(_)) => ctx.host.park_steer(&ctx.session_id, steer),
+        Ok(Err(_)) => {
+            if let Err(error) = ctx.host.park_steer(&ctx.session_id, steer) {
+                ctx.push_error(format!("Could not preserve steering message: {error}"));
+            }
+        }
         Err(e) => {
             // Record it anyway: the composer is already cleared, so this is
             // the only copy of what the user typed.

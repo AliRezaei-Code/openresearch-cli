@@ -1756,7 +1756,11 @@ async fn run_attempt(ctx: &mut TurnCtx, spec: SpawnSpec) -> Result<(TurnState, u
                 // to error out — park the text so it survives into the next one.
                 match client.send_user_message(&steer.text).await {
                     Ok(()) => ctx.record_steer(&steer.display),
-                    Err(_) => ctx.host.park_steer(&ctx.session_id, steer),
+                    Err(_) => {
+                        if let Err(error) = ctx.host.park_steer(&ctx.session_id, steer) {
+                            ctx.push_error(format!("Could not preserve steering message: {error}"));
+                        }
+                    }
                 }
                 continue;
             }

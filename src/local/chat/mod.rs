@@ -1444,6 +1444,9 @@ pub struct ChatHost {
     /// sequential: each session holds this gate from card creation through the
     /// user's answer, so later bridge requests cannot surface alongside it.
     permission_review_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Serializes terminal recovery per session so double-clicks converge on
+    /// the first durable action before either request re-reads the failed turn.
+    recovery_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Per-session bridge token and immutable spawn-time Plan policy, minted
     /// once per bridged child spawn (the
     /// resident bridge carries it for the child's whole life — re-minting
@@ -1472,8 +1475,10 @@ pub struct ChatHost {
     pending_client_turns: std::sync::Mutex<HashMap<(String, String), PendingClientTurn>>,
     queue_dispatch_suppressed: std::sync::Mutex<HashSet<String>>,
     queue_dispatch_cancelled: std::sync::Mutex<HashSet<String>>,
+    queue_cancellation_held: std::sync::Mutex<HashSet<String>>,
     /// Sink for mid-turn steering text, present only while a capable harness is running.
     steering: std::sync::Mutex<HashMap<String, SteerSink>>,
+    queue_dispatch_in_flight: std::sync::Mutex<HashMap<String, String>>,
 }
 
 struct PendingClientTurnGuard {
@@ -1512,6 +1517,74 @@ impl Drop for PendingClientTurnGuard {
             .lock()
             .unwrap()
             .remove(&self.key);
+    }
+}
+
+struct QueueDispatchGuard {
+    host: Arc<ChatHost>,
+    session_id: String,
+    item_id: String,
+    armed: bool,
+}
+
+impl QueueDispatchGuard {
+    fn begin_locked(host: Arc<ChatHost>, session_id: &str, item_id: &str) -> Self {
+        host.queue_dispatch_in_flight
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), item_id.to_string());
+        Self {
+            host,
+            session_id: session_id.to_string(),
+            item_id: item_id.to_string(),
+            armed: true,
+        }
+    }
+
+    fn finish_locked(&mut self, clear_suppression: bool) {
+        let removed = {
+            let mut in_flight = self.host.queue_dispatch_in_flight.lock().unwrap();
+            if in_flight.get(&self.session_id) == Some(&self.item_id) {
+                in_flight.remove(&self.session_id);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            if clear_suppression {
+                self.host
+                    .queue_dispatch_suppressed
+                    .lock()
+                    .unwrap()
+                    .remove(&self.session_id);
+            }
+            if !self
+                .host
+                .queue_cancellation_held
+                .lock()
+                .unwrap()
+                .contains(&self.session_id)
+            {
+                self.host
+                    .queue_dispatch_cancelled
+                    .lock()
+                    .unwrap()
+                    .remove(&self.session_id);
+            }
+        }
+        self.armed = false;
+    }
+}
+
+impl Drop for QueueDispatchGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let host = self.host.clone();
+        let _mutation = host.queue_persistence.lock().unwrap();
+        self.finish_locked(true);
     }
 }
 
@@ -1685,13 +1758,34 @@ impl TurnAttachments {
 enum TurnSubmission {
     Started(String),
     Queued(String),
+    QueuedExisting(String),
     Existing(String),
     NotStarted,
+}
+
+#[derive(Debug)]
+struct ClientTurnConflict;
+
+impl std::fmt::Display for ClientTurnConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("clientTurnId was already used with different content")
+    }
+}
+
+impl std::error::Error for ClientTurnConflict {}
+
+fn client_turn_conflict() -> crate::error::Error {
+    crate::error::Error::new(ClientTurnConflict)
+}
+
+pub fn is_client_turn_conflict(error: &crate::error::Error) -> bool {
+    error.downcast_ref::<ClientTurnConflict>().is_some()
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SendMessageResult {
+    /// A queued submission has no durable turn yet, so this is its client turn id.
     pub turn_id: String,
     pub queued: bool,
     pub existing: bool,
@@ -1783,6 +1877,21 @@ fn queued_label(m: &QueuedMessage) -> String {
     }
     let n = m.images.len();
     format!("{n} attachment{}", if n == 1 { "" } else { "s" })
+}
+
+fn reset_exhausted_queued_message(message: &QueuedMessage) -> Option<QueuedMessage> {
+    if !queued_delivery_exhausted(message) {
+        return None;
+    }
+    let mut reset = message.clone();
+    reset.dispatch_attempts = 0;
+    reset.dispatch_error = None;
+    reset.next_retry_at = None;
+    Some(reset)
+}
+
+fn queued_delivery_exhausted(message: &QueuedMessage) -> bool {
+    message.dispatch_error.is_some() && message.next_retry_at.is_none()
 }
 
 fn persisted_queue_delay(next_retry_at: Option<i64>, now: i64) -> Duration {
@@ -2069,6 +2178,7 @@ impl ChatHost {
             msg_write: std::sync::Mutex::new(()),
             pending_permissions: std::sync::Mutex::new(HashMap::new()),
             permission_review_locks: Mutex::new(HashMap::new()),
+            recovery_locks: Mutex::new(HashMap::new()),
             gate_tokens: std::sync::Mutex::new(HashMap::new()),
             plan_changes: std::sync::Mutex::new(HashMap::new()),
             permission_changes: std::sync::Mutex::new(HashMap::new()),
@@ -2079,7 +2189,9 @@ impl ChatHost {
             pending_client_turns: std::sync::Mutex::new(HashMap::new()),
             queue_dispatch_suppressed: std::sync::Mutex::new(HashSet::new()),
             queue_dispatch_cancelled: std::sync::Mutex::new(HashSet::new()),
+            queue_cancellation_held: std::sync::Mutex::new(HashSet::new()),
             steering: std::sync::Mutex::new(HashMap::new()),
+            queue_dispatch_in_flight: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -2435,15 +2547,19 @@ impl ChatHost {
             .map(|q| {
                 q.iter()
                     .map(|m| {
+                        let error = m.dispatch_error.clone().map(|mut error| {
+                            cap_tool_text(&mut error);
+                            error
+                        });
                         json!({
                             "id": m.id,
                             "text": queued_label(m),
                             "planMode": m.overrides.plan_mode,
-                            "dispatchState": if m.dispatch_error.is_some() {
+                            "dispatchState": if error.is_some() {
                                 if m.next_retry_at.is_some() { "retrying" } else { "blocked" }
                             } else { "queued" },
                             "nextRetryAt": m.next_retry_at,
-                            "error": m.dispatch_error,
+                            "error": error,
                         })
                     })
                     .collect()
@@ -2461,6 +2577,10 @@ impl ChatHost {
 
     fn refresh_persisted_queue(&self, session_id: &str) -> Result<()> {
         let _mutation = self.queue_persistence.lock().unwrap();
+        self.refresh_persisted_queue_locked(session_id)
+    }
+
+    fn refresh_persisted_queue_locked(&self, session_id: &str) -> Result<()> {
         if self
             .queue_dispatch_cancelled
             .lock()
@@ -2469,12 +2589,19 @@ impl ChatHost {
         {
             return Err(anyhow!("queued messages are being cancelled"));
         }
-        let rows = Store::open()?.list_queued_chat_messages()?;
-        let restored = rows
+        let in_flight = self
+            .queue_dispatch_in_flight
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .cloned();
+        let restored = Store::open()?
+            .list_queued_chat_messages_for_session(session_id)?
             .into_iter()
-            .filter(|row| row.session_id == session_id)
             .filter_map(|row| serde_json::from_str::<QueuedMessage>(&row.payload_json).ok())
+            .filter(|message| in_flight.as_deref() != Some(message.id.as_str()))
             .collect::<VecDeque<_>>();
+        let exhausted = restored.front().is_some_and(queued_delivery_exhausted);
         let mut queued = self.queued.lock().unwrap();
         if restored.is_empty() {
             queued.remove(session_id);
@@ -2482,35 +2609,54 @@ impl ChatHost {
             queued.insert(session_id.to_string(), restored);
         }
         drop(queued);
+        if in_flight.is_none() {
+            let mut suppressed = self.queue_dispatch_suppressed.lock().unwrap();
+            if exhausted {
+                suppressed.insert(session_id.to_string());
+            } else {
+                suppressed.remove(session_id);
+            }
+        }
         self.emit_queued(session_id);
         Ok(())
     }
 
     pub fn resume_persisted_queues(self: &Arc<Self>) {
-        let pending: Vec<(String, Duration)> = self
-            .queued
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|(session_id, queue)| {
-                if self
-                    .queue_dispatch_cancelled
-                    .lock()
-                    .unwrap()
-                    .contains(session_id)
+        let candidates = {
+            let queued = self.queued.lock().unwrap();
+            queued
+                .iter()
+                .filter_map(|(session_id, queue)| {
+                    let item = queue.front()?;
+                    Some((
+                        session_id.clone(),
+                        item.next_retry_at,
+                        queued_delivery_exhausted(item),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        let pending = candidates
+            .into_iter()
+            .filter_map(|(session_id, next_retry_at, exhausted)| {
+                if exhausted
+                    || self
+                        .queue_dispatch_cancelled
+                        .lock()
+                        .unwrap()
+                        .contains(&session_id)
+                    || self
+                        .queue_dispatch_suppressed
+                        .lock()
+                        .unwrap()
+                        .contains(&session_id)
                 {
-                    return None;
+                    None
+                } else {
+                    Some((session_id, persisted_queue_delay(next_retry_at, now_ms())))
                 }
-                let item = queue.front()?;
-                if item.dispatch_attempts > crate::local::harness::ORX_MAX_RETRIES {
-                    return None;
-                }
-                Some((
-                    session_id.clone(),
-                    persisted_queue_delay(item.next_retry_at, now_ms()),
-                ))
             })
-            .collect();
+            .collect::<Vec<_>>();
         for (session_id, delay) in pending {
             let host = self.clone();
             tokio::spawn(async move {
@@ -2519,7 +2665,10 @@ impl ChatHost {
                 }
                 let should_drain = {
                     let mut turns = host.turns.lock().await;
-                    if turns.contains_key(&session_id) || !host.claim_durable_turn(&session_id) {
+                    if host.deleting_sessions.lock().unwrap().contains(&session_id)
+                        || turns.contains_key(&session_id)
+                        || !host.claim_durable_turn(&session_id)
+                    {
                         false
                     } else {
                         turns.insert(session_id.clone(), TurnState::Draining);
@@ -2569,36 +2718,63 @@ impl ChatHost {
     /// rejects `turn/steer`, a dead child, a turn that ended underneath the
     /// send. It becomes an ordinary queued message (chip and all) so the text
     /// still runs when the turn ends instead of vanishing.
-    pub fn park_steer(&self, session_id: &str, message: SteerMessage) {
+    pub fn park_steer(&self, session_id: &str, message: SteerMessage) -> Result<()> {
+        let store = Store::open()?;
+        self.park_steer_with_store(session_id, message, &store)
+    }
+
+    fn park_steer_with_store(
+        &self,
+        session_id: &str,
+        message: SteerMessage,
+        store: &Store,
+    ) -> Result<()> {
         let _mutation = self.queue_persistence.lock().unwrap();
+        if self
+            .queue_dispatch_cancelled
+            .lock()
+            .unwrap()
+            .contains(session_id)
+            || self.deleting_sessions.lock().unwrap().contains(session_id)
+        {
+            return Ok(());
+        }
         let id = new_queued_id();
         let client_turn_id = format!("ct_{}", uuid::Uuid::new_v4());
-        let mut digest = Sha256::new();
-        digest.update(message.display.as_bytes());
+        let messages = vec![AnnotatedText {
+            text: message.display.clone(),
+            annotations: Vec::new(),
+        }];
+        let transcript = TranscriptDisplay {
+            text: None,
+            annotations: None,
+            record_user_message: true,
+        };
+        let overrides = TurnOverrides::default();
+        let images = TurnAttachments::Uploaded(Vec::new());
         let queued = QueuedMessage {
             id: id.clone(),
             client_turn_id: client_turn_id.clone(),
-            request_hash: format!("{:x}", digest.finalize()),
+            request_hash: turn_request_hash(&messages, &transcript, &overrides, &images)?,
             // The raw text: the queue path expands slash-skills itself.
             text: message.display,
             transcript_text: None,
-            overrides: TurnOverrides::default(),
+            overrides,
             images: Vec::new(),
             annotations: Vec::new(),
             dispatch_attempts: 0,
             dispatch_error: None,
             next_retry_at: None,
         };
-        if let Ok(store) = Store::open() {
-            let _ = store.insert_queued_chat_message(&StoredQueuedChatMessage {
-                id,
-                session_id: session_id.to_string(),
-                client_turn_id,
-                request_hash: queued.request_hash.clone(),
-                payload_json: serde_json::to_string(&queued).unwrap_or_default(),
-                created_at: now_ms(),
-            });
-        }
+        let payload_json = serde_json::to_string(&queued)?;
+        store.insert_queued_chat_message(&StoredQueuedChatMessage {
+            id,
+            session_id: session_id.to_string(),
+            client_turn_id,
+            request_hash: queued.request_hash.clone(),
+            payload_json,
+            created_at: now_ms(),
+        })?;
         self.queued
             .lock()
             .unwrap()
@@ -2606,12 +2782,23 @@ impl ChatHost {
             .or_default()
             .push_back(queued);
         self.emit_queued(session_id);
+        Ok(())
     }
 
     /// Drop every parked message for a session (user Stop / delete). Emits an
     /// empty `chat.queued` only if there was something to clear.
     pub fn clear_queue(&self, session_id: &str) -> Result<()> {
+        self.clear_queue_inner(session_id, false)
+    }
+
+    fn clear_queue_inner(&self, session_id: &str, hold_cancellation: bool) -> Result<()> {
         let _mutation = self.queue_persistence.lock().unwrap();
+        if hold_cancellation {
+            self.queue_cancellation_held
+                .lock()
+                .unwrap()
+                .insert(session_id.to_string());
+        }
         self.queue_dispatch_cancelled
             .lock()
             .unwrap()
@@ -2620,7 +2807,23 @@ impl ChatHost {
             .lock()
             .unwrap()
             .remove(session_id);
-        Store::open()?.delete_queued_chat_messages_for_session(session_id)?;
+        if let Err(error) = Store::open()
+            .and_then(|store| store.delete_queued_chat_messages_for_session(session_id))
+        {
+            if !hold_cancellation
+                && !self
+                    .queue_dispatch_in_flight
+                    .lock()
+                    .unwrap()
+                    .contains_key(session_id)
+            {
+                self.queue_dispatch_cancelled
+                    .lock()
+                    .unwrap()
+                    .remove(session_id);
+            }
+            return Err(error);
+        }
         let had = self
             .queued
             .lock()
@@ -2630,18 +2833,45 @@ impl ChatHost {
         if had {
             self.emit_queued(session_id);
         }
-        self.queue_dispatch_cancelled
+        if !hold_cancellation
+            && !self
+                .queue_dispatch_in_flight
+                .lock()
+                .unwrap()
+                .contains_key(session_id)
+        {
+            self.queue_dispatch_cancelled
+                .lock()
+                .unwrap()
+                .remove(session_id);
+        }
+        Ok(())
+    }
+
+    fn release_queue_cancellation_if_idle(&self, session_id: &str) {
+        let _mutation = self.queue_persistence.lock().unwrap();
+        self.queue_cancellation_held
             .lock()
             .unwrap()
             .remove(session_id);
-        Ok(())
+        if !self
+            .queue_dispatch_in_flight
+            .lock()
+            .unwrap()
+            .contains_key(session_id)
+        {
+            self.queue_dispatch_cancelled
+                .lock()
+                .unwrap()
+                .remove(session_id);
+        }
     }
 
     /// Remove one parked message by id (the ✕ on a queued chip).
     pub fn cancel_queued(self: &Arc<Self>, session_id: &str, item_id: &str) -> Result<bool> {
         let _mutation = self.queue_persistence.lock().unwrap();
         let store = Store::open()?;
-        let removed = {
+        let (removed, exhausted_head) = {
             let mut map = self.queued.lock().unwrap();
             let Some(q) = map.get_mut(session_id) else {
                 return Ok(false);
@@ -2656,27 +2886,99 @@ impl ChatHost {
             if q.is_empty() {
                 map.remove(session_id);
             }
-            removed
+            let exhausted_head = map
+                .get(session_id)
+                .and_then(|queue| queue.front())
+                .is_some_and(queued_delivery_exhausted);
+            (removed, exhausted_head)
         };
-        if removed {
-            self.queue_dispatch_suppressed
+        if removed
+            && !self
+                .queue_dispatch_in_flight
                 .lock()
                 .unwrap()
-                .remove(session_id);
-            self.emit_queued(session_id);
-            if !store
-                .list_queued_chat_messages()?
-                .iter()
-                .any(|message| message.session_id == session_id)
-            {
-                self.queue_dispatch_cancelled
-                    .lock()
-                    .unwrap()
-                    .remove(session_id);
+                .contains_key(session_id)
+            && !self
+                .queue_dispatch_cancelled
+                .lock()
+                .unwrap()
+                .contains(session_id)
+        {
+            let mut suppressed = self.queue_dispatch_suppressed.lock().unwrap();
+            if exhausted_head {
+                suppressed.insert(session_id.to_string());
+            } else {
+                suppressed.remove(session_id);
             }
+        }
+        drop(_mutation);
+        if removed {
+            self.emit_queued(session_id);
             self.resume_persisted_queues();
         }
         Ok(removed)
+    }
+
+    /// Reset an exhausted queued delivery and resume the same persisted item.
+    pub fn retry_queued(self: &Arc<Self>, session_id: &str, item_id: &str) -> Result<bool> {
+        let _mutation = self.queue_persistence.lock().unwrap();
+        if self
+            .queue_dispatch_in_flight
+            .lock()
+            .unwrap()
+            .contains_key(session_id)
+            || self
+                .queue_dispatch_cancelled
+                .lock()
+                .unwrap()
+                .contains(session_id)
+        {
+            return Ok(false);
+        }
+        let store = Store::open()?;
+        let harness = store
+            .get_chat_session(session_id)
+            .ok()
+            .flatten()
+            .map(|session| session.harness)
+            .unwrap_or_else(|| "unknown".into());
+        let exhausted_attempts = {
+            let mut map = self.queued.lock().unwrap();
+            let Some(queue) = map.get_mut(session_id) else {
+                return Ok(false);
+            };
+            let Some(index) = queue.iter().position(|message| message.id == item_id) else {
+                return Ok(false);
+            };
+            if index != 0 {
+                return Ok(false);
+            }
+            let Some(reset) = reset_exhausted_queued_message(&queue[index]) else {
+                return Ok(false);
+            };
+            let attempts = queue[index].dispatch_attempts;
+            store.update_queued_chat_message(item_id, &serde_json::to_string(&reset)?)?;
+            queue[index] = reset;
+            attempts
+        };
+        self.queue_dispatch_suppressed
+            .lock()
+            .unwrap()
+            .remove(session_id);
+        drop(_mutation);
+        self.emit_queued(session_id);
+        crate::telemetry::capture(
+            "chat_recovery_action",
+            json!({
+                "harness": harness,
+                "owner": "orx",
+                "reason": "queue_dispatch",
+                "attempt": exhausted_attempts,
+                "action": "retry",
+            }),
+        );
+        self.resume_persisted_queues();
+        Ok(true)
     }
 
     /// Drain the oldest parked message once the current turn finishes. Each
@@ -2719,29 +3021,45 @@ impl ChatHost {
                 return;
             }
             // Scope the guard: a std mutex must never be held across an await.
-            let item = {
-                let _plan_changes = self.plan_changes.lock().unwrap();
-                let _permission_changes = self.permission_changes.lock().unwrap();
-                let mut map = self.queued.lock().unwrap();
-                let item = map.get_mut(session_id).and_then(VecDeque::pop_front);
-                if map.get(session_id).is_some_and(VecDeque::is_empty) {
-                    map.remove(session_id);
+            let (item, dispatch_cleanup) = {
+                let _mutation = self.queue_persistence.lock().unwrap();
+                let cancelled = self
+                    .queue_dispatch_cancelled
+                    .lock()
+                    .unwrap()
+                    .contains(session_id);
+                let suppressed = self
+                    .queue_dispatch_suppressed
+                    .lock()
+                    .unwrap()
+                    .contains(session_id);
+                if cancelled || suppressed {
+                    (None, None)
+                } else {
+                    let _plan_changes = self.plan_changes.lock().unwrap();
+                    let _permission_changes = self.permission_changes.lock().unwrap();
+                    let mut map = self.queued.lock().unwrap();
+                    let item = map.get_mut(session_id).and_then(VecDeque::pop_front);
+                    if map.get(session_id).is_some_and(VecDeque::is_empty) {
+                        map.remove(session_id);
+                    }
+                    let cleanup = item.as_ref().map(|item| {
+                        QueueDispatchGuard::begin_locked(self.clone(), session_id, &item.id)
+                    });
+                    if item.is_some() {
+                        self.queue_dispatch_suppressed
+                            .lock()
+                            .unwrap()
+                            .insert(session_id.to_string());
+                    }
+                    (item, cleanup)
                 }
-                item
             };
             let Some(item) = item else {
                 guard.release().await;
-                if self
-                    .queued
-                    .lock()
-                    .unwrap()
-                    .get(session_id)
-                    .is_some_and(|queue| !queue.is_empty())
-                {
-                    self.drain_queue(session_id).await;
-                }
                 return;
             };
+            let mut dispatch_cleanup = dispatch_cleanup.expect("popped queue item has cleanup");
             let overrides = item.overrides.clone();
             if let Some(plan_mode) = overrides.plan_mode {
                 if let Ok(store) = Store::open() {
@@ -2764,10 +3082,6 @@ impl ChatHost {
                 text: item.text.clone(),
                 annotations: item.annotations.clone(),
             }];
-            self.queue_dispatch_suppressed
-                .lock()
-                .unwrap()
-                .insert(session_id.to_string());
             let send_result = self
                 .send_message_showing(
                     session_id,
@@ -2789,27 +3103,52 @@ impl ChatHost {
                 )
                 .await;
             match send_result {
-                Ok(_) => {
-                    let _mutation = self.queue_persistence.lock().unwrap();
-                    self.queue_dispatch_suppressed
-                        .lock()
-                        .unwrap()
-                        .remove(session_id);
-                    if let Ok(store) = Store::open() {
-                        let _ = store.delete_queued_chat_message(&item.id);
+                Ok(TurnSubmission::NotStarted) => {
+                    let requeued = {
+                        let _mutation = self.queue_persistence.lock().unwrap();
+                        let cancelled = self
+                            .queue_dispatch_cancelled
+                            .lock()
+                            .unwrap()
+                            .contains(session_id);
+                        let deleting = self.deleting_sessions.lock().unwrap().contains(session_id);
+                        dispatch_cleanup.finish_locked(true);
+                        !cancelled
+                            && !deleting
+                            && self.refresh_persisted_queue_locked(session_id).is_ok()
+                    };
+                    if requeued {
+                        self.resume_persisted_queues();
                     }
+                }
+                Ok(_) => {
+                    {
+                        let _mutation = self.queue_persistence.lock().unwrap();
+                        dispatch_cleanup.finish_locked(true);
+                        if let Ok(store) = Store::open() {
+                            let _ = store.delete_queued_chat_message(&item.id);
+                        }
+                    }
+                    self.resume_persisted_queues();
                 }
                 Err(err) => {
                     let _mutation = self.queue_persistence.lock().unwrap();
-                    let suppression = self.queue_dispatch_suppressed.lock().unwrap();
-                    if !suppression.contains(session_id)
-                        || self.deleting_sessions.lock().unwrap().contains(session_id)
-                    {
+                    let cancelled = self
+                        .queue_dispatch_cancelled
+                        .lock()
+                        .unwrap()
+                        .contains(session_id);
+                    let deleting = self.deleting_sessions.lock().unwrap().contains(session_id);
+                    if cancelled || deleting {
+                        dispatch_cleanup.finish_locked(true);
                         return;
                     }
+                    let suppression = self.queue_dispatch_suppressed.lock().unwrap();
                     let mut item = item;
                     item.dispatch_attempts += 1;
-                    item.dispatch_error = Some(err.to_string());
+                    let mut dispatch_error = err.to_string();
+                    cap_tool_text(&mut dispatch_error);
+                    item.dispatch_error = Some(dispatch_error);
                     let harness = Store::open()
                         .ok()
                         .and_then(|store| store.get_chat_session(session_id).ok().flatten())
@@ -2854,6 +3193,7 @@ impl ChatHost {
                     let queue = queued.entry(session_id.to_string()).or_default();
                     queue.push_front(item);
                     drop(queued);
+                    dispatch_cleanup.finish_locked(false);
                     drop(suppression);
                     self.emit_queued(session_id);
                     eprintln!("orx up: queued-message dispatch blocked: {err}");
@@ -2881,7 +3221,8 @@ impl ChatHost {
                                 .remove(&session_id);
                             let should_drain = {
                                 let mut turns = host.turns.lock().await;
-                                if turns.contains_key(&session_id)
+                                if host.deleting_sessions.lock().unwrap().contains(&session_id)
+                                    || turns.contains_key(&session_id)
                                     || !host.claim_durable_turn(&session_id)
                                 {
                                     false
@@ -2912,7 +3253,8 @@ impl ChatHost {
         overrides: TurnOverrides,
         images: Vec<ImageAttachment>,
         annotations: Vec<TextAnnotation>,
-    ) -> Result<()> {
+        client_turn_id: Option<String>,
+    ) -> Result<Option<SendMessageResult>> {
         if !text.trim().is_empty() && images.is_empty() && annotations.is_empty() {
             let sink = {
                 let steering = self.steering.lock().unwrap();
@@ -2934,13 +3276,20 @@ impl ChatHost {
                     display: text.clone(),
                 };
                 if sink.send(message).is_ok() {
-                    return Ok(());
+                    return Ok(None);
                 }
             }
         }
-        self.send_message(session_id, text, overrides, images, annotations, None)
-            .await
-            .map(|_| ())
+        self.send_message(
+            session_id,
+            text,
+            overrides,
+            images,
+            annotations,
+            client_turn_id,
+        )
+        .await
+        .map(Some)
     }
 
     /// Persist the user message and run one harness turn in the background.
@@ -2990,6 +3339,11 @@ impl ChatHost {
                 queued: true,
                 existing: false,
             }),
+            TurnSubmission::QueuedExisting(turn_id) => Ok(SendMessageResult {
+                turn_id,
+                queued: true,
+                existing: true,
+            }),
             TurnSubmission::Existing(turn_id) => Ok(SendMessageResult {
                 turn_id,
                 queued: false,
@@ -3004,8 +3358,16 @@ impl ChatHost {
         session_id: &str,
         turn_id: &str,
         action: &str,
-        explicit_overrides: TurnOverrides,
+        explicit_overrides: RecoveryOverrides,
     ) -> Result<SendMessageResult> {
+        let recovery_lock = self
+            .recovery_locks
+            .lock()
+            .await
+            .entry(session_id.to_string())
+            .or_default()
+            .clone();
+        let _recovery = recovery_lock.lock().await;
         let store = Store::open()?;
         let mut session = store
             .get_chat_session(session_id)?
@@ -3032,12 +3394,11 @@ impl ChatHost {
                 existing: true,
             });
         }
-        if turn.state != "failed" || turn.recovery_action.as_deref() != Some(action) {
-            return Err(anyhow!("this recovery action is no longer available"));
-        }
-
         if !matches!(action, "retry" | "continue") {
             return Err(anyhow!("recovery action must be retry or continue"));
+        }
+        if turn.state != "failed" || turn.recovery_action.as_deref() != Some(action) {
+            return Err(anyhow!("this recovery action is no longer available"));
         }
         if action == "retry" && !matches!(turn.delivery_state.as_str(), "not_sent" | "rejected") {
             return Err(anyhow!("an accepted or uncertain turn cannot be replayed"));
@@ -3057,7 +3418,7 @@ impl ChatHost {
                 return Err(anyhow!("this harness activates Plan through permissions"));
             }
         }
-        settings.apply_explicit(&explicit_overrides);
+        explicit_overrides.apply_to(&mut settings);
         if let Some(mode) = settings.permission_mode.as_deref() {
             if crate::local::harness::permission_mode_for(&session.harness, mode).is_none() {
                 return Err(anyhow!("invalid permission mode for selected harness"));
@@ -3092,6 +3453,11 @@ impl ChatHost {
                 let Some(guard) = TurnGuard::claim(self, session_id, None).await else {
                     return Err(anyhow!("session is busy — interrupt it first"));
                 };
+                if let Some(TurnState::Reserved { turn_id: reserved }) =
+                    self.turns.lock().await.get_mut(session_id)
+                {
+                    *reserved = Some(turn_id.to_string());
+                }
                 if !store.reset_chat_turn_for_retry(turn_id)? {
                     return Err(anyhow!("this recovery action is no longer available"));
                 }
@@ -3146,7 +3512,13 @@ impl ChatHost {
                 );
                 crate::telemetry::capture(
                     "chat_recovery_action",
-                    json!({ "harness": session.harness, "action": "retry" }),
+                    json!({
+                        "harness": session.harness,
+                        "owner": "orx",
+                        "reason": "terminal_turn",
+                        "attempt": turn.attempt_count,
+                        "action": "retry",
+                    }),
                 );
                 let ctx = turn_ctx_from_stored(self.clone(), &session, project, &turn, assistant);
                 let launched = self.launch_turn_ctx(ctx, guard, None).await;
@@ -3241,7 +3613,13 @@ impl ChatHost {
                 }
                 crate::telemetry::capture(
                     "chat_recovery_action",
-                    json!({ "harness": session.harness, "action": "continue" }),
+                    json!({
+                        "harness": session.harness,
+                        "owner": "orx",
+                        "reason": "terminal_turn",
+                        "attempt": turn.attempt_count,
+                        "action": "continue",
+                    }),
                 );
                 Ok(SendMessageResult {
                     turn_id: recovered_by,
@@ -3535,9 +3913,7 @@ impl ChatHost {
             return if existing.request_hash == request_hash {
                 Ok(TurnSubmission::Existing(existing.id))
             } else {
-                Err(anyhow!(
-                    "clientTurnId was already used with different content"
-                ))
+                Err(client_turn_conflict())
             };
         }
         if let Some(mode) = overrides
@@ -3558,7 +3934,7 @@ impl ChatHost {
         // reservation happen under one lock so two concurrent sends (or a
         // send racing a /respond resume) can't both spawn a turn against the
         // same session. `_guard` releases the reservation on any early error.
-        let (guard, mut pending_client_turn) = match admission {
+        let (mut guard, mut pending_client_turn) = match admission {
             TurnAdmission::Preclaimed(guard) => (guard, None),
             TurnAdmission::RejectIfBusy => {
                 match TurnGuard::claim(self, session_id, Some(&mut overrides)).await {
@@ -3581,9 +3957,7 @@ impl ChatHost {
                 };
                 if let Some(mut pending) = pending {
                     if pending.request_hash != request_hash {
-                        return Err(anyhow!(
-                            "clientTurnId was already used with different content"
-                        ));
+                        return Err(client_turn_conflict());
                     }
                     drop(turns);
                     if pending.outcome.borrow().is_none() {
@@ -3608,11 +3982,9 @@ impl ChatHost {
                         })
                 {
                     return if existing.request_hash == request_hash {
-                        Ok(TurnSubmission::Existing(existing.client_turn_id))
+                        Ok(TurnSubmission::QueuedExisting(existing.client_turn_id))
                     } else {
-                        Err(anyhow!(
-                            "clientTurnId was already used with different content"
-                        ))
+                        Err(client_turn_conflict())
                     };
                 }
                 let has_queued = self
@@ -3973,27 +4345,31 @@ impl ChatHost {
             created_at,
             updated_at: created_at,
         };
+        let mut turns = self.turns.lock().await;
+        let Some(TurnState::Reserved { turn_id: reserved }) = turns.get_mut(session_id) else {
+            drop(turns);
+            guard.release().await;
+            return Ok(TurnSubmission::NotStarted);
+        };
+        *reserved = Some(turn_id.clone());
         match store.admit_chat_turn(stored_user.as_ref(), &turn)? {
             ChatTurnAdmission::Inserted => {}
             ChatTurnAdmission::Existing(existing) => {
                 if let Some(pending) = pending_client_turn.take() {
                     pending.finish();
                 }
+                drop(turns);
+                guard.release().await;
                 return Ok(TurnSubmission::Existing(existing.id));
             }
             ChatTurnAdmission::Conflict => {
-                return Err(anyhow!(
-                    "clientTurnId was already used with different content"
-                ));
+                drop(turns);
+                guard.release().await;
+                return Err(client_turn_conflict());
             }
         }
         if let Some(pending) = pending_client_turn.take() {
             pending.finish();
-        }
-        if let Some(TurnState::Reserved { turn_id: reserved }) =
-            self.turns.lock().await.get_mut(session_id)
-        {
-            *reserved = Some(turn_id.clone());
         }
         if starts_session {
             crate::telemetry::capture_chat_session_started(&session.harness);
@@ -4028,19 +4404,18 @@ impl ChatHost {
                 parent_id: None,
             },
         );
-        self.launch_turn_ctx(ctx, guard, title_seed).await
+        self.launch_turn_ctx_locked(ctx, guard, title_seed, turns)
     }
 
     async fn launch_turn_ctx(
         self: &Arc<Self>,
-        mut ctx: TurnCtx,
+        ctx: TurnCtx,
         mut guard: TurnGuard,
         title_seed: Option<String>,
     ) -> Result<TurnSubmission> {
         let sid = ctx.session_id.clone();
         let turn_id = ctx.turn_id.clone();
-        let harness = ctx.harness.clone();
-        let mut turns = self.turns.lock().await;
+        let turns = self.turns.lock().await;
         if self.deleting_sessions.lock().unwrap().contains(&sid)
             || !matches!(turns.get(&sid), Some(TurnState::Reserved { .. }))
         {
@@ -4049,6 +4424,19 @@ impl ChatHost {
             guard.release().await;
             return Ok(TurnSubmission::NotStarted);
         }
+        self.launch_turn_ctx_locked(ctx, guard, title_seed, turns)
+    }
+
+    fn launch_turn_ctx_locked(
+        self: &Arc<Self>,
+        mut ctx: TurnCtx,
+        guard: TurnGuard,
+        title_seed: Option<String>,
+        mut turns: tokio::sync::MutexGuard<'_, HashMap<String, TurnState>>,
+    ) -> Result<TurnSubmission> {
+        let sid = ctx.session_id.clone();
+        let turn_id = ctx.turn_id.clone();
+        let harness = ctx.harness.clone();
         let (target_path, target_event_offset) = target_event_start(&sid, &ctx.assistant.id);
         ctx.target_event_path = Some(target_path);
         ctx.target_event_offset = target_event_offset;
@@ -4082,7 +4470,9 @@ impl ChatHost {
             if let Some(mut steering) = ctx.steering.take() {
                 steering.close();
                 while let Some(message) = steering.recv().await {
-                    ctx.host.park_steer(&ctx.session_id, message);
+                    if let Err(error) = ctx.host.park_steer(&ctx.session_id, message) {
+                        ctx.push_error(format!("Could not preserve steering message: {error}"));
+                    }
                 }
             }
             let failure = match result {
@@ -4096,7 +4486,7 @@ impl ChatHost {
                 }
                 Ok(crate::local::harness::TurnOutcome::Completed) => ctx.terminal_error.take(),
             };
-            let terminal_won = if let Some((kind, message)) = failure {
+            let _terminal_won = if let Some((kind, message)) = failure {
                 let action = ctx.delivery_state.recovery_action();
                 let retry_owner = ctx
                     .retry_owner
@@ -4141,9 +4531,7 @@ impl ChatHost {
             } else {
                 false
             };
-            if terminal_won {
-                let _ = ctx.flush();
-            }
+            let _ = ctx.flush();
             if let Some(path) = ctx.target_event_path.as_ref() {
                 let _ = std::fs::remove_file(path);
             }
@@ -4201,7 +4589,7 @@ impl ChatHost {
             None
         };
         let reserved_queue = {
-            let _ = self.refresh_persisted_queue(session_id);
+            let refreshed = self.refresh_persisted_queue(session_id).is_ok();
             let mut turns = self.turns.lock().await;
             let matches = match (turns.get(session_id), message_id) {
                 (Some(TurnState::Active(active)), Some(message_id)) => {
@@ -4214,6 +4602,17 @@ impl ChatHost {
                 return;
             }
             let reserved_queue = message_id.is_some()
+                && refreshed
+                && !self
+                    .queue_dispatch_cancelled
+                    .lock()
+                    .unwrap()
+                    .contains(session_id)
+                && !self
+                    .queue_dispatch_suppressed
+                    .lock()
+                    .unwrap()
+                    .contains(session_id)
                 && self
                     .queued
                     .lock()
@@ -4357,9 +4756,9 @@ impl ChatHost {
         let created_at = now_ms();
         // Stop means stop everything: drop any messages parked behind this turn
         // so they don't fire the moment it aborts.
-        let _ = self.clear_queue(session_id);
+        let durable_clear = self.clear_queue_inner(session_id, true);
         let interrupted = self.interrupt(session_id).await;
-        let durable_clear = self.clear_queue(session_id);
+        self.release_queue_cancellation_if_idle(session_id);
         if !interrupted? {
             return durable_clear;
         }
@@ -4770,6 +5169,27 @@ impl ChatHost {
         self.codex.kill_session(session_id).await;
         self.claude.forget_session(session_id).await;
         self.respond_locks.lock().await.remove(session_id);
+        self.recovery_locks.lock().await.remove(session_id);
+        self.queue_dispatch_cancelled
+            .lock()
+            .unwrap()
+            .remove(session_id);
+        self.queue_cancellation_held
+            .lock()
+            .unwrap()
+            .remove(session_id);
+        self.queue_dispatch_suppressed
+            .lock()
+            .unwrap()
+            .remove(session_id);
+        self.queue_dispatch_in_flight
+            .lock()
+            .unwrap()
+            .remove(session_id);
+        self.pending_client_turns
+            .lock()
+            .unwrap()
+            .retain(|(queued_session_id, _), _| queued_session_id != session_id);
         let store = Store::open()?;
         let session = store.get_chat_session(session_id)?;
         store.delete_chat_session(session_id)?;
@@ -5088,6 +5508,31 @@ pub struct TurnOverrides {
     pub reasoning_level: Option<String>,
 }
 
+#[derive(Debug, Default)]
+pub struct RecoveryOverrides {
+    pub model: Option<Option<String>>,
+    pub permission_mode: Option<Option<String>>,
+    pub plan_mode: Option<bool>,
+    pub reasoning_level: Option<Option<String>>,
+}
+
+impl RecoveryOverrides {
+    fn apply_to(self, settings: &mut TurnOverrides) {
+        if let Some(model) = self.model {
+            settings.model = model;
+        }
+        if let Some(permission_mode) = self.permission_mode {
+            settings.permission_mode = permission_mode;
+        }
+        if let Some(plan_mode) = self.plan_mode {
+            settings.plan_mode = Some(plan_mode);
+        }
+        if let Some(reasoning_level) = self.reasoning_level {
+            settings.reasoning_level = reasoning_level;
+        }
+    }
+}
+
 fn turn_request_hash(
     messages: &[AnnotatedText],
     transcript: &TranscriptDisplay,
@@ -5316,6 +5761,9 @@ impl TurnCtx {
     }
 
     pub fn persist_delivery(&mut self, delivery: DeliveryState) -> Result<()> {
+        if self.delivery_state == delivery {
+            return Ok(());
+        }
         self.delivery_state = delivery;
         if !self.durable {
             return Ok(());
@@ -6012,7 +6460,7 @@ fn materialize_unfinished_turns(
                 role: "assistant".into(),
                 parts: Vec::new(),
                 created_at: turn.created_at,
-                parent_id: None,
+                parent_id: turn.user_message_id.clone(),
             });
         message.parts.retain(|part| part.id != "turn-retry");
         let mut part = WirePart::tool(
@@ -6119,6 +6567,7 @@ async fn process_run_wakeups(
             }
             Ok(
                 TurnSubmission::Queued(_)
+                | TurnSubmission::QueuedExisting(_)
                 | TurnSubmission::Existing(_)
                 | TurnSubmission::NotStarted,
             ) => {
@@ -8116,6 +8565,38 @@ with other project runs using `orx runs p1` and inspect this run's logs using `o
         assert!(TurnGuard::claim_hidden(&host, "owner").await.is_none());
     }
 
+    #[test]
+    fn only_exhausted_queued_delivery_can_be_reset() {
+        let mut message = QueuedMessage {
+            id: "q_1".into(),
+            client_turn_id: "ct_1".into(),
+            request_hash: "hash".into(),
+            text: "retry me".into(),
+            transcript_text: None,
+            overrides: TurnOverrides::default(),
+            images: Vec::new(),
+            annotations: Vec::new(),
+            dispatch_attempts: crate::local::harness::ORX_MAX_RETRIES + 1,
+            dispatch_error: Some("connection refused".into()),
+            next_retry_at: None,
+        };
+
+        let reset = reset_exhausted_queued_message(&message).unwrap();
+        assert_eq!(reset.id, message.id);
+        assert_eq!(reset.client_turn_id, message.client_turn_id);
+        assert_eq!(reset.dispatch_attempts, 0);
+        assert!(reset.dispatch_error.is_none());
+        assert!(reset.next_retry_at.is_none());
+
+        message.next_retry_at = Some(123);
+        assert!(reset_exhausted_queued_message(&message).is_none());
+        message.next_retry_at = None;
+        message.dispatch_attempts = crate::local::harness::ORX_MAX_RETRIES;
+        assert!(reset_exhausted_queued_message(&message).is_some());
+        message.dispatch_error = None;
+        assert!(reset_exhausted_queued_message(&message).is_none());
+    }
+
     #[tokio::test]
     async fn terminal_run_without_subscription_starts_no_turn() {
         let (store, dir) = temp_store("unsubscribed");
@@ -8306,6 +8787,34 @@ mod steering_tests {
         ))
     }
 
+    fn test_store(tag: &str) -> (Store, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("orx-steer-{tag}-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store
+            .create_chat_session(&StoredChatSession {
+                id: "owner".into(),
+                project_id: "p1".into(),
+                harness: "codex".into(),
+                native_session_id: None,
+                title: None,
+                title_source: None,
+                model: None,
+                permission_mode: None,
+                plan_mode: false,
+                plan_reset_pending: false,
+                reasoning_level: None,
+                archived: false,
+                context_usage_json: None,
+                bootstrap_context: None,
+                active_leaf_id: None,
+                parent_session_id: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        (store, dir)
+    }
+
     fn running_settings() -> TurnSettings {
         TurnSettings {
             model: Some("opus".into()),
@@ -8369,13 +8878,17 @@ mod steering_tests {
     #[tokio::test]
     async fn an_undeliverable_steer_becomes_a_queued_chip() {
         let host = test_host();
+        let (store, dir) = test_store("queued");
 
-        host.park_steer("owner", steer("/plan the migration"));
+        host.park_steer_with_store("owner", steer("/plan the migration"), &store)
+            .unwrap();
 
         let queued = host.queued_items("owner");
         assert_eq!(queued.len(), 1);
         // The chip shows what the user typed, and the queue path re-expands it.
         assert_eq!(queued[0]["text"], "/plan the migration");
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
@@ -8413,6 +8926,55 @@ mod steering_tests {
         .is_err());
     }
 
+    #[test]
+    fn queue_dispatch_and_stop_release_only_their_own_cancellation_state() {
+        let host = test_host();
+        host.queue_cancellation_held
+            .lock()
+            .unwrap()
+            .insert("owner".into());
+        host.queue_dispatch_cancelled
+            .lock()
+            .unwrap()
+            .insert("owner".into());
+        let mut dispatch = QueueDispatchGuard::begin_locked(host.clone(), "owner", "q1");
+
+        dispatch.finish_locked(true);
+        assert!(host
+            .queue_dispatch_cancelled
+            .lock()
+            .unwrap()
+            .contains("owner"));
+        host.release_queue_cancellation_if_idle("owner");
+        assert!(!host
+            .queue_dispatch_cancelled
+            .lock()
+            .unwrap()
+            .contains("owner"));
+
+        host.queue_cancellation_held
+            .lock()
+            .unwrap()
+            .insert("owner".into());
+        host.queue_dispatch_cancelled
+            .lock()
+            .unwrap()
+            .insert("owner".into());
+        let mut dispatch = QueueDispatchGuard::begin_locked(host.clone(), "owner", "q2");
+        host.release_queue_cancellation_if_idle("owner");
+        assert!(host
+            .queue_dispatch_cancelled
+            .lock()
+            .unwrap()
+            .contains("owner"));
+        dispatch.finish_locked(true);
+        assert!(!host
+            .queue_dispatch_cancelled
+            .lock()
+            .unwrap()
+            .contains("owner"));
+    }
+
     #[tokio::test]
     async fn a_steer_survives_the_event_arm_winning_the_select() {
         // Cancel-safety is what lets the harness loops park a steer beside
@@ -8437,6 +8999,7 @@ mod steering_tests {
     async fn a_closed_sink_sends_the_message_back_to_the_queue() {
         // What the turn epilogue does: detach, close, park the remainder.
         let host = test_host();
+        let (store, dir) = test_store("closed");
         let (tx, rx) = mpsc::unbounded_channel();
         let route = host.register_steering("owner", tx.clone(), TurnSettings::default());
         let mut steering = Some(rx);
@@ -8446,12 +9009,15 @@ mod steering_tests {
         if let Some(mut rx) = steering.take() {
             rx.close();
             while let Some(message) = rx.recv().await {
-                host.park_steer("owner", message);
+                host.park_steer_with_store("owner", message, &store)
+                    .unwrap();
             }
         }
 
         assert!(host.steering.lock().unwrap().get("owner").is_none());
         assert!(tx.send(steer("too late")).is_err());
         assert_eq!(host.queued_items("owner")[0]["text"], "still here");
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

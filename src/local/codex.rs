@@ -539,8 +539,9 @@ async fn read_loop(client: Arc<CodexClient>, stdout: tokio::process::ChildStdout
     }
     // EOF or read error: the connection is unusable either way. Kill the child
     // if it is somehow still alive (a half-dead child left in the registry
-    // would eat a request timeout per turn until restart), then fail everything
-    // still waiting.
+    // would eat a request timeout per turn until restart), then drop pending
+    // senders so callers classify this as an ambiguous transport close rather
+    // than a structured server rejection that would be safe to replay.
     let _ = client.child.lock().await.kill().await;
     client.pending.lock().unwrap().clear();
     client.unanswered.lock().unwrap().clear();
