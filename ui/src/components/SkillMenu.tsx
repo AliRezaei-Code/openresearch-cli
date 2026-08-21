@@ -5,11 +5,14 @@ import type { SkillInfo } from "../api";
 export function SkillMenu({
   skills,
   activeIndex,
+  advisory,
   onPick,
   onHover,
 }: {
   skills: SkillInfo[];
   activeIndex: number;
+  /** Mid-sentence Enter still sends, so name the key that does accept. */
+  advisory: boolean;
   onPick: (skill: SkillInfo) => void;
   onHover: (index: number) => void;
 }) {
@@ -27,8 +30,9 @@ export function SkillMenu({
           }}
           onMouseEnter={() => onHover(i)}
         >
-          <span className="skill-name">
+          <span className="skill-name flex items-baseline gap-1">
             /{s.name} <span className="skill-hint">{s.argHint}</span>
+            {advisory && i === activeIndex && <span className="skill-hint ml-auto">Tab</span>}
           </span>
           <span className="skill-desc">{s.description}</span>
         </button>
