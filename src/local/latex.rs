@@ -204,8 +204,9 @@ pub fn find_engine() -> Option<&'static str> {
         .find(|binary| on_path(binary))
 }
 
-/// Guidance for the no-engine case. A full distribution comes first because it
-/// is what matches Overleaf — every engine, biber, and the whole of CTAN.
+/// Guidance for the no-engine case. Tectonic comes first because it is the one
+/// a user can finish, and its XeTeX-only trade is named here because this is
+/// the last screen that can say so — the hint is gone once an engine exists.
 pub fn install_hint() -> String {
     let distribution = if cfg!(target_os = "macos") {
         "MacTeX"
@@ -213,9 +214,10 @@ pub fn install_hint() -> String {
         "TeX Live"
     };
     format!(
-        "No LaTeX toolchain found on PATH. Install {distribution} for the same \
-         engines and packages Overleaf runs, or Tectonic for a smaller \
-         XeTeX-only setup that needs no distribution."
+        "No LaTeX toolchain found on PATH. Install Tectonic — one self-contained \
+         binary that fetches each document's packages, though it runs only XeTeX. \
+         For every engine and package, install {distribution} instead, which is \
+         what Overleaf runs."
     )
 }
 
@@ -223,7 +225,7 @@ pub fn install_hint() -> String {
 /// known to work — a wrong command pasted into a terminal is worse than none.
 pub fn install_command() -> Option<&'static str> {
     if cfg!(target_os = "macos") {
-        Some("brew install --cask mactex")
+        Some("brew install tectonic")
     } else {
         None
     }
@@ -851,16 +853,29 @@ mod tests {
     }
 
     #[test]
-    fn the_no_engine_guidance_points_at_a_full_distribution_first() {
+    fn the_no_engine_guidance_points_at_tectonic_first() {
         let hint = install_hint();
+        let distribution = if cfg!(target_os = "macos") {
+            "MacTeX"
+        } else {
+            "TeX Live"
+        };
+        let tectonic = hint.find("Tectonic").expect("the recommendation is named");
+        let fallback = hint.find(distribution).expect("the fallback is named");
         assert!(
-            hint.contains("Overleaf"),
-            "parity is the reason to install it"
+            tectonic < fallback,
+            "the install a user can finish comes first"
         );
-        // The prose must not duplicate the copyable command.
+        // The caveat has to sit in Tectonic's own clause: recommending it
+        // without one sends a user to an engine that silently retypesets their
+        // pdfLaTeX document, and this hint is the only place that says so.
+        let xetex = hint.find("XeTeX").expect("the limitation is named");
+        assert!(tectonic < xetex && xetex < fallback);
+        // The prose must not duplicate the copyable command, but the command
+        // must install what the prose leads with.
         assert!(!hint.contains("brew install"));
         #[cfg(target_os = "macos")]
-        assert_eq!(install_command(), Some("brew install --cask mactex"));
+        assert_eq!(install_command(), Some("brew install tectonic"));
         #[cfg(not(target_os = "macos"))]
         assert_eq!(install_command(), None);
     }
