@@ -824,8 +824,7 @@ export default function App() {
     observedRunsProjectRef.current = projectId;
     observedRunsRef.current.clear();
     liveRunIdsRef.current.clear();
-    // Record the visit; the resulting project.updated SSE event refreshes the
-    // list's recency order.
+    // Record the visit for persisted project-level UI recency.
     openProject(projectId).catch(() => {});
     setExperiments([]);
     setRuns([]);

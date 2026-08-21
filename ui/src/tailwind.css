@@ -453,6 +453,22 @@ textarea::placeholder {
   text-decoration-color: transparent;
 }
 
+.project-row:hover .project-row-title {
+  text-decoration-line: underline;
+  text-underline-offset: 2px;
+}
+
+.project-row:has(.project-row-secondary:hover) .project-row-title {
+  text-decoration-line: none;
+}
+
+@media (hover: none) {
+  .project-row-delete {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
 .tool-target:hover,
 .tool-target-more:hover {
   color: var(--primary);
@@ -468,6 +484,10 @@ textarea::placeholder {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .activity-pulse {
+    animation: none;
+  }
+
   .tool-group-disclosure {
     transition: none;
   }

@@ -109,6 +109,19 @@ const put = <T>(url: string, body: unknown) =>
 export const listProjects = () =>
   get<{ projects: Project[] }>("/api/projects").then((r) => r.projects);
 
+export interface ProjectActivity {
+  projectId: string;
+  activeAgents: number;
+  /** Lifetime sessions for this project, including archived agents. */
+  totalAgents: number;
+  runningExperiments: number;
+  totalExperiments: number;
+  lastMessageAt: number | null;
+}
+
+export const listProjectActivity = () =>
+  get<{ activity: ProjectActivity[] }>("/api/projects/activity").then((r) => r.activity);
+
 export interface OnboardingSelection {
   harness: HarnessId;
   model: string | null;
@@ -217,7 +230,7 @@ export const resolvePaper = (id: string) =>
 export const updateProject = (projectId: string, body: { runCommand?: string; name?: string }) =>
   patch<{ project: Project }>(`/api/projects/${projectId}`, body).then((r) => r.project);
 
-/** Record a visit: bumps the project's updatedAt, which drives the recency sort. */
+/** Record a visit so the backend can persist project-level UI recency. */
 export const openProject = (projectId: string) =>
   post<{ project: Project }>(`/api/projects/${projectId}/open`).then((r) => r.project);
 
