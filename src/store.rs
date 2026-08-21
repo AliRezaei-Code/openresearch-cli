@@ -222,6 +222,15 @@ pub struct StoredRun {
 }
 
 #[derive(Debug, Clone)]
+pub struct ProjectActivitySummary {
+    pub project_id: String,
+    pub total_agents: usize,
+    pub running_experiments: usize,
+    pub total_experiments: usize,
+    pub last_message_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
 pub struct RunWakeup {
     pub run: StoredRun,
     pub chat_session_id: String,
@@ -1641,6 +1650,68 @@ impl Store {
              ORDER BY updated_at DESC"
         ))?;
         let rows = stmt.query_map(params![project_id], row_to_chat_session)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_chat_session_project_ids(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, project_id FROM chat_sessions")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Project totals include archived sessions so the agent count reflects
+    /// every agent that has worked on the project, not only the visible rail.
+    pub fn list_project_activity_summaries(&self) -> Result<Vec<ProjectActivitySummary>> {
+        let mut stmt = self.conn.prepare(
+            "WITH agent_counts AS (
+                 SELECT project_id, COUNT(*) AS total_agents
+                 FROM chat_sessions
+                 GROUP BY project_id
+             ),
+             experiment_counts AS (
+                 SELECT project_id, COUNT(*) AS total_experiments
+                 FROM local_experiments
+                 GROUP BY project_id
+             ),
+             running_experiment_counts AS (
+                 SELECT runs.project_id, COUNT(DISTINCT runs.experiment_id) AS running_experiments
+                 FROM runs
+                 JOIN local_experiments
+                   ON local_experiments.id = runs.experiment_id
+                  AND local_experiments.project_id = runs.project_id
+                 WHERE runs.status IN ('starting', 'running')
+                 GROUP BY runs.project_id
+             ),
+             latest_messages AS (
+                 SELECT chat_sessions.project_id, MAX(chat_messages.created_at) AS last_message_at
+                 FROM chat_messages
+                 JOIN chat_sessions ON chat_sessions.id = chat_messages.session_id
+                 WHERE chat_messages.role IN ('user', 'assistant')
+                 GROUP BY chat_sessions.project_id
+             )
+             SELECT local_projects.id,
+                    COALESCE(agent_counts.total_agents, 0),
+                    COALESCE(running_experiment_counts.running_experiments, 0),
+                    COALESCE(experiment_counts.total_experiments, 0),
+                    latest_messages.last_message_at
+             FROM local_projects
+             LEFT JOIN agent_counts ON agent_counts.project_id = local_projects.id
+             LEFT JOIN experiment_counts ON experiment_counts.project_id = local_projects.id
+             LEFT JOIN running_experiment_counts
+               ON running_experiment_counts.project_id = local_projects.id
+             LEFT JOIN latest_messages ON latest_messages.project_id = local_projects.id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ProjectActivitySummary {
+                project_id: row.get(0)?,
+                total_agents: row.get::<_, i64>(1)? as usize,
+                running_experiments: row.get::<_, i64>(2)? as usize,
+                total_experiments: row.get::<_, i64>(3)? as usize,
+                last_message_at: row.get(4)?,
+            })
+        })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
@@ -4024,6 +4095,85 @@ mod tests {
             updated_at: 1,
             chat_session_id: chat_session_id.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn project_activity_summaries_aggregate_lifetime_work() {
+        let dir = std::env::temp_dir().join(format!(
+            "orx-store-project-activity-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store
+            .create_local_project(&LocalProject {
+                id: "proj_1".into(),
+                name: "Project".into(),
+                slug: "project".into(),
+                github_owner: String::new(),
+                github_repo: String::new(),
+                github_sync_enabled: false,
+                baseline_branch: "main".into(),
+                repo_path: dir.join("project").to_string_lossy().into_owned(),
+                run_command: None,
+                paper_id: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+
+        let mut archived = chat_session_fixture("archived");
+        archived.archived = true;
+        store.create_chat_session(&archived).unwrap();
+        store
+            .create_chat_session(&chat_session_fixture("current"))
+            .unwrap();
+        for (id, role, created_at) in [
+            ("user", "user", 10),
+            ("assistant", "assistant", 20),
+            ("system", "system", 30),
+        ] {
+            store
+                .upsert_chat_message(&StoredChatMessage {
+                    id: id.into(),
+                    session_id: "current".into(),
+                    role: role.into(),
+                    parts_json: "[]".into(),
+                    created_at,
+                    parent_id: None,
+                    base_native_session_id: None,
+                    result_native_session_id: None,
+                })
+                .unwrap();
+        }
+
+        store
+            .create_local_experiment(&experiment_fixture("exp_1", None))
+            .unwrap();
+        store
+            .create_local_experiment(&experiment_fixture("exp_2", None))
+            .unwrap();
+        for (id, experiment_id, status) in [
+            ("run_1", "exp_1", "starting"),
+            ("run_2", "exp_2", "running"),
+            ("run_done", "exp_1", "done"),
+            ("run_orphan", "missing", "running"),
+        ] {
+            let mut run = run_fixture(id, status, None);
+            run.experiment_id = experiment_id.into();
+            store.upsert_run(&run).unwrap();
+        }
+
+        let summaries = store.list_project_activity_summaries().unwrap();
+        assert_eq!(summaries.len(), 1);
+        let summary = &summaries[0];
+        assert_eq!(summary.project_id, "proj_1");
+        assert_eq!(summary.total_agents, 2);
+        assert_eq!(summary.running_experiments, 2);
+        assert_eq!(summary.total_experiments, 2);
+        assert_eq!(summary.last_message_at, Some(20));
+        assert_eq!(store.list_chat_session_project_ids().unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

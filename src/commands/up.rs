@@ -295,6 +295,7 @@ fn router(state: AppState) -> Router {
         .route("/api/project-path/status", get(project_path_status))
         .route("/api/project-path/pick", post(pick_project_folder))
         .route("/api/projects", get(list_projects).post(create_project))
+        .route("/api/projects/activity", get(list_project_activity))
         .route(
             "/api/projects/{id}",
             get(get_project)
@@ -885,6 +886,38 @@ async fn list_projects() -> ApiResult {
     let projects = Store::open()?.list_local_projects()?;
     let projects: Vec<Value> = projects.iter().map(project_json).collect();
     Ok(Json(json!({ "projects": projects })))
+}
+
+async fn list_project_activity(State(state): State<AppState>) -> ApiResult {
+    let busy: HashSet<String> = state.chat.busy_sessions().await.into_iter().collect();
+    tokio::task::spawn_blocking(move || -> Result<Json<Value>> {
+        let store = Store::open()?;
+        let mut active_agents = HashMap::<String, usize>::new();
+        for (session_id, project_id) in store.list_chat_session_project_ids()? {
+            if busy.contains(&session_id) {
+                *active_agents.entry(project_id).or_default() += 1;
+            }
+        }
+        let activity = store
+            .list_project_activity_summaries()?
+            .into_iter()
+            .map(|summary| {
+                let active_agents = active_agents.get(&summary.project_id).copied().unwrap_or(0);
+                json!({
+                    "projectId": summary.project_id,
+                    "activeAgents": active_agents,
+                    "totalAgents": summary.total_agents,
+                    "runningExperiments": summary.running_experiments,
+                    "totalExperiments": summary.total_experiments,
+                    "lastMessageAt": summary.last_message_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(Json(json!({ "activity": activity })))
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow!("project activity task failed: {error}")))?
+    .map_err(ApiError::from)
 }
 
 #[derive(Deserialize)]
