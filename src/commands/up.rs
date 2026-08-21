@@ -342,6 +342,8 @@ fn router(state: AppState) -> Router {
         )
         .route("/api/projects/{id}/file/raw", get(project_raw_file))
         .route("/api/projects/{id}/file/open", post(open_project_file))
+        .route("/api/projects/{id}/file/latex", post(compile_project_latex))
+        .route("/api/latex/engine", get(latex_engine))
         .route("/api/files/abs", get(absolute_file))
         .route("/api/files/abs/raw", get(absolute_raw_file))
         .route(
@@ -433,6 +435,12 @@ fn router(state: AppState) -> Router {
         )
         .route("/api/user-skills/import", post(import_user_skill))
         .route("/api/harness-skills", get(list_harness_skills))
+        .route(
+            "/api/latex-templates",
+            get(list_latex_templates)
+                .post(upload_latex_template)
+                .delete(delete_latex_template),
+        )
         .route(
             "/api/chat/sessions",
             get(list_chat_sessions).post(create_chat_session),
@@ -759,7 +767,7 @@ struct UserSkillsListQ {
     project: Option<String>,
 }
 
-/// Both scopes for the Skills tab: globals plus the project's own.
+/// Both scopes for the Customize tab: globals plus the project's own.
 async fn list_user_skills(Query(q): Query<UserSkillsListQ>) -> ApiResult {
     let skills: Vec<Value> = crate::local::user_skills::list_for_project(q.project.as_deref())
         .iter()
@@ -812,6 +820,51 @@ async fn delete_user_skill(Query(q): Query<DeleteSkillQ>) -> ApiResult {
     let scope = parse_scope(&q.scope)?;
     let project = resolve_skill_scope(scope, q.project.as_deref())?;
     crate::local::user_skills::delete(&q.name, scope, project.as_deref()).map_err(bad_request)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+fn latex_template_json(t: &crate::local::latex_templates::LatexTemplate) -> Value {
+    json!({
+        "name": t.name,
+        "scope": t.scope,
+        "entry": t.entry,
+        "supportFiles": t.support_files,
+        "bytes": t.bytes,
+        "updatedAt": t.updated_at,
+    })
+}
+
+/// Both scopes for the Customize tab's templates card.
+async fn list_latex_templates(Query(q): Query<UserSkillsListQ>) -> ApiResult {
+    let templates: Vec<Value> =
+        crate::local::latex_templates::list_for_project(q.project.as_deref())
+            .iter()
+            .map(latex_template_json)
+            .collect();
+    Ok(Json(json!({ "templates": templates })))
+}
+
+async fn upload_latex_template(Json(req): Json<UploadSkillReq>) -> ApiResult {
+    let scope = parse_scope(&req.scope)?;
+    let project = resolve_skill_scope(scope, req.project_id.as_deref())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(req.content_base64.trim())
+        .map_err(|e| bad_request(format!("invalid file data: {e}")))?;
+    let saved = crate::local::latex_templates::save_upload(
+        &req.filename,
+        &bytes,
+        scope,
+        project.as_deref(),
+    )
+    .map_err(bad_request)?;
+    Ok(Json(json!({ "template": latex_template_json(&saved) })))
+}
+
+async fn delete_latex_template(Query(q): Query<DeleteSkillQ>) -> ApiResult {
+    let scope = parse_scope(&q.scope)?;
+    let project = resolve_skill_scope(scope, q.project.as_deref())?;
+    crate::local::latex_templates::delete(&q.name, scope, project.as_deref())
+        .map_err(bad_request)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -2391,6 +2444,94 @@ async fn open_project_file(
         crate::editors::open_in_default_app(&full)
             .map_err(|e| ApiError::from(anyhow!("could not open file: {e}")))?;
         Ok(Json(json!({ "ok": true })))
+    })
+    .await
+}
+
+/// Whether this machine can compile at all, so the dashboard can render a real
+/// document by default and fall back to its approximate preview when it cannot.
+async fn latex_engine() -> ApiResult {
+    blocking_api(move || {
+        let engine = local::latex::find_engine();
+        Ok(Json(json!({
+            "engine": engine,
+            "hint": engine.is_none().then(local::latex::install_hint),
+            "installCommand": engine.is_none().then(local::latex::install_command).flatten(),
+        })))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompileLatexReq {
+    path: String,
+    session_id: Option<String>,
+}
+
+/// Compile a checkout `.tex` file to a PDF beside it with the machine's own
+/// LaTeX engine, so the dashboard's approximate preview has an exact
+/// counterpart. Resolves and confines the path exactly like `open_project_file`;
+/// a compile failure is a 200 carrying the log, not an error — the log is the
+/// answer the user came for.
+async fn compile_project_latex(
+    Path(id): Path<String>,
+    Json(req): Json<CompileLatexReq>,
+) -> ApiResult {
+    blocking_api(move || {
+        let (rel, rel_path) = validated_project_file_path(&req.path)?;
+        if touches_git_dir(&rel_path) {
+            return Err(bad_request("cannot compile files under .git"));
+        }
+        if !rel.to_ascii_lowercase().ends_with(".tex") {
+            return Err(bad_request("not a .tex file"));
+        }
+        let store = Store::open()?;
+        let project = store
+            .get_local_project(&id)?
+            .ok_or_else(|| not_found("project"))?;
+        let (root, root_kind) = resolve_checkout_root(&store, &project, req.session_id.as_deref())?;
+        // Compiling writes a PDF, so a session that fell back to the clone is
+        // refused for the same reason `write_project_file` refuses it.
+        if req.session_id.is_some() && root_kind == "clone" {
+            return Err(bad_request(
+                "this session's worktree is no longer available — reload the file",
+            ));
+        }
+        let full = match std::fs::canonicalize(root.join(&rel_path)) {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(not_found("file")),
+            Err(e) => return Err(ApiError::from(anyhow!("compile failed: {e}"))),
+        };
+        if !full.starts_with(&root) {
+            return Err(bad_request("path escapes repository"));
+        }
+        if full.is_dir() {
+            return Err(bad_request("path is a directory"));
+        }
+        // Asked here rather than inside `compile` so a machine that cannot build
+        // *this* document gets a 400 with the install hint instead of a 500.
+        if let Some(hint) = local::latex::missing_toolchain(&full) {
+            return Err(bad_request(hint));
+        }
+        let result = local::latex::compile(&full)?;
+        let pdf_path = match result.pdf.as_deref() {
+            Some(pdf) => Some(
+                pdf.strip_prefix(&root)
+                    .map_err(|_| anyhow!("compiled PDF landed outside the checkout"))?
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            ),
+            None => None,
+        };
+        Ok(Json(json!({
+            "ok": pdf_path.is_some(),
+            "pdfPath": pdf_path,
+            "engine": result.engine,
+            "note": result.note,
+            "hadErrors": result.had_errors,
+            "log": result.log,
+        })))
     })
     .await
 }
