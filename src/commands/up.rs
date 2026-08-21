@@ -1100,12 +1100,20 @@ async fn create_project(
     let create_folder = req.create_folder;
     let initialize_git = req.initialize_git;
     let clone_url = req.clone_url.filter(|url| !url.trim().is_empty());
-    let paper_id = req.paper_id.filter(|paper_id| !paper_id.trim().is_empty());
-    if paper_id.is_some() && clone_url.is_none() {
-        return Err(bad_request(
-            "A paper project requires a linked public code repository.",
-        ));
-    }
+    let paper_id = req
+        .paper_id
+        .map(|paper_id| paper_id.trim().to_string())
+        .filter(|paper_id| !paper_id.is_empty());
+    // A paper with no linked repository starts blank, seeded with its PDF — the
+    // only content such a project has, so a failed download fails the request.
+    let paper_pdf = match (paper_id.as_deref(), clone_url.as_deref()) {
+        (Some(id), None) => Some(
+            crate::client::fetch_paper_pdf(id)
+                .await
+                .map_err(bad_request)?,
+        ),
+        _ => None,
+    };
     let github_sync_enabled = req
         .github_sync_enabled
         .unwrap_or_else(crate::config::github_for_new_projects);
@@ -1129,6 +1137,7 @@ async fn create_project(
                 shallow_clone,
                 run_command,
                 paper_id,
+                paper_pdf,
             },
         )?;
         if let Err(error) = local::files::ensure_project_brief(&project) {

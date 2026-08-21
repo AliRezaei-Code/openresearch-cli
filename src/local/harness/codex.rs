@@ -38,8 +38,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 use super::detect::{
-    bin_version, find_on_path, jwt_payload, nonempty_str, parse_version, read_json,
-    resolve_symlinks, title_case, HarnessInfo, ModelInfo,
+    bin_version, jwt_payload, nonempty_str, parse_version, read_json, resolve_symlinks, title_case,
+    HarnessInfo, ModelInfo,
 };
 use super::options::{
     resolve_reasoning, HarnessOptions, OptionChoice, PermissionMode, PlanActivation,
@@ -57,6 +57,7 @@ use crate::local::chat::{
 };
 use crate::local::codex::{CodexClient, JsonRpcError, ServerReqKind, TurnEvent};
 use crate::local::opencode::ensure_playbook;
+use crate::local::shell_env::find_on_path;
 use crate::store::{Store, StoredChatMessage};
 
 // FALLBACK model table, used only when the app-server catalog is unreachable

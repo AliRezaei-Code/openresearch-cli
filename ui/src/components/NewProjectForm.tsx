@@ -313,21 +313,32 @@ export function NewProjectForm({
     Boolean(path.trim()) && pathStatus?.exists === true && pathStatus.directory === false;
   const nonemptyPaperCloneFolder =
     mode === "paper" && Boolean(paper?.repoUrl) && pathStatus?.empty === false;
+  // A blank paper project is seeded and committed at the folder it initializes,
+  // so it needs a folder of its own rather than one inside an existing repo.
+  const unusableBlankPaperFolder =
+    mode === "paper" &&
+    Boolean(paper) &&
+    !paper?.repoUrl &&
+    (pathStatus?.empty === false ||
+      (pathStatus?.gitState != null && pathStatus.gitState !== "notRepository"));
   const unusableRepository =
     mode === "folder" &&
     (pathStatus?.gitState === "detached" || pathStatus?.gitState === "invalid");
-  const paperDestinationHasError = invalidProjectDestination || nonemptyPaperCloneFolder;
+  const paperDestinationHasError =
+    invalidProjectDestination || nonemptyPaperCloneFolder || unusableBlankPaperFolder;
   const paperDestinationDescription = invalidProjectDestination
     ? "Choose a different destination. This path is a file, not a folder."
     : nonemptyPaperCloneFolder
       ? "Choose a different destination. The paper repository needs a new or empty folder."
-      : paper?.repoUrl
-        ? pathStatus?.exists === false
-          ? "OpenResearch will create this folder and clone the paper's repository into it."
-          : "OpenResearch will clone the paper's repository here and use it as your local workspace."
-        : pathStatus?.exists === false
-          ? "OpenResearch will create this folder and initialize it as the local project workspace."
-          : "OpenResearch will use this folder as the local workspace and initialize Git if needed.";
+      : unusableBlankPaperFolder
+        ? "Choose a different destination. A paper project needs a new or empty folder of its own, outside any Git repository."
+        : paper?.repoUrl
+          ? pathStatus?.exists === false
+            ? "OpenResearch will create this folder and clone the paper's repository into it."
+            : "OpenResearch will clone the paper's repository here and use it as your local workspace."
+          : pathStatus?.exists === false
+            ? "OpenResearch will create this folder, initialize it, and save the paper's PDF here."
+            : "OpenResearch will initialize this empty folder and save the paper's PDF here.";
   const canCreate =
     Boolean(name.trim() && path.trim()) &&
     !pending &&
@@ -339,8 +350,9 @@ export function NewProjectForm({
     !missingLocalFolder &&
     !invalidProjectDestination &&
     !nonemptyPaperCloneFolder &&
+    !unusableBlankPaperFolder &&
     !unusableRepository &&
-    (mode !== "paper" || Boolean(paper?.repoUrl)) &&
+    (mode !== "paper" || Boolean(paper)) &&
     (!githubSyncEnabled ||
       (typeof githubLogin === "string" &&
         !githubRepoPreviewPending &&
@@ -385,7 +397,7 @@ export function NewProjectForm({
             placeholder="arXiv id, URL, or title"
             autoFocus
           />
-          <span className="repo-hint">{searching ? "Searching alphaXiv…" : "The public code repository is cloned without credentials."}</span>
+          <span className="repo-hint">{searching ? "Searching alphaXiv…" : "A linked public code repository is cloned without credentials."}</span>
           {hits.length > 0 && (
             <div className="paper-results">
               {hits.map((hit) => (
@@ -417,7 +429,14 @@ export function NewProjectForm({
         </div>
       )}
 
-      {(mode !== "paper" || paper?.repoUrl) && (
+      {mode === "paper" && paper && !paper.repoUrl && (
+        <div className="project-path-notice">
+          alphaXiv links no public code repository to this paper. OpenResearch will start a blank
+          project with the paper's PDF.
+        </div>
+      )}
+
+      {(mode !== "paper" || paper) && (
         <>
           {mode === "paper" ? (
             <div className="project-location-field">
@@ -508,7 +527,7 @@ export function NewProjectForm({
       )}
 
       {error && <div className="error">{error}</div>}
-      {(mode !== "paper" || paper?.repoUrl) && path && (
+      {(mode !== "paper" || paper) && path && (
         <label className="flex w-full flex-col items-stretch gap-[7px] font-normal">
           <span className="flex flex-row items-center gap-[9px]">
             <input

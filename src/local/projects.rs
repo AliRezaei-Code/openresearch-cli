@@ -59,12 +59,15 @@ pub(crate) fn expand_path(path: &str) -> Result<PathBuf> {
     }
 }
 
+const PAPER_PDF_NAME: &str = "paper.pdf";
+
 fn prepare_path(
     path: &str,
     create_folder: bool,
     initialize_git: bool,
     clone_url: Option<&str>,
     shallow_clone: bool,
+    paper_pdf: Option<&[u8]>,
 ) -> Result<PathBuf> {
     let path = expand_path(path)?;
     if let Some(url) = clone_url.map(str::trim).filter(|url| !url.is_empty()) {
@@ -93,10 +96,25 @@ fn prepare_path(
         return Err(crate::error::anyhow!("{} is not a folder", path.display()));
     }
 
+    if paper_pdf.is_some() && std::fs::read_dir(&path)?.next().is_some() {
+        return Err(crate::error::anyhow!(
+            "{} must be empty to start a paper project",
+            path.display()
+        ));
+    }
+
     let repository_state = git::repository_state(&path);
     if repository_state == git::RepositoryState::Invalid {
         return Err(crate::error::anyhow!(
             "{} is not a valid Git repository",
+            path.display()
+        ));
+    }
+    // Seeding an existing repository would leave the paper uncommitted, and in a
+    // subdirectory it would land outside the project root.
+    if paper_pdf.is_some() && repository_state != git::RepositoryState::NotRepository {
+        return Err(crate::error::anyhow!(
+            "{} is already inside a Git repository; a paper project needs a folder of its own",
             path.display()
         ));
     }
@@ -109,6 +127,13 @@ fn prepare_path(
                 "Experiments need a local Git repository. Confirm initialization for {} and try again.",
                 path.display()
             ));
+        }
+        // Written before initialization so the paper lands in the initial commit.
+        if let Some(pdf) = paper_pdf {
+            let pdf_path = path.join(PAPER_PDF_NAME);
+            std::fs::write(&pdf_path, pdf).map_err(|e| {
+                crate::error::anyhow!("Could not write {}: {}", pdf_path.display(), e)
+            })?;
         }
         git::initialize_repository(&path)?;
     }
@@ -133,6 +158,7 @@ pub fn create_project(
         shallow_clone,
         run_command,
         paper_id,
+        paper_pdf,
     } = options;
     let slug = unique_project_slug(store, &slugify(name))?;
     let repo_path = prepare_path(
@@ -141,6 +167,7 @@ pub fn create_project(
         initialize_git,
         clone_url.as_deref(),
         shallow_clone,
+        paper_pdf.as_deref(),
     )?;
     if store
         .list_local_projects()?
@@ -183,6 +210,7 @@ pub struct CreateProjectOptions {
     pub shallow_clone: bool,
     pub run_command: Option<String>,
     pub paper_id: Option<String>,
+    pub paper_pdf: Option<Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -272,6 +300,54 @@ mod tests {
             std::fs::canonicalize(&project_path).unwrap()
         );
         assert!(git::remotes(&project_path).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn paper_project(store: &Store, path: &Path) -> Result<LocalProject> {
+        create_project(
+            store,
+            "Paper project",
+            path.to_str().unwrap(),
+            CreateProjectOptions {
+                create_folder: true,
+                initialize_git: true,
+                paper_pdf: Some(b"%PDF-1.7 test".to_vec()),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn commits_the_paper_pdf_into_a_blank_paper_project() {
+        let root = root();
+        let store = Store::open_at(root.join("data")).unwrap();
+        let project = paper_project(&store, &root.join("project")).unwrap();
+        let repo_path = Path::new(&project.repo_path);
+        assert_eq!(
+            std::fs::read(repo_path.join(PAPER_PDF_NAME)).unwrap(),
+            b"%PDF-1.7 test"
+        );
+        assert_eq!(
+            git_output(repo_path, &["ls-tree", "-r", "--name-only", "HEAD"]),
+            PAPER_PDF_NAME
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_seed_a_paper_project_inside_an_existing_repository() {
+        let root = root();
+        let store = Store::open_at(root.join("data")).unwrap();
+        let repository = root.join("repository");
+        initialized(&repository);
+        let nested = repository.join("nested");
+        let error = paper_project(&store, &nested).unwrap_err().to_string();
+        assert!(error.contains("already inside a Git repository"), "{error}");
+        assert!(!nested.join(PAPER_PDF_NAME).exists());
+
+        let error = paper_project(&store, &repository).unwrap_err().to_string();
+        assert!(error.contains("must be empty"), "{error}");
+        assert!(!repository.join(PAPER_PDF_NAME).exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 

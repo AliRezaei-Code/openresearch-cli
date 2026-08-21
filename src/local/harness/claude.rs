@@ -30,8 +30,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 use super::detect::{
-    bin_version, find_on_path, nonempty_str, parse_version, read_json, HarnessAuthState,
-    HarnessInfo, ModelInfo,
+    bin_version, nonempty_str, parse_version, read_json, HarnessAuthState, HarnessInfo, ModelInfo,
 };
 use super::options::{
     HarnessOptions, OptionChoice, PermissionMode, PlanActivation, REASONING_DEFAULT_ID,
@@ -46,6 +45,7 @@ use crate::local::chat::{
 };
 use crate::local::claude::{SpawnConfig, SpawnSpec, TurnEvent};
 use crate::local::opencode::ensure_playbook;
+use crate::local::shell_env::find_on_path;
 
 /// FALLBACK model list, used only when the `list_models` control request fails
 /// (a CLI too old to answer it, or a spawn/timeout failure). The primary source
