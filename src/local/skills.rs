@@ -265,6 +265,36 @@ Molab publication can be a later explicit step after the user enables GitHub
 for this project.
 "#;
 
+const WRITE_PAPER_TEMPLATE: &str = r#"Draft a paper or preprint on this project's work, as LaTeX.
+
+Scope: {args}
+
+Load the `orx-paper` skill first (`orx skill paper`) and follow it — it carries a
+preamble that compiles, the environment-to-package table that is the usual cause
+of a failed build, and the file-citation rule.
+
+Check `.orx/latex-templates/` before writing a preamble. If the user has uploaded
+exactly one template, use it; if several, ask which unless the scope above names
+one; if none, use the skill's default preamble.
+
+Method:
+1. Ground the paper in what actually ran. Read the tree with `orx project view
+   <projectId>`, then pull every number you intend to report out of `orx logs`
+   (the `orx-evidence` skill covers this). Never write a metric you have not read
+   out of a run; if something is not measured yet, say so in the text.
+2. Find real related work with `orx lit` and read the promising hits with
+   `orx paper <id>`. Cite those. Do not invent plausible-looking references.
+3. Write the document to `paper.tex` at the repository root, in the working tree
+   — a copy in the artifacts directory is not compiled.
+4. Structure it as abstract, introduction, method, experiments (a table of
+   measured results), related work, conclusion, and an inline `thebibliography`.
+5. Cite the finished file as raw <file path="paper.tex"/> so the user can open the
+   rendered document.
+6. If the build fails, read the first line of the log beginning with `!` — it
+   names the problem and the source line — fix the source, and build again. Do
+   not hand back a document that does not compile.
+"#;
+
 pub const CATALOG: &[Skill] = &[
     Skill {
         name: "lit-review",
@@ -286,6 +316,13 @@ pub const CATALOG: &[Skill] = &[
         arg_hint: "[paper] on [compute]",
         template: REPRODUCE_PAPER_TEMPLATE,
         no_args: "(none given — reproduce the linked paper named in your instructions (the `Paper:` line, the one this project starts from) when present; otherwise infer the paper from the current repository: read the README, docs, and code, and if the repo clearly corresponds to an identifiable paper, reproduce that one; only ask the user if no paper can be identified. For compute, use the configured default target when one is set, per the rules below; otherwise ask before launching.)",
+    },
+    Skill {
+        name: "write-paper",
+        description: "Draft a paper or preprint as LaTeX, grounded in this project's runs",
+        arg_hint: "[topic or scope]",
+        template: WRITE_PAPER_TEMPLATE,
+        no_args: "(none given — infer the scope from this project: read the experiment tree and the runs that have finished, and write the paper about the work that is actually there. Ask the user only if the project has no results worth writing up.)",
     },
     Skill {
         name: "paper-to-marimo",
@@ -433,6 +470,24 @@ mod tests {
         let icml = super::expand("/icml-repro example", false).unwrap();
         assert!(icml.contains("source snapshots"));
         assert!(!icml.contains("GitHub syncing"));
+    }
+
+    #[test]
+    fn write_paper_targets_a_compilable_tex_in_the_working_tree() {
+        let prompt = super::expand("/write-paper scaling laws", false).unwrap();
+        assert!(prompt.contains("scaling laws"));
+        assert!(prompt.contains("paper.tex"));
+        assert!(
+            prompt.contains("not compiled"),
+            "must steer away from artifacts"
+        );
+        assert!(
+            prompt.contains("orx-paper"),
+            "must load the skill that has the preamble"
+        );
+        // No-args form still has to produce a paper, not a question.
+        let bare = super::expand("/write-paper", false).unwrap();
+        assert!(bare.contains("infer the scope from this project"));
     }
 
     #[test]

@@ -54,6 +54,7 @@ const LIT: &str = include_str!("../../agent-skills/orx-lit/SKILL.md");
 const CREATE: &str = include_str!("../../agent-skills/orx-create/SKILL.md");
 const REPORTS: &str = include_str!("../../agent-skills/orx-reports/SKILL.md");
 const EVIDENCE: &str = include_str!("../../agent-skills/orx-evidence/SKILL.md");
+const PAPER: &str = include_str!("../../agent-skills/orx-paper/SKILL.md");
 
 // Descriptions are the *trigger surface*: what the module covers plus explicit,
 // liberal "Use when …" cues (false positives beat false negatives — an agent
@@ -99,6 +100,11 @@ const S_REPORTS: AgentSkill = AgentSkill {
     description: "Write durable research outputs into the local project's artifacts directory. Use when a line of work concludes, when the user asks for a write-up, summary, comparison, figures, or exported data, or before ending a long task — findings not written down are lost.",
     content: REPORTS,
 };
+const S_PAPER: AgentSkill = AgentSkill {
+    name: "orx-paper",
+    description: "Draft a paper or preprint as LaTeX. Create a .tex file in the project working tree, where it renders for the user and compiles to PDF. Use whenever the user asks for a paper, preprint, arXiv draft, submission, write-up of results, or a related-work section: create the file rather than outlining in chat.",
+    content: PAPER,
+};
 const S_EVIDENCE: AgentSkill = AgentSkill {
     name: "orx-evidence",
     description: "Analyze run results through `orx logs`. Use after any run reaches a terminal state, before declaring a run a success or failure, when metrics are missing from output, or when designing what a run command should print.",
@@ -116,6 +122,7 @@ pub fn skills(set: SkillSet) -> Vec<&'static AgentSkill> {
             &S_COMPUTE_K8S,
             &S_EVIDENCE,
             &S_REPORTS,
+            &S_PAPER,
             &S_LIT,
         ],
         SkillSet::Full => vec![
@@ -126,6 +133,7 @@ pub fn skills(set: SkillSet) -> Vec<&'static AgentSkill> {
             &S_COMPUTE_K8S,
             &S_EVIDENCE,
             &S_REPORTS,
+            &S_PAPER,
             &S_LIT,
         ],
     }
@@ -306,6 +314,22 @@ mod tests {
         assert!(REPORTS.contains("cite every relevant output as raw"));
         assert!(REPORTS.contains("<file path=\"artifacts/<relative-path>\" />"));
         assert!(REPORTS.contains("never as a bare or backticked path"));
+    }
+
+    #[test]
+    fn paper_skill_writes_a_compilable_tex_and_cites_it() {
+        assert!(PAPER.contains("keep the `.tex` out of the artifacts"));
+        assert!(PAPER.contains("<file path=\"paper.tex\"/>"));
+        // The trap that makes a draft fail to compile rather than look wrong.
+        assert!(PAPER.contains("Every environment needs the package that defines it"));
+        assert!(PAPER.contains("\\newtheorem"));
+        // \citet without natbib is a hard build failure the preview never shows.
+        assert!(PAPER.contains("natbib"));
+        // The engine a document needs travels in the file, not in a setting.
+        assert!(PAPER.contains("% !TeX program"));
+        for set in [SkillSet::Local, SkillSet::Full] {
+            assert_eq!(find("paper", set).map(|s| s.name), Some("orx-paper"));
+        }
     }
 
     #[test]

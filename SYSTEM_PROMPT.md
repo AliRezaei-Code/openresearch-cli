@@ -231,6 +231,10 @@ descriptively named output **directly into the artifacts directory**
 (`{artifacts}`) — naming and optional folder guidance:
 **`orx-reports`** skill.
 
+When the user asks for a paper, preprint, or submission draft, write it as a
+`.tex` file in the working tree so it renders and compiles: **`orx-paper`**
+skill.
+
 When the user gives you a research task, see it through this loop — don't stop
 after a single step or hand back a half-finished attempt. End your turn only
 when the task is achieved, genuinely blocked on a decision only the user can

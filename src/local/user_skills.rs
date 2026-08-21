@@ -1,4 +1,4 @@
-//! User-uploaded agent skills — the dashboard's Skills tab.
+//! User-uploaded agent skills — the dashboard's Customize tab.
 //!
 //! Unlike the built-in `orx-*` modules in [`super::agent_skills`] (embedded in
 //! the binary), these are authored by the user and stored on disk under the
@@ -63,7 +63,7 @@ fn root() -> PathBuf {
 
 /// The directory holding a scope's skill folders under `root`. Validates
 /// `project_id` so a crafted id can never escape the store root.
-fn scope_dir(root: &Path, scope: Scope, project_id: Option<&str>) -> Result<PathBuf> {
+pub(crate) fn scope_dir(root: &Path, scope: Scope, project_id: Option<&str>) -> Result<PathBuf> {
     match scope {
         Scope::Global => Ok(root.join("global")),
         Scope::Project => {
@@ -636,7 +636,7 @@ fn expand_in(root: &Path, text: &str, project_id: &str) -> Option<String> {
 
 // --- fs helpers ---------------------------------------------------------------
 
-fn copy_dir_all(src: &Path, dest: &Path) -> Result<()> {
+pub(crate) fn copy_dir_all(src: &Path, dest: &Path) -> Result<()> {
     fs::create_dir_all(dest).map_err(|e| anyhow!("could not create {}: {e}", dest.display()))?;
     for entry in fs::read_dir(src).map_err(|e| anyhow!("could not read {}: {e}", src.display()))? {
         let entry = entry.map_err(|e| anyhow!("could not read dir entry: {e}"))?;
@@ -651,7 +651,7 @@ fn copy_dir_all(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-fn dir_size(dir: &Path) -> u64 {
+pub(crate) fn dir_size(dir: &Path) -> u64 {
     let mut total = 0;
     let Ok(entries) = fs::read_dir(dir) else {
         return 0;
@@ -667,7 +667,7 @@ fn dir_size(dir: &Path) -> u64 {
     total
 }
 
-fn mtime_ms(path: &Path) -> i64 {
+pub(crate) fn mtime_ms(path: &Path) -> i64 {
     fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
@@ -676,11 +676,11 @@ fn mtime_ms(path: &Path) -> i64 {
         .unwrap_or(0)
 }
 
-fn basename(path: &str) -> &str {
+pub(crate) fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-fn depth(path: &str) -> usize {
+pub(crate) fn depth(path: &str) -> usize {
     path.matches('/').count()
 }
 
