@@ -1204,7 +1204,19 @@ export function modelLabel(id: string): string {
 
 export interface ChatToolState {
   status: "running" | "completed" | "error";
-  input?: { command?: string; filePath?: string; description?: string; [k: string]: unknown };
+  input?: {
+    command?: string;
+    filePath?: string;
+    description?: string;
+    retryOwner?: "native" | "orx";
+    attempt?: number;
+    maximum?: number | null;
+    nextRetryAt?: number | null;
+    turnId?: string;
+    errorKind?: string;
+    recoveryAction?: "retry" | "continue";
+    [k: string]: unknown;
+  };
   output?: string;
   error?: string;
   title?: string;
@@ -1351,6 +1363,9 @@ export interface QueuedMessage {
   id: string;
   text: string;
   planMode?: boolean;
+  dispatchState?: "queued" | "retrying" | "blocked";
+  nextRetryAt?: number | null;
+  error?: string | null;
 }
 
 export const getChatMessages = (sessionId: string) =>
@@ -1362,11 +1377,17 @@ export const getChatMessages = (sessionId: string) =>
     activeLeafId: r.activeLeafId ?? null,
   }));
 
-/** Cancel a still-parked message (the ✕ on a queued chip). */
+/** Remove a still-parked message. */
 export const cancelQueuedMessage = (sessionId: string, itemId: string) =>
   fetch(`/api/chat/sessions/${sessionId}/queue/${encodeURIComponent(itemId)}`, {
     method: "DELETE",
   }).then((r) => json<{ ok: boolean; removed: boolean }>(r));
+
+/** Retry the same parked message after safe queue delivery was exhausted. */
+export const retryQueuedMessage = (sessionId: string, itemId: string) =>
+  post<{ ok: boolean; retried: boolean }>(
+    `/api/chat/sessions/${sessionId}/queue/${encodeURIComponent(itemId)}`,
+  );
 
 /** A pasted image or uploaded file riding a chat message. */
 export interface ChatImageAttachment {
@@ -1391,18 +1412,39 @@ export const sendChatMessage = (
   opts: TurnOptions = {},
   images?: ChatImageAttachment[],
   annotations?: ChatTextAnnotation[],
+  clientTurnId?: string,
   mode?: "steer",
 ) =>
-  post<{ ok: boolean }>(`/api/chat/sessions/${sessionId}/message`, {
+  post<{ ok: boolean; turn?: ChatTurnResult; steered?: boolean }>(
+    `/api/chat/sessions/${sessionId}/message`, {
     text,
+    clientTurnId,
     model: opts.model,
     permissionMode: opts.permissionMode,
     planMode: opts.planMode,
     reasoningLevel: opts.reasoningLevel,
     images,
     annotations,
-    mode,
-  });
+      mode,
+    },
+  );
+
+export interface ChatTurnResult {
+  turnId: string;
+  queued: boolean;
+  existing: boolean;
+}
+
+export const recoverChatTurn = (
+  sessionId: string,
+  turnId: string,
+  action: "retry" | "continue",
+  opts: TurnOptions = {},
+) =>
+  post<{ ok: boolean; turn: ChatTurnResult }>(
+    `/api/chat/sessions/${sessionId}/turns/${turnId}/recover`,
+    { action, ...opts },
+  );
 
 /** Pass `text` to re-ask an edited version of a user message; omit it to retry a
  * response. Returns immediately; the new turn streams over /api/events. */

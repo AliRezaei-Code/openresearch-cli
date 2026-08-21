@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
@@ -50,7 +51,7 @@ pub enum Line {
     },
     Response {
         id: i64,
-        result: Result<Value, String>,
+        result: std::result::Result<Value, JsonRpcError>,
     },
     Notification {
         method: String,
@@ -58,6 +59,21 @@ pub enum Line {
     },
     Junk,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JsonRpcError {
+    pub code: i64,
+    pub message: String,
+    pub data: Option<Value>,
+}
+
+impl std::fmt::Display for JsonRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (JSON-RPC {})", self.message, self.code)
+    }
+}
+
+impl std::error::Error for JsonRpcError {}
 
 /// Classify one wire line. Pure — the reader task and the tests share it.
 pub fn classify_line(line: &str) -> Line {
@@ -81,11 +97,15 @@ pub fn classify_line(line: &str) -> Line {
                 return Line::Junk; // we only ever send integer ids
             };
             let result = match msg.get("error") {
-                Some(err) => Err(err
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("codex app-server error")
-                    .to_string()),
+                Some(err) => Err(JsonRpcError {
+                    code: err.get("code").and_then(Value::as_i64).unwrap_or(-32000),
+                    message: err
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("codex app-server error")
+                        .to_string(),
+                    data: err.get("data").cloned(),
+                }),
                 None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
             };
             Line::Response { id, result }
@@ -153,7 +173,8 @@ pub struct CodexClient {
     next_id: AtomicI64,
     /// Our outstanding requests. Sync mutex: touched from the reader task and
     /// from `request()`, held only for map ops, never across an await.
-    pending: std::sync::Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>,
+    pending:
+        std::sync::Mutex<HashMap<i64, oneshot::Sender<std::result::Result<Value, JsonRpcError>>>>,
     /// The session's in-flight turn, if any (one per session-child). The
     /// registration guard drops synchronously on task abort, hence sync mutex.
     turn: std::sync::Mutex<Option<mpsc::UnboundedSender<TurnEvent>>>,
@@ -187,7 +208,11 @@ impl CodexClient {
     /// Callers that must tell "codex said no" apart from "codex didn't answer"
     /// (e.g. the thread/resume fallback) use this; everyone else wants
     /// [`Self::request`].
-    pub async fn try_request(&self, method: &str, params: Value) -> Result<Result<Value, String>> {
+    pub async fn try_request(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<std::result::Result<Value, JsonRpcError>> {
         self.try_request_with_timeout(method, params, REQUEST_TIMEOUT)
             .await
     }
@@ -198,7 +223,7 @@ impl CodexClient {
         method: &str,
         params: Value,
         timeout: Duration,
-    ) -> Result<Result<Value, String>> {
+    ) -> Result<std::result::Result<Value, JsonRpcError>> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
@@ -514,12 +539,11 @@ async fn read_loop(client: Arc<CodexClient>, stdout: tokio::process::ChildStdout
     }
     // EOF or read error: the connection is unusable either way. Kill the child
     // if it is somehow still alive (a half-dead child left in the registry
-    // would eat a request timeout per turn until restart), then fail everything
-    // still waiting.
+    // would eat a request timeout per turn until restart), then drop pending
+    // senders so callers classify this as an ambiguous transport close rather
+    // than a structured server rejection that would be safe to replay.
     let _ = client.child.lock().await.kill().await;
-    for (_, tx) in client.pending.lock().unwrap().drain() {
-        let _ = tx.send(Err("codex app-server exited".into()));
-    }
+    client.pending.lock().unwrap().clear();
     client.unanswered.lock().unwrap().clear();
     if let Some(tx) = client.turn.lock().unwrap().as_ref() {
         let _ = tx.send(TurnEvent::Closed);
@@ -769,12 +793,18 @@ mod tests {
                 result: Ok(json!({"thread":{"id":"abc"}}))
             }
         );
-        // Error response carries the message.
+        // Error response preserves the structured JSON-RPC contract.
         assert_eq!(
-            classify_line(r#"{"id":3,"error":{"code":-32600,"message":"bad"}}"#),
+            classify_line(
+                r#"{"id":3,"error":{"code":-32001,"message":"busy","data":{"retryAfterMs":250}}}"#
+            ),
             Line::Response {
                 id: 3,
-                result: Err("bad".into())
+                result: Err(JsonRpcError {
+                    code: -32001,
+                    message: "busy".into(),
+                    data: Some(json!({"retryAfterMs": 250})),
+                })
             }
         );
         // Notification: method only.

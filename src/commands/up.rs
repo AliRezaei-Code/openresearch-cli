@@ -47,6 +47,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
     // Open early so the schema exists before any request or agent spawn.
     {
         let store = Store::open()?;
+        local::chat::reconcile_unfinished_turns(&store)?;
         for run in store.list_active_runs()? {
             if store.get_local_experiment(&run.experiment_id)?.is_some() {
                 if let Err(err) = crate::commands::exp::spawn_detached_supervise(&run.id) {
@@ -75,6 +76,29 @@ pub async fn run(args: UpArgs) -> Result<()> {
     };
     // Plan-mode turns hand this port to the `orx mcp-gate` permission bridge.
     state.chat.set_up_port(port);
+    state.chat.resume_persisted_queues();
+    {
+        let chat = state.chat.clone();
+        let moving = state.data_dir_move_in_progress.clone();
+        let gate = state.data_dir_gate.clone();
+        tokio::spawn(async move {
+            let interval =
+                Duration::from_millis((crate::store::CHAT_TURN_LEASE_TTL_MS + 1_000) as u64);
+            loop {
+                tokio::time::sleep(interval).await;
+                if moving.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
+                let _gate = gate.lock().await;
+                if moving.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
+                if let Err(err) = chat.reconcile_expired_turn_leases() {
+                    eprintln!("orx up: could not reconcile expired chat turns: {err}");
+                }
+            }
+        });
+    }
 
     spawn_agent_preflight();
     // Deliver explicitly registered run wake-ups once their chat becomes idle.
@@ -420,12 +444,16 @@ fn router(state: AppState) -> Router {
         .route("/api/chat/sessions/{id}/messages", get(chat_messages))
         .route("/api/chat/sessions/{id}/worktree", get(session_worktree))
         .route("/api/chat/sessions/{id}/message", post(send_chat_message))
+        .route(
+            "/api/chat/sessions/{id}/turns/{turnId}/recover",
+            post(recover_chat_turn),
+        )
         .route("/api/chat/sessions/{id}/fork", post(fork_chat_turn))
         .route("/api/chat/sessions/{id}/branch", post(select_chat_branch))
         .route("/api/chat/sessions/{id}/interrupt", post(interrupt_chat))
         .route(
             "/api/chat/sessions/{id}/queue/{itemId}",
-            axum::routing::delete(cancel_queued_chat),
+            axum::routing::delete(cancel_queued_chat).post(retry_queued_chat),
         )
         .route("/api/chat/sessions/{id}/respond", post(respond_chat))
         // Internal: the `orx mcp-gate` permission bridge's long-poll (plan
@@ -1488,7 +1516,7 @@ async fn delete_project(State(state): State<AppState>, Path(id): Path<String>) -
         );
     }
     for session in &sessions {
-        state.chat.clear_queue(&session.id);
+        state.chat.clear_queue(&session.id)?;
         let _ = state.chat.interrupt(&session.id).await;
         state.chat.opencode.kill_session(&session.id).await;
         state.chat.codex.kill_session(&session.id).await;
@@ -4651,8 +4679,8 @@ async fn chat_messages(State(state): State<AppState>, Path(id): Path<String>) ->
     let session = Store::open()?
         .get_chat_session(&id)?
         .ok_or_else(|| not_found("chat session"))?;
-    // Parked messages are in-memory, so a reload mid-turn recovers them here
-    // rather than from the store.
+    // The host restores its durable queue at startup; return the live snapshot
+    // so dispatch progress and cancellation are reflected immediately.
     let queued = state.chat.queued_items(&id);
     Ok(Json(json!({
         "messages": messages,
@@ -4665,6 +4693,7 @@ async fn chat_messages(State(state): State<AppState>, Path(id): Path<String>) ->
 #[serde(rename_all = "camelCase")]
 struct SendChatReq {
     text: String,
+    client_turn_id: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
     plan_mode: Option<bool>,
@@ -4708,21 +4737,98 @@ async fn send_chat_message(
         reasoning_level: req.reasoning_level,
     };
     // The turn runs in the background; progress streams over /api/events.
-    let sent = if matches!(req.mode, Some(SendMode::Steer)) {
-        state
+    let response = if matches!(req.mode, Some(SendMode::Steer)) {
+        let result = state
             .chat
-            .steer_message(&id, text, overrides, req.images, annotations)
+            .steer_message(
+                &id,
+                text,
+                overrides,
+                req.images,
+                annotations,
+                req.client_turn_id,
+            )
             .await
+            .map_err(|error| {
+                if local::chat::is_client_turn_conflict(&error) {
+                    ApiError(StatusCode::CONFLICT, error.to_string())
+                } else {
+                    bad_request(error)
+                }
+            })?;
+        match result {
+            Some(turn) => json!({ "ok": true, "turn": turn }),
+            None => json!({ "ok": true, "steered": true }),
+        }
     } else {
-        state
+        let result = state
             .chat
-            .send_message(&id, text, overrides, req.images, annotations)
+            .send_message(
+                &id,
+                text,
+                overrides,
+                req.images,
+                annotations,
+                req.client_turn_id,
+            )
             .await
+            .map_err(|error| {
+                if local::chat::is_client_turn_conflict(&error) {
+                    ApiError(StatusCode::CONFLICT, error.to_string())
+                } else {
+                    bad_request(error)
+                }
+            })?;
+        json!({ "ok": true, "turn": result })
     };
-    sent.map_err(bad_request)?;
-    // A steered message is still a message the user sent.
     crate::telemetry::capture_chat_message_sent();
-    Ok(Json(json!({ "ok": true })))
+    Ok(Json(response))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoverChatReq {
+    action: String,
+    #[serde(default, deserialize_with = "present_nullable_string")]
+    model: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present_nullable_string")]
+    permission_mode: Option<Option<String>>,
+    plan_mode: Option<bool>,
+    #[serde(default, deserialize_with = "present_nullable_string")]
+    reasoning_level: Option<Option<String>>,
+}
+
+fn present_nullable_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+async fn recover_chat_turn(
+    State(state): State<AppState>,
+    Path((id, turn_id)): Path<(String, String)>,
+    Json(req): Json<RecoverChatReq>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    let result = state
+        .chat
+        .recover_turn(
+            &id,
+            &turn_id,
+            &req.action,
+            local::chat::RecoveryOverrides {
+                model: req.model,
+                permission_mode: req.permission_mode,
+                plan_mode: req.plan_mode,
+                reasoning_level: req.reasoning_level,
+            },
+        )
+        .await
+        .map_err(|error| ApiError(StatusCode::CONFLICT, error.to_string()))?;
+    Ok(Json(json!({ "ok": true, "turn": result })))
 }
 
 #[derive(Deserialize)]
@@ -4828,8 +4934,24 @@ async fn cancel_queued_chat(
     State(state): State<AppState>,
     Path((id, item_id)): Path<(String, String)>,
 ) -> ApiResult {
-    let removed = state.chat.cancel_queued(&id, &item_id);
+    let removed = state.chat.cancel_queued(&id, &item_id)?;
     Ok(Json(json!({ "ok": true, "removed": removed })))
+}
+
+/// Retry one queued message after its safe delivery budget was exhausted.
+async fn retry_queued_chat(
+    State(state): State<AppState>,
+    Path((id, item_id)): Path<(String, String)>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    let retried = state.chat.retry_queued(&id, &item_id)?;
+    if !retried {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "queued message is no longer available for retry".into(),
+        ));
+    }
+    Ok(Json(json!({ "ok": true, "retried": retried })))
 }
 
 #[derive(Deserialize)]
