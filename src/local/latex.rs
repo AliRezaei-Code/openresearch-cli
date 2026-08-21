@@ -19,6 +19,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::error::{anyhow, Result};
+use crate::local::shell_env::{find_on_path, search_path};
 
 /// The TeX engine a document is written for. Overleaf's default is pdfLaTeX and
 /// so is ours; a document says otherwise with a `% !TeX program` line.
@@ -133,15 +134,27 @@ pub struct Compilation {
     pub log: String,
 }
 
-/// True when a binary answers `--version` on this machine's PATH.
+/// True when a file of that name sits on the shell's PATH — not the process's,
+/// which in app mode is launchd's and has no TeX on it. That it runs is not
+/// checked; `find_engine` probes on every `.tex` tab and spawning five engines
+/// to ask their versions cost more than the case it caught.
 fn on_path(binary: &str) -> bool {
-    Command::new(binary)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    find_on_path(binary).is_some()
+}
+
+/// A TeX tool, with the shell's PATH in its environment: latexmk finds the
+/// engine, biber and bibtex on PATH, so resolving latexmk alone is not enough.
+fn tex_command(binary: &str) -> Command {
+    // biber is never probed — it is chosen from what a pass wrote — so a bare
+    // name here is what makes a machine without it fail as ENOENT at spawn.
+    let mut command = match find_on_path(binary) {
+        Some(path) => Command::new(path),
+        None => Command::new(binary),
+    };
+    if let Some(paths) = search_path() {
+        command.env("PATH", paths);
+    }
+    command
 }
 
 /// Pick how to compile a document written for `program`. Split from the PATH
@@ -298,7 +311,7 @@ fn run_bibliography(
     // cwd is the aux dir (bibtex refuses to write outside it), so `.` no longer
     // means the paper's directory — both search paths have to say so.
     let search = format!("{}:", source_dir.to_string_lossy());
-    let mut command = Command::new(tool);
+    let mut command = tex_command(tool);
     command
         .arg(stem)
         .current_dir(outdir)
@@ -353,7 +366,7 @@ struct Run {
 }
 
 fn run_pass(binary: &str, dir: &Path, args: &[String]) -> Result<Run> {
-    let mut command = Command::new(binary);
+    let mut command = tex_command(binary);
     command.args(args).current_dir(dir);
     run_command(command, binary)
 }
@@ -850,6 +863,19 @@ mod tests {
         assert_eq!(install_command(), Some("brew install --cask mactex"));
         #[cfg(not(target_os = "macos"))]
         assert_eq!(install_command(), None);
+    }
+
+    #[test]
+    fn a_tex_tool_is_handed_the_path_its_own_children_need() {
+        // `sh` stands in for a TeX tool; all that matters is that it is on PATH.
+        let command = tex_command("sh");
+        let (_, value) = command
+            .get_envs()
+            .find(|(key, _)| *key == "PATH")
+            .expect("the child is given an explicit PATH");
+        assert_eq!(value, search_path().as_deref());
+        // And the tool itself is resolved, not left to the child's own lookup.
+        assert!(Path::new(command.get_program()).is_absolute());
     }
 
     #[test]
