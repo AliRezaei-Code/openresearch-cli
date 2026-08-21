@@ -7,13 +7,10 @@ export const PLAN_COMMAND: SkillInfo = {
   source: "command",
 };
 
-const INLINE_COMMAND_NAMES = new Set([PLAN_COMMAND.name]);
-
 export interface SlashCommandContext {
   query: string;
   start: number;
   end: number;
-  inline: boolean;
 }
 
 export function slashCommandContext(
@@ -28,24 +25,17 @@ export function slashCommandContext(
   while (end < text.length && !/\s/.test(text[end])) end += 1;
   const query = text.slice(start + 1, end);
   if (query.includes("/")) return null;
-  return {
-    query: query.toLowerCase(),
-    start,
-    end,
-    inline: text.slice(0, start).trim().length > 0,
-  };
+  return { query: query.toLowerCase(), start, end };
 }
 
-export function commandsForSlashContext(
-  commands: SkillInfo[],
-  inline: boolean,
-): SkillInfo[] {
-  return inline
-    ? commands.filter(
-        (command) =>
-          command.source === "command" && INLINE_COMMAND_NAMES.has(command.name.toLowerCase()),
-      )
-    : commands;
+/** Whether the `/name` opens the draft or one of its lines, which is the point
+ * at which it is unambiguously a command rather than part of a sentence. */
+export function isAnchoredSlashCommand(
+  text: string,
+  context: SlashCommandContext,
+): boolean {
+  const before = text.slice(0, context.start);
+  return !before.slice(before.lastIndexOf("\n") + 1).trim();
 }
 
 export function removeSlashCommand(

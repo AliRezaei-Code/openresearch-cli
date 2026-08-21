@@ -104,9 +104,9 @@ import {
 import { ContextMeter } from "./ContextMeter";
 import { renderNote } from "./agentNote";
 import {
-  commandsForSlashContext,
   commandsForHarness,
   effectiveCommandPlanMode,
+  isAnchoredSlashCommand,
   parsePlanCommand,
   removeSlashCommand,
   slashCommandContext,
@@ -4260,8 +4260,9 @@ export function ChatPanel({
     transcriptSelection.dismiss();
   }, [activeId, projectId, transcriptSelection.dismiss]);
 
-  // Slash-skills: menu state is derived from the draft — open while the first
-  // token is an unfinished `/command` (no whitespace yet) with matches.
+  // Slash-skills: menu state is derived from the draft — open while the token
+  // under the caret is an unfinished `/command` (no whitespace yet) with
+  // matches, wherever in the message it was typed.
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [skillIdx, setSkillIdx] = useState(0);
   const [skillMenuDismissed, setSkillMenuDismissed] = useState(false);
@@ -4294,29 +4295,23 @@ export function ChatPanel({
   useEffect(() => {
     getSkills(projectId).then(setSkills).catch(() => {});
   }, [projectId, mainView]);
+  // Only reachable while the menu is open, which needs a live slash context.
   function pickSkill(skill: SkillInfo) {
-    if (skill.source === "command" && skill.name === "plan" && slashContext) {
+    if (!slashContext) return;
+    if (skill.source === "command" && skill.name === "plan") {
       activatePlanCommand(draft, slashContext);
       return;
     }
-    if (slashContext?.inline) {
-      const before = draft.slice(0, slashContext.start);
-      const after = draft.slice(slashContext.end);
-      const insertion = `/${skill.name}`;
-      const separator = after ? "" : " ";
-      const cursor = before.length + insertion.length + separator.length;
-      setDraft(`${before}${insertion}${separator}${after}`);
-      setSkillMenuDismissed(true);
-      window.requestAnimationFrame(() => {
-        composerRef.current?.focus();
-        composerRef.current?.setSelectionRange(cursor, cursor);
-        setComposerCursor(cursor);
-      });
-      return;
-    }
+    // Whatever surrounds the `/name` token becomes the chip's args, so a skill
+    // can be picked after the message is written.
+    const next = removeSlashCommand(draft, slashContext);
     setPickedSkill(skill);
-    setDraft("");
-    composerRef.current?.focus();
+    setDraft(next.text);
+    window.requestAnimationFrame(() => {
+      composerRef.current?.focus();
+      composerRef.current?.setSelectionRange(next.cursor, next.cursor);
+      setComposerCursor(next.cursor);
+    });
   }
 
   /** Backspace at the start deletes the command outright (Claude-desktop
@@ -4400,11 +4395,12 @@ export function ChatPanel({
   const commands = commandsForHarness(skills, opts?.planActivation);
   const slashContext = !pickedSkill ? slashCommandContext(draft, composerCursor) : null;
   const slashToken = slashContext?.query ?? null;
+  const anchoredSlash = !!slashContext && isAnchoredSlashCommand(draft, slashContext);
+  // A lone `/` lists every command only where one can open the message — in the
+  // middle of a sentence it is far more often punctuation ("either / or").
   const skillMatches =
-    slashToken !== null && !skillMenuDismissed
-      ? commandsForSlashContext(commands, slashContext?.inline ?? false).filter((command) =>
-          command.name.startsWith(slashToken),
-        )
+    slashToken !== null && !skillMenuDismissed && (slashToken !== "" || anchoredSlash)
+      ? commands.filter((command) => command.name.startsWith(slashToken))
       : [];
   const skillMenuOpen = skillMatches.length > 0;
   const activeSkillIdx = Math.min(skillIdx, Math.max(0, skillMatches.length - 1));
@@ -6022,6 +6018,7 @@ export function ChatPanel({
             <SkillMenu
               skills={skillMatches}
               activeIndex={activeSkillIdx}
+              advisory={!anchoredSlash}
               onPick={pickSkill}
               onHover={setSkillIdx}
             />
@@ -6136,10 +6133,12 @@ export function ChatPanel({
                   activatePlanCommand(v, completedCommand);
                   return;
                 }
-                // Auto-convert a typed/pasted full `/name ` into the chip the
-                // moment the space lands. Known names only — unknown `/foo`
-                // stays plain text (server-side pass-through contract). Not
-                // while a question card is pending (its answer is a note, never
+                // Auto-convert a typed/pasted full `/name ` that opens the
+                // draft into the chip the moment the space lands; mid-message
+                // a `/token` is as likely to be a path, so it chips only on an
+                // explicit menu pick. Known names only — unknown `/foo` stays
+                // plain text (server-side pass-through contract). Not while a
+                // question card is pending (its answer is a note, never
                 // skill-expanded) and not mid-IME-composition.
                 if (!pickedSkill && !pendingQuestion && !composingRef.current) {
                   const m = v.match(/^\/(\S+)\s([\s\S]*)$/);
@@ -6147,6 +6146,7 @@ export function ChatPanel({
                   if (hit) {
                     setPickedSkill(hit);
                     setDraft(m[2]);
+                    setComposerCursor(m[2].length);
                     setSkillMenuDismissed(false);
                     return;
                   }
@@ -6171,7 +6171,9 @@ export function ChatPanel({
                     );
                     return;
                   }
-                  if (e.key === "Enter" || e.key === "Tab") {
+                  // Tab accepts wherever the menu is open, Enter only where the
+                  // command opens the message — mid-sentence Enter still sends.
+                  if (e.key === "Tab" || (e.key === "Enter" && anchoredSlash)) {
                     e.preventDefault();
                     pickSkill(skillMatches[activeSkillIdx]);
                     return;
