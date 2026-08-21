@@ -19,6 +19,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::error::{anyhow, Result};
+use crate::local::shell_env::{find_on_path, search_path};
 
 /// The TeX engine a document is written for. Overleaf's default is pdfLaTeX and
 /// so is ours; a document says otherwise with a `% !TeX program` line.
@@ -133,15 +134,27 @@ pub struct Compilation {
     pub log: String,
 }
 
-/// True when a binary answers `--version` on this machine's PATH.
+/// True when a file of that name sits on the shell's PATH — not the process's,
+/// which in app mode is launchd's and has no TeX on it. That it runs is not
+/// checked; `find_engine` probes on every `.tex` tab and spawning five engines
+/// to ask their versions cost more than the case it caught.
 fn on_path(binary: &str) -> bool {
-    Command::new(binary)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    find_on_path(binary).is_some()
+}
+
+/// A TeX tool, with the shell's PATH in its environment: latexmk finds the
+/// engine, biber and bibtex on PATH, so resolving latexmk alone is not enough.
+fn tex_command(binary: &str) -> Command {
+    // biber is never probed — it is chosen from what a pass wrote — so a bare
+    // name here is what makes a machine without it fail as ENOENT at spawn.
+    let mut command = match find_on_path(binary) {
+        Some(path) => Command::new(path),
+        None => Command::new(binary),
+    };
+    if let Some(paths) = search_path() {
+        command.env("PATH", paths);
+    }
+    command
 }
 
 /// Pick how to compile a document written for `program`. Split from the PATH
@@ -191,8 +204,9 @@ pub fn find_engine() -> Option<&'static str> {
         .find(|binary| on_path(binary))
 }
 
-/// Guidance for the no-engine case. A full distribution comes first because it
-/// is what matches Overleaf — every engine, biber, and the whole of CTAN.
+/// Guidance for the no-engine case. Tectonic comes first because it is the one
+/// a user can finish, and its XeTeX-only trade is named here because this is
+/// the last screen that can say so — the hint is gone once an engine exists.
 pub fn install_hint() -> String {
     let distribution = if cfg!(target_os = "macos") {
         "MacTeX"
@@ -200,9 +214,10 @@ pub fn install_hint() -> String {
         "TeX Live"
     };
     format!(
-        "No LaTeX toolchain found on PATH. Install {distribution} for the same \
-         engines and packages Overleaf runs, or Tectonic for a smaller \
-         XeTeX-only setup that needs no distribution."
+        "No LaTeX toolchain found on PATH. Install Tectonic — one self-contained \
+         binary that fetches each document's packages, though it runs only XeTeX. \
+         For every engine and package, install {distribution} instead, which is \
+         what Overleaf runs."
     )
 }
 
@@ -210,7 +225,7 @@ pub fn install_hint() -> String {
 /// known to work — a wrong command pasted into a terminal is worse than none.
 pub fn install_command() -> Option<&'static str> {
     if cfg!(target_os = "macos") {
-        Some("brew install --cask mactex")
+        Some("brew install tectonic")
     } else {
         None
     }
@@ -298,7 +313,7 @@ fn run_bibliography(
     // cwd is the aux dir (bibtex refuses to write outside it), so `.` no longer
     // means the paper's directory — both search paths have to say so.
     let search = format!("{}:", source_dir.to_string_lossy());
-    let mut command = Command::new(tool);
+    let mut command = tex_command(tool);
     command
         .arg(stem)
         .current_dir(outdir)
@@ -353,7 +368,7 @@ struct Run {
 }
 
 fn run_pass(binary: &str, dir: &Path, args: &[String]) -> Result<Run> {
-    let mut command = Command::new(binary);
+    let mut command = tex_command(binary);
     command.args(args).current_dir(dir);
     run_command(command, binary)
 }
@@ -838,18 +853,44 @@ mod tests {
     }
 
     #[test]
-    fn the_no_engine_guidance_points_at_a_full_distribution_first() {
+    fn the_no_engine_guidance_points_at_tectonic_first() {
         let hint = install_hint();
+        let distribution = if cfg!(target_os = "macos") {
+            "MacTeX"
+        } else {
+            "TeX Live"
+        };
+        let tectonic = hint.find("Tectonic").expect("the recommendation is named");
+        let fallback = hint.find(distribution).expect("the fallback is named");
         assert!(
-            hint.contains("Overleaf"),
-            "parity is the reason to install it"
+            tectonic < fallback,
+            "the install a user can finish comes first"
         );
-        // The prose must not duplicate the copyable command.
+        // The caveat has to sit in Tectonic's own clause: recommending it
+        // without one sends a user to an engine that silently retypesets their
+        // pdfLaTeX document, and this hint is the only place that says so.
+        let xetex = hint.find("XeTeX").expect("the limitation is named");
+        assert!(tectonic < xetex && xetex < fallback);
+        // The prose must not duplicate the copyable command, but the command
+        // must install what the prose leads with.
         assert!(!hint.contains("brew install"));
         #[cfg(target_os = "macos")]
-        assert_eq!(install_command(), Some("brew install --cask mactex"));
+        assert_eq!(install_command(), Some("brew install tectonic"));
         #[cfg(not(target_os = "macos"))]
         assert_eq!(install_command(), None);
+    }
+
+    #[test]
+    fn a_tex_tool_is_handed_the_path_its_own_children_need() {
+        // `sh` stands in for a TeX tool; all that matters is that it is on PATH.
+        let command = tex_command("sh");
+        let (_, value) = command
+            .get_envs()
+            .find(|(key, _)| *key == "PATH")
+            .expect("the child is given an explicit PATH");
+        assert_eq!(value, search_path().as_deref());
+        // And the tool itself is resolved, not left to the child's own lookup.
+        assert!(Path::new(command.get_program()).is_absolute());
     }
 
     #[test]

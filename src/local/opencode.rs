@@ -31,15 +31,8 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `opencode` on PATH, else the installer's default drop location.
 pub fn find_opencode() -> Result<PathBuf> {
-    if let Some(paths) = crate::local::shell_env::search_path() {
-        // An empty component (`PATH=":/usr/bin"`) means cwd — never a place to
-        // pick up a binary we are about to execute. Mirrors `find_on_path`.
-        for dir in std::env::split_paths(&paths).filter(|dir| !dir.as_os_str().is_empty()) {
-            let candidate = dir.join("opencode");
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
+    if let Some(found) = crate::local::shell_env::find_on_path("opencode") {
+        return Ok(found);
     }
     if let Some(home) = dirs::home_dir() {
         let fallback = home.join(".opencode").join("bin").join("opencode");
