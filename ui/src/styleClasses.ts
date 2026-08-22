@@ -71,7 +71,6 @@ export const BUTTON_CLASS_NAME = [
 export const SMALL_BUTTON_CLASS_NAME = `${BUTTON_CLASS_NAME} sm`;
 export const PRIMARY_BUTTON_CLASS_NAME = `${BUTTON_CLASS_NAME} primary`;
 export const GHOST_BUTTON_CLASS_NAME = `${BUTTON_CLASS_NAME} ghost`;
-export const SMALL_PRIMARY_BUTTON_CLASS_NAME = `${SMALL_BUTTON_CLASS_NAME} primary`;
 
 export const BADGE_CLASS_NAME = [
   "badge inline-flex items-center font-sans text-xs",

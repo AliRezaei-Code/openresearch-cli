@@ -146,7 +146,7 @@ const S_CREATE: AgentSkill = AgentSkill {
 };
 const S_REPORTS: AgentSkill = AgentSkill {
     name: "orx-reports",
-    description: "Maintain the user-facing project brief and write durable outputs into the artifacts directory. Use when direction or project state changes materially, a line of work concludes, the user asks for a write-up, summary, comparison, figures, or exported data, or before ending a long task.",
+    description: "Write durable outputs into the artifacts directory. Use when a line of work concludes or the user asks for a write-up, summary, comparison, figures, or exported data.",
     content: REPORTS,
     resources: &[],
 };
