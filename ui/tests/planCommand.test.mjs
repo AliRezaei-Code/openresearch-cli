@@ -5,8 +5,11 @@ import {
   effectiveCommandPlanMode,
   isAnchoredSlashCommand,
   parsePlanCommand,
+  insertSlashCommand,
+  normalizeLeadingCommand,
   removeSlashCommand,
   slashCommandContext,
+  splitCommandTokens,
 } from "../src/planCommand.ts";
 
 test("Plan is the first command for every plan-capable harness", () => {
@@ -78,6 +81,69 @@ test("a command is anchored when it opens the draft or one of its lines", () => 
     isAnchoredSlashCommand("ask this\nnow /plan", { query: "plan", start: 13, end: 18 }),
     false,
   );
+});
+
+const isWrite = (name) => name === "write";
+
+test("known command tokens split out wherever they were typed", () => {
+  assert.deepEqual(splitCommandTokens("use the /write skill", isWrite), [
+    { text: "use the ", command: false },
+    { text: "/write", command: true },
+    { text: " skill", command: false },
+  ]);
+  assert.deepEqual(splitCommandTokens("/Write now", isWrite), [
+    { text: "/Write", command: true },
+    { text: " now", command: false },
+  ]);
+  assert.deepEqual(splitCommandTokens("/write ", isWrite), [
+    { text: "/write", command: true },
+    { text: " ", command: false },
+  ]);
+  assert.deepEqual(splitCommandTokens("", isWrite), []);
+  assert.deepEqual(splitCommandTokens("no commands here", isWrite), [
+    { text: "no commands here", command: false },
+  ]);
+  // Unknown commands, paths, and URLs stay plain text.
+  assert.deepEqual(splitCommandTokens("/unknown /src/write https://x.dev/write", isWrite), [
+    { text: "/unknown /src/write https://x.dev/write", command: false },
+  ]);
+});
+
+test("splitting a message loses nothing — the chips are painted by offset", () => {
+  for (const text of [
+    "use the /write skill",
+    "/write",
+    "  /write  two  spaces  ",
+    "line one\n/write args\n\nline three",
+    "/write/write /write\t/write",
+  ])
+    assert.equal(
+      splitCommandTokens(text, isWrite)
+        .map((segment) => segment.text)
+        .join(""),
+      text,
+    );
+});
+
+test("only a leading command is lowercased for the wire — prose is left alone", () => {
+  assert.equal(normalizeLeadingCommand("/WRITE the notes", isWrite), "/write the notes");
+  assert.equal(normalizeLeadingCommand("Use the /Write skill", isWrite), "Use the /Write skill");
+  assert.equal(normalizeLeadingCommand("/Unknown Thing", isWrite), "/Unknown Thing");
+});
+
+test("picking a command replaces the token in place", () => {
+  const text = "look at /wr now";
+  // The caret lands in the args, past the space that already followed.
+  assert.deepEqual(insertSlashCommand(text, slashCommandContext(text, 11), "write"), {
+    text: "look at /write now",
+    cursor: 15,
+  });
+  // A command ending the draft gets the space its args will need.
+  const tail = "look at /wr";
+  assert.deepEqual(insertSlashCommand(tail, slashCommandContext(tail, 11), "write"), {
+    text: "look at /write ",
+    cursor: 15,
+  });
 });
 
 test("removing a slash command preserves the surrounding message", () => {
