@@ -20,6 +20,7 @@ import {
   DEMO_FIGURE_SESSION_ID,
   DEMO_LITERATURE_SESSION_ID,
   DEMO_MAIN_SESSION_ID,
+  DEMO_OVERVIEW_ARTIFACT,
   getArtifacts,
   getChatMessages,
   getUiState,
@@ -28,7 +29,6 @@ import {
   listProjects,
   listRuns,
   openProject,
-  PROJECT_BRIEF_NAME,
   updateUiState,
   type AgentSelection,
   type Experiment,
@@ -225,7 +225,7 @@ interface RightPaneSessionState {
 
 function initialRightPaneSessionState(
   sessionId?: string,
-  openDemoBrief = false,
+  openDemoOverview = false,
 ): RightPaneSessionState {
   const initial: RightPaneSessionState = {
     rightTab: "experiments",
@@ -247,17 +247,17 @@ function initialRightPaneSessionState(
     panelOpen: false,
     panelMax: false,
   };
-  if (sessionId === DEMO_MAIN_SESSION_ID && openDemoBrief) {
-    const projectBriefTab: FileViewDef = {
-      path: PROJECT_BRIEF_NAME,
+  if (sessionId === DEMO_MAIN_SESSION_ID && openDemoOverview) {
+    const demoOverviewTab: FileViewDef = {
+      path: DEMO_OVERVIEW_ARTIFACT,
       source: "artifacts",
     };
     return {
       ...initial,
-      rightTab: projectBriefTab,
-      tabHistory: [projectBriefTab],
-      fileTabs: [projectBriefTab],
-      contentTabOrder: [rightTabKey(projectBriefTab)],
+      rightTab: demoOverviewTab,
+      tabHistory: [demoOverviewTab],
+      fileTabs: [demoOverviewTab],
+      contentTabOrder: [rightTabKey(demoOverviewTab)],
       panelOpen: true,
     };
   }
@@ -446,7 +446,7 @@ export default function App() {
   const [uiState, setUiState] = useState<UiState | null>(null);
   const tourCompletedRef = useRef<boolean | undefined>(undefined);
   tourCompletedRef.current = uiState?.tourCompleted;
-  const demoBriefSeededRef = useRef(false);
+  const demoOverviewSeededRef = useRef(false);
   const [startupError, setStartupError] = useState<string | null>(null);
   const persistedPreferredAgent = useRef<AgentSelection | null>(null);
   const [projectId, setProjectId] = useState<string | null>(null);
@@ -476,7 +476,7 @@ export default function App() {
   const { open: scopeMenuOpen, setOpen: setScopeMenuOpen, ref: scopeMenuRef } =
     usePopover(scopeTriggerRef);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const [demoBriefLeading, setDemoBriefLeading] = useState(false);
+  const [demoOverviewLeading, setDemoOverviewLeading] = useState(false);
   const allExperimentsAttributed = experiments.every((experiment) => experiment.chatSessionId);
   const effectiveScope = activeSessionId && allExperimentsAttributed ? scope : "project";
   const scopedExperiments = useMemo(() => {
@@ -727,15 +727,15 @@ export default function App() {
     }
     let nextState = nextSessionId ? rightPaneStatesRef.current.get(nextSessionId) : undefined;
     if (!nextState) {
-      const openDemoBrief =
+      const openDemoOverview =
         nextSessionId === DEMO_MAIN_SESSION_ID &&
         tourCompletedRef.current === false &&
-        !demoBriefSeededRef.current;
-      if (openDemoBrief) {
-        demoBriefSeededRef.current = true;
-        setDemoBriefLeading(true);
+        !demoOverviewSeededRef.current;
+      if (openDemoOverview) {
+        demoOverviewSeededRef.current = true;
+        setDemoOverviewLeading(true);
       }
-      nextState = initialRightPaneSessionState(nextSessionId ?? undefined, openDemoBrief);
+      nextState = initialRightPaneSessionState(nextSessionId ?? undefined, openDemoOverview);
     }
     if (nextSessionId && pendingExperimentsAutoOpenRef.current) {
       pendingExperimentsAutoOpenRef.current = false;
@@ -939,7 +939,7 @@ export default function App() {
     setSelectedRunId(null);
     setExpTabs([]);
     setFileTabs([]);
-    setDemoBriefLeading(false);
+    setDemoOverviewLeading(false);
     setPlanTabs([]);
     setSubagentTabs([]);
     setCodeTabs([]);
@@ -1221,9 +1221,9 @@ export default function App() {
       }
       if (
         activeSessionId === DEMO_MAIN_SESSION_ID &&
-        sameFileTab(tab, { path: PROJECT_BRIEF_NAME, source: "artifacts" })
+        sameFileTab(tab, { path: DEMO_OVERVIEW_ARTIFACT, source: "artifacts" })
       ) {
-        setDemoBriefLeading(false);
+        setDemoOverviewLeading(false);
       }
       forgetRightTab(tab, rightTabKey(rightTab) === rightTabKey(tab));
     },
@@ -1515,19 +1515,19 @@ export default function App() {
   const expTab =
     typeof rightTab === "object" && "id" in rightTab ? rightTab : null;
   const fileTab = typeof rightTab === "object" && "path" in rightTab ? rightTab : null;
-  const onboardingProjectBriefTab =
-    activeSessionId === DEMO_MAIN_SESSION_ID && demoBriefLeading
+  const onboardingOverviewTab =
+    activeSessionId === DEMO_MAIN_SESSION_ID && demoOverviewLeading
       ? fileTabs.find(
           (tab) =>
             sameFileTab(tab, {
-              path: PROJECT_BRIEF_NAME,
+              path: DEMO_OVERVIEW_ARTIFACT,
               source: "artifacts",
             }),
         )
       : undefined;
-  // The demo brief leads the home tabs; every other content tab follows the
+  // The demo overview leads the home tabs; every other content tab follows the
   // stable order in which it was opened (or reused as the preview slot).
-  const leadingFileTabs = onboardingProjectBriefTab ? [onboardingProjectBriefTab] : [];
+  const leadingFileTabs = onboardingOverviewTab ? [onboardingOverviewTab] : [];
   // PlanViewDef and SubagentViewDef both carry `kind`; discriminate on its value.
   const planTab =
     typeof rightTab === "object" && "kind" in rightTab && rightTab.kind === "plan"
@@ -1546,8 +1546,8 @@ export default function App() {
   for (const tab of [...expTabs, ...fileTabs, ...planTabs, ...subagentTabs, ...codeTabs]) {
     contentTabByKey.set(rightTabKey(tab), tab);
   }
-  const leadingContentKey = onboardingProjectBriefTab
-    ? rightTabKey(onboardingProjectBriefTab)
+  const leadingContentKey = onboardingOverviewTab
+    ? rightTabKey(onboardingOverviewTab)
     : null;
   const orderedContentTabs = contentTabOrder
     .filter((key) => key !== leadingContentKey)

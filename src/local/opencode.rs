@@ -719,20 +719,12 @@ mod tests {
     }
 
     #[test]
-    fn reports_skill_owns_project_brief_policy() {
+    fn reports_skill_owns_artifact_output_policy() {
         let md = sample_playbook();
         let reports = agent_skills::find("orx-reports", SkillSet::Local).unwrap();
-        assert!(reports.content.contains("user's latest request"));
-        assert!(reports.content.contains("descriptive user-facing snapshot"));
-        assert!(reports
-            .content
-            .contains("refuse, delay, redirect, or ask for confirmation solely because"));
-        assert!(reports.content.contains("Do not read it at session start"));
-        assert!(reports.content.contains("orx project brief update"));
-        assert!(!md.contains("## The user directs the project"));
+        assert!(reports.content.contains("descriptive filename"));
+        assert!(reports.content.contains("artifacts root"));
         assert!(!md.contains("PROJECT.md"));
-        assert!(!md.contains("No project summary yet."));
-        assert!(!md.contains("None proposed yet."));
     }
 
     #[test]
