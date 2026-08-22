@@ -510,19 +510,32 @@ function TreeRows({
           );
         }
 
+        // Artifacts keeps preview in this split view; explicit opens use file tabs.
         return (
           <button
             key={e.path}
             type="button"
             className={`file-tree-row flex w-full min-w-0 items-center gap-1.5 py-[3px] px-2.5 border-0 bg-transparent text-text text-left cursor-pointer font-[inherit] text-[length:inherit] [&:hover]:bg-panel [&_>_svg]:shrink-0 [&_>_svg]:text-subtext [&_>_svg.file-tree-chevron]:text-muted artifact-tree-row [&.selected]:bg-panel [&.selected:hover]:bg-panel [&:hover_.ft-row-delete]:opacity-100 ${selected === e.path ? "selected" : ""}`}
             style={indent}
-            title={`${e.path} — double-click or Command/Ctrl+Enter to open in a tab`}
-            aria-keyshortcuts="Meta+Enter Control+Enter"
+            title={`${e.path} — Space previews inline; double-click or Enter keeps open in a tab`}
+            aria-keyshortcuts="Space Enter"
             aria-pressed={selected === e.path}
             onClick={() => onSelect(e.path)}
             onDoubleClick={() => onOpenFile(e.path)}
+            onAuxClick={(event) => {
+              if (event.button !== 1) return;
+              event.preventDefault();
+              onSelect(e.path);
+              onOpenFile(e.path);
+            }}
             onKeyDown={(event) => {
-              if (event.key !== "Enter" || (!event.metaKey && !event.ctrlKey)) return;
+              if (event.key === " ") {
+                event.preventDefault();
+                event.stopPropagation();
+                onSelect(e.path);
+                return;
+              }
+              if (event.key !== "Enter") return;
               event.preventDefault();
               event.stopPropagation();
               onSelect(e.path);
