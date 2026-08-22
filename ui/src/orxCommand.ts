@@ -33,7 +33,6 @@ export function shellWords(input: string): string[] {
   let word = "";
   let hasWord = false;
   let quote: '"' | "'" | null = null;
-  let escaped = false;
 
   const push = () => {
     if (hasWord) words.push(word);
@@ -41,15 +40,26 @@ export function shellWords(input: string): string[] {
     hasWord = false;
   };
 
-  for (const char of input) {
-    if (escaped) {
-      word += char;
-      hasWord = true;
-      escaped = false;
-      continue;
-    }
+  for (let index = 0; index < input.length; index++) {
+    const char = input[index];
     if (char === "\\" && quote !== "'") {
-      escaped = true;
+      const next = input[index + 1];
+      const escapesInDoubleQuotes = next !== undefined && ["$", "`", '"', "\\", "\n"].includes(next);
+      if (quote === '"' && !escapesInDoubleQuotes) {
+        word += char;
+        hasWord = true;
+        continue;
+      }
+      if (next === undefined) {
+        word += char;
+        hasWord = true;
+        continue;
+      }
+      index++;
+      if (next !== "\n") {
+        word += next;
+        hasWord = true;
+      }
       continue;
     }
     if (quote) {
@@ -77,15 +87,15 @@ export function shellWords(input: string): string[] {
 /** Remove quotes only when they make the entire body one shell word. */
 export function unwrapShellBody(input: string): string {
   const first = input[0];
-  if ((first === '"' || first === "'") && input.at(-1) === first && shellWords(input).length === 1) {
-    return input.slice(1, -1);
+  if ((first === '"' || first === "'") && input.at(-1) === first) {
+    const words = shellWords(input);
+    if (words.length === 1) return words[0];
   }
   return input;
 }
 
 /** The argv after an `orx` executable in shell command position. */
-export function orxArgv(command: string): string[] | null {
-  const tokens = shellWords(command);
+export function orxArgvFromTokens(tokens: readonly string[]): string[] | null {
   let index = 0;
   while (["do", "then", "else", "if", "while", "until"].includes(tokens[index])) index++;
   while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index] ?? "")) index++;
@@ -104,8 +114,18 @@ export function orxArgv(command: string): string[] | null {
   return tokens.slice(index + 1);
 }
 
+export function orxArgv(command: string | readonly string[]): string[] | null {
+  return orxArgvFromTokens(typeof command === "string" ? shellWords(command) : command);
+}
+
+export function shellWrapperBody(argv: readonly string[]): string | null {
+  const shell = argv[0]?.split("/").pop();
+  if (!shell || !["sh", "bash", "zsh"].includes(shell) || argv[1] !== "-lc") return null;
+  return argv[2] ?? null;
+}
+
 /** Match an `orx` argv prefix regardless of whether Codex quoted every token. */
-export function orxArgsMatch(command: string, args: string): boolean {
+export function orxArgsMatch(command: string | readonly string[], args: string): boolean {
   const argv = orxArgv(command);
   if (argv === null) return false;
   // Each `\s+`-separated fragment is one argv-token regex, never a literal space.
@@ -116,7 +136,7 @@ export function orxArgsMatch(command: string, args: string): boolean {
 }
 
 /** Parse the first literature command from a shell segment. */
-export function parseOrxLit(command: string): OrxLitCall | null {
+export function parseOrxLit(command: string | readonly string[]): OrxLitCall | null {
   const argv = orxArgv(command);
   if (!argv) return null;
   const kind = argv[0];
