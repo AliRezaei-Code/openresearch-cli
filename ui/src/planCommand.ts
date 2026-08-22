@@ -38,6 +38,62 @@ export function isAnchoredSlashCommand(
   return !before.slice(before.lastIndexOf("\n") + 1).trim();
 }
 
+interface CommandSegment {
+  text: string;
+  command: boolean;
+}
+
+/** Split a message into plain runs and whole `/name` tokens naming a known
+ * command, so both the composer and the transcript can chip them in place. */
+export function splitCommandTokens(
+  text: string,
+  isCommand: (name: string) => boolean,
+): CommandSegment[] {
+  const segments: CommandSegment[] = [];
+  let plain = "";
+  for (const run of text.split(/(\s+)/)) {
+    const match = /^\/([^\s/]+)$/.exec(run);
+    if (match && isCommand(match[1].toLowerCase())) {
+      if (plain) segments.push({ text: plain, command: false });
+      plain = "";
+      segments.push({ text: run, command: true });
+    } else {
+      plain += run;
+    }
+  }
+  if (plain) segments.push({ text: plain, command: false });
+  return segments;
+}
+
+/** Only a leading command expands, and the backend matches its lowercase slug
+ * exactly — so a typed `/Lit-Review` has to reach the wire as `/lit-review`.
+ * Every other token is the user's prose and stays as written. */
+export function normalizeLeadingCommand(
+  text: string,
+  isCommand: (name: string) => boolean,
+): string {
+  const segments = splitCommandTokens(text, isCommand);
+  if (!segments[0]?.command) return text;
+  return segments[0].text.toLowerCase() + segments.slice(1).map((s) => s.text).join("");
+}
+
+/** Replace the `/query` token under the caret with the chosen command, leaving
+ * the rest of the message where it was. */
+export function insertSlashCommand(
+  text: string,
+  context: SlashCommandContext,
+  name: string,
+): { text: string; cursor: number } {
+  const before = text.slice(0, context.start);
+  const after = text.slice(context.end);
+  // The caret lands where the args go, past whatever space now separates them.
+  const gap = /^\s/.exec(after)?.[0] ?? " ";
+  return {
+    text: `${before}/${name}${/^\s/.test(after) ? "" : " "}${after}`,
+    cursor: before.length + name.length + 1 + gap.length,
+  };
+}
+
 export function removeSlashCommand(
   text: string,
   context: SlashCommandContext,
