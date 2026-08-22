@@ -36,6 +36,7 @@ import { useLatexCompile } from "../useLatexCompile";
 import { CodeView } from "./CodeView";
 import { CodeEditor } from "./CodeEditor";
 import { ArtifactMarkdown } from "./ArtifactsTab";
+import type { TabOpenIntent } from "../tabPreview";
 import { isLatexFile, isMarkdownFile } from "./FileTypeIcon";
 import { MediaPreview, mediaPreviewKind } from "./MediaPreview";
 import { Md } from "./Md";
@@ -139,7 +140,12 @@ export function FileViewer({
    * baseline) — shown in the header so a code tab always names its branch. */
   branchLabel?: string;
   /** Open a linked file as another tab (rendered-markdown links). */
-  onOpenFile?: (path: string, sessionId?: string, ref?: string) => void;
+  onOpenFile?: (
+    path: string,
+    sessionId: string | undefined,
+    ref: string | undefined,
+    intent: TabOpenIntent,
+  ) => void;
   scrollPosition?: FileScrollPosition;
   onScrollPositionChange?: (position: FileScrollPosition) => void;
   lineScrollRequest?: number;
@@ -625,7 +631,7 @@ export function FileViewer({
                 text={data.content}
                 onOpenFile={
                   onOpenFile &&
-                  ((p) =>
+                  ((p, _line, _exp, _ref, intent) =>
                     // A relative link inside an abs file names a sibling on disk,
                     // not a repo-relative path — anchor it to this file's dir so
                     // it re-enters the abs branch instead of hitting the clone.
@@ -633,6 +639,7 @@ export function FileViewer({
                       isAbsolute && !p.startsWith("/") ? `${parentFolder}/${p}` : p,
                       sessionId,
                       gitRef,
+                      intent,
                     ))
                 }
               />

@@ -17,6 +17,7 @@ import { unified } from "unified";
 import { resolveSyntaxLanguage } from "../syntaxLanguage";
 import { highlight } from "../syntaxHighlight";
 import { normalizeMarkdownForRendering } from "../markdownNormalization";
+import { tabOpenGestureHandlers, type TabOpenIntent } from "../tabPreview";
 
 // Chat blocks are short; cap tokenizing well below the file viewer's limit.
 const HIGHLIGHT_MAX_BYTES = 100_000;
@@ -198,7 +199,13 @@ function FileChip({
   lines?: string;
   /** Experiment id this file was cited from, if any (`<file exp=…>`). */
   exp?: string;
-  onOpenFile?: (path: string, line?: number, exp?: string) => void;
+  onOpenFile?: (
+    path: string,
+    line: number | undefined,
+    exp: string | undefined,
+    ref: string | undefined,
+    intent: TabOpenIntent,
+  ) => void;
 }) {
   const name = path.split("/").pop() || path;
   // `lines` may be a single line or a range ("20-40"); show the first.
@@ -208,7 +215,9 @@ function FileChip({
     <button
       className="file-chip"
       title={`Open ${path}`}
-      onClick={() => onOpenFile?.(path, line, exp)}
+      {...tabOpenGestureHandlers<HTMLButtonElement>((intent) =>
+        onOpenFile?.(path, line, exp, undefined, intent),
+      )}
       disabled={!onOpenFile}
     >
       <FileCode size={12} />
@@ -227,13 +236,13 @@ function RunChip({
 }: {
   id: string;
   label?: string;
-  onOpenRun?: (runId: string) => void;
+  onOpenRun?: (runId: string, intent: TabOpenIntent) => void;
 }) {
   return (
     <button
       className="file-chip run-chip"
       title={`Open logs for run ${id}`}
-      onClick={() => onOpenRun?.(id)}
+      {...tabOpenGestureHandlers<HTMLButtonElement>((intent) => onOpenRun?.(id, intent))}
       disabled={!onOpenRun}
     >
       <ScrollText size={12} />
@@ -294,8 +303,14 @@ export const Md = memo(function Md({
   predict = false,
 }: {
   text: string;
-  onOpenFile?: (path: string, line?: number, exp?: string) => void;
-  onOpenRun?: (runId: string) => void;
+  onOpenFile?: (
+    path: string,
+    line: number | undefined,
+    exp: string | undefined,
+    ref: string | undefined,
+    intent: TabOpenIntent,
+  ) => void;
+  onOpenRun?: (runId: string, intent: TabOpenIntent) => void;
   predict?: boolean;
 }) {
   const components: Record<string, (props: any) => ReactNode> = useMemo(() => ({

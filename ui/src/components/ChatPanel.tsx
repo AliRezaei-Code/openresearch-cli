@@ -41,6 +41,7 @@ import {
   useReducer,
   useRef,
   useState,
+  type MouseEvent as ReactMouseEvent,
 } from "react";
 import { BrandMark } from "./Wordmark";
 import {
@@ -117,6 +118,7 @@ import {
 } from "../planCommand";
 import { loadReadDemoSessions, markDemoSessionRead } from "../demoSessionState";
 import { ICON_BUTTON_BASE_CLASS_NAME, ICON_BUTTON_CLASS_NAME, MODEL_ITEM_CLASS_NAME, PAPER_TITLE_CLASS_NAME, SPINNER_CLASS_NAME } from "../styleClasses";
+import { tabOpenGestureHandlers, type TabOpenIntent } from "../tabPreview";
 import {
   escapeMarkdownText,
   fencedCodeMarkdown,
@@ -959,7 +961,19 @@ interface ToolActivity {
   spawnedSessionIds?: string[];
 }
 
-type OpenTranscriptFile = (path: string, line?: number, exp?: string, ref?: string) => void;
+type OpenTranscriptFile = (
+  path: string,
+  line: number | undefined,
+  exp: string | undefined,
+  ref: string | undefined,
+  intent: TabOpenIntent,
+) => void;
+type OpenTranscriptTarget = (id: string, intent: TabOpenIntent) => void;
+type OpenSubagent = (
+  spawnPartId: string,
+  label: string | undefined,
+  intent: TabOpenIntent,
+) => void;
 
 function inputString(input: Record<string, unknown>, ...keys: string[]): string | null {
   for (const key of keys) {
@@ -1941,10 +1955,12 @@ function ToolActivityIcon({ activity, className = "" }: { activity: ToolActivity
 function ToolTargetOverflow({
   items,
   onOpen,
+  onSelect,
   targetType,
 }: {
   items: Array<{ id: string; label: string }>;
-  onOpen?: (id: string) => void;
+  onOpen?: OpenTranscriptTarget;
+  onSelect?: (id: string) => void;
   targetType: string;
 }) {
   const [open, setOpen] = useState(false);
@@ -1964,14 +1980,20 @@ function ToolTargetOverflow({
           {items.map((item, index) => (
             <span key={item.id}>
               {index > 0 && ", "}
-              {onOpen ? (
+              {onOpen || onSelect ? (
                 <button
                   className="tool-target"
-                  onClick={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    onOpen(item.id);
-                  }}
+                  {...(onOpen
+                    ? tabOpenGestureHandlers<HTMLButtonElement>(
+                        (intent) => onOpen(item.id, intent),
+                        { stopPropagation: true },
+                      )
+                    : {
+                        onClick: (event: ReactMouseEvent<HTMLButtonElement>) => {
+                          event.stopPropagation();
+                          onSelect?.(item.id);
+                        },
+                      })}
                 >
                   {item.label}
                 </button>
@@ -2011,10 +2033,10 @@ function ToolActivityLabel({
 }: {
   activity: ToolActivity;
   onOpenFile?: OpenTranscriptFile;
-  onOpenRun?: (runId: string) => void;
+  onOpenRun?: OpenTranscriptTarget;
   onOpenSpawnedSession?: (sessionId: string) => void;
   runExperimentName?: (runId: string) => string;
-  onOpenExperiment?: (experimentId: string) => void;
+  onOpenExperiment?: OpenTranscriptTarget;
   experimentName?: (experimentId: string) => string;
 }) {
   if (activity.searchPattern) {
@@ -2056,11 +2078,9 @@ function ToolActivityLabel({
         {activity.labelPrefix}
         <button
           className="tool-target"
-          onClick={(event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            onOpenFile(filePath, undefined, undefined, activity.fileRef);
-          }}
+          {...tabOpenGestureHandlers<HTMLButtonElement>((intent) =>
+            onOpenFile(filePath, undefined, undefined, activity.fileRef, intent),
+          { stopPropagation: true })}
         >
           {activity.labelTarget}
         </button>
@@ -2097,7 +2117,11 @@ function ToolActivityLabel({
         {hiddenSessions.length > 0 && (
           <>
             {", "}
-            <ToolTargetOverflow items={hiddenSessions} onOpen={onOpenSpawnedSession} targetType="agent sessions" />
+            <ToolTargetOverflow
+              items={hiddenSessions}
+              onSelect={onOpenSpawnedSession}
+              targetType="agent sessions"
+            />
           </>
         )}
       </>
@@ -2124,11 +2148,9 @@ function ToolActivityLabel({
               <button
                 className="tool-target"
                 title={`Open logs for run ${runId}`}
-                onClick={(event) => {
-                  event.preventDefault();
-                  event.stopPropagation();
-                  onOpenRun(runId);
-                }}
+                {...tabOpenGestureHandlers<HTMLButtonElement>((intent) =>
+                  onOpenRun(runId, intent),
+                { stopPropagation: true })}
               >
                 {runExperimentName?.(runId) || "Experiment"}
               </button>
@@ -2165,11 +2187,9 @@ function ToolActivityLabel({
               <button
                 className="tool-target"
                 title={`Open experiment ${experimentName?.(experimentId) || ""}`.trim()}
-                onClick={(event) => {
-                  event.preventDefault();
-                  event.stopPropagation();
-                  onOpenExperiment(experimentId);
-                }}
+                {...tabOpenGestureHandlers<HTMLButtonElement>((intent) =>
+                  onOpenExperiment(experimentId, intent),
+                { stopPropagation: true })}
               >
                 {experimentName?.(experimentId) || "Experiment"}
               </button>
@@ -2483,10 +2503,10 @@ function ToolRow({
   part: ChatPart;
   repeatCount?: number;
   onOpenFile?: OpenTranscriptFile;
-  onOpenRun?: (runId: string) => void;
+  onOpenRun?: OpenTranscriptTarget;
   onOpenSpawnedSession?: (sessionId: string) => void;
   runExperimentName?: (runId: string) => string;
-  onOpenExperiment?: (experimentId: string) => void;
+  onOpenExperiment?: OpenTranscriptTarget;
   experimentName?: (experimentId: string) => string;
 }) {
   const state = part.state;
@@ -2568,10 +2588,10 @@ function ToolGroup({
   parts: ChatPart[];
   pendingTail?: boolean;
   onOpenFile?: OpenTranscriptFile;
-  onOpenRun?: (runId: string) => void;
+  onOpenRun?: OpenTranscriptTarget;
   onOpenSpawnedSession?: (sessionId: string) => void;
   runExperimentName?: (runId: string) => string;
-  onOpenExperiment?: (experimentId: string) => void;
+  onOpenExperiment?: OpenTranscriptTarget;
   experimentName?: (experimentId: string) => string;
 }) {
   const [open, setOpen] = useState(false);
@@ -2713,7 +2733,7 @@ function PromptCard({
   part: ChatPart;
   onRespond?: (answer: PromptAnswer) => void;
   onOpenFile?: OpenTranscriptFile;
-  onOpenPlan?: (plan: string, promptId: string) => void;
+  onOpenPlan?: (plan: string, promptId: string, intent: TabOpenIntent) => void;
 }) {
   const p = part.prompt as ChatPrompt;
   const [picked, setPicked] = useState<string[]>([]);
@@ -2805,7 +2825,12 @@ function PromptCard({
           <Md text={p.plan ?? ""} onOpenFile={onOpenFile} />
         </div>
         {docked && (
-          <button className="prompt-plan-open self-start border-0 bg-transparent text-accent-blue text-sm p-0 cursor-pointer [&:hover]:underline" onClick={() => onOpenPlan(p.plan ?? "", part.id)}>
+          <button
+            className="prompt-plan-open self-start border-0 bg-transparent text-accent-blue text-sm p-0 cursor-pointer [&:hover]:underline"
+            {...tabOpenGestureHandlers<HTMLButtonElement>((intent) =>
+              onOpenPlan(p.plan ?? "", part.id, intent),
+            )}
+          >
             View full plan
           </button>
         )}
@@ -3091,16 +3116,16 @@ const Message = memo(function Message({
   activePermissionId: string | null;
   pendingTailToolId?: string | null;
   onOpenFile?: OpenTranscriptFile;
-  onOpenRun?: (runId: string) => void;
+  onOpenRun?: OpenTranscriptTarget;
   onOpenSpawnedSession?: (sessionId: string) => void;
   runExperimentName?: (runId: string) => string;
-  onOpenExperiment?: (experimentId: string) => void;
+  onOpenExperiment?: OpenTranscriptTarget;
   experimentName?: (experimentId: string) => string;
   onRespond?: (answer: PromptAnswer) => void;
   /** Open a plan's full markdown in the right pane (plan cards/strip). */
-  onOpenPlan?: (plan: string, promptId: string) => void;
+  onOpenPlan?: (plan: string, promptId: string, intent: TabOpenIntent) => void;
   /** Open a sub-agent's transcript in the right pane (spawn-row "view"). */
-  onOpenSubagent?: (spawnPartId: string, label?: string) => void;
+  onOpenSubagent?: OpenSubagent;
   busy?: boolean;
   recoveringTurnId?: string | null;
   onRecover?: (turnId: string, action: "retry" | "continue") => void;
@@ -3272,14 +3297,14 @@ function renderParts(
     activePermissionId?: string | null;
     pendingTailToolId?: string | null;
     onOpenFile?: OpenTranscriptFile;
-    onOpenRun?: (runId: string) => void;
+    onOpenRun?: OpenTranscriptTarget;
     onOpenSpawnedSession?: (sessionId: string) => void;
     runExperimentName?: (runId: string) => string;
-    onOpenExperiment?: (experimentId: string) => void;
+    onOpenExperiment?: OpenTranscriptTarget;
     experimentName?: (experimentId: string) => string;
     onRespond?: (answer: PromptAnswer) => void;
-    onOpenPlan?: (plan: string, promptId: string) => void;
-    onOpenSubagent?: (spawnPartId: string, label?: string) => void;
+    onOpenPlan?: (plan: string, promptId: string, intent: TabOpenIntent) => void;
+    onOpenSubagent?: OpenSubagent;
     predictTextTail?: boolean;
   },
 ): React.ReactNode[] {
@@ -3443,11 +3468,11 @@ export function SubagentTranscript({
 }: {
   spawn: ChatPart;
   onOpenFile?: OpenTranscriptFile;
-  onOpenRun?: (runId: string) => void;
+  onOpenRun?: OpenTranscriptTarget;
   runExperimentName?: (runId: string) => string;
-  onOpenExperiment?: (experimentId: string) => void;
+  onOpenExperiment?: OpenTranscriptTarget;
   experimentName?: (experimentId: string) => string;
-  onOpenSubagent?: (spawnPartId: string, label?: string) => void;
+  onOpenSubagent?: OpenSubagent;
 }) {
   const parts = spawn.children ?? [];
   const running = spawn.state?.status === "running";
@@ -3506,7 +3531,7 @@ function SubagentBlock({
 }: {
   part: ChatPart;
   pendingTail?: boolean;
-  onOpenSubagent?: (spawnPartId: string, label?: string) => void;
+  onOpenSubagent?: OpenSubagent;
 }) {
   const errored = part.state?.status === "error";
   const errorMessage = cleanToolError(part.state?.error || part.state?.output || "");
@@ -3545,7 +3570,9 @@ function SubagentBlock({
     <button
       className="subagent-row flex items-center gap-2 w-full my-3.5 mx-0 py-[3px] px-1 cursor-pointer text-text text-lg text-left rounded-sm [&:hover:not(:disabled)]:bg-surface [&:disabled]:cursor-default [&_.tool-line]:text-lg"
       title={errored && errorMessage ? errorMessage : "Open sub-agent transcript"}
-      onClick={() => onOpenSubagent?.(part.id, activity.label)}
+      {...tabOpenGestureHandlers<HTMLButtonElement>((intent) =>
+        onOpenSubagent?.(part.id, activity.label, intent),
+      )}
       disabled={!onOpenSubagent}
     >
       {line}
@@ -3741,14 +3768,14 @@ const Transcript = memo(function Transcript({
   onSelectFork: (leafId: string) => void;
   busy: boolean;
   onOpenFile?: OpenTranscriptFile;
-  onOpenRun?: (runId: string) => void;
+  onOpenRun?: OpenTranscriptTarget;
   onOpenSpawnedSession?: (sessionId: string) => void;
   runExperimentName?: (runId: string) => string;
-  onOpenExperiment?: (experimentId: string) => void;
+  onOpenExperiment?: OpenTranscriptTarget;
   experimentName?: (experimentId: string) => string;
   onRespond?: (answer: PromptAnswer) => void;
-  onOpenPlan?: (plan: string, promptId: string) => void;
-  onOpenSubagent?: (spawnPartId: string, label?: string) => void;
+  onOpenPlan?: (plan: string, promptId: string, intent: TabOpenIntent) => void;
+  onOpenSubagent?: OpenSubagent;
   recoveringTurnId?: string | null;
   onRecover?: (turnId: string, action: "retry" | "continue") => void;
   skills?: SkillInfo[];
@@ -4143,21 +4170,38 @@ export function ChatPanel({
   /** Open a project file in the right pane (chat tool rows are clickable).
    * `sessionId` is the chat session the click came from, so relative paths
    * can resolve against that session's worktree. */
-  onOpenFile?: (path: string, sessionId?: string, line?: number, exp?: string, ref?: string) => void;
+  onOpenFile?: (
+    path: string,
+    sessionId: string | undefined,
+    line: number | undefined,
+    exp: string | undefined,
+    ref: string | undefined,
+    intent: TabOpenIntent,
+  ) => void;
   /** Open a run's logs in the right pane (agent-emitted `<run>` evidence chips).
    * Run ids are globally unique, so no session context is needed. */
-  onOpenRun?: (runId: string) => void;
+  onOpenRun?: OpenTranscriptTarget;
   /** Resolve a run to the experiment name shown on tool activity links. */
   runExperimentName?: (runId: string) => string;
   /** Open an experiment overview, where its notes are displayed. */
-  onOpenExperiment?: (experimentId: string) => void;
+  onOpenExperiment?: OpenTranscriptTarget;
   /** Resolve an experiment id to the name shown on tool activity links. */
   experimentName?: (experimentId: string) => string;
   /** Open a plan's markdown as a right-pane tab (plan strip / plan cards). */
-  onOpenPlan?: (plan: string, sessionId: string, promptId: string) => void;
+  onOpenPlan?: (
+    plan: string,
+    sessionId: string,
+    promptId: string,
+    intent: TabOpenIntent,
+  ) => void;
   /** Open a sub-agent's transcript as a right-pane tab (spawn-row "view").
    * `sessionId` is the chat session; `spawnPartId` locates the spawn part. */
-  onOpenSubagent?: (sessionId: string, spawnPartId: string, label?: string) => void;
+  onOpenSubagent?: (
+    sessionId: string,
+    spawnPartId: string,
+    label: string | undefined,
+    intent: TabOpenIntent,
+  ) => void;
   /** Open the pinned Files home for the active session. */
   onOpenWorktree: () => void;
   /** Reopen the demo welcome modal from the chat header. */
@@ -5000,7 +5044,8 @@ export function ChatPanel({
   const openPlan = useMemo(
     () =>
       onOpenPlan && activeId
-        ? (plan: string, promptId: string) => onOpenPlan(plan, activeId, promptId)
+        ? (plan: string, promptId: string, intent: TabOpenIntent) =>
+            onOpenPlan(plan, activeId, promptId, intent)
         : undefined,
     [onOpenPlan, activeId],
   );
@@ -5008,7 +5053,8 @@ export function ChatPanel({
   const openSubagent = useMemo(
     () =>
       onOpenSubagent && activeId
-        ? (spawnPartId: string, label?: string) => onOpenSubagent(activeId, spawnPartId, label)
+        ? (spawnPartId: string, label: string | undefined, intent: TabOpenIntent) =>
+            onOpenSubagent(activeId, spawnPartId, label, intent)
         : undefined,
     [onOpenSubagent, activeId],
   );
@@ -5018,8 +5064,13 @@ export function ChatPanel({
   const openFileInSession = useMemo(
     () =>
       onOpenFile &&
-      ((path: string, line?: number, exp?: string, ref?: string) =>
-        onOpenFile(path, activeId ?? undefined, line, exp, ref)),
+      ((
+        path: string,
+        line: number | undefined,
+        exp: string | undefined,
+        ref: string | undefined,
+        intent: TabOpenIntent,
+      ) => onOpenFile(path, activeId ?? undefined, line, exp, ref, intent)),
     [onOpenFile, activeId],
   );
 
@@ -5934,7 +5985,7 @@ export function ChatPanel({
               activeSession ? HARNESS_LABELS[activeSession.harness] : "The agent"
             }
             showResumeModes={activeSession?.harness === "claude-code"}
-            onView={() => openPlan?.(pendingPlan.plan, pendingPlan.promptId)}
+            onView={(intent) => openPlan?.(pendingPlan.plan, pendingPlan.promptId, intent)}
             onApprove={(resumeMode) =>
               respond({
                 promptId: pendingPlan.promptId,
