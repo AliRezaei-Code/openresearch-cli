@@ -94,6 +94,7 @@ import { Md } from "./Md";
 import { PlanStrip } from "./PlanStrip";
 import { SETTINGS_NAV, type SettingsTab } from "./SettingsPage";
 import { SkillMenu } from "./SkillMenu";
+import { ComposerSkillChips, MessageWithChips } from "./SkillChips";
 import {
   defaultSelection,
   HARNESS_LABELS,
@@ -106,7 +107,9 @@ import { renderNote } from "./agentNote";
 import {
   commandsForHarness,
   effectiveCommandPlanMode,
+  insertSlashCommand,
   isAnchoredSlashCommand,
+  normalizeLeadingCommand,
   parsePlanCommand,
   removeSlashCommand,
   slashCommandContext,
@@ -3101,7 +3104,7 @@ const Message = memo(function Message({
   busy?: boolean;
   recoveringTurnId?: string | null;
   onRecover?: (turnId: string, action: "retry" | "continue") => void;
-  /** Known slash-skills, for rendering a leading `/name` as a command chip. */
+  /** Known slash-skills, for rendering a `/name` token as a command chip. */
   skills?: SkillInfo[];
   predictTextTail?: boolean;
   /** Set only on a user message, the one bearer of the fork controls. */
@@ -3124,10 +3127,9 @@ const Message = memo(function Message({
       .filter((p) => p.type === "text")
       .map((p) => p.text ?? "")
       .join("\n");
-    // A leading known `/command` renders as the same chip the composer shows.
-    // Unknown commands (or skills removed since) fall back to plain text.
-    const slash = text.match(/^\/(\S+)([\s\S]*)$/);
-    const command = slash ? skills?.find((s) => s.name === slash[1]) : undefined;
+    // Known `/command` tokens render as the chips the composer showed, where
+    // they were typed. Unknown commands (or skills removed since) stay plain text.
+    const isCommand = (name: string) => !!skills?.some((s) => s.name === name);
     // Optimistic parts carry a data URL; server parts carry a file name.
     const attachments = message.parts
       .filter((p) => p.type === "image" && p.text)
@@ -3190,14 +3192,7 @@ const Message = memo(function Message({
           <AnnotationsPopover annotations={annotations} variant="sent" />
         )}
         <div className="msg-user max-w-full bg-surface rounded-[16px] py-2.5 px-[15px] text-base whitespace-pre-wrap wrap-anywhere [&_.skill-chip]:mr-0.5 [&_.skill-chip]:align-baseline">
-          {command ? (
-            <>
-              <span className="skill-chip inline-flex items-center py-px px-[7px] font-mono text-md font-medium text-primary bg-primary-subtle border border-border-variant rounded-sm">/{command.name}</span>
-              {slash![2]}
-            </>
-          ) : (
-            text
-          )}
+          <MessageWithChips text={text} isCommand={isCommand} />
           {images.length > 0 && (
             <div className="msg-images flex flex-wrap gap-1.5 mt-2 [&_img]:max-w-55 [&_img]:max-h-40 [&_img]:border [&_img]:border-border-variant [&_img]:rounded-xs [&_img]:block">
               {images.map((a, i) => (
@@ -4267,29 +4262,20 @@ export function ChatPanel({
   const [skillIdx, setSkillIdx] = useState(0);
   const [skillMenuDismissed, setSkillMenuDismissed] = useState(false);
   const [composerCursor, setComposerCursor] = useState(0);
-  // A picked skill renders as a chip on the textarea's first line
-  // (Claude-desktop style); the textarea then holds only the args. send()
-  // reassembles `/name args`, so the wire and transcript keep the plain-text
-  // form. The chip overlays the textarea and the first line is indented past
-  // it (text-indent), so long args wrap full-width beneath the chip instead
-  // of being squeezed into a narrower column.
-  const [pickedSkill, setPickedSkill] = useState<SkillInfo | null>(null);
-  const chipRef = useRef<HTMLSpanElement>(null);
-  const [chipIndent, setChipIndent] = useState(0);
-  useLayoutEffect(() => {
-    setChipIndent(pickedSkill && chipRef.current ? chipRef.current.offsetWidth + 8 : 0);
-    syncChipScroll();
-  }, [pickedSkill]);
-
-  /** The chip belongs to the first line of *content*, so when the textarea
-   * scrolls it must ride along (and clip at the wrapper) instead of sitting
-   * fixed over whatever line scrolled to the top. */
-  function syncChipScroll() {
-    if (chipRef.current)
-      chipRef.current.style.transform = `translateY(${-(composerRef.current?.scrollTop ?? 0)}px)`;
-  }
   // IME guard: mid-composition text can transiently look like a full command.
   const composingRef = useRef(false);
+
+  /** Seed the composer from a button rather than a keystroke. The caret has to
+   * move with the text: it feeds the slash-menu, which would otherwise read a
+   * stale offset and open over a draft the user never typed. */
+  function armDraft(text: string) {
+    setDraft(text);
+    setComposerCursor(text.length);
+    composerRef.current?.focus();
+    window.requestAnimationFrame(() =>
+      composerRef.current?.setSelectionRange(text.length, text.length),
+    );
+  }
   // Refetch when navigating (esp. back to chat after a Skills-tab upload) so
   // freshly uploaded skills appear in the `/` menu without a reload.
   useEffect(() => {
@@ -4302,10 +4288,9 @@ export function ChatPanel({
       activatePlanCommand(draft, slashContext);
       return;
     }
-    // Whatever surrounds the `/name` token becomes the chip's args, so a skill
-    // can be picked after the message is written.
-    const next = removeSlashCommand(draft, slashContext);
-    setPickedSkill(skill);
+    // The command replaces the `/query` token in place, so the chip lands where
+    // it was typed and the rest of the message stays untouched.
+    const next = insertSlashCommand(draft, slashContext, skill.name);
     setDraft(next.text);
     window.requestAnimationFrame(() => {
       composerRef.current?.focus();
@@ -4314,11 +4299,21 @@ export function ChatPanel({
     });
   }
 
-  /** Backspace at the start deletes the command outright (Claude-desktop
-   * behavior) — the args stay put; re-type `/` to pick another skill. */
-  function removeSkillChip() {
-    setPickedSkill(null);
-    composerRef.current?.focus();
+  /** Backspace just behind a chip deletes the whole command, the way the chip
+   * it paints reads — a single object, not eight characters. */
+  function deleteCommandBehindCaret(textarea: HTMLTextAreaElement): boolean {
+    const cursor = textarea.selectionStart;
+    if (composingRef.current || cursor !== textarea.selectionEnd) return false;
+    const context = slashCommandContext(draft, cursor);
+    if (!context || context.end !== cursor) return false;
+    if (!knownCommand(context.query)) return false;
+    const next = removeSlashCommand(draft, context);
+    setDraft(next.text);
+    setComposerCursor(next.cursor);
+    window.requestAnimationFrame(() =>
+      textarea.setSelectionRange(next.cursor, next.cursor),
+    );
+    return true;
   }
 
   /** Queue files (upload button, clipboard paste, or drag-drop) as composer
@@ -4393,14 +4388,23 @@ export function ChatPanel({
     : undefined;
   const opts = activeHarness?.options;
   const commands = commandsForHarness(skills, opts?.planActivation);
-  const slashContext = !pickedSkill ? slashCommandContext(draft, composerCursor) : null;
+  const slashContext = slashCommandContext(draft, composerCursor);
   const slashToken = slashContext?.query ?? null;
   const anchoredSlash = !!slashContext && isAnchoredSlashCommand(draft, slashContext);
   // A lone `/` lists every command only where one can open the message — in the
   // middle of a sentence it is far more often punctuation ("either / or").
+  // Commands now live in the draft as text, so the menu also has to stay shut
+  // when the caret merely lands in or behind a name the user already finished —
+  // unless a longer command still extends it.
+  const completions =
+    slashToken === null ? [] : commands.filter((command) => command.name.startsWith(slashToken));
+  const typingCommand =
+    slashToken !== null &&
+    slashContext?.end === composerCursor &&
+    completions.some((command) => command.name !== slashToken);
   const skillMatches =
-    slashToken !== null && !skillMenuDismissed && (slashToken !== "" || anchoredSlash)
-      ? commands.filter((command) => command.name.startsWith(slashToken))
+    typingCommand && !skillMenuDismissed && (slashToken !== "" || anchoredSlash)
+      ? completions
       : [];
   const skillMenuOpen = skillMatches.length > 0;
   const activeSkillIdx = Math.min(skillIdx, Math.max(0, skillMatches.length - 1));
@@ -4580,7 +4584,6 @@ export function ChatPanel({
   function activatePlanCommand(text: string, context: SlashCommandContext) {
     const next = removeSlashCommand(text, context);
     setDraft(next.text);
-    setPickedSkill(null);
     setSkillMenuDismissed(true);
     void togglePlanMode();
     window.requestAnimationFrame(() => {
@@ -4680,7 +4683,6 @@ export function ChatPanel({
         : new Set(),
     );
     setDraft("");
-    setPickedSkill(null);
     setAttachments([]);
     dispatch({ type: "reset" });
     loadedSessions.current = new Set();
@@ -4946,6 +4948,22 @@ export function ChatPanel({
     return null;
   }, [messages, activeSession?.harness, activeId, state.busySessions]);
 
+  // A pending question card owns the composer's text as a plain answer — no
+  // command in it is ever expanded, so none of it is chipped either.
+  const knownCommand = (name: string) =>
+    !pendingQuestion && commands.some((command) => command.name === name);
+  // A command typed with no args yet shows its arg hint as ghost text where the
+  // args go. Both paper skills default their args (linked paper, configured
+  // compute), so theirs states the defaults instead.
+  const bareCommand = /^\/(\S+) ?$/.exec(pendingQuestion ? "" : draft);
+  const armedCommand =
+    bareCommand && commands.find((command) => command.name === bareCommand[1].toLowerCase());
+  const commandHint = !armedCommand
+    ? null
+    : ["reproduce-paper", "paper-to-marimo"].includes(armedCommand.name) && paperId
+      ? `[optional — defaults to ${paperId} on your default compute]`
+      : armedCommand.argHint || null;
+
   // A submitted plan revision, until its replacement card arrives: hides the
   // outgoing card's strip so it never sits there looking actionable while
   // the model rewrites the plan (the transcript's Working… spinner is the
@@ -5056,10 +5074,9 @@ export function ChatPanel({
 
   /** `queue` (the ⌘/Ctrl+Enter chord) parks the message even on a harness that steers. */
   async function send({ queue = false }: { queue?: boolean } = {}) {
-    const args = draft.trim();
-    // Reassemble the picked skill chip into the plain `/name args` wire form —
-    // the backend's slash expansion and the transcript both see only text.
-    const originalText = pickedSkill ? `/${pickedSkill.name}${args ? ` ${args}` : ""}` : args;
+    // The draft is already the wire form: the chip is painted behind a plain
+    // `/name` token, so what was typed is what the harness and transcript see.
+    const originalText = normalizeLeadingCommand(draft.trim(), knownCommand);
     const planCommand = !pendingQuestion
       ? parsePlanCommand(originalText, opts?.planActivation)
       : null;
@@ -5093,7 +5110,6 @@ export function ChatPanel({
     };
     if (planRequested && !text && pending.length === 0 && pendingAnnotations.length === 0) {
       setDraft("");
-      setPickedSkill(null);
       setSkillMenuDismissed(false);
       try {
         if (activeHarness?.id === "claude-code") {
@@ -5133,11 +5149,10 @@ export function ChatPanel({
     // (Claude-desktop behavior). This also works while the turn is HELD on
     // the card — where a new message would be rejected as busy and silently
     // dropped. A failed answer restores the draft so the text isn't lost.
-    // (Auto-convert is off while a card is pending; a chip picked from the
-    // menu or left over just serializes into the note text, same as typing it.)
+    // (Nothing is chipped or expanded while a card is pending — a `/command`
+    // in the answer serializes into the note text exactly as it reads.)
     if ((text || pendingAnnotations.length > 0) && pendingQuestion && pending.length === 0) {
       setDraft("");
-      setPickedSkill(null);
       setAnnotations([]);
       void respond({
         promptId: pendingQuestion,
@@ -5182,7 +5197,6 @@ export function ChatPanel({
       }
       const sid = activeId;
       setDraft("");
-      setPickedSkill(null);
       setAttachments([]);
       setAnnotations([]);
       setAttachError(null);
@@ -5243,7 +5257,6 @@ export function ChatPanel({
       return;
     }
     setDraft("");
-    setPickedSkill(null);
     setAttachments([]);
     setAnnotations([]);
     setAttachError(null);
@@ -5792,11 +5805,11 @@ export function ChatPanel({
             <button
               type="button"
               className="chat-empty-starter min-h-28 flex flex-col items-start justify-between gap-5 p-4 border border-border rounded-lg text-text bg-background shadow-[0_1px_3px_color-mix(in_oklab,_var(--text)_5%,_transparent)] text-left text-md font-medium leading-[1.35] transition-[border-color,background,translate] duration-120 ease-standard [&:hover]:border-muted [&:hover]:bg-surface [&:hover]:-translate-y-px [&.blue_svg]:text-accent-blue [&.purple_svg]:text-accent-purple [&.green_svg]:text-accent-green [&.orange_svg]:text-accent-orange blue"
-              onClick={() => {
-                setPickedSkill(null);
-                setDraft("Explore this codebase and explain its architecture, key components, and open research questions.");
-                composerRef.current?.focus();
-              }}
+              onClick={() =>
+                armDraft(
+                  "Explore this codebase and explain its architecture, key components, and open research questions.",
+                )
+              }
             >
               <BookOpen size={16} />
               <span>Explore this codebase</span>
@@ -5804,23 +5817,15 @@ export function ChatPanel({
             <button
               type="button"
               className="chat-empty-starter min-h-28 flex flex-col items-start justify-between gap-5 p-4 border border-border rounded-lg text-text bg-background shadow-[0_1px_3px_color-mix(in_oklab,_var(--text)_5%,_transparent)] text-left text-md font-medium leading-[1.35] transition-[border-color,background,translate] duration-120 ease-standard [&:hover]:border-muted [&:hover]:bg-surface [&:hover]:-translate-y-px [&.blue_svg]:text-accent-blue [&.purple_svg]:text-accent-purple [&.green_svg]:text-accent-green [&.orange_svg]:text-accent-orange purple"
-              onClick={() => {
-                const skill = skills.find((s) => s.name === "reproduce-paper");
-                if (paperId && skill) {
-                  // Both args are optional (the playbook injects the linked paper;
-                  // compute defaults to the configured target) — arm with an empty draft.
-                  setPickedSkill(skill);
-                  setDraft("");
-                } else {
-                  setPickedSkill(null);
-                  setDraft(
-                    paperId
-                      ? `/reproduce-paper `
-                      : "Find and summarize the research most relevant to this project.",
-                  );
-                }
-                composerRef.current?.focus();
-              }}
+              onClick={() =>
+                // Both args are optional (the playbook injects the linked paper;
+                // compute defaults to the configured target) — arm the bare command.
+                armDraft(
+                  paperId
+                    ? "/reproduce-paper "
+                    : "Find and summarize the research most relevant to this project.",
+                )
+              }
             >
               <GitBranch size={16} />
               <span>{paperId ? "Reproduce the linked paper" : "Review relevant literature"}</span>
@@ -5828,11 +5833,11 @@ export function ChatPanel({
             <button
               type="button"
               className="chat-empty-starter min-h-28 flex flex-col items-start justify-between gap-5 p-4 border border-border rounded-lg text-text bg-background shadow-[0_1px_3px_color-mix(in_oklab,_var(--text)_5%,_transparent)] text-left text-md font-medium leading-[1.35] transition-[border-color,background,translate] duration-120 ease-standard [&:hover]:border-muted [&:hover]:bg-surface [&:hover]:-translate-y-px [&.blue_svg]:text-accent-blue [&.purple_svg]:text-accent-purple [&.green_svg]:text-accent-green [&.orange_svg]:text-accent-orange green"
-              onClick={() => {
-                setPickedSkill(null);
-                setDraft("Set up and run an experiment for this project, including a baseline and meaningful variants.");
-                composerRef.current?.focus();
-              }}
+              onClick={() =>
+                armDraft(
+                  "Set up and run an experiment for this project, including a baseline and meaningful variants.",
+                )
+              }
             >
               <FlaskConical size={16} />
               <span>Run an experiment</span>
@@ -5840,11 +5845,11 @@ export function ChatPanel({
             <button
               type="button"
               className="chat-empty-starter min-h-28 flex flex-col items-start justify-between gap-5 p-4 border border-border rounded-lg text-text bg-background shadow-[0_1px_3px_color-mix(in_oklab,_var(--text)_5%,_transparent)] text-left text-md font-medium leading-[1.35] transition-[border-color,background,translate] duration-120 ease-standard [&:hover]:border-muted [&:hover]:bg-surface [&:hover]:-translate-y-px [&.blue_svg]:text-accent-blue [&.purple_svg]:text-accent-purple [&.green_svg]:text-accent-green [&.orange_svg]:text-accent-orange orange"
-              onClick={() => {
-                setPickedSkill(null);
-                setDraft("Analyze the latest experiment results and recommend the most useful next iteration.");
-                composerRef.current?.focus();
-              }}
+              onClick={() =>
+                armDraft(
+                  "Analyze the latest experiment results and recommend the most useful next iteration.",
+                )
+              }
             >
               <ChartSpline size={16} />
               <span>Analyze results</span>
@@ -6074,24 +6079,14 @@ export function ChatPanel({
             </div>
           )}
           <div className="composer-input relative flex overflow-hidden [&_textarea]:flex-1">
-            {pickedSkill && (
-              // Inert like inline text: clicks fall through to the textarea
-              // (pointer-events: none); Backspace at the start removes it.
-              <span ref={chipRef} className="skill-chip inline-flex items-center py-px px-[7px] font-mono text-md font-medium text-primary bg-primary-subtle border border-border-variant rounded-sm composer-chip absolute top-[9px] left-3 z-1 pointer-events-none">
-                /{pickedSkill.name}
-              </span>
-            )}
             <textarea
               ref={composerRef}
+              // Stacked over the chips, which paint behind the text it renders.
+              className="relative z-1 bg-transparent"
               value={draft}
-              style={pickedSkill ? { textIndent: chipIndent } : undefined}
-              onScroll={syncChipScroll}
+              aria-describedby={commandHint ? "composer-command-hint" : undefined}
               placeholder={
                 // A pending question card owns typed text (see send()); say so.
-                // With a chip active, the skill's arg hint says what to type. For
-                // the paper-reproduction skills with a paper attached, both parts
-                // are optional — paper defaults to it, compute to the configured
-                // target — so the hint just states the defaults.
                 // While a steerable turn runs, Enter goes to that turn, so name
                 // the gesture and its queue chord — the send button is a Stop
                 // button for the whole busy stretch.
@@ -6099,13 +6094,8 @@ export function ChatPanel({
                 // picker for a new session and the open session once one exists.
                 pendingQuestion
                   ? "Type a custom answer…"
-                  : pickedSkill
-                    ? ["reproduce-paper", "paper-to-marimo"].includes(pickedSkill.name) &&
-                      paperId
-                      ? `[optional — defaults to ${paperId} on your default compute]`
-                      : pickedSkill.argHint
-                    : steering && activeHarness
-                      ? `Steer ${HARNESS_LABELS[activeHarness.id]}… (${queueChord} to queue)`
+                  : steering && activeHarness
+                    ? `Steer ${HARNESS_LABELS[activeHarness.id]}… (${queueChord} to queue)`
                     : composerSelection
                       ? activeHarness?.agentReady
                         ? `Message ${HARNESS_LABELS[composerSelection.harness]}… ( / for commands)`
@@ -6126,30 +6116,18 @@ export function ChatPanel({
                 const v = e.target.value;
                 const cursor = e.target.selectionStart;
                 setComposerCursor(cursor);
-                const completedCommand = cursor > 0 && /\s/.test(v[cursor - 1])
-                  ? slashCommandContext(v, cursor - 1)
-                  : null;
-                if (completedCommand?.query === "plan") {
+                // `/plan` is the one command the composer consumes rather than
+                // sends: it toggles the mode the moment the space lands. Not
+                // while a question card is pending (its answer is a note, never
+                // a command) and not mid-IME-composition, where the text can
+                // transiently look complete.
+                const completedCommand =
+                  cursor > 0 && /\s/.test(v[cursor - 1]) && !pendingQuestion && !composingRef.current
+                    ? slashCommandContext(v, cursor - 1)
+                    : null;
+                if (completedCommand?.query === "plan" && opts?.planActivation) {
                   activatePlanCommand(v, completedCommand);
                   return;
-                }
-                // Auto-convert a typed/pasted full `/name ` that opens the
-                // draft into the chip the moment the space lands; mid-message
-                // a `/token` is as likely to be a path, so it chips only on an
-                // explicit menu pick. Known names only — unknown `/foo` stays
-                // plain text (server-side pass-through contract). Not while a
-                // question card is pending (its answer is a note, never
-                // skill-expanded) and not mid-IME-composition.
-                if (!pickedSkill && !pendingQuestion && !composingRef.current) {
-                  const m = v.match(/^\/(\S+)\s([\s\S]*)$/);
-                  const hit = m && commands.find((command) => command.name === m[1].toLowerCase());
-                  if (hit) {
-                    setPickedSkill(hit);
-                    setDraft(m[2]);
-                    setComposerCursor(m[2].length);
-                    setSkillMenuDismissed(false);
-                    return;
-                  }
                 }
                 setDraft(v);
                 setSkillMenuDismissed(false);
@@ -6184,17 +6162,11 @@ export function ChatPanel({
                     return;
                   }
                 }
-                // Backspace at the very start deletes the command chip.
-                // (Escape deliberately doesn't touch the chip — it's the
+                // Backspace just behind a chip deletes the whole command.
+                // (Escape deliberately doesn't touch it — that's the
                 // stop-the-turn gesture, see the document listener above.)
-                if (
-                  pickedSkill &&
-                  e.key === "Backspace" &&
-                  e.currentTarget.selectionStart === 0 &&
-                  e.currentTarget.selectionEnd === 0
-                ) {
+                if (e.key === "Backspace" && deleteCommandBehindCaret(e.currentTarget)) {
                   e.preventDefault();
-                  removeSkillChip();
                   return;
                 }
                 if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
@@ -6202,6 +6174,19 @@ export function ChatPanel({
                   void send({ queue: e.metaKey || e.ctrlKey });
                 }
               }}
+            />
+            {commandHint && (
+              <span id="composer-command-hint" className="sr-only">
+                {commandHint}
+              </span>
+            )}
+            {/* After the textarea: its ref must be attached before the mirror
+              * measures it. */}
+            <ComposerSkillChips
+              text={draft}
+              hint={commandHint}
+              isCommand={knownCommand}
+              textareaRef={composerRef}
             />
           </div>
           <div className="composer-actions flex min-w-0 justify-end items-center gap-2 pt-1.5 px-2 pb-2">
@@ -6293,10 +6278,7 @@ export function ChatPanel({
                 onClick={() => void send()}
                 disabled={
                   !activeHarness?.agentReady ||
-                  (!pickedSkill &&
-                    !draft.trim() &&
-                    attachments.length === 0 &&
-                    annotations.length === 0)
+                  (!draft.trim() && attachments.length === 0 && annotations.length === 0)
                 }
               >
                 <CornerDownLeft size={16} />
