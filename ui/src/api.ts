@@ -1296,6 +1296,7 @@ export interface ChatToolState {
   status: "running" | "completed" | "error";
   input?: {
     command?: string;
+    commandArgv?: string[];
     filePath?: string;
     description?: string;
     retryOwner?: "native" | "orx";

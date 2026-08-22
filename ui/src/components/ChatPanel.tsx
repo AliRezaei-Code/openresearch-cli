@@ -88,7 +88,13 @@ import {
   recoveryTurnOptions,
   retryStatusLabel,
 } from "../chatRecovery";
-import { orxArgsMatch, orxArgv, shellWords, unwrapShellBody } from "../orxCommand";
+import {
+  orxArgsMatch,
+  orxArgv,
+  shellWords,
+  shellWrapperBody,
+  unwrapShellBody,
+} from "../orxCommand";
 import { LitSourceLogo, parseOrxLit, paperUrl } from "./LitSourceLogo";
 import { LitSourcesList } from "./LitSourcesPicker";
 import { Md } from "./Md";
@@ -1005,6 +1011,17 @@ function inputStringArray(input: Record<string, unknown>, key: string): string[]
   return strings;
 }
 
+function exactInputStringArray(input: Record<string, unknown>, key: string): string[] | null {
+  const values = input[key];
+  if (!Array.isArray(values)) return null;
+  const strings: string[] = [];
+  for (const value of values) {
+    if (typeof value !== "string") return null;
+    strings.push(value);
+  }
+  return strings;
+}
+
 function normalizedTargetIds(...collections: string[][]): string[] {
   const ids = new Set<string>();
   const target = new RegExp(`^${RUN_TARGET_PATTERN}$`, "i");
@@ -1050,6 +1067,10 @@ function meaningfulCommand(command: string): string {
   const wrapped = trimmed.match(/^\/bin\/(?:ba|z)?sh\s+-lc\s+([\s\S]+)$/);
   let body = (wrapped?.[1] ?? trimmed).trim();
   body = unwrapShellBody(body);
+  return normalizeShellBody(body);
+}
+
+function normalizeShellBody(body: string): string {
   return stripHeredocBodies(body).replace(/[\t\r ]+/g, " ").trim();
 }
 
@@ -1566,6 +1587,7 @@ function toolActivity(part: ChatPart): ToolActivity {
     : {};
   const normalizedInput = { ...input, ...argumentsInput };
   const rawCommand = inputString(normalizedInput, "command", "cmd");
+  const commandArgv = exactInputStringArray(normalizedInput, "commandArgv");
   const toolOutput = part.state?.output || part.state?.error;
   const legacyTargetIds = normalizedTargetIds(inputStringArray(normalizedInput, "targetIds"));
   const resourceRunIds = normalizedTargetIds(inputStringArray(normalizedInput, "runTargetIds"));
@@ -1601,16 +1623,23 @@ function toolActivity(part: ChatPart): ToolActivity {
   ]).get(baseTool) ?? baseTool;
   switch (normalizedTool) {
     case "bash": {
-      if (!rawCommand) return { kind: "command", label: "Ran a command" };
-      const command = meaningfulCommand(rawCommand);
+      if (!rawCommand && !commandArgv?.length) return { kind: "command", label: "Ran a command" };
+      const command = meaningfulCommand(rawCommand ?? commandArgv?.join(" ") ?? "");
       const shellSegments = shellCommandSegments(command);
+      let literatureInputs: Array<string | readonly string[]> = shellSegments.map((segment) => segment.raw);
+      if (commandArgv?.length) {
+        const wrapperBody = shellWrapperBody(commandArgv);
+        literatureInputs = wrapperBody === null
+          ? [commandArgv]
+          : shellCommandSegments(normalizeShellBody(wrapperBody)).map((segment) => segment.raw);
+      }
       let litCall: ReturnType<typeof parseOrxLit> = null;
-      for (const segment of shellSegments) {
-        litCall = parseOrxLit(segment.raw);
+      for (const input of literatureInputs) {
+        litCall = parseOrxLit(input);
         if (litCall) break;
       }
-      const hasNonLiteratureOrx = shellSegments.some((segment) => {
-        const argv = orxArgv(segment.raw);
+      const hasNonLiteratureOrx = literatureInputs.some((input) => {
+        const argv = orxArgv(input);
         return argv !== null && argv[0] !== "discover" && argv[0] !== "paper";
       });
       if (litCall && !hasNonLiteratureOrx) {

@@ -3,8 +3,10 @@ import test from "node:test";
 import {
   orxArgsMatch,
   orxArgv,
+  orxArgvFromTokens,
   parseOrxLit,
   shellWords,
+  shellWrapperBody,
   unwrapShellBody,
 } from "../src/orxCommand.ts";
 
@@ -35,6 +37,15 @@ test("quoted Codex argv is tokenized as a normal command", () => {
 test("outer shell quotes do not consume quoted argv", () => {
   assert.equal(unwrapShellBody("'orx projects'"), "orx projects");
   assert.equal(unwrapShellBody('"orx" "projects"'), '"orx" "projects"');
+  const serialized = String.raw`"orx discover keyword \"Scaling Laws for Neural Language Models\" --limit 5"`;
+  const decoded = unwrapShellBody(serialized);
+  assert.equal(decoded, 'orx discover keyword "Scaling Laws for Neural Language Models" --limit 5');
+  assert.deepEqual(parseOrxLit(decoded), {
+    kind: "discover",
+    source: "alphaxiv",
+    strategy: "keyword",
+    query: "Scaling Laws for Neural Language Models",
+  });
   const command = unwrapShellBody('"orx" "discover" "keyword" "biology agent benchmark"');
   assert.deepEqual(parseOrxLit(command), {
     kind: "discover",
@@ -46,6 +57,59 @@ test("outer shell quotes do not consume quoted argv", () => {
 
 test("tokenization stops at shell operators", () => {
   assert.deepEqual(shellWords('orx projects && echo ignored'), ["orx", "projects"]);
+  assert.deepEqual(shellWords(String.raw`foo\
+bar`), ["foobar"]);
+  assert.deepEqual(shellWords(String.raw`\
+`), []);
+});
+
+test("double-quoted backslashes survive before ordinary characters", () => {
+  const command = String.raw`orx discover keyword "C:\models\papers"`;
+  assert.deepEqual(shellWords(command), ["orx", "discover", "keyword", String.raw`C:\models\papers`]);
+  assert.deepEqual(parseOrxLit(command), {
+    kind: "discover",
+    source: "alphaxiv",
+    strategy: "keyword",
+    query: String.raw`C:\models\papers`,
+  });
+  assert.deepEqual(
+    shellWords(String.raw`orx discover keyword "a\\b \$x"`),
+    ["orx", "discover", "keyword", String.raw`a\b $x`],
+  );
+});
+
+test("structured argv preserves query boundaries and shell bodies", () => {
+  const direct = ["env", "ORX_DATA_DIR=/tmp", "command", "/usr/local/bin/orx", "discover", "keyword", "multi word query"];
+  assert.deepEqual(orxArgvFromTokens(direct), ["discover", "keyword", "multi word query"]);
+  assert.deepEqual(parseOrxLit(direct), {
+    kind: "discover",
+    source: "alphaxiv",
+    strategy: "keyword",
+    query: "multi word query",
+  });
+
+  const body = 'orx discover openalex "protein folding" --limit 20';
+  const wrappedBody = shellWrapperBody(["/bin/zsh", "-lc", body]);
+  assert.equal(wrappedBody, body);
+  assert.equal(shellWrapperBody(["/bin/zsh", "-c", body]), null);
+  if (wrappedBody === null) assert.fail("expected a shell body");
+  assert.deepEqual(parseOrxLit(wrappedBody), {
+    kind: "discover",
+    source: "openalex",
+    strategy: "openalex",
+    query: "protein folding",
+  });
+});
+
+test("orx text outside command position is ignored", () => {
+  for (const command of [
+    'echo "orx discover keyword hidden"',
+    'node -e \'console.log("orx discover keyword hidden")\'',
+    'printf \'{"command":"orx discover keyword hidden"}\'',
+    '# orx discover keyword hidden',
+  ]) {
+    assert.equal(parseOrxLit(command), null);
+  }
 });
 
 test("paper discovery commands expose their strategy and query", () => {

@@ -993,9 +993,11 @@ fn apply_notification(ctx: &mut TurnCtx, method: &str, params: &Value) -> Option
                 ctx.push_error(message);
             }
         }
-        "guardianWarning" => {
-            if let Some(message) = params.get("message").and_then(Value::as_str) {
-                ctx.push_error(message.to_string());
+        // Codex 0.144 emits this before the typed review event; ignoring it avoids duplicate rows.
+        "guardianWarning" => {}
+        "item/autoApprovalReview/started" | "item/autoApprovalReview/completed" => {
+            if let Some(message) = guardian_review_failure(params) {
+                ctx.push_error(message);
             }
         }
         "turn/completed" => {
@@ -1279,6 +1281,9 @@ fn item_to_part(item: &Value, completed: bool, prior: &[WirePart]) -> Option<Wir
             let mut input = serde_json::json!({
                 "command": item.get("command").map(command_string).unwrap_or_default(),
             });
+            if let Some(argv) = item.get("command").and_then(command_argv) {
+                input["commandArgv"] = serde_json::json!(argv);
+            }
             if let Some(cwd) = item.get("cwd").and_then(Value::as_str) {
                 input["cwd"] = Value::String(cwd.to_string());
             }
@@ -3153,6 +3158,46 @@ fn command_string(v: &Value) -> String {
     }
 }
 
+fn command_argv(v: &Value) -> Option<Vec<String>> {
+    let Value::Array(parts) = v else {
+        return None;
+    };
+    if parts.is_empty() {
+        return None;
+    }
+    parts
+        .iter()
+        .map(|part| part.as_str().map(str::to_string))
+        .collect()
+}
+
+fn guardian_review_failure(params: &Value) -> Option<String> {
+    let review = params.get("review");
+    let status = review
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str);
+    if matches!(status, Some("inProgress") | Some("approved")) {
+        return None;
+    }
+    if let Some(rationale) = review
+        .and_then(|value| value.get("rationale"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(rationale.to_string());
+    }
+    Some(
+        match status {
+            Some("denied") => "Automatic approval review denied.",
+            Some("timedOut") => "Automatic approval review timed out.",
+            Some("aborted") => "Automatic approval review aborted.",
+            _ => "Automatic approval review failed.",
+        }
+        .to_string(),
+    )
+}
+
 // --- legacy exec path (codex < 0.144, and ORX_CODEX_EXEC=1) -------------------
 
 /// Session mode → Codex `exec` sandbox policy. `codex exec` can't prompt for
@@ -4359,6 +4404,76 @@ requires_openai_auth = false
         assert_eq!(state.output.as_deref(), Some("final"));
     }
 
+    #[test]
+    fn command_execution_preserves_structured_argv() {
+        let array_part = item_to_part(
+            &serde_json::json!({
+                "type": "commandExecution",
+                "id": "c1",
+                "command": ["/bin/zsh", "-lc", "orx discover keyword \"multi word query\""]
+            }),
+            false,
+            &[],
+        )
+        .unwrap();
+        let array_input = array_part.state.unwrap().input.unwrap();
+        assert_eq!(
+            array_input["command"],
+            "/bin/zsh -lc orx discover keyword \"multi word query\""
+        );
+        assert_eq!(
+            array_input["commandArgv"],
+            serde_json::json!([
+                "/bin/zsh",
+                "-lc",
+                "orx discover keyword \"multi word query\""
+            ])
+        );
+
+        let string_part = item_to_part(
+            &serde_json::json!({
+                "type": "commandExecution",
+                "id": "c2",
+                "command": "orx projects"
+            }),
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            string_part.state.unwrap().input.unwrap()["commandArgv"].is_null(),
+            "string commands keep the legacy wire shape"
+        );
+
+        let malformed_part = item_to_part(
+            &serde_json::json!({
+                "type": "commandExecution",
+                "id": "c3",
+                "command": ["orx", 7, "projects"]
+            }),
+            false,
+            &[],
+        )
+        .unwrap();
+        let malformed_input = malformed_part.state.unwrap().input.unwrap();
+        assert_eq!(malformed_input["command"], "orx projects");
+        assert!(malformed_input["commandArgv"].is_null());
+
+        let empty_part = item_to_part(
+            &serde_json::json!({
+                "type": "commandExecution",
+                "id": "c4",
+                "command": []
+            }),
+            false,
+            &[],
+        )
+        .unwrap();
+        let empty_input = empty_part.state.unwrap().input.unwrap();
+        assert_eq!(empty_input["command"], "");
+        assert!(empty_input["commandArgv"].is_null());
+    }
+
     /// The live spike's approval request (trimmed) → a permission card whose
     /// native_id round-trips the JSON-RPC id, plus the decision mapping.
     #[test]
@@ -4500,17 +4615,87 @@ requires_openai_auth = false
     }
 
     #[test]
-    fn guardian_warning_surfaces_message() {
+    fn guardian_approval_reviews_use_typed_statuses() {
         let mut ctx = TurnCtx::test_stub();
         apply_notification(
             &mut ctx,
             "guardianWarning",
             &serde_json::json!({"message":"Automatic review stopped this turn."}),
         );
-        let warning = ctx.assistant.parts[0].state.as_ref().unwrap();
+        apply_notification(
+            &mut ctx,
+            "item/autoApprovalReview/started",
+            &serde_json::json!({"review":{"status":"inProgress","rationale":null}}),
+        );
+        apply_notification(
+            &mut ctx,
+            "item/autoApprovalReview/completed",
+            &serde_json::json!({"review":{"status":"approved","rationale":"Safe."}}),
+        );
+        assert!(ctx.assistant.parts.is_empty());
+
+        apply_notification(
+            &mut ctx,
+            "item/autoApprovalReview/completed",
+            &serde_json::json!({"review":{"status":"denied","rationale":"Blocked by policy."}}),
+        );
+        assert_eq!(ctx.assistant.parts.len(), 1);
         assert_eq!(
-            warning.error.as_deref(),
-            Some("Automatic review stopped this turn.")
+            ctx.assistant.parts[0]
+                .state
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("Blocked by policy.")
+        );
+    }
+
+    #[test]
+    fn guardian_terminal_reviews_have_deterministic_fallbacks() {
+        for (status, expected) in [
+            ("denied", "Automatic approval review denied."),
+            ("timedOut", "Automatic approval review timed out."),
+            ("aborted", "Automatic approval review aborted."),
+            ("futureStatus", "Automatic approval review failed."),
+        ] {
+            let mut ctx = TurnCtx::test_stub();
+            apply_notification(
+                &mut ctx,
+                "guardianWarning",
+                &serde_json::json!({"message":"duplicate untyped notice"}),
+            );
+            apply_notification(
+                &mut ctx,
+                "item/autoApprovalReview/completed",
+                &serde_json::json!({"review":{"status":status,"rationale":"  "}}),
+            );
+            assert_eq!(ctx.assistant.parts.len(), 1);
+            assert_eq!(
+                ctx.assistant.parts[0]
+                    .state
+                    .as_ref()
+                    .unwrap()
+                    .error
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+
+        let mut missing = TurnCtx::test_stub();
+        apply_notification(
+            &mut missing,
+            "item/autoApprovalReview/completed",
+            &serde_json::json!({"review":{}}),
+        );
+        assert_eq!(
+            missing.assistant.parts[0]
+                .state
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("Automatic approval review failed.")
         );
     }
 
