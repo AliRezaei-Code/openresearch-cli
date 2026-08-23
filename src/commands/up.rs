@@ -1072,6 +1072,8 @@ struct CreateProjectReq {
     #[serde(default)]
     create_folder: bool,
     #[serde(default)]
+    require_new_folder: bool,
+    #[serde(default)]
     initialize_git: bool,
     github_sync_enabled: Option<bool>,
 }
@@ -1092,6 +1094,7 @@ async fn create_project(
     }
     let path = req.path;
     let create_folder = req.create_folder;
+    let require_new_folder = req.require_new_folder;
     let initialize_git = req.initialize_git;
     let clone_url = req.clone_url.filter(|url| !url.trim().is_empty());
     let paper_id = req
@@ -1126,6 +1129,7 @@ async fn create_project(
             &path,
             local::projects::CreateProjectOptions {
                 create_folder,
+                require_new_folder,
                 initialize_git,
                 clone_url,
                 shallow_clone,

@@ -64,12 +64,26 @@ const PAPER_PDF_NAME: &str = "paper.pdf";
 fn prepare_path(
     path: &str,
     create_folder: bool,
+    require_new_folder: bool,
     initialize_git: bool,
     clone_url: Option<&str>,
     shallow_clone: bool,
     paper_pdf: Option<&[u8]>,
 ) -> Result<PathBuf> {
     let path = expand_path(path)?;
+    if require_new_folder && !path.exists() {
+        let existing_parent = path
+            .parent()
+            .and_then(|parent| parent.ancestors().find(|ancestor| ancestor.is_dir()));
+        if let Some(parent) = existing_parent {
+            if git::repository_state(parent) != git::RepositoryState::NotRepository {
+                return Err(crate::error::anyhow!(
+                    "{} is already inside a Git repository; a blank project needs a folder of its own",
+                    path.display()
+                ));
+            }
+        }
+    }
     if let Some(url) = clone_url.map(str::trim).filter(|url| !url.is_empty()) {
         if path.exists() {
             let mut entries = std::fs::read_dir(&path)?;
@@ -84,6 +98,11 @@ fn prepare_path(
         }
         git::clone_public(url, &path, shallow_clone)?;
         git::rename_origin_to_upstream(&path)?;
+    } else if require_new_folder && path.exists() {
+        return Err(crate::error::anyhow!(
+            "{} already exists; choose a new folder for a blank project",
+            path.display()
+        ));
     } else if !path.exists() {
         if !create_folder {
             return Err(crate::error::anyhow!(
@@ -115,6 +134,12 @@ fn prepare_path(
     if paper_pdf.is_some() && repository_state != git::RepositoryState::NotRepository {
         return Err(crate::error::anyhow!(
             "{} is already inside a Git repository; a paper project needs a folder of its own",
+            path.display()
+        ));
+    }
+    if require_new_folder && repository_state != git::RepositoryState::NotRepository {
+        return Err(crate::error::anyhow!(
+            "{} is already inside a Git repository; a blank project needs a folder of its own",
             path.display()
         ));
     }
@@ -153,6 +178,7 @@ pub fn create_project(
 ) -> Result<LocalProject> {
     let CreateProjectOptions {
         create_folder,
+        require_new_folder,
         initialize_git,
         clone_url,
         shallow_clone,
@@ -164,6 +190,7 @@ pub fn create_project(
     let repo_path = prepare_path(
         path,
         create_folder,
+        require_new_folder,
         initialize_git,
         clone_url.as_deref(),
         shallow_clone,
@@ -205,6 +232,7 @@ pub fn create_project(
 #[derive(Default)]
 pub struct CreateProjectOptions {
     pub create_folder: bool,
+    pub require_new_folder: bool,
     pub initialize_git: bool,
     pub clone_url: Option<String>,
     pub shallow_clone: bool,
@@ -300,6 +328,84 @@ mod tests {
             std::fs::canonicalize(&project_path).unwrap()
         );
         assert!(git::remotes(&project_path).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_an_existing_folder_for_a_blank_project() {
+        let root = root();
+        let store = Store::open_at(root.join("data")).unwrap();
+        let project_path = root.join("project");
+        std::fs::create_dir_all(&project_path).unwrap();
+
+        let error = create_project(
+            &store,
+            "Blank project",
+            project_path.to_str().unwrap(),
+            CreateProjectOptions {
+                create_folder: true,
+                require_new_folder: true,
+                initialize_git: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("choose a new folder"));
+        assert!(store.list_local_projects().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn create_folder_permission_still_accepts_an_existing_folder() {
+        let root = root();
+        let store = Store::open_at(root.join("data")).unwrap();
+        let project_path = root.join("project");
+        std::fs::create_dir_all(&project_path).unwrap();
+
+        let project = create_project(
+            &store,
+            "Existing project",
+            project_path.to_str().unwrap(),
+            CreateProjectOptions {
+                create_folder: true,
+                initialize_git: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            Path::new(&project.repo_path),
+            std::fs::canonicalize(project_path).unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_blank_project_nested_in_an_existing_repository() {
+        let root = root();
+        let repository = root.join("repository");
+        initialized(&repository);
+        let project_path = repository.join("blank-project");
+        let store = Store::open_at(root.join("data")).unwrap();
+
+        let error = create_project(
+            &store,
+            "Blank project",
+            project_path.to_str().unwrap(),
+            CreateProjectOptions {
+                create_folder: true,
+                require_new_folder: true,
+                initialize_git: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("folder of its own"));
+        assert!(store.list_local_projects().unwrap().is_empty());
+        assert!(!project_path.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 

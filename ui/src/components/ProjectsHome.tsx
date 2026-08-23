@@ -31,7 +31,7 @@ export function NewProjectDialog({
       [...dialog.querySelectorAll<HTMLElement>(
         'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
       )];
-    (focusable()[0] ?? dialog).focus();
+    (dialog.querySelector<HTMLElement>("[data-initial-focus]") ?? focusable()[0] ?? dialog).focus();
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
@@ -77,14 +77,14 @@ export function NewProjectDialog({
 
   return (
     <div
-      className="modal-backdrop fixed inset-0 bg-[rgba(29,_27,_26,_0.42)] flex items-center justify-center p-5 overflow-y-auto z-100"
+      className="modal-backdrop fixed inset-0 bg-[rgba(29,_27,_26,_0.42)] flex items-start justify-center p-5 [--new-project-modal-top:clamp(4rem,20vh,24rem)] pt-[var(--new-project-modal-top)] overflow-y-auto z-100"
       onClick={(event) => {
         if (event.target === event.currentTarget) onClose();
       }}
     >
       <div
         ref={dialogRef}
-        className="modal w-120 max-w-full max-h-[calc(100vh_-_40px)] overflow-y-auto bg-background border border-border rounded-xl shadow-[0_24px_60px_rgba(0,_0,_0,_0.22)] p-6 [&_h2]:mt-0 [&_h2]:mx-0 [&_h2]:mb-3.5 [&_h2]:text-xl"
+        className="modal w-120 max-w-full max-h-[calc(100vh_-_var(--new-project-modal-top)_-_1.25rem)] overflow-y-auto bg-background border border-border rounded-xl shadow-[0_24px_60px_rgba(0,_0,_0,_0.22)] p-6 [&_h2]:mt-0 [&_h2]:mx-0 [&_h2]:mb-3.5 [&_h2]:text-xl [&_h2]:font-medium"
         role="dialog"
         aria-modal="true"
         aria-labelledby="new-project-dialog-title"
