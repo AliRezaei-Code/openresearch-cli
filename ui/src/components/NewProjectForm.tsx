@@ -662,7 +662,7 @@ export function NewProjectForm({
             : mode === "paper"
               ? paper?.repoUrl
                 ? "Clone paper project"
-                : "Create paper project"
+                : "Create project"
               : mode === "folder"
                 ? "Use folder"
                 : "Create project"}
