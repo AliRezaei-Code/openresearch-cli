@@ -177,6 +177,7 @@ export interface NewProject {
   paperId?: string;
   cloneUrl?: string;
   createFolder?: boolean;
+  requireNewFolder?: boolean;
   initializeGit?: boolean;
   githubSyncEnabled?: boolean;
 }
