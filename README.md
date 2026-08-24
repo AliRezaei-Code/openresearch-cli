@@ -1,11 +1,13 @@
 <div align="center">
 
-# OpenResearch
+<h1><img src=".github/readme-assets/openresearch.svg" alt="" width="36" /> OpenResearch</h1>
 
 **The local-first workspace for research agents and autoresearch.**
 
-Turn Claude Code, Codex, or OpenCode into research agents that can review
-literature, develop hypotheses, run experiments, and produce research artifacts.
+<p>Turn <img src=".github/readme-assets/claude.svg" alt="" width="18" /> Claude Code,
+<img src=".github/readme-assets/codex.svg" alt="" width="18" /> Codex, or
+<img src=".github/readme-assets/opencode.svg" alt="" width="18" /> OpenCode into research agents that can review
+literature, develop hypotheses, run experiments, and produce research artifacts.</p>
 
 [Download the desktop app](https://openresearch.sh/download) ·
 [Documentation](https://openresearch.sh/docs) ·
