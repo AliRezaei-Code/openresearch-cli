@@ -37,6 +37,7 @@ export const HARNESS_LABELS: Record<HarnessId, string> = {
   "claude-code": "Claude Code",
   codex: "Codex",
   opencode: "OpenCode",
+  "oh-my-pi": "Oh My Pi",
 };
 
 /** First harness that can actually run — the fallback when nothing is picked.
@@ -165,8 +166,9 @@ export function ModelPicker({
     return shown.map((h) => {
       let models = h.models;
       if (q) models = models.filter((m) => m.id.toLowerCase().includes(q));
-      // opencode's long tail (openrouter etc.) stays behind the filter box.
-      else if (h.id === "opencode") models = models.slice(0, 6);
+      // opencode's long tail (openrouter etc.) stays behind the filter box;
+      // omp's catalog is the same size, so it gets the same treatment.
+      else if (h.id === "opencode" || h.id === "oh-my-pi") models = models.slice(0, 6);
       return { harness: h, models, hidden: q ? 0 : h.models.length - models.length };
     });
   }, [harnesses, filter, lockHarness, value]);
@@ -218,7 +220,8 @@ export function ModelPicker({
   const reasoningLabel = reasoningChoices.find((choice) => choice.id === effectiveReasoningId)?.label;
   const effectivePermissionId = value?.permissionMode ?? defaultPermissionId ?? permissionChoices[0]?.id;
   const permissionLabel = permissionChoices.find((choice) => choice.id === effectivePermissionId)?.label;
-  const reasoningAxisLabel = value?.harness === "opencode" ? "Variant" : "Effort";
+  const reasoningAxisLabel =
+    value?.harness === "opencode" || value?.harness === "oh-my-pi" ? "Variant" : "Effort";
   const selectedHarness = harnesses.find((harness) => harness.id === value?.harness);
   const speedChoices = serviceTiersFor(selectedHarness, value?.model);
   const effectiveServiceTier = reconcileServiceTier(
