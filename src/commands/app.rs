@@ -42,6 +42,178 @@ pub fn launched_as_app_bundle() -> bool {
     is_bundle_exe_launch(&exe, std::env::args_os().next().as_deref())
 }
 
+/// The Linux desktop app root marker: `build-linux-app.sh` drops this file in
+/// the app dir so neither the launch check nor the update-channel detector
+/// needs to know where an install lives (it can be `~/.local/share/
+/// openresearch/app`, `/opt/openresearch`, or anything else).
+pub(crate) const LINUX_APP_MARKER: &str = ".openresearch-app";
+
+/// True when `exe` sits in `<root>/bin/` and the root carries the app marker.
+/// Mirrors `updates::linux_app_root`, which classifies the same install for
+/// self-update; both must agree or an app install is silently a CLI forever.
+#[cfg(target_os = "linux")]
+fn linux_app_root(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let bin = exe.parent()?;
+    if bin.file_name() != Some(std::ffi::OsStr::new("bin")) {
+        return None;
+    }
+    let root = bin.parent()?;
+    root.join(LINUX_APP_MARKER)
+        .is_file()
+        .then(|| root.to_path_buf())
+}
+
+/// Whether to enter GUI app mode on Linux. Same shape as macOS: the real
+/// executable is `bin/openresearch` (launched by the `.desktop` entry with no
+/// arguments), while `bin/orx` is a symlink to the same file that stays a
+/// plain CLI because its argv0 name differs from the resolved executable name.
+#[cfg(target_os = "linux")]
+pub fn launched_as_app_bundle() -> bool {
+    let Ok(exe) = std::env::current_exe().and_then(|exe| exe.canonicalize()) else {
+        return false;
+    };
+    let in_bundle = linux_app_root(&exe).is_some();
+    let invoked_as_bundle_exe = std::env::args_os()
+        .next()
+        .as_deref()
+        .map(std::path::Path::new)
+        .and_then(std::path::Path::file_name)
+        == exe.file_name();
+    in_bundle && invoked_as_bundle_exe
+}
+
+/// Enter GUI app mode on Linux: adopt the user's shell environment, take the
+/// lifecycle lock, focus an already-running dashboard if one is reachable,
+/// then start the dashboard server on an ephemeral loopback port, open the
+/// default browser, and block until the desktop session asks us to quit.
+/// There is no native run loop like AppKit's — parking on SIGINT/SIGTERM is
+/// the Linux equivalent of `imp::run_event_loop`.
+#[cfg(target_os = "linux")]
+pub async fn run() {
+    // First: everything below resolves a directory the probe can still change.
+    // The lock lives under `config_dir()`, so taking it earlier would lock the
+    // default path while the CLI locks the user's `XDG_CONFIG_HOME` one —
+    // protecting nothing at all.
+    hydrate_shell_env().await;
+    // App mode returns before `dispatch`, which is where `orx up` takes this
+    // same read lock. Without it `orx delete` from a CLI install sees no
+    // reader and wipes the store out from under a running app.
+    let lifecycle = crate::store::open_lifecycle_lock()
+        .inspect_err(|err| eprintln!("openresearch app: could not open the lifecycle lock: {err}"))
+        .ok();
+    let _lifecycle_guard = lifecycle.as_ref().and_then(|lock| {
+        lock.read()
+            .inspect_err(|err| {
+                eprintln!("openresearch app: could not hold the lifecycle lock: {err}")
+            })
+            .ok()
+    });
+
+    // Re-launch while a dashboard is up: raise the existing one and exit
+    // instead of starting a second server (the macOS Dock-click analogue; the
+    // desktop's launcher has no reopen event).
+    if let Some(existing) = live_app_port() {
+        crate::browser::open_browser(&format!("http://127.0.0.1:{existing}/"));
+        return;
+    }
+    // Ephemeral loopback port so the app never collides with a terminal
+    // `orx up`. Bind-then-drop to reserve it; the tiny race is harmless locally.
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .unwrap_or(4791);
+    write_app_port(port);
+    let url = format!("http://127.0.0.1:{port}/");
+
+    // Dashboard server on background workers (we're inside main's runtime).
+    tokio::spawn(async move {
+        let args = crate::UpArgs {
+            port,
+            remote: None,
+            no_browser: true,
+            no_agent: false,
+            model: None,
+        };
+        if let Err(err) = crate::commands::up::run(args).await {
+            eprintln!("openresearch app: dashboard server exited: {err}");
+        }
+        remove_app_port();
+    });
+
+    // Open the browser once the server accepts connections.
+    let ready_url = url.clone();
+    tokio::spawn(async move {
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                crate::browser::open_browser(&ready_url);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    });
+
+    // Block until the desktop session (or a terminal Ctrl-C) quits us; the
+    // spawned tasks die with the runtime right after `main` returns.
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate_signal() => {}
+    }
+    remove_app_port();
+}
+
+/// The file recording the running app's loopback port, plus its pid. Lives in
+/// the shared store dir; the CLI never reads it, so coexistence is unaffected.
+#[cfg(target_os = "linux")]
+fn app_port_path() -> std::path::PathBuf {
+    crate::store::data_dir().join("app-port")
+}
+
+#[cfg(target_os = "linux")]
+fn write_app_port(port: u16) {
+    use std::io::Write;
+    let _ = std::fs::create_dir_all(crate::store::data_dir());
+    let line = format!("{port} {}\n", std::process::id());
+    if std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(app_port_path())
+        .and_then(|mut f| f.write_all(line.as_bytes()))
+        .is_err()
+    {
+        eprintln!("openresearch app: could not record the dashboard port");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn remove_app_port() {
+    let _ = std::fs::remove_file(app_port_path());
+}
+
+/// The port of a live app dashboard, if any. A stale file (crash, reboot)
+/// fails the TCP probe and is treated as absent — a fresh server then
+/// overwrites it. The probe is bounded so a dead-but-listening port can't hang
+/// the launch.
+#[cfg(target_os = "linux")]
+fn live_app_port() -> Option<u16> {
+    let text = std::fs::read_to_string(app_port_path()).ok()?;
+    let port: u16 = text.split_whitespace().next()?.parse().ok()?;
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300))
+        .ok()?;
+    Some(port)
+}
+
+#[cfg(target_os = "linux")]
+async fn terminate_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+    term.recv().await;
+}
+
 /// Enter GUI app mode: adopt the user's shell PATH, pick a free port, start the
 /// dashboard server on background threads, and hand the main thread to the
 /// AppKit run loop. Returns only when the user quits the app (usually the
@@ -70,8 +242,11 @@ pub async fn run() {
     imp::run_event_loop(format!("http://127.0.0.1:{port}/"), port);
 }
 
-/// Adopt the user's shell environment in place of the one launchd handed us
-/// (see [`crate::local::shell_env`]).
+/// Adopt the user's shell environment in place of the one the desktop session
+/// handed us (see [`crate::local::shell_env`]). Applies to both desktop apps:
+/// Finder/launchd on macOS and the desktop launcher on Linux both start with a
+/// minimal `PATH` and no shell rc, which is exactly where `codex`/`omp` and the
+/// `orx`-visible exports live.
 ///
 /// `-ilc`, not `-lc`: zsh reads `.zshrc` only for *interactive* shells, and
 /// that is where these exports overwhelmingly live. The inner `sh -c` keeps the
@@ -79,13 +254,17 @@ pub async fn run() {
 /// inherited, where fish would have printed its own list-valued `$PATH`
 /// space-separated. NUL separates them because a PATH or a directory may
 /// contain spaces, colons, and newlines, but never NUL.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) async fn hydrate_shell_env() {
     // Nonce, so rc-file chatter can't forge the fence around the values. The
     // leading `_` is load-bearing: `printf` reads `\0` plus up to three octal
     // digits, so a marker starting with a digit would be eaten by the escape.
     let marker = format!("__ORX_ENV_{}__", uuid::Uuid::new_v4().simple());
-    let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
+    #[cfg(target_os = "macos")]
+    let default_shell = "/bin/zsh";
+    #[cfg(target_os = "linux")]
+    let default_shell = "/bin/bash";
+    let shell = std::env::var_os("SHELL").unwrap_or_else(|| default_shell.into());
     let reads = crate::local::shell_env::IMPORTED
         .map(|key| format!(r#""${key}""#))
         .join(" ");

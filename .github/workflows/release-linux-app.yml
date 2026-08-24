@@ -1,0 +1,74 @@
+# Attaches the Linux desktop app (OpenResearch-linux-<arch>.tar.gz) to a
+# GitHub Release, right after the CLI's own release assets.
+#
+# Simpler than the macOS pipeline on purpose: no signing environment, no
+# notarization, no workflow_run cascade — Linux apps trust the published
+# checksum (see src/updates/linux_app.rs), so a plain `release: published`
+# trigger is sufficient, and a manual `workflow_dispatch` covers re-attaching
+# to a release that missed it.
+#
+# linux-app.json is what the app's self-updater reads; it must never be
+# published without — or ahead of — the tarball it describes, so the upload
+# order here is: delete a stale manifest, upload the tarball, then publish the
+# new manifest.
+
+name: Attach Linux app to release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to attach the Linux app to (e.g. v0.1.99)
+        required: true
+        type: string
+
+permissions:
+  contents: write # upload release assets
+
+concurrency:
+  group: release-linux-app
+  cancel-in-progress: false
+
+jobs:
+  linux-app:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build and package the app
+        run: |
+          bash scripts/build-linux-app.sh
+          bash scripts/package-linux-app.sh
+
+      - name: Upload the tarball and its manifest to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
+          arch="$(case "$(uname -m)" in x86_64) echo x86_64 ;; aarch64) echo aarch64 ;; *) echo unknown ;; esac)"
+          asset="OpenResearch-linux-${arch}.tar.gz"
+          shasum=''
+          gh release delete-asset "$TAG" linux-app.json --yes 2>/dev/null || true
+          gh release upload "$TAG" "dist/$asset" "dist/$asset.sha256" --clobber
+          shasum="$(cat "dist/$asset.sha256")"
+          jq -n \
+            --arg version "$version" \
+            --arg tag "$TAG" \
+            --arg asset "$asset" \
+            --arg sha256 "$shasum" \
+            '$ARGS.named' > dist/linux-app.json
+          cat dist/linux-app.json
+          gh release upload "$TAG" dist/linux-app.json --clobber

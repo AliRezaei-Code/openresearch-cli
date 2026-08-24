@@ -92,10 +92,25 @@ async fn apply(args: crate::UpdateArgs) -> Result<Outcome> {
     let target = updates::preflight(args.force)?;
 
     let receipt = match target {
+        // The two desktop apps share one swap shape but live in per-OS modules
+        // (different trust models, different asset formats).
         UpdateTarget::AppBundle(root) => {
-            return updates::macos_app::update(&root, &current, args.dry_run, args.background)
-                .await
-                .map(|_| Outcome::Done)
+            #[cfg(target_os = "macos")]
+            {
+                return updates::macos_app::update(&root, &current, args.dry_run, args.background)
+                    .await
+                    .map(|_| Outcome::Done);
+            }
+            #[cfg(target_os = "linux")]
+            {
+                return updates::linux_app::update(&root, &current, args.dry_run, args.background)
+                    .await
+                    .map(|_| Outcome::Done);
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                unreachable!("AppBundle update on an unsupported OS");
+            }
         }
         UpdateTarget::Installer(receipt) => receipt,
     };

@@ -759,7 +759,7 @@ async fn main() {
     // server, browser) instead of parsing CLI args. Also require an empty argv so
     // the bundled binary stays usable as a CLI (`…/MacOS/OpenResearch up`), since
     // the bundle itself launches it with no arguments. See commands::app.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     if commands::app::launched_as_app_bundle() && std::env::args_os().len() == 1 {
         // Shell hydration may change XDG_CONFIG_HOME; settle it before telemetry or the lifecycle lock.
         commands::app::hydrate_shell_env().await;

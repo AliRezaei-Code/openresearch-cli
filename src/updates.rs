@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{anyhow, Result};
 
 pub mod macos_app;
+#[cfg(target_os = "linux")]
+pub mod linux_app;
 
 /// GitHub repo the released binaries come from.
 pub const REPO_URL: &str = "https://github.com/alphaXiv/openresearch-cli";
@@ -208,8 +210,8 @@ pub fn exe_matches_prefix(exe: &Path, prefix: &Path) -> bool {
 // ---------------------------------------------------------------------------
 
 /// How this orx got onto the machine — which decides whether it may replace
-/// itself, and with what. Only the two channels we ship (the installer script
-/// and the macOS bundle) can self-update; everything else belongs to a package
+/// itself, and with what. Only the channels we ship (the installer script and
+/// the two desktop apps) can self-update; everything else belongs to a package
 /// manager that would be clobbered by writing over its files.
 #[derive(Debug)]
 pub enum InstallChannel {
@@ -221,6 +223,9 @@ pub enum InstallChannel {
     },
     /// The executable inside `OpenResearch.app`; the path is the bundle root.
     AppBundle(PathBuf),
+    /// The executable inside a Linux desktop app install (`<root>/bin/`); the
+    /// path is the app root. See [`linux_app_root`].
+    LinuxApp(PathBuf),
     /// `cargo install` — lands in the same `~/.cargo/bin/orx` as the installer,
     /// so only the absent receipt tells them apart.
     Cargo,
@@ -235,6 +240,7 @@ impl InstallChannel {
         match self {
             InstallChannel::Installer { .. } => "installer",
             InstallChannel::AppBundle(_) => "app-bundle",
+            InstallChannel::LinuxApp(_) => "linux-app",
             InstallChannel::Cargo => "cargo",
             InstallChannel::Homebrew => "homebrew",
             InstallChannel::Nix => "nix",
@@ -247,7 +253,9 @@ impl InstallChannel {
     pub fn self_updates(&self) -> bool {
         matches!(
             self,
-            InstallChannel::Installer { .. } | InstallChannel::AppBundle(_)
+            InstallChannel::Installer { .. }
+                | InstallChannel::AppBundle(_)
+                | InstallChannel::LinuxApp(_)
         )
     }
 }
@@ -263,6 +271,26 @@ fn app_bundle_root(exe: &Path) -> Option<PathBuf> {
     macos.parent()?.parent().map(Path::to_path_buf)
 }
 
+/// The marker that distinguishes a Linux desktop-app root from any other
+/// directory that happens to have a `bin/` subdirectory. Dropped by
+/// `scripts/build-linux-app.sh`; must match `commands::app::LINUX_APP_MARKER`.
+pub(crate) const LINUX_APP_MARKER: &str = ".openresearch-app";
+
+/// The app root for a Linux desktop-app executable at `<root>/bin/<exe>`.
+/// `None` for any other layout — a CLI install (or a plain `bin/` dir) is not
+/// an app, and must never be misclassified or the updater replaces the wrong
+/// files. Split out from [`detect_channel`] so it can be tested off Linux.
+pub(crate) fn linux_app_root(exe: &Path) -> Option<PathBuf> {
+    let bin = exe.parent()?;
+    if bin.file_name() != Some(std::ffi::OsStr::new("bin")) {
+        return None;
+    }
+    let root = bin.parent()?;
+    root.join(LINUX_APP_MARKER)
+        .is_file()
+        .then(|| root.to_path_buf())
+}
+
 /// Classify `exe`. The bundle test comes first: the bundled binary has no
 /// receipt, so every later branch would misfile it. A malformed receipt is an
 /// error rather than "no receipt" for the reason [`load_receipt`] gives — the
@@ -270,6 +298,9 @@ fn app_bundle_root(exe: &Path) -> Option<PathBuf> {
 pub fn detect_channel(exe: &Path) -> Result<InstallChannel> {
     if let Some(root) = app_bundle_root(exe) {
         return Ok(InstallChannel::AppBundle(root));
+    }
+    if let Some(root) = linux_app_root(exe) {
+        return Ok(InstallChannel::LinuxApp(root));
     }
     let exe_str = exe.to_string_lossy();
     if exe_str.starts_with("/nix/store/") {
@@ -359,7 +390,9 @@ pub fn preflight(force: bool) -> Result<UpdateTarget> {
     let exe = current_exe()?;
     let channel = detect_channel(&exe)?;
     let (receipt, prefix) = match channel {
-        InstallChannel::AppBundle(root) => return Ok(UpdateTarget::AppBundle(root)),
+        InstallChannel::AppBundle(root) | InstallChannel::LinuxApp(root) => {
+            return Ok(UpdateTarget::AppBundle(root))
+        }
         InstallChannel::Nix => {
             return Err(anyhow!(
                 "This orx is managed by Nix ({}). Update it through your Nix configuration.",
