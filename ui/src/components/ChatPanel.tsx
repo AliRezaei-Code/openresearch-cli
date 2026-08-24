@@ -123,7 +123,15 @@ import {
   type SlashCommandContext,
 } from "../planCommand";
 import { loadReadDemoSessions, markDemoSessionRead } from "../demoSessionState";
-import { ICON_BUTTON_BASE_CLASS_NAME, ICON_BUTTON_CLASS_NAME, MODEL_ITEM_CLASS_NAME, PAPER_TITLE_CLASS_NAME, SPINNER_CLASS_NAME } from "../styleClasses";
+import {
+  COMPOSER_CONTROL_CLASS_NAME,
+  COMPOSER_ICON_CONTROL_CLASS_NAME,
+  ICON_BUTTON_BASE_CLASS_NAME,
+  ICON_BUTTON_CLASS_NAME,
+  MODEL_ITEM_CLASS_NAME,
+  PAPER_TITLE_CLASS_NAME,
+  SPINNER_CLASS_NAME,
+} from "../styleClasses";
 import { tabOpenGestureHandlers, type TabOpenIntent } from "../tabPreview";
 import {
   escapeMarkdownText,
@@ -6273,7 +6281,7 @@ export function ChatPanel({
             <div className="option-picker relative inline-flex shrink-0" ref={dataSources.ref}>
               <button
                 type="button"
-                className="composer-bare inline-flex items-center justify-center rounded-sm p-1.5 text-text transition-[background] duration-150 ease-standard hover:bg-surface"
+                className={`${COMPOSER_ICON_CONTROL_CLASS_NAME} composer-bare`}
                 title="Data sources"
                 aria-label="Data sources"
                 aria-haspopup="dialog"
@@ -6302,7 +6310,7 @@ export function ChatPanel({
             />
             <button
               type="button"
-              className="composer-attach inline-flex shrink-0 items-center justify-center w-7.5 h-7.5 rounded-sm text-text cursor-pointer transition-[background] duration-150 ease-standard [&:hover]:bg-surface"
+              className={`${COMPOSER_ICON_CONTROL_CLASS_NAME} composer-attach`}
               title="Attach a PDF or image"
               aria-label="Attach a PDF or image"
               onClick={() => fileInputRef.current?.click()}
@@ -6312,7 +6320,7 @@ export function ChatPanel({
             {planActive && (
               <button
                 type="button"
-                className="plan-indicator group inline-flex h-7.5 shrink-0 items-center gap-1.5 rounded-sm bg-surface px-2 text-sm text-muted transition-colors hover:text-text focus-visible:text-text"
+                className={`${COMPOSER_CONTROL_CLASS_NAME} plan-indicator group shrink-0 gap-1.5 bg-surface px-2 text-sm text-muted hover:text-text focus-visible:text-text`}
                 title="Exit Plan mode"
                 aria-label="Exit Plan mode"
                 onClick={() => void exitPlanMode()}

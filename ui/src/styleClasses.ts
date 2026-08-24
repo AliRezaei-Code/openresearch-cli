@@ -10,6 +10,16 @@ export const ICON_BUTTON_CLASS_NAME = [
   "w-7 h-7",
 ].join(" ");
 
+export const COMPOSER_CONTROL_CLASS_NAME = [
+  "inline-flex h-8 items-center rounded-md",
+  "transition-[background,color] duration-150 ease-standard hover:bg-surface",
+].join(" ");
+
+export const COMPOSER_ICON_CONTROL_CLASS_NAME = [
+  COMPOSER_CONTROL_CLASS_NAME,
+  "w-8 shrink-0 justify-center text-text",
+].join(" ");
+
 export const MODEL_ITEM_CLASS_NAME = [
   "model-item [&.danger]:text-accent-red [&.danger:hover]:text-accent-red flex",
   "items-center justify-between gap-2 w-full text-left py-1.5 px-2",
