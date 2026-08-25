@@ -129,10 +129,11 @@ fn codex_model_reasoning(model: &str) -> Option<&'static [&'static str]> {
 
 /// Query the app-server's `model/list` — codex's own catalog, the same data its
 /// TUI picker renders: every model with its `supportedReasoningEfforts` and
-/// default. This is the primary model source (the static table is only the
-/// fallback), for the same reason opencode parses `models --verbose`: the
-/// installed CLI knows its catalog and we don't — a curated table here shipped
-/// missing three models and a wrong Luna tier before this existed.
+/// default. This is the primary model source for first-party accounts and for
+/// custom providers that declare an explicit model catalog (the static table is
+/// only the fallback), for the same reason opencode parses `models --verbose`:
+/// the installed CLI knows its catalog and we don't — a curated table here
+/// shipped missing three models and a wrong Luna tier before this existed.
 ///
 /// Protocol: spawn `codex app-server`, `initialize` → `initialized` (the same
 /// handshake `local::codex` uses, incl. `experimentalApi` — `model/list` is
@@ -267,6 +268,12 @@ struct CodexConfig {
     /// catalog's per-model `defaultReasoningEffort`, so the picker's
     /// preselected tier must too.
     model_reasoning_effort: Option<String>,
+    /// An explicit provider model catalog (`model_catalog_json`). When a custom
+    /// provider declares one, the app-server's `model/list` reflects it and the
+    /// picker can offer every model the provider exposes; without one the CLI
+    /// falls back to its bundled first-party catalog, which says nothing about
+    /// a custom endpoint.
+    model_catalog_json: Option<String>,
     #[serde(default)]
     model_providers: HashMap<String, CodexProvider>,
 }
@@ -276,6 +283,32 @@ fn parse_configured_effort(raw: &str) -> Option<String> {
     toml::from_str::<CodexConfig>(raw)
         .ok()?
         .model_reasoning_effort
+}
+
+/// Keep the configured model first without discarding catalog metadata.
+/// With either input absent, preserve the other as-is.
+fn custom_provider_models(
+    configured_model: Option<&str>,
+    catalog: Option<Vec<ModelInfo>>,
+) -> Vec<ModelInfo> {
+    let Some(configured_model) = configured_model else {
+        return catalog.unwrap_or_default();
+    };
+    let Some(mut models) = catalog else {
+        return vec![ModelInfo::new(configured_model)];
+    };
+    match models.iter().position(|model| model.id == configured_model) {
+        Some(0) => {}
+        Some(index) => {
+            let configured = models.remove(index);
+            models.insert(0, configured);
+        }
+        None => {
+            // Unknown catalog metadata keeps "no override", so Codex applies configured effort.
+            models.insert(0, ModelInfo::new(configured_model));
+        }
+    }
+    models
 }
 
 #[derive(Deserialize)]
@@ -288,6 +321,7 @@ struct CodexProvider {
 struct CustomProvider {
     model: Option<String>,
     env_key: Option<String>,
+    has_model_catalog: bool,
 }
 
 impl CustomProvider {
@@ -313,6 +347,9 @@ fn parse_custom_provider(raw: &str) -> Option<CustomProvider> {
     Some(CustomProvider {
         model: cfg.model.filter(|model| !model.trim().is_empty()),
         env_key: provider.env_key.clone(),
+        has_model_catalog: cfg
+            .model_catalog_json
+            .is_some_and(|path| !path.trim().is_empty()),
     })
 }
 
@@ -485,22 +522,25 @@ impl Harness for Codex {
 
         info.agent_ready = info.installed && info.authenticated;
         if info.agent_ready {
-            // The first-party catalog is meaningless for a custom provider, so
-            // offer only the model that provider is configured with (the
-            // picker's "Default model" entry covers the unset case).
-            //
-            // A custom provider's model gets no reasoning list of its own: the
-            // curated tiers below describe OpenAI's models, and we know nothing
-            // about what an arbitrary provider accepts. `ModelInfo::new` leaves
-            // `reasoning_levels` absent, so the composer falls back to the
-            // conservative harness-wide list rather than offering `ultra` to a
-            // provider that would reject it.
+            // A custom provider's bundled first-party catalog is meaningless,
+            // so probe only when its config declares an explicit catalog.
+            let custom_catalog = match (
+                custom_provider.as_ref(),
+                info.bin_path.as_deref().map(Path::new),
+            ) {
+                (Some(provider), Some(bin)) if provider.has_model_catalog => {
+                    codex_model_list(bin, configured_effort.as_deref()).await
+                }
+                _ => None,
+            };
             match custom_provider
                 .as_ref()
                 .map(|provider| provider.model.as_deref())
             {
-                Some(Some(model)) => info = info.with_models(vec![ModelInfo::new(model)]),
-                Some(None) => info = info.with_models(Vec::new()),
+                Some(configured_model) => {
+                    info =
+                        info.with_models(custom_provider_models(configured_model, custom_catalog))
+                }
                 None => {
                     // First-party account: ask the installed CLI for its own
                     // catalog (models + per-model efforts, the data codex's TUI
@@ -3594,6 +3634,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn model_ids(models: &[ModelInfo]) -> Vec<&str> {
+        models.iter().map(|model| model.id.as_str()).collect()
+    }
+
     #[test]
     fn custom_provider_uses_its_env_key_and_configured_model() {
         // The exact shape from the bug report: a gateway provider that opts out
@@ -3664,6 +3708,98 @@ requires_openai_auth = false
         assert!(!provider.is_ready());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn custom_provider_records_whether_a_model_catalog_is_declared() {
+        // A declared catalog (the DeepSeek-style setup) means the app-server
+        // `model/list` reflects the provider's own models, so orx should probe
+        // it and offer every listed model.
+        assert!(
+            parse_custom_provider(
+                r#"
+model = "deepseek-v4-flash"
+model_provider = "deepseek"
+model_catalog_json = "~/.codex/models.json"
+
+[model_providers.deepseek]
+base_url = "https://api.deepseek.com/"
+wire_api = "responses"
+requires_openai_auth = false
+"#,
+            )
+            .unwrap()
+            .has_model_catalog
+        );
+
+        // A bare gateway provider has no explicit catalog; the CLI would fall
+        // back to its bundled first-party list, so orx keeps offering only the
+        // configured model instead of a catalog that says nothing about the
+        // endpoint.
+        assert!(
+            !parse_custom_provider(
+                r#"
+model = "gateway-model"
+model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://gateway.example/v1"
+wire_api = "responses"
+requires_openai_auth = false
+"#,
+            )
+            .unwrap()
+            .has_model_catalog
+        );
+        assert!(
+            !parse_custom_provider(
+                r#"
+model_provider = "custom"
+model_catalog_json = "  "
+[model_providers.custom]
+requires_openai_auth = false
+"#,
+            )
+            .unwrap()
+            .has_model_catalog
+        );
+        assert!(parse_custom_provider("not toml ===").is_none());
+    }
+
+    #[test]
+    fn custom_provider_models_keep_the_configured_model_first() {
+        let models = custom_provider_models(
+            Some("configured"),
+            Some(vec![
+                ModelInfo::new("first"),
+                ModelInfo::new("configured").with_label(Some("Configured model"), None),
+                ModelInfo::new("last"),
+            ]),
+        );
+
+        assert_eq!(model_ids(&models), ["configured", "first", "last"]);
+        assert_eq!(models[0].display_name.as_deref(), Some("Configured model"));
+
+        let models = custom_provider_models(
+            Some("configured"),
+            Some(vec![ModelInfo::new("first"), ModelInfo::new("last")]),
+        );
+        assert_eq!(model_ids(&models), ["configured", "first", "last"]);
+        assert!(models[0].reasoning_levels.is_none());
+        assert!(models[0].default_reasoning_level.is_none());
+    }
+
+    #[test]
+    fn custom_provider_models_preserve_catalog_fallbacks() {
+        let models = custom_provider_models(Some("configured"), None);
+        assert_eq!(model_ids(&models), ["configured"]);
+
+        let models = custom_provider_models(
+            None,
+            Some(vec![ModelInfo::new("first"), ModelInfo::new("last")]),
+        );
+        assert_eq!(model_ids(&models), ["first", "last"]);
+        assert!(custom_provider_models(None, None).is_empty());
     }
 
     #[test]
