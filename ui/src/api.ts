@@ -1107,6 +1107,8 @@ export const pushProjectGithub = (projectId: string) =>
 export interface TelemetrySettings {
   /** Whether usage analytics linked to the random installation ID is on. */
   enabled: boolean;
+  /** Saved user preference, independent of build and runtime eligibility. */
+  preferenceEnabled: boolean;
   /** When off, a short human reason (e.g. "--no-telemetry flag"); null when on. */
   reason: string | null;
 }
@@ -1115,11 +1117,6 @@ export const getTelemetry = () => get<TelemetrySettings>("/api/settings/telemetr
 
 export const setTelemetry = (enabled: boolean) =>
   post<TelemetrySettings>("/api/settings/telemetry", { enabled });
-
-/** Record the consent decision once when the user leaves onboarding. Eligible
- * official builds send this even for opt-outs; development builds stay inert. */
-export const recordTelemetryConsent = (enabled: boolean) =>
-  post<{ ok: boolean }>("/api/settings/telemetry/consent", { enabled });
 
 export type HarnessId = "claude-code" | "codex" | "opencode";
 

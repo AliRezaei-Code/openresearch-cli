@@ -108,7 +108,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
         state.data_dir_gate.clone(),
     ));
     spawn_claude_auth_monitor(state.chat.clone(), claude.clone(), state.harnesses.clone());
-    spawn_update_checker();
+    spawn_background_tasks();
 
     let app = router(state);
     let url = format!("http://127.0.0.1:{port}");
@@ -406,10 +406,6 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/settings/telemetry",
             get(telemetry_settings).post(set_telemetry_settings),
-        )
-        .route(
-            "/api/settings/telemetry/consent",
-            post(record_telemetry_consent),
         )
         .route(
             "/api/settings/profile",
@@ -3377,14 +3373,18 @@ async fn set_hf_token(Json(req): Json<SetHfTokenReq>) -> ApiResult {
     Ok(Json(json!(hf_token_status().await)))
 }
 
-/// Keep a long-running dashboard current. `main`'s invocation-time check only
-/// fires once, and `orx up` (and the macOS app it backs) can stay up for days —
-/// long enough to drift several releases behind without this.
-fn spawn_update_checker() {
+/// Keep update checks and telemetry delivery running for long-lived dashboards.
+fn spawn_background_tasks() {
     tokio::spawn(async {
         loop {
             updates::periodic_update_pass().await;
             tokio::time::sleep(updates::PERIODIC_CHECK_INTERVAL).await;
+        }
+    });
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            crate::telemetry::retry_outbox();
         }
     });
 }
@@ -4075,13 +4075,14 @@ async fn set_git_settings(Json(req): Json<SetGitSettingsReq>) -> ApiResult {
 
 // --- telemetry settings -----------------------------------------------------
 
-/// `{ enabled, reason }` — the effective analytics state after build/runtime
-/// eligibility, per-run flags, and the persisted preference. `reason` is null
-/// when enabled.
+/// Effective eligibility plus the saved preference controlled by the switch.
 fn telemetry_settings_json() -> Value {
+    let preference_enabled = crate::telemetry::preference_enabled();
     match crate::telemetry::effective_disabled_reason() {
-        None => json!({ "enabled": true, "reason": null }),
-        Some(r) => json!({ "enabled": false, "reason": r.as_str() }),
+        None => json!({ "enabled": true, "preferenceEnabled": preference_enabled, "reason": null }),
+        Some(r) => {
+            json!({ "enabled": false, "preferenceEnabled": preference_enabled, "reason": r.as_str() })
+        }
     }
 }
 
@@ -4098,6 +4099,7 @@ struct SetTelemetryReq {
 
 async fn set_telemetry_settings(Json(req): Json<SetTelemetryReq>) -> ApiResult {
     let enabled = req.enabled;
+    crate::telemetry::record_consent(enabled).await;
     tokio::task::spawn_blocking(move || {
         crate::telemetry::set_persisted_disabled(!enabled)
             .map_err(|e| ApiError::from(anyhow!("could not save telemetry setting: {e}")))?;
@@ -4323,15 +4325,6 @@ async fn set_lit_sources_settings(Json(req): Json<SetLitSourcesReq>) -> ApiResul
     })
     .await
     .map_err(|e| ApiError::from(anyhow!("lit-sources task failed: {e}")))?
-}
-
-/// Record the analytics choice once when the user leaves onboarding. In an
-/// eligible official build this ignores the persisted preference so opt-outs
-/// are counted; development and runtime-disabled builds stay inert.
-async fn record_telemetry_consent(Json(req): Json<SetTelemetryReq>) -> ApiResult {
-    crate::telemetry::record_consent(req.enabled).await;
-    crate::telemetry::capture_onboarding_completed();
-    Ok(Json(json!({ "ok": true })))
 }
 
 // --- ssh hosts ----------------------------------------------------------------
