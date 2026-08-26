@@ -1595,7 +1595,7 @@ async fn update_project(
 /// Delete a project and everything hanging off it. Refuses while runs are in
 /// flight (deleting their rows would strand the supervisor mid-job) — but
 /// requests their cancellation, so a retry shortly after goes through. The
-/// The registered repository folder is left untouched.
+/// registered repository folder is left untouched.
 async fn delete_project(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
     reject_if_moving(&state)?;
     let _deleting_project = state
@@ -4688,6 +4688,7 @@ fn compute_settings_json(ssh: SshReadiness) -> Value {
     };
 
     let hf = crate::jobs::huggingface::resolve_token_with_source().ok();
+    let tinker = crate::jobs::tinker::resolve_api_key_with_source().ok();
     let modal_source = crate::jobs::modal::token_source();
     let k8s_settings = k8s::load_settings().ok().flatten();
     let ssh_hosts = list_ssh_hosts().len();
@@ -4718,6 +4719,15 @@ fn compute_settings_json(ssh: SshReadiness) -> Value {
             "id": "local",
             "configured": true,
             "summary": "Runs as a detached process on this machine",
+        },
+        {
+            "id": "tinker",
+            "configured": tinker.is_some(),
+            "summary": match tinker.map(|(_, source)| source) {
+                Some(crate::jobs::tinker::ApiKeySource::Env) => "TINKER_API_KEY env var",
+                Some(crate::jobs::tinker::ApiKeySource::OpenresearchEnv) => "Key from ~/.openresearch/env",
+                None => "No API key",
+            },
         },
         {
             "id": "hf",
@@ -6058,6 +6068,20 @@ mod tests {
 
         let value = serde_json::to_value(ApiRun::from(&run)).unwrap();
         assert_eq!(value["cancelRequested"], true);
+    }
+
+    #[test]
+    fn compute_settings_registers_tinker_without_exposing_its_key() {
+        let settings = compute_settings_json(SshReadiness::NoUsableKey { pub_path: None });
+        let tinker = settings["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|target| target["id"] == "tinker")
+            .unwrap();
+        assert!(tinker["configured"].is_boolean());
+        assert!(tinker.get("key").is_none());
+        assert!(tinker.get("apiKey").is_none());
     }
 
     #[test]

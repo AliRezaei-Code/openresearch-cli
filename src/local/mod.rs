@@ -79,6 +79,7 @@ pub fn slugify(text: &str) -> String {
 /// agree on these strings.
 pub const BACKENDS: &[&str] = &[
     "local",
+    "tinker",
     "hf",
     "modal",
     "k8s",
@@ -273,7 +274,7 @@ mod tests {
                 "{b} flavored"
             );
         }
-        for b in ["k8s", "ssh", "local"] {
+        for b in ["k8s", "ssh", "tinker", "local"] {
             assert!(
                 validate_compute_default(b, Some("x")).is_err(),
                 "{b} must reject a flavor"
