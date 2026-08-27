@@ -264,7 +264,7 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
         .stderr(Stdio::from(harness_log("oh-my-pi")?))
         .kill_on_drop(true);
     prepare_env(&mut cmd);
-    set_chat_session_env(&mut cmd, &ctx.session_id);
+    set_chat_session_env(&mut cmd, &ctx.session_id, ctx.host.up_port());
 
     ctx.persist_delivery(DeliveryState::Unknown)?;
     let mut child = match cmd.spawn() {
