@@ -2,6 +2,7 @@ import { RefreshCw, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { getUpdateStatus, type UpdateStatus } from "../api";
 import { onUpdateStatus } from "../events";
+import { useI18n } from "../i18n";
 
 export interface UpdateState {
   status: UpdateStatus | null;
@@ -40,6 +41,7 @@ export function useUpdateStatus(): UpdateState {
  *  updater's job, and a banner for something already in hand is noise. */
 export function UpdateBanner() {
   const { status } = useUpdateStatus();
+  const { t } = useI18n();
   const [dismissed, setDismissed] = useState<string | null>(null);
 
   // `installedVersion`, not `latest`: a release can land between the install and
@@ -54,12 +56,12 @@ export function UpdateBanner() {
     >
       <RefreshCw size={13} className="shrink-0 text-subtext" />
       <span className="min-w-0">
-        Updated to <strong className="font-semibold">{version}</strong>. Restart to use it.
+        {t("updates.banner", { version })}
       </span>
       <button
         type="button"
         className="ml-auto shrink-0 p-1 rounded-sm text-subtext hover:text-text hover:bg-highlight"
-        aria-label="Dismiss"
+        aria-label={t("updates.dismiss")}
         onClick={() => setDismissed(version)}
       >
         <X size={13} />

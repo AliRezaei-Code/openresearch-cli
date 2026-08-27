@@ -14,6 +14,7 @@ import {
   X,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { LOCALES, useI18n, type MessageKey } from "../i18n";
 import {
   deleteEnvVar,
   deleteOverleafToken,
@@ -271,6 +272,7 @@ function AuthLabel({ h }: { h: Harness }) {
 }
 
 function HarnessesTab() {
+  const { t } = useI18n();
   const [harnesses, setHarnesses] = useState<Harness[] | null>(null);
   const [active, setActive] = useState<HarnessId>("claude-code");
   const [refreshing, setRefreshing] = useState(false);
@@ -289,11 +291,9 @@ function HarnessesTab() {
 
   return (
     <>
-      <h2>Harnesses</h2>
+      <h2>{t("settings.harnesses")}</h2>
       <p className="settings-sub mt-0 mx-0 mb-4.5 text-text text-md">
-        Coding-agent setups detected on this machine. The research agent chat is served by
-        OpenCode; Claude Code and Codex accounts surface their models in the composer's model
-        picker.
+        {t("settings.harnessesSub")}
       </p>
       <div className="harness-tabs flex gap-1 mb-3.5 border-b border-b-border-variant [&_button]:inline-flex [&_button]:items-center [&_button]:gap-[7px] [&_button]:py-[7px] [&_button]:px-3 [&_button]:text-md [&_button]:font-semibold [&_button]:text-text [&_button]:border-b-2 [&_button]:border-b-transparent [&_button]:-mb-px [&_button:hover]:text-text [&_button.active]:border-b-primary">
         {(harnesses ?? []).map((x) => (
@@ -309,7 +309,7 @@ function HarnessesTab() {
       </div>
       {!harnesses ? (
         <div className={SETTINGS_LOADING_CLASS_NAME}>
-          <span className={SPINNER_CLASS_NAME} /> Detecting harnesses…
+          <span className={SPINNER_CLASS_NAME} /> {t("settings.detectingHarnesses")}
         </div>
       ) : !h ? null : (
         <div className={SETTINGS_CARD_CLASS_NAME}>
@@ -317,7 +317,7 @@ function HarnessesTab() {
             <span className={`${BADGE_CLASS_NAME} ${harnessStatus(h).cls}`}>{harnessStatus(h).label}</span>
             <div className="spacer" style={{ flex: 1 }} />
             <button className={SMALL_BUTTON_CLASS_NAME} onClick={() => load(true, true)} disabled={refreshing}>
-              <RefreshCw size={12} className={refreshing ? "spin animate-[settings-spin_0.9s_linear_infinite]" : ""} /> Refresh
+              <RefreshCw size={12} className={refreshing ? "spin animate-[settings-spin_0.9s_linear_infinite]" : ""} /> {t("settings.refresh")}
             </button>
           </div>
           <div className={KV_CLASS_NAME}>
@@ -1551,6 +1551,7 @@ function ComputeTab({
   project: Project | null;
   onViewHistory: () => void;
 }) {
+  const { t } = useI18n();
   const [settings, setSettings] = useState<ComputeSettings | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [selectedTarget, setSelectedTarget] = useState<ComputeTargetId | null>(null);
@@ -1629,7 +1630,7 @@ function ComputeTab({
 
   return (
     <>
-      <h1>Compute</h1>
+      <h1>{t("settings.compute")}</h1>
       <p className="settings-sub mt-0 mx-0 mb-4.5 text-text text-md">
         Connect compute backends and choose where new runs execute.
       </p>
@@ -2089,67 +2090,123 @@ function EnvVarsSection() {
 
 const THEME_OPTIONS: {
   value: ThemePreference;
-  label: string;
+  labelKey: MessageKey;
   icon: typeof Monitor;
 }[] = [
-  { value: "system", label: "System", icon: Monitor },
-  { value: "light", label: "Light", icon: Sun },
-  { value: "dark", label: "Dark", icon: Moon },
+  { value: "system", labelKey: "settings.themeSystem", icon: Monitor },
+  { value: "light", labelKey: "settings.themeLight", icon: Sun },
+  { value: "dark", labelKey: "settings.themeDark", icon: Moon },
 ];
+
+/** Segmented-radio button styling shared by the theme and language groups. */
+const SEGMENTED_RADIO_CLASS_NAME = [
+  "inline-flex items-center gap-1.5 py-[5px] px-2.5 rounded-sm text-subtext text-sm",
+  "cursor-pointer transition-[background,color] duration-120 ease-standard",
+  "[&:hover:not(.on)]:text-text [&:hover:not(.on)]:bg-highlight",
+  "[&.on]:text-background [&.on]:bg-primary",
+  "[&:focus-visible]:outline-2 [&:focus-visible]:outline-solid [&:focus-visible]:outline-text [&:focus-visible]:outline-offset-2",
+].join(" ");
+
+/** Arrow keys move selection relative to the focused radio, with focus
+ *  following the new choice (WAI-ARIA radio pattern). */
+function onRadioKeyDown(
+  e: React.KeyboardEvent,
+  optionCount: number,
+  anchorIndex: number,
+  onSelect: (index: number) => void,
+) {
+  const dir =
+    e.key === "ArrowRight" || e.key === "ArrowDown"
+      ? 1
+      : e.key === "ArrowLeft" || e.key === "ArrowUp"
+        ? -1
+        : 0;
+  if (!dir) return;
+  e.preventDefault();
+  const radios = [
+    ...e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="radio"]'),
+  ];
+  const from = radios.findIndex((r) => r === document.activeElement);
+  const anchor = from === -1 ? anchorIndex : from;
+  const next = (anchor + dir + optionCount) % optionCount;
+  onSelect(next);
+  radios[next]?.focus();
+}
 
 function AppearanceTab() {
   const [preference, setPreference] = useThemePreference();
-
-  // Arrow keys move selection relative to the focused radio, with focus
-  // following the new choice (WAI-ARIA radio pattern).
-  const onKeyDown = (e: React.KeyboardEvent) => {
-    const dir =
-      e.key === "ArrowRight" || e.key === "ArrowDown"
-        ? 1
-        : e.key === "ArrowLeft" || e.key === "ArrowUp"
-          ? -1
-          : 0;
-    if (!dir) return;
-    e.preventDefault();
-    const radios = [
-      ...e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="radio"]'),
-    ];
-    const from = radios.findIndex((r) => r === document.activeElement);
-    const anchor =
-      from === -1 ? THEME_OPTIONS.findIndex((o) => o.value === preference) : from;
-    const next = (anchor + dir + THEME_OPTIONS.length) % THEME_OPTIONS.length;
-    setPreference(THEME_OPTIONS[next].value);
-    radios[next]?.focus();
-  };
+  const { t, locale, setLocale } = useI18n();
 
   return (
     <>
-      <h2>Appearance</h2>
-      <p className="settings-sub mt-0 mx-0 mb-4.5 text-text text-md">How the interface looks on this device.</p>
+      <h2>{t("settings.appearance")}</h2>
+      <p className="settings-sub mt-0 mx-0 mb-4.5 text-text text-md">
+        {t("settings.appearanceSub")}
+      </p>
       <div className={SETTINGS_CARD_CLASS_NAME}>
         <div className={PROJECT_DEFAULT_ROW_CLASS_NAME}>
           <div>
-            <div className="project-default-title text-md font-semibold">Theme</div>
-            <p>System follows your operating system's light or dark setting.</p>
+            <div className="project-default-title text-md font-semibold">{t("settings.theme")}</div>
+            <p>{t("settings.themeSub")}</p>
           </div>
           <div
             className="theme-segmented inline-flex flex-none gap-0.5 p-0.5 border border-border rounded-md bg-surface"
             role="radiogroup"
-            aria-label="Theme"
-            onKeyDown={onKeyDown}
+            aria-label={t("settings.theme")}
+            onKeyDown={(e) =>
+              onRadioKeyDown(
+                e,
+                THEME_OPTIONS.length,
+                THEME_OPTIONS.findIndex((o) => o.value === preference),
+                (i) => setPreference(THEME_OPTIONS[i].value),
+              )
+            }
           >
-            {THEME_OPTIONS.map(({ value, label, icon: Icon }) => (
+            {THEME_OPTIONS.map(({ value, labelKey, icon: Icon }) => (
               <button
                 key={value}
                 type="button"
                 role="radio"
                 aria-checked={preference === value}
                 tabIndex={preference === value ? 0 : -1}
-                className={`theme-segment inline-flex items-center gap-1.5 py-[5px] px-2.5 rounded-sm text-subtext text-sm cursor-pointer transition-[background,color] duration-120 ease-standard [&:hover:not(.on)]:text-text [&:hover:not(.on)]:bg-highlight [&.on]:text-background [&.on]:bg-primary [&:focus-visible]:outline-2 [&:focus-visible]:outline-solid [&:focus-visible]:outline-text [&:focus-visible]:outline-offset-2 ${preference === value ? "on" : ""}`}
+                className={`${SEGMENTED_RADIO_CLASS_NAME} ${preference === value ? "on" : ""}`}
                 onClick={() => setPreference(value)}
               >
                 <Icon size={14} />
-                {label}
+                {t(labelKey)}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className={PROJECT_DEFAULT_ROW_CLASS_NAME}>
+          <div>
+            <div className="project-default-title text-md font-semibold">{t("settings.language")}</div>
+            <p>{t("settings.languageSub")}</p>
+          </div>
+          <div
+            className="theme-segmented inline-flex flex-none gap-0.5 p-0.5 border border-border rounded-md bg-surface"
+            role="radiogroup"
+            aria-label={t("settings.language")}
+            onKeyDown={(e) =>
+              onRadioKeyDown(
+                e,
+                LOCALES.length,
+                LOCALES.indexOf(locale),
+                (i) => setLocale(LOCALES[i]),
+              )
+            }
+          >
+            {LOCALES.map((id) => (
+              <button
+                key={id}
+                type="button"
+                role="radio"
+                aria-checked={locale === id}
+                tabIndex={locale === id ? 0 : -1}
+                className={`${SEGMENTED_RADIO_CLASS_NAME} ${locale === id ? "on" : ""}`}
+                onClick={() => setLocale(id)}
+              >
+                {t(`settings.lang.${id}`)}
               </button>
             ))}
           </div>
@@ -2178,6 +2235,7 @@ const MANUAL_UPDATE_HINT: Partial<Record<InstallChannel, string>> = {
 };
 
 function UpdatesTab() {
+  const { t } = useI18n();
   const { status, error: loadError, apply } = useUpdateStatus();
   // Per-action only so the right button reads "Working…"; any write disables
   // all three, since they mutate overlapping state.
@@ -2187,7 +2245,7 @@ function UpdatesTab() {
   if (!status) {
     return (
       <>
-        <h2>Updates</h2>
+        <h2>{t("settings.updates")}</h2>
         {loadError ? (
           <div className={SETTINGS_CARD_CLASS_NAME}>
             <div className="error">{loadError}</div>
@@ -2217,7 +2275,7 @@ function UpdatesTab() {
 
   return (
     <>
-      <h2>Updates</h2>
+      <h2>{t("settings.updates")}</h2>
       <p className="settings-sub mt-0 mx-0 mb-4.5 text-text text-md">
         Keeping this copy of orx on the latest release.
       </p>
@@ -2438,6 +2496,7 @@ function InstallCliRow({
 // --- project defaults ----------------------------------------------------------
 
 function ProjectDefaultsTab() {
+  const { t } = useI18n();
   const [settings, setSettings] = useState<ProjectDefaultsSettings | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -2463,10 +2522,10 @@ function ProjectDefaultsTab() {
 
   return (
     <>
-      <h2>General</h2>
-      <p className="settings-sub mt-0 mx-0 mb-4.5 text-text text-md">Defaults applied when you create a project.</p>
+      <h2>{t("settings.general")}</h2>
+      <p className="settings-sub mt-0 mx-0 mb-4.5 text-text text-md">{t("settings.generalSub")}</p>
       {!settings ? (
-        error ? <div className="error">{error}</div> : <div className={SETTINGS_LOADING_CLASS_NAME}><span className={SPINNER_CLASS_NAME} /> Loading…</div>
+        error ? <div className="error">{error}</div> : <div className={SETTINGS_LOADING_CLASS_NAME}><span className={SPINNER_CLASS_NAME} /> {t("settings.loading")}</div>
       ) : (
         <div className="settings-card [&_>_.error]:text-accent-red [&_>_.error]:text-md [&_>_.error]:whitespace-pre-wrap bg-background border border-border rounded-lg py-4 px-4.5 mb-4 [&_h3]:mt-0 [&_h3]:mx-0 [&_h3]:mb-2.5 [&_h3]:text-sm [&_h3]:font-semibold [&_h3]:text-text [&_.settings-sub]:mb-3 [&_.kv]:gap-y-1.5 [&_.kv]:gap-x-4.5 [&_>_.project-default-row:first-child]:pt-0 [&_>_.project-default-row:first-child]:border-t-0 project-defaults-card [&_.settings-card-head]:justify-between [&_.settings-card-head]:mb-0 [&_.settings-card-head]:pb-3 [&_.settings-card-head_h3]:m-0">
           <div className="settings-card-head flex items-center gap-2.5 mb-3">
@@ -2618,6 +2677,7 @@ function GitTab({
   publicationError: string | null;
   onProjectUpdate: (project: Project) => void;
 }) {
+  const { t } = useI18n();
   const [status, setStatus] = useState<ProjectGitStatus | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -2690,7 +2750,7 @@ function GitTab({
 
   return (
     <>
-      <h1>Repository</h1>
+      <h1>{t("settings.repository")}</h1>
       <p className="settings-sub mt-0 mx-0 mb-4.5 text-text text-md">
         Git and GitHub settings for <strong>{project?.name ?? "the current project"}</strong>.
         Local Git powers experiments; publishing is optional.
@@ -2806,6 +2866,7 @@ type MoveState =
   | { kind: "error"; message: string };
 
 function StorageTab() {
+  const { t } = useI18n();
   const [settings, setSettings] = useState<DataDirSettings | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [path, setPath] = useState("");
@@ -2899,11 +2960,9 @@ function StorageTab() {
 
   return (
     <>
-      <h2>Storage</h2>
+      <h2>{t("settings.storage")}</h2>
       <p className="settings-sub mt-0 mx-0 mb-4.5 text-text text-md">
-        Where orx keeps everything on this machine — the local database, run logs, artifacts, and
-        chat attachments for <strong>all</strong> projects. Moving it copies the whole store to the
-        new location and activates it there.
+        {t("settings.storageSub")}
       </p>
       {loadError ? (
         <div className={SETTINGS_CARD_CLASS_NAME}>
@@ -3155,6 +3214,7 @@ function ComputeActivity({ projectId, onViewHistory }: { projectId?: string; onV
 }
 
 function InstanceHistory({ projectId, onBack }: { projectId?: string; onBack: () => void }) {
+  const { t } = useI18n();
   const [instances, setInstances] = useState<Run[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -3190,14 +3250,14 @@ function InstanceHistory({ projectId, onBack }: { projectId?: string; onBack: ()
         <ArrowLeft size={14} /> Back to Compute
       </button>
       <div className="settings-head-row flex items-center justify-between gap-2.5 [&_h1]:m-0">
-        <h1>Instance history</h1>
+        <h1>{t("settings.instanceHistory")}</h1>
         <button className={SMALL_BUTTON_CLASS_NAME} onClick={load} disabled={refreshing}>
           <RefreshCw size={12} className={refreshing ? "spin animate-[settings-spin_0.9s_linear_infinite]" : ""} /> Refresh
         </button>
       </div>
       {error && <div className="error">{error}</div>}
       {!instances ? (
-        <div className={SETTINGS_LOADING_CLASS_NAME}><span className={SPINNER_CLASS_NAME} /> Loading…</div>
+        <div className={SETTINGS_LOADING_CLASS_NAME}><span className={SPINNER_CLASS_NAME} /> {t("settings.loading")}</div>
       ) : (
         <InstancesTable instances={instances} emptyLabel={projectId ? "No instances yet." : "Select a project to see its history."} />
       )}
@@ -3209,7 +3269,7 @@ function InstanceHistory({ projectId, onBack }: { projectId?: string; onBack: ()
 
 type SettingsNavItem = {
   id: Tab;
-  label: string;
+  labelKey: MessageKey;
   icon: React.ReactNode;
   activeTabs: Tab[];
 };
@@ -3220,14 +3280,19 @@ const SETTINGS_SECTIONS: Tab[] = ["projects", "harnesses", "storage"];
 export const SETTINGS_NAV: SettingsNavItem[] = [
   {
     id: "compute",
-    label: "Compute",
+    labelKey: "nav.compute",
     icon: <Cpu size={15} />,
     activeTabs: ["compute", "instances"],
   },
-  { id: "environment", label: "Environment", icon: <SquareTerminal size={15} />, activeTabs: ["environment"] },
+  {
+    id: "environment",
+    labelKey: "nav.environment",
+    icon: <SquareTerminal size={15} />,
+    activeTabs: ["environment"],
+  },
   {
     id: "settings",
-    label: "Settings",
+    labelKey: "nav.settings",
     icon: <Settings size={15} />,
     activeTabs: ["settings", ...SETTINGS_SECTIONS],
   },
@@ -3252,12 +3317,13 @@ export function SettingsView({
   onSelectTab: (tab: Tab) => void;
 }) {
   const showsSettings = tab === "settings" || isSettingsSection(tab);
+  const { t } = useI18n();
 
   return (
     <div className="settings-view max-w-readable my-0 mx-auto pt-6 px-8 pb-15 [&_h1]:mt-0 [&_h1]:mx-0 [&_h1]:mb-1.5 [&_h1]:text-3xl [&_>_.error]:text-accent-red [&_>_.error]:text-md [&_>_.error]:whitespace-pre-wrap [&_>_.error]:mt-0 [&_>_.error]:mx-0 [&_>_.error]:mb-3">
       {showsSettings && (
         <>
-          <h1>Settings</h1>
+          <h1>{t("settings.title")}</h1>
           <div className="settings-stack mt-4.5">
             <section className={SETTINGS_STACK_SECTION_CLASS_NAME}>
               <AppearanceTab />
@@ -3291,9 +3357,9 @@ export function SettingsView({
       )}
       {tab === "environment" && (
         <>
-          <h1>Environment</h1>
+          <h1>{t("settings.environment")}</h1>
           <p className="settings-sub mt-0 mx-0 mb-4.5 text-text text-md">
-            Variables available to runs and the research agent (API keys, tokens).
+            {t("settings.environmentSub")}
           </p>
           <EnvVarsSection />
         </>

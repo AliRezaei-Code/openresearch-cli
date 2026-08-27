@@ -10,6 +10,7 @@ import { useCallback, useEffect, useRef, useState, type RefObject } from "react"
 import { createPortal } from "react-dom";
 import { FolderTree, GitBranch, Terminal } from "lucide-react";
 import { parseDiff, type FileData } from "react-diff-view";
+import { useI18n, localeTag } from "../i18n";
 import {
   backendKind,
   fmtDuration,
@@ -104,13 +105,13 @@ interface DiffStat {
   truncated: boolean;
 }
 
-function fmtCreated(ms: number): string {
+function fmtCreated(ms: number, tag: string): string {
   const d = new Date(ms);
   const opts: Intl.DateTimeFormatOptions =
     d.getFullYear() === new Date().getFullYear()
       ? { month: "short", day: "numeric" }
       : { month: "short", day: "numeric", year: "numeric" };
-  return d.toLocaleDateString(undefined, opts);
+  return d.toLocaleDateString(tag, opts);
 }
 
 export function ExpHoverCard({
@@ -136,6 +137,7 @@ export function ExpHoverCard({
   onMouseLeave: () => void;
 }) {
   const measure = useMeasure();
+  const { locale } = useI18n();
   // Prefer beside the node; on windows too narrow for either side, go
   // above/below — usePopoverPosition only clamps, and a clamped side
   // placement would sit the card on top of the node it describes.
@@ -330,7 +332,7 @@ export function ExpHoverCard({
       </div>
       <div className="hc-foot">
         <span className="hc-mono">$ {exp.runCommand}</span>
-        <span>created {fmtCreated(exp.createdAt)}</span>
+        <span>created {fmtCreated(exp.createdAt, localeTag(locale))}</span>
       </div>
     </div>,
     document.body,

@@ -11,6 +11,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useI18n, localeTag } from "../i18n";
 import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
@@ -244,6 +245,7 @@ function PreviewPane({
   onDelete: (path: string) => void;
 }) {
   const kind = previewKind(entry);
+  const { locale } = useI18n();
   const { text, binary, truncated, error, wantsText } = useTextBody(projectId, entry, kind);
   const [showSource, setShowSource] = useState(false);
   const isDoc = kind === "markdown";
@@ -293,7 +295,7 @@ function PreviewPane({
         </code>
         <span className="fpreview-date text-xs text-muted whitespace-nowrap shrink-0">
           Modified{" "}
-          {new Date(entry.modifiedAt).toLocaleString(undefined, {
+          {new Date(entry.modifiedAt).toLocaleString(localeTag(locale), {
             dateStyle: "medium",
             timeStyle: "short",
           })}

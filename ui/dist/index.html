@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" dir="ltr">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -21,13 +21,27 @@
         }
       })();
     </script>
+    <script>
+      // Resolve the interface language before first paint to avoid an
+      // LTR/English flash. Storage key and values must match src/i18n.ts.
+      (function () {
+        try {
+          var locale = localStorage.getItem("orx:locale") || "en";
+          document.documentElement.lang = locale;
+          document.documentElement.dir = locale === "fa" ? "rtl" : "ltr";
+        } catch (e) {
+          document.documentElement.lang = "en";
+          document.documentElement.dir = "ltr";
+        }
+      })();
+    </script>
     <style>
       /* Pre-CSS background; keep in sync with --base in src/tailwind.css. */
       html { background: #ffffff; }
       html[data-theme="dark"] { background: #0e0c0c; }
     </style>
-    <script type="module" crossorigin src="/assets/index-DfoIjp19.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-Dc0I88Kl.css">
+    <script type="module" crossorigin src="/assets/index-BGUWhu5O.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-pa41ZaOV.css">
   </head>
   <body>
     <div

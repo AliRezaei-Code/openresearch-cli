@@ -6,6 +6,7 @@ import {
   Terminal,
 } from "lucide-react";
 import { useEffect, useState } from "react";
+import { useI18n, localeTag } from "../i18n";
 import {
   fmtDuration,
   runDisplayStatus,
@@ -40,8 +41,8 @@ const EXPERIMENT_OVERVIEW_COMMAND_CLASS_NAME = [
   "wrap-anywhere",
 ].join(" ");
 
-function fmtDate(ms: number): string {
-  return new Date(ms).toLocaleString(undefined, {
+function fmtDate(ms: number, tag: string): string {
+  return new Date(ms).toLocaleString(tag, {
     month: "short",
     day: "numeric",
     year: "numeric",
@@ -70,6 +71,7 @@ export function ExperimentOverview({
   onOpenCode: (intent: TabOpenIntent) => void;
 }) {
   const latestRun = runs[0] ?? null;
+  const { locale } = useI18n();
   const hasLiveRun = runs.some(
     (run) => run.status === "running" || run.status === "starting",
   );
@@ -130,7 +132,7 @@ export function ExperimentOverview({
                 <BackendBadge backend={latestRun.backend} />
                 <span title="Started">
                   <CalendarDays size={13} />
-                  {fmtDate(latestRun.createdAt)}
+                  {fmtDate(latestRun.createdAt, localeTag(locale))}
                 </span>
                 <span title="Duration">
                   <Clock3 size={13} />
@@ -175,7 +177,7 @@ export function ExperimentOverview({
                 from <code>{parentExperiment.slug}</code>
               </span>
             )}
-            <span title={fmtDate(experiment.createdAt)}>
+            <span title={fmtDate(experiment.createdAt, localeTag(locale))}>
               created {timeAgo(experiment.createdAt)}
             </span>
           </div>

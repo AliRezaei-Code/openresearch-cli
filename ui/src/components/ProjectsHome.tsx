@@ -11,6 +11,7 @@ import {
 import { onProjectActivityEvent } from "../events";
 import { NewProjectForm } from "./NewProjectForm";
 import { BUTTON_CLASS_NAME } from "../styleClasses";
+import { useI18n } from "../i18n";
 
 export function NewProjectDialog({
   onClose,
@@ -158,6 +159,7 @@ function DeleteProjectDialog({
   const hasSyncedRepository = Boolean(
     project.githubEnabled && (project.githubUrl || (project.githubOwner && project.githubRepo)),
   );
+  const { t } = useI18n();
 
   return (
     <div
@@ -175,21 +177,24 @@ function DeleteProjectDialog({
         aria-describedby="delete-project-dialog-description"
         tabIndex={-1}
       >
-        <h2 id="delete-project-dialog-title" className="mt-0 mb-3 text-xl">Delete project?</h2>
+        <h2 id="delete-project-dialog-title" className="mt-0 mb-3 text-xl">{t("projects.deleteTitle")}</h2>
         <div id="delete-project-dialog-description" className="flex flex-col gap-2 text-md leading-normal text-subtext">
           <p className="m-0">
-            Delete <strong className="font-semibold text-text">{project.name}</strong> from OpenResearch?
-            Its experiments, runs, and chats will be permanently removed.
+            {t("projects.deleteBody", { name: project.name })}
           </p>
           <p className="m-0">
-            The local folder{hasSyncedRepository ? " and linked GitHub repository are" : " is"} kept.
+            {t("projects.deleteBodyFolder", {
+              linked: hasSyncedRepository
+                ? t("projects.deleteBodyLinked")
+                : t("projects.deleteBodyLocal"),
+            })}
           </p>
           {error && <p className="m-0 text-accent-red" role="alert">{error}</p>}
         </div>
         <div className="mt-5 flex justify-end gap-2">
-          <button className={BUTTON_CLASS_NAME} disabled={deleting} onClick={onClose}>Cancel</button>
+          <button className={BUTTON_CLASS_NAME} disabled={deleting} onClick={onClose}>{t("projects.cancel")}</button>
           <button className={`${BUTTON_CLASS_NAME} danger`} disabled={deleting} onClick={onConfirm}>
-            {deleting ? "Deleting…" : "Delete project"}
+            {deleting ? t("projects.deleting") : t("projects.deleteProject")}
           </button>
         </div>
       </div>
@@ -215,6 +220,7 @@ export function ProjectsHome({
   onDeleted: (id: string) => void;
 }) {
   const [modalOpen, setModalOpen] = useState(false);
+  const { t } = useI18n();
   const [deleting, setDeleting] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [projectPendingDelete, setProjectPendingDelete] = useState<Project | null>(null);
@@ -271,24 +277,24 @@ export function ProjectsHome({
     <div className="home flex-1 min-h-0 overflow-y-auto [scrollbar-gutter:stable_both-edges] bg-canvas">
       <div className="home-inner max-w-290 my-0 mx-auto pt-12 px-6 pb-16 [@media((max-width:_960px))]:pt-6 [@media((max-width:_960px))]:px-4">
         <div className="home-head flex items-center justify-between gap-3 mb-4.5 [&_h2]:m-0 [&_h2]:text-4xl [&_h2]:tracking-[-0.02em] [@media((max-width:_520px))]:items-start [@media((max-width:_520px))]:flex-col">
-          <h2>Projects</h2>
+          <h2>{t("projects.title")}</h2>
           <button
             className={BUTTON_CLASS_NAME}
             onClick={() => setModalOpen(true)}
           >
-            <Plus size={15} /> New project
+            <Plus size={15} /> {t("projects.newProject")}
           </button>
         </div>
         <div className="home-list overflow-hidden rounded-lg border border-border bg-background">
           <div>
             <div className="grid grid-cols-[minmax(0,1fr)_9rem_9rem_minmax(18rem,max-content)] items-center gap-3 border-b border-border bg-background py-2.5 pl-4 pr-2 text-2xs font-medium tracking-[0.06em] text-text uppercase [@media((max-width:_960px))]:hidden">
-              <span>Project</span>
-              <span>Agents</span>
-              <span>Experiments</span>
-              <span>Repository</span>
+              <span>{t("projects.column.project")}</span>
+              <span>{t("projects.column.agents")}</span>
+              <span>{t("projects.column.experiments")}</span>
+              <span>{t("projects.column.repository")}</span>
             </div>
             {projects.length === 0 ? (
-              <div className="py-8 px-4 text-sm text-muted">No projects yet — create one to get started.</div>
+              <div className="py-8 px-4 text-sm text-muted">{t("projects.empty")}</div>
             ) : (
               [...projects].sort((a, b) => {
                 const aActivity = activityByProject[a.id]?.lastMessageAt ?? a.createdAt;
@@ -309,25 +315,28 @@ export function ProjectsHome({
                         .replace(/^https?:\/\/github\.com\//, "")
                         .replace(/\.git$/, "")
                         .replace(/\/$/, "")
-                  : "Local";
+                  : t("projects.local");
                 const agentsLabel = summary
                   ? summary.activeAgents > 0
-                    ? `${summary.activeAgents} active`
-                    : "Idle"
+                    ? t("projects.active", { n: summary.activeAgents })
+                    : t("projects.idle")
                   : "—";
                 const agentTotal = summary
-                  ? `${summary.totalAgents} total agent${summary.totalAgents === 1 ? "" : "s"}`
+                  ? t("projects.agentsTotal", {
+                      n: summary.totalAgents,
+                      s: summary.totalAgents === 1 ? "" : "s",
+                    })
                   : "—";
                 const experimentLabel = !summary
                   ? "—"
                   : summary.runningExperiments > 0
-                    ? `${summary.runningExperiments} running`
+                    ? t("projects.running", { n: summary.runningExperiments })
                     : summary.totalExperiments === 0
-                      ? "None"
-                      : `${summary.totalExperiments} total`;
+                      ? t("projects.none")
+                      : t("projects.experimentsTotal", { n: summary.totalExperiments });
                 const experimentTotal =
                   summary && summary.runningExperiments > 0
-                    ? `${summary.totalExperiments} total`
+                    ? t("projects.experimentsTotal", { n: summary.totalExperiments })
                     : null;
                 return (
                   <div
@@ -336,19 +345,19 @@ export function ProjectsHome({
                   >
                     <button
                       className="project-row-open absolute inset-0 z-0 cursor-pointer rounded-[inherit] focus-visible:outline focus-visible:outline-2 focus-visible:outline-text focus-visible:outline-offset-[-2px]"
-                      aria-label={`Open ${p.name}`}
+                      aria-label={t("projects.open", { name: p.name })}
                       onClick={() => onOpen(p.id)}
                     />
                     {/* Cells stay click-transparent so the stretched button owns row navigation. */}
                     <div className="relative z-1 flex min-w-0 flex-col gap-1 pointer-events-none [@media((max-width:_960px))]:col-span-3 [@media((max-width:_600px))]:col-span-2">
                       <span className="project-row-title whitespace-normal break-words text-base font-semibold text-text pointer-events-none">{p.name}</span>
                       <span className="relative z-2 flex items-center gap-1.5 text-xs text-muted [@media((max-width:_960px))]:flex-wrap">
-                        <span>Created {timeAgo(p.createdAt)}</span>
+                        <span>{t("projects.created", { time: timeAgo(p.createdAt) })}</span>
                         {p.paperId && <span aria-hidden="true">·</span>}
-                        {p.paperId && <span>arXiv paper ID: {p.paperId}</span>}
+                        {p.paperId && <span>{t("projects.arxivId", { id: p.paperId })}</span>}
                         <button
                           className="project-row-secondary project-row-delete inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-sm leading-0 text-muted opacity-0 pointer-events-none transition-opacity hover:bg-surface hover:text-accent-red group-hover:opacity-100 group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:pointer-events-auto focus:opacity-100 focus:pointer-events-auto focus-visible:outline focus-visible:outline-2 focus-visible:outline-text"
-                          aria-label={`Delete ${p.name}`}
+                          aria-label={t("projects.delete", { name: p.name })}
                           disabled={deleting === p.id}
                           onClick={(event) => {
                             event.stopPropagation();
@@ -361,7 +370,7 @@ export function ProjectsHome({
                       </span>
                     </div>
                     <div className="relative z-1 flex min-w-0 flex-col gap-1 pointer-events-none">
-                      <span className="hidden text-2xs font-medium tracking-[0.06em] text-text uppercase [@media((max-width:_960px))]:block">Agents</span>
+                      <span className="hidden text-2xs font-medium tracking-[0.06em] text-text uppercase [@media((max-width:_960px))]:block">{t("projects.column.agents")}</span>
                       <span className="inline-flex items-center gap-2 text-md text-text">
                         {summary && summary.activeAgents > 0 && (
                           <LiveDot />
@@ -371,7 +380,7 @@ export function ProjectsHome({
                       <span className="text-xs text-muted">{agentTotal}</span>
                     </div>
                     <div className="relative z-1 flex min-w-0 flex-col gap-1 pointer-events-none">
-                      <span className="hidden text-2xs font-medium tracking-[0.06em] text-text uppercase [@media((max-width:_960px))]:block">Experiments</span>
+                      <span className="hidden text-2xs font-medium tracking-[0.06em] text-text uppercase [@media((max-width:_960px))]:block">{t("projects.column.experiments")}</span>
                       <span className="inline-flex items-center gap-2 text-md text-text">
                         {summary && summary.runningExperiments > 0 && (
                           <LiveDot />

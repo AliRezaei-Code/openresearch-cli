@@ -55,6 +55,7 @@ import { ExperimentsTable } from "./components/ExperimentsTable";
 import { Md } from "./components/Md";
 import { usePopover } from "./components/ModelPicker";
 import { SettingsView, type SettingsTab } from "./components/SettingsPage";
+import { useI18n } from "./i18n";
 import { DemoWelcomeModal } from "./components/Tour";
 import { clearReadDemoSessions } from "./demoSessionState";
 import { TreeView } from "./components/TreeView";
@@ -451,6 +452,7 @@ function useStableStringMap(next: Map<string, string>): Map<string, string> {
 }
 
 export default function App() {
+  const { t } = useI18n();
   const [projects, setProjects] = useState<Project[] | null>(null);
   const [uiState, setUiState] = useState<UiState | null>(null);
   const tourCompletedRef = useRef<boolean | undefined>(undefined);
@@ -1784,7 +1786,7 @@ export default function App() {
         >
           <div
             className={`panel-resizer absolute left-0 top-0 bottom-0 w-1.5 z-30 [&:hover]:bg-[color-mix(in_oklab,_var(--text)_12%,_transparent)] [&:active]:bg-[color-mix(in_oklab,_var(--text)_12%,_transparent)] ${panelMax ? "cursor-e-resize" : "cursor-col-resize"}`}
-            title={panelMax ? "Drag right to restore panel" : "Drag to resize panel"}
+            title={panelMax ? t("panel.dragRestore") : t("panel.dragResize")}
             onPointerDown={resizePanel}
           />
           <div className="tabs flex items-end gap-0 pt-1 pr-1.5 pb-0 pl-2 h-10 border-b border-b-border bg-background shrink-0">
@@ -1793,7 +1795,7 @@ export default function App() {
               {filesTabOpen && (
                 <ClosableTab
                   active={rightTab === "files"}
-                  label="Files"
+                  label={t("nav.files")}
                   icon={<FolderOpen size={12} style={{ flexShrink: 0 }} />}
                   onSelect={() => selectRightTab("files")}
                   onClose={() => closeHomeTab("files")}
@@ -1802,7 +1804,7 @@ export default function App() {
               {artifactsTabOpen && (
                 <ClosableTab
                   active={rightTab === "artifacts"}
-                  label="Artifacts"
+                  label={t("nav.artifacts")}
                   icon={<Package size={12} style={{ flexShrink: 0 }} />}
                   onSelect={() => selectRightTab("artifacts")}
                   onClose={() => closeHomeTab("artifacts")}
@@ -1811,7 +1813,7 @@ export default function App() {
               {experimentsTabOpen && (
                 <ClosableTab
                   active={rightTab === "experiments"}
-                  label="Experiments"
+                  label={t("nav.experiments")}
                   icon={<FlaskConical size={12} style={{ flexShrink: 0 }} />}
                   onSelect={() => selectRightTab("experiments")}
                   onClose={() => closeHomeTab("experiments")}
@@ -1822,16 +1824,16 @@ export default function App() {
             <div className="panel-controls inline-flex items-center gap-0.5 self-center py-0 px-1.5 shrink-0">
               <button
                 className={ICON_BUTTON_CLASS_NAME}
-                title={panelMax ? "Restore panel" : "Expand panel"}
-                aria-label={panelMax ? "Restore panel" : "Expand panel"}
+                title={panelMax ? t("panel.restore") : t("panel.expand")}
+                aria-label={panelMax ? t("panel.restore") : t("panel.expand")}
                 onClick={() => setPanelMax((m) => !m)}
               >
                 {panelMax ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
               </button>
               <button
                 className={ICON_BUTTON_CLASS_NAME}
-                title="Close panel"
-                aria-label="Close panel"
+                title={t("panel.close")}
+                aria-label={t("panel.close")}
                 onClick={() => {
                   pendingExperimentsAutoOpenRef.current = false;
                   setPanelOpen(false);

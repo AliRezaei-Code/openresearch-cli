@@ -42,6 +42,7 @@ import {
   type MouseEvent as ReactMouseEvent,
 } from "react";
 import { BrandMark } from "./Wordmark";
+import { useI18n, type MessageKey } from "../i18n";
 import {
   cancelQueuedMessage,
   chatAttachmentUrl,
@@ -3894,10 +3895,10 @@ const matchesFilter = (filter: SessionFilter, archived: boolean) =>
   filter === "all" ? true : filter === "archived" ? archived : !archived;
 
 /** Menu label + rail section heading per filter — "Recents" for the default view. */
-const SESSION_FILTERS: { id: SessionFilter; label: string; railLabel: string }[] = [
-  { id: "active", label: "Active", railLabel: "Recents" },
-  { id: "archived", label: "Archived", railLabel: "Archived" },
-  { id: "all", label: "All", railLabel: "All sessions" },
+const SESSION_FILTERS: { id: SessionFilter; labelKey: MessageKey; railLabelKey: MessageKey }[] = [
+  { id: "active", labelKey: "sessions.active", railLabelKey: "sessions.recents" },
+  { id: "archived", labelKey: "sessions.archived", railLabelKey: "sessions.archived" },
+  { id: "all", labelKey: "sessions.all", railLabelKey: "sessions.all" },
 ];
 
 /** Filter control beside the "Recents" label: Active (default) / Archived / All. */
@@ -3908,13 +3909,14 @@ function SessionFilterMenu({
   value: SessionFilter;
   onChange: (next: SessionFilter) => void;
 }) {
+  const { t } = useI18n();
   const { open, setOpen, ref } = usePopover();
   return (
     <div className="rail-filter relative inline-flex" ref={ref}>
       <button
         className={`${ICON_BUTTON_BASE_CLASS_NAME} rail-filter-btn w-6 h-6 rounded-sm ${value !== "active" ? "active" : ""}`}
-        title="Filter sessions"
-        aria-label="Filter sessions"
+        title={t("sessions.filter")}
+        aria-label={t("sessions.filter")}
         onClick={() => setOpen((v) => !v)}
       >
         <SlidersHorizontal size={13} />
@@ -3930,7 +3932,7 @@ function SessionFilterMenu({
                 setOpen(false);
               }}
             >
-              <span>{f.label}</span>
+              <span>{t(f.labelKey)}</span>
               {value === f.id && <Check size={13} />}
             </button>
           ))}
@@ -4262,6 +4264,7 @@ export function ChatPanel({
   const [draft, setDraft] = useState("");
   const [annotations, setAnnotations] = useState<ComposerAnnotation[]>([]);
   const annotationId = useRef(0);
+  const { t } = useI18n();
   const composerScopeRef = useRef({ projectId, activeId });
   composerScopeRef.current = { projectId, activeId };
   // Pasted/dropped/uploaded attachments waiting in the composer, as data URLs.
@@ -5717,7 +5720,7 @@ export function ChatPanel({
           onClick={onOpenWorktree}
         >
           <FolderOpen size={15} />
-          Files
+          {t("nav.files")}
         </button>
         <button
           className={`rail-nav-item flex items-center gap-2.5 py-[7px] px-2.5 text-base text-text rounded-md text-left [&:hover]:bg-surface [&.active]:bg-panel [&.active]:font-semibold ${artifactsActive ? "active" : ""}`}
@@ -5725,21 +5728,21 @@ export function ChatPanel({
           onClick={onOpenArtifacts}
         >
           <Package size={15} />
-          Artifacts
+          {t("nav.artifacts")}
         </button>
         <button
           className={`rail-nav-item flex items-center gap-2.5 py-[7px] px-2.5 text-base text-text rounded-md text-left [&:hover]:bg-surface [&.active]:bg-panel [&.active]:font-semibold ${experimentsActive ? "active" : ""}`}
           onClick={onOpenExperiments}
         >
           <FlaskConical size={15} />
-          Experiments
+          {t("nav.experiments")}
         </button>
         <button
           className={`rail-nav-item flex items-center gap-2.5 py-[7px] px-2.5 text-base text-text rounded-md text-left [&:hover]:bg-surface [&.active]:bg-panel [&.active]:font-semibold ${mainView === "skills" ? "active" : ""}`}
           onClick={() => onSelectMainView("skills")}
         >
           <Blocks size={15} />
-          Customize
+          {t("nav.customize")}
         </button>
         {SETTINGS_NAV.map((item) => (
           <button
@@ -5749,13 +5752,13 @@ export function ChatPanel({
             onClick={() => onSelectMainView(item.id)}
           >
             {item.icon}
-            {item.label}
+            {t(item.labelKey)}
           </button>
         ))}
       </nav>
       <div className="rail-section-head flex items-center justify-between shrink-0 pt-3.5 pr-2.5 pb-1.5 pl-4.5">
         <div className="rail-section-label p-0 text-md font-medium text-subtext">
-          {SESSION_FILTERS.find((f) => f.id === sessionFilter)?.railLabel ?? "Recents"}
+          {t(SESSION_FILTERS.find((f) => f.id === sessionFilter)?.railLabelKey ?? "sessions.recents")}
         </div>
         <div className="rail-section-actions flex items-center gap-0.5">
           <button
@@ -5766,7 +5769,7 @@ export function ChatPanel({
             onClick={startNewTask}
           >
             <Plus size={13} />
-            Task
+            {t("rail.newTask")}
           </button>
           <SessionFilterMenu value={sessionFilter} onChange={setSessionFilter} />
         </div>

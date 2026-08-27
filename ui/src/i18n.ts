@@ -46,6 +46,7 @@ const en = {
   "sessions.active": "Active",
   "sessions.archived": "Archived",
   "sessions.all": "All sessions",
+  "sessions.filter": "Filter sessions",
   "rail.newTask": "Task",
   "rail.hideSidebar": "Hide sidebar",
 
@@ -74,6 +75,7 @@ const en = {
   "projects.experimentsTotal": "{n} total",
   "projects.open": "Open {name}",
   "projects.delete": "Delete {name}",
+  "projects.deleteProject": "Delete project",
   "projects.deleteTitle": "Delete project?",
   "projects.deleteBody":
     "Delete {name} from OpenResearch? Its experiments, runs, and chats will be permanently removed.",
@@ -96,9 +98,14 @@ const en = {
   "settings.languageSub": "Choose the language of the interface.",
   "settings.lang.en": "English",
   "settings.lang.fa": "فارسی",
-  "settings.projectDefaults": "Project defaults",
+  "settings.general": "General",
+  "settings.generalSub": "Defaults applied when you create a project.",
   "settings.harnesses": "Harnesses",
+  "settings.harnessesSub":
+    "Coding-agent setups detected on this machine. The research agent chat is served by OpenCode; Claude Code and Codex accounts surface their models in the composer's model picker.",
   "settings.storage": "Storage",
+  "settings.storageSub":
+    "Where orx keeps everything on this machine — the local database, run logs, artifacts, and chat attachments for all projects. Moving it copies the whole store to the new location and activates it there.",
   "settings.updates": "Updates",
   "settings.environment": "Environment",
   "settings.environmentSub":
@@ -106,6 +113,9 @@ const en = {
   "settings.compute": "Compute",
   "settings.instances": "Instances",
   "settings.git": "Git",
+  "settings.repository": "Repository",
+  "settings.instanceHistory": "Instance history",
+  "settings.detectingHarnesses": "Detecting harnesses…",
   "settings.loading": "Loading…",
   "settings.refresh": "Refresh",
 
@@ -141,6 +151,7 @@ const fa: Record<MessageKey, string> = {
   "sessions.active": "فعال",
   "sessions.archived": "بایگانی‌شده",
   "sessions.all": "همهٔ نشست‌ها",
+  "sessions.filter": "فیلتر نشست‌ها",
   "rail.newTask": "وظیفه",
   "rail.hideSidebar": "پنهان‌کردن نوار کناری",
 
@@ -167,6 +178,7 @@ const fa: Record<MessageKey, string> = {
   "projects.experimentsTotal": "در مجموع {n}",
   "projects.open": "باز کردن {name}",
   "projects.delete": "حذف {name}",
+  "projects.deleteProject": "حذف پروژه",
   "projects.deleteTitle": "پروژه حذف شود؟",
   "projects.deleteBody":
     "{name} از OpenResearch حذف شود؟ آزمایش‌ها، اجراها و گفت‌وگوهای آن برای همیشه پاک می‌شوند.",
@@ -188,9 +200,14 @@ const fa: Record<MessageKey, string> = {
   "settings.languageSub": "زبان رابط کاربری را انتخاب کنید.",
   "settings.lang.en": "English",
   "settings.lang.fa": "فارسی",
-  "settings.projectDefaults": "پیش‌فرض‌های پروژه",
+  "settings.general": "عمومی",
+  "settings.generalSub": "پیش‌فرض‌هایی که هنگام ایجاد پروژه اعمال می‌شوند.",
   "settings.harnesses": "هارنس‌ها",
+  "settings.harnessesSub":
+    "تنظیمات عامل‌های کدنویسی شناسایی‌شده روی این دستگاه. گفت‌وگوی عامل پژوهش توسط OpenCode ارائه می‌شود؛ حساب‌های Claude Code و Codex مدل‌هایشان را در انتخاب‌گر مدل نمایش می‌دهند.",
   "settings.storage": "ذخیره‌سازی",
+  "settings.storageSub":
+    "جایی که orx همه‌چیز را روی این دستگاه نگه می‌دارد — پایگاه‌دادهٔ محلی، گزارش‌های اجرا، مصنوعات و پیوست‌های گفت‌وگو برای همهٔ پروژه‌ها. جابه‌جایی آن، کل فروشگاه را به مکان جدید کپی کرده و در آنجا فعال می‌کند.",
   "settings.updates": "به‌روزرسانی‌ها",
   "settings.environment": "محیط",
   "settings.environmentSub":
@@ -198,6 +215,9 @@ const fa: Record<MessageKey, string> = {
   "settings.compute": "محاسبات",
   "settings.instances": "نمونه‌ها",
   "settings.git": "گیت",
+  "settings.repository": "مخزن",
+  "settings.instanceHistory": "تاریخچهٔ نمونه‌ها",
+  "settings.detectingHarnesses": "در حال شناسایی هارنس‌ها…",
   "settings.loading": "در حال بارگذاری…",
   "settings.refresh": "تازه‌سازی",
 
