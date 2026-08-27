@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" dir="ltr">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -18,6 +18,20 @@
           document.documentElement.dataset.theme = dark ? "dark" : "light";
         } catch (e) {
           document.documentElement.dataset.theme = "light";
+        }
+      })();
+    </script>
+    <script>
+      // Resolve the interface language before first paint to avoid an
+      // LTR/English flash. Storage key and values must match src/i18n.ts.
+      (function () {
+        try {
+          var locale = localStorage.getItem("orx:locale") || "en";
+          document.documentElement.lang = locale;
+          document.documentElement.dir = locale === "fa" ? "rtl" : "ltr";
+        } catch (e) {
+          document.documentElement.lang = "en";
+          document.documentElement.dir = "ltr";
         }
       })();
     </script>

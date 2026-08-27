@@ -602,3 +602,39 @@ textarea::placeholder {
     transform: rotate(360deg);
   }
 }
+
+/* ---------------------------------------------------------------------------
+ * RTL layout (Farsi).
+ *
+ * The app is built from physical utility classes (left-/right-, ml-/mr-, pl-/
+ * pr-). Tailwind has no logical-property build in this project, so when the
+ * document flips to `dir="rtl"` (see src/i18n.ts) a small patch layer mirrors
+ * the few chrome elements whose physical positioning would otherwise break.
+ * Flex/grid flows and text alignment follow the document direction for free.
+ * ------------------------------------------------------------------------- */
+
+[dir="rtl"] .settings-switch > span {
+  left: auto;
+  right: 3px;
+}
+[dir="rtl"] .settings-switch.on > span {
+  transform: translateX(-1rem);
+}
+
+/* Right-pane resize handle and project switcher menu are pinned to the
+   leading edge in LTR; in RTL the leading edge is the right. */
+[dir="rtl"] .panel-resizer {
+  left: auto;
+  right: 0;
+}
+[dir="rtl"] .project-menu:not(.align-right) {
+  left: auto;
+  right: 0;
+}
+
+/* Left-aligned rail/session text is a physical utility; follow the document
+   direction so Farsi labels read from the right edge. */
+[dir="rtl"] .rail-nav-item,
+[dir="rtl"] .session-row {
+  text-align: right;
+}
