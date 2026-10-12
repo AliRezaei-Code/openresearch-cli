@@ -12,6 +12,7 @@ mod telemetry;
 pub(crate) use telemetry::{InvocationIdentity, TokenUsage};
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -435,6 +436,11 @@ fn migrate_chat_spawns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Default SQLite busy_timeout for every store connection (5s). Long enough
+/// to ride out ordinary writer bursts, short enough that a dead writer doesn't
+/// stall a command for long.
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
+
 pub struct Store {
     conn: Connection,
     data_dir_move_lock_path: PathBuf,
@@ -456,7 +462,13 @@ impl Store {
     /// Open (creating dirs/schema as needed). WAL so the supervise writers and
     /// the serve readers never block each other.
     pub fn open() -> Result<Self> {
-        Self::open_at_with_move_lock(data_dir(), data_dir_move_lock_path())
+        Self::open_at_with_move_lock(data_dir(), data_dir_move_lock_path(), BUSY_TIMEOUT)
+    }
+
+    /// Open like `open`, but cap SQLite's lock wait — `orx exp wait` shrinks
+    /// this to its deadline so one blocked open can't overshoot it.
+    pub fn open_with_busy_timeout(busy_timeout: Duration) -> Result<Self> {
+        Self::open_at_with_move_lock(data_dir(), data_dir_move_lock_path(), busy_timeout)
     }
 
     /// Open a store rooted at an explicit directory, bypassing `data_dir()`
@@ -465,15 +477,27 @@ impl Store {
     /// (tests in different modules share env under the parallel runner).
     pub fn open_at(dir: PathBuf) -> Result<Self> {
         let move_lock_path = dir.join(".orx-data-dir-move.lock");
-        Self::open_at_with_move_lock(dir, move_lock_path)
+        Self::open_at_with_move_lock(dir, move_lock_path, BUSY_TIMEOUT)
     }
 
-    fn open_at_with_move_lock(dir: PathBuf, data_dir_move_lock_path: PathBuf) -> Result<Self> {
+    /// Shrink this connection's lock wait (e.g. to a wait loop's remaining
+    /// deadline). The next call can pass the default back to restore it.
+    pub(crate) fn set_busy_timeout(&self, timeout: Duration) -> Result<()> {
+        self.conn
+            .pragma_update(None, "busy_timeout", timeout.as_millis() as u64)?;
+        Ok(())
+    }
+
+    fn open_at_with_move_lock(
+        dir: PathBuf,
+        data_dir_move_lock_path: PathBuf,
+        busy_timeout: Duration,
+    ) -> Result<Self> {
         std::fs::create_dir_all(dir.join("run-logs"))
             .map_err(|e| anyhow!("Could not create {}: {}", dir.display(), e))?;
         let conn = Connection::open(dir.join("orx.db"))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "busy_timeout", busy_timeout.as_millis() as u64)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS runs (
                 id           TEXT PRIMARY KEY,
