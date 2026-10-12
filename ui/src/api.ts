@@ -1728,10 +1728,11 @@ export interface HarnessSetupCommands {
 export const getHarnessSetupCommands = (signal?: AbortSignal) =>
   get<Record<HarnessId, HarnessSetupCommands>>("/api/harnesses/setup/commands", signal);
 
-export const getHarnesses = (refresh = false, retryRejected = false, signal?: AbortSignal) => {
+export const getHarnesses = (refresh = false, retryRejected = false, signal?: AbortSignal, harness?: HarnessId) => {
   const params = new URLSearchParams();
   if (refresh) params.set("refresh", "1");
   if (retryRejected) params.set("retry", "1");
+  if (harness) params.set("harness", harness);
   const query = params.size > 0 ? `?${params.toString()}` : "";
   return get<{ harnesses: Harness[] }>(`/api/harnesses${query}`, signal).then((r) => r.harnesses);
 };

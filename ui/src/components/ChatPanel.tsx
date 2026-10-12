@@ -18,6 +18,7 @@ import { useChatState } from "../queries/chatStore";
 
 import {
   getHarnessesQuery,
+  getHarnessSetupCommandsQuery,
   getSkillsQuery,
 } from "../queries/settings";
 import { listChatSessionsQuery, getChatMessagesQuery, listNativeChatsQuery, readSidebarChatPage } from "../queries/chat";
@@ -177,7 +178,7 @@ import { LitSourceLogo, parseOrxLit, paperUrl } from "./LitSourceLogo";
 import { LitSourcesList } from "./LitSourcesPicker";
 import { ChatImageScope, Md } from "./Md";
 import { PlanStrip } from "./PlanStrip";
-import { SETTINGS_NAV, type SettingsTab } from "./SettingsPage";
+import { SETTINGS_NAV, harnessSetupPath, type SettingsTab } from "./SettingsPage";
 import { SkillMenu } from "./SkillMenu";
 import { FileMentionMenu } from "./FileMentionMenu";
 import { ComposerSkillChips, MessageWithChips, skillMarginSpaces } from "./SkillChips";
@@ -4244,6 +4245,7 @@ export function ChatPanel({
   onPreferredAutonomyChange,
   embedded = false,
   onOpenSideChat,
+  onRunSetup,
   children,
 }: {
   projectId: string;
@@ -4258,6 +4260,8 @@ export function ChatPanel({
   /** Reopen the rail (from the chat header's sidebar icon). */
   onShowRail: () => void;
   onNewProject?: () => void;
+  /** Run a harness setup command (`path` is its setup route) in the right panel's terminal tab. */
+  onRunSetup?: (command: string, path: string) => void;
   /** Settings sections replace chat; Artifacts remains a right-panel tool. */
   mainView: "chat" | "skills" | SettingsTab;
   onSelectMainView: (view: "chat" | "skills" | SettingsTab) => void;
@@ -4683,6 +4687,14 @@ export function ChatPanel({
     ? harnesses.find((h) => h.id === rawSelection.harness)
     : undefined;
   const opts = activeHarness?.options;
+  const { data: setupCommands } = useQuery({ ...getHarnessSetupCommandsQuery(), enabled: !!onRunSetup });
+  const setupPath = (command: string) => {
+    if (!activeHarness) return undefined;
+    const setup = setupCommands?.[activeHarness.id];
+    // The setup route refuses a Claude login its auth state rules out.
+    if (activeHarness.id === "claude-code" && command === setup?.login && !activeHarness.loginEligible) return undefined;
+    return harnessSetupPath(activeHarness, setup, command);
+  };
   const commands = useMemo(
     () => commandsForHarness(skills, opts?.planActivation),
     [skills, opts?.planActivation],
@@ -6823,7 +6835,15 @@ export function ChatPanel({
                 ) : (
                   <>
                     <strong>{activeHarness.name} {m.chat_panel_is_unavailable()}</strong>{" "}
-                    {activeHarness.agentNote ? renderNote(activeHarness.agentNote) : m.chat_recheck_setup()}
+                    {activeHarness.agentNote
+                      ? renderNote(activeHarness.agentNote, onRunSetup && {
+                        canRun: (command) => setupPath(command) !== undefined,
+                        onRun: (command) => {
+                          const path = setupPath(command);
+                          if (path) onRunSetup(command, path);
+                        },
+                      })
+                      : m.chat_recheck_setup()}
                   </>
                 )}
               </div>

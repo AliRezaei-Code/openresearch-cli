@@ -6512,6 +6512,8 @@ const FILL_RETRY_FLOOR: Duration = Duration::from_secs(5);
 struct HarnessQuery {
     refresh: Option<u8>,
     retry: Option<u8>,
+    /// With `refresh=1`, re-detect only this harness instead of every one.
+    harness: Option<String>,
 }
 
 fn overlay_claude_auth(payload: &mut Value, snapshot: &local::claude::AuthSnapshot) {
@@ -6785,11 +6787,24 @@ async fn list_harnesses(
 /// a background fill replaces the entry with the full catalog, then tells the
 /// dashboard to re-read it. `refresh=1` still runs the full probe inline: an
 /// explicit re-check wants the real answer, and the UI shows its own spinner.
+/// With `harness=<id>` it probes only that harness (unless a fill is running)
+/// and serves the cache with it patched in.
 async fn harnesses_payload(state: &AppState, q: &HarnessQuery) -> Value {
     // `retry` only escalates to a full detect when it actually cleared a
     // runtime rejection — a bare retry is an ordinary cached read.
     let retried = q.retry == Some(1) && state.claude.clear_runtime_rejection();
-    if q.refresh == Some(1) || retried {
+    if let (Some(1), Some(id)) = (q.refresh, q.harness.as_deref()) {
+        // Publishing re-stamps the cache, voiding an in-flight fill's other harnesses;
+        // the fill commits this one itself and the auth monitor re-checks after it.
+        if !state
+            .harness_fill_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            if let Some(info) = local::harness::detect_harness(id).await {
+                publish_harness(state, &info).await;
+            }
+        }
+    } else if q.refresh == Some(1) || retried {
         // An explicit re-check detects outside the cache lock: a full sweep
         // takes seconds and must not stall every ordinary read queued behind
         // it. Last writer wins — concurrent refreshes may duplicate a sweep.
@@ -6833,8 +6848,8 @@ async fn harnesses_payload(state: &AppState, q: &HarnessQuery) -> Value {
     seed_harnesses_locked(state, &mut cache).await
 }
 
-/// Commit one harness's full detection after setup changed it, so the
-/// dashboard need not wait on every sibling's probes to see the result.
+/// Commit one harness's full detection after setup or a sign-in changed it, so
+/// the dashboard need not wait on every sibling's probes to see the result.
 async fn publish_harness(state: &AppState, info: &local::harness::HarnessInfo) {
     if info.id == "claude-code" {
         if let Some(probe) = info.auth_observation.as_ref() {
@@ -6925,7 +6940,7 @@ async fn seed_harnesses_locked(
 /// live Claude auth observations and first-install telemetry.
 /// The returned `Option` is a claimed auth announcement: the caller emits it
 /// only after committing the payload, so a discarded pass never sends the
-/// dashboard on a `refresh=1` sweep for results nobody will see.
+/// dashboard to re-probe Claude for results nobody will see.
 async fn finish_harnesses_payload(
     state: &AppState,
     harnesses: Vec<local::harness::HarnessInfo>,
@@ -6951,8 +6966,8 @@ async fn finish_harnesses_payload(
         snapshot = state.claude.auth_snapshot();
     }
     // A provisional pass must not announce: `harness.auth` makes the dashboard
-    // call `refreshHarnesses(true)`, an inline full sweep — the stall this
-    // whole design exists to remove — fired by the snapshot's own adoption.
+    // re-probe Claude inline — the stall this whole design exists to remove —
+    // fired by the snapshot's own adoption.
     // A real pass hands its auth snapshot back unclaimed; the caller claims at
     // emit time, after the payload commits, so a pass that loses the cache
     // race never burns a generation it can't announce.
@@ -7400,6 +7415,7 @@ async fn create_chat_session(
             &HarnessQuery {
                 refresh: None,
                 retry: None,
+                harness: None,
             },
         )
         .await;

@@ -382,7 +382,7 @@ function AuthLabel({ h }: { h: Harness }) {
 /** A note command that is one of the harness's setup commands runs through the
  * setup route, which owns install/login/update semantics (telemetry, OpenCode's
  * isolated store, verification); `shell` keeps the terminal open afterwards. */
-function harnessSetupPath(h: Harness, setup: HarnessSetupCommands | undefined, command: string) {
+export function harnessSetupPath(h: Harness, setup: HarnessSetupCommands | undefined, command: string) {
   if (!setup) return undefined;
   // Install notes quote the vendor one-liner (`curl … | bash`) while the shown
   // setup command fetches to a temp file first, so exact equality would drop the
