@@ -1517,10 +1517,13 @@ export const captureUiEvent = (event: UiEvent): void => {
   void post<{ ok: boolean }>("/api/telemetry/event", event).catch(() => {});
 };
 
-/** Tells orx which language the dashboard displays, for usage analytics. Fire-and-forget. */
-export const reportLocale = (locale: string): void => {
-  void post<{ locale: string }>("/api/telemetry/locale", { locale }).catch(() => {});
-};
+export const reportLocale = (locale: string, signal?: AbortSignal) =>
+  writeResponse("/api/telemetry/locale", {
+    method: "POST",
+    signal,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ locale }),
+  }).then((r) => json<{ locale: string }>(r));
 
 export type HarnessId = "claude-code" | "codex" | "opencode" | "cursor" | "antigravity";
 
