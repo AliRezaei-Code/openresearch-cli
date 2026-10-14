@@ -67,6 +67,7 @@ import {
   ToggleRight,
   TriangleAlert,
   Users,
+  WifiOff,
   X,
 } from "lucide-react";
 import {
@@ -2283,9 +2284,11 @@ function TurnStatusRow({
   recovering,
   onRecover,
   usageLimited = false,
+  temporaryApiError = false,
 }: {
   part: ChatPart;
   usageLimited?: boolean;
+  temporaryApiError?: boolean;
   busy: boolean;
   recovering: boolean;
   onRecover?: (turnId: string, action: "retry" | "continue") => void;
@@ -2317,13 +2320,14 @@ function TurnStatusRow({
   const turnId = input?.turnId;
   const label = isModelAccessLimitPart(part)
     ? m.chat_model_unavailable()
-    : usageLimited ? m.chat_session_limit_reached() : m.chat_turn_incomplete();
-  const Icon = usageLimited ? Gauge : TriangleAlert;
+    : usageLimited ? m.chat_session_limit_reached()
+    : temporaryApiError ? m.chat_panel_temporary_api_error() : m.chat_turn_incomplete();
+  const Icon = temporaryApiError ? WifiOff : usageLimited ? Gauge : TriangleAlert;
   const errorMessage = cleanToolError(part.state?.error || m.chat_turn_incomplete());
   return (
     <details className="turn-usage-limit group/limit text-base text-subtext">
       <summary className="flex w-fit max-w-full items-center gap-2 cursor-pointer list-none rounded-sm focus-visible:outline-2 focus-visible:outline-text [&::-webkit-details-marker]:hidden">
-        <Icon size={18} className="shrink-0 text-accent-red" aria-hidden="true" />
+        <Icon size={18} className={temporaryApiError ? "shrink-0 text-subtext" : "shrink-0 text-accent-red"} aria-hidden="true" />
         <span>{label}</span>
         <ChevronRight size={16} className="shrink-0 text-text transition-transform duration-120 ease-standard group-open/limit:rotate-90 motion-reduce:transition-none" aria-hidden="true" />
       </summary>
@@ -2959,7 +2963,7 @@ function ForkControls({
   );
 }
 
-const Message = memo(function Message({
+export const Message = memo(function Message({
   message,
   activePermissionId,
   pendingTailToolId,
@@ -3140,10 +3144,9 @@ const Message = memo(function Message({
   }
   const usageLimit = message.parts.find((part) => part.type === "tool" && isUsageLimitPart(part));
   const turnStatus = message.parts.find(isTurnStatusPart) ?? usageLimit;
-  const regularParts = withoutDuplicateTurnError(
-    message.parts.filter((part) => part !== turnStatus && !(usageLimit && isUsageLimitPart(part))),
-    turnStatus,
-  );
+  const turnParts = message.parts.filter((part) => part !== turnStatus && !(usageLimit && isUsageLimitPart(part)));
+  const regularParts = withoutDuplicateTurnError(turnParts, turnStatus);
+  const temporaryApiError = regularParts.length < turnParts.length && turnParts.at(-1)?.tool === "api_error";
   const copyText = predictTextTail && !message.completedAt ? "" : responseText(message);
   return (
     <div className="msg-assistant group/turn text-base leading-[1.62] text-text min-w-0">
@@ -3165,6 +3168,7 @@ const Message = memo(function Message({
         <TurnStatusRow
           part={turnStatus}
           usageLimited={Boolean(usageLimit)}
+          temporaryApiError={temporaryApiError}
           busy={busy}
           recovering={recoveringTurnId === turnStatus.state?.input?.turnId}
           onRecover={onRecover}
@@ -3343,6 +3347,11 @@ function renderParts(
     // resolved permission card. Without this, each invisible part splits
     // consecutive tools into single-row groups.
     if (!partIsVisible(part, activePermissionId)) continue;
+    if (part.type === "tool" && part.tool === "api_error") {
+      flushTools();
+      rendered.push(<TurnStatusRow key={part.id} part={part} busy={false} recovering={false} temporaryApiError />);
+      continue;
+    }
     // A sub-agent spawn part streams its own transcript in `children` — render
     // it as a standalone nested block, not folded into a tool run. Codex tags
     // its rows `subagent`; Claude's `Task`/`Agent` and OpenCode's `task` are
