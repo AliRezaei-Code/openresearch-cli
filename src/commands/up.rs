@@ -7238,6 +7238,12 @@ struct SessionsQuery {
     before_id: Option<String>,
 }
 
+fn sidebar_session_json(store: &Store, session: &StoredChatSession, busy: bool) -> Result<Value> {
+    let mut value = local::chat::session_json(session, busy);
+    value["awaitingInput"] = json!(store.chat_session_awaiting_input(&session.id, busy)?);
+    Ok(value)
+}
+
 async fn list_chat_sessions(
     State(state): State<AppState>,
     Query(q): Query<SessionsQuery>,
@@ -7259,8 +7265,8 @@ async fn list_chat_sessions(
         let busy = state.chat.busy_sessions().await;
         let sessions: Vec<Value> = sessions
             .iter()
-            .map(|session| local::chat::session_json(session, busy.contains(&session.id)))
-            .collect();
+            .map(|session| sidebar_session_json(&store, session, busy.contains(&session.id)))
+            .collect::<Result<_>>()?;
         return Ok(Json(json!({ "sessions": sessions, "next": next })));
     }
     let sessions = match (q.project_id.as_deref(), q.scope.as_deref()) {
@@ -7271,8 +7277,8 @@ async fn list_chat_sessions(
     let busy = state.chat.busy_sessions().await;
     let sessions: Vec<Value> = sessions
         .iter()
-        .map(|s| local::chat::session_json(s, busy.contains(&s.id)))
-        .collect();
+        .map(|s| sidebar_session_json(&store, s, busy.contains(&s.id)))
+        .collect::<Result<_>>()?;
     Ok(Json(json!({ "sessions": sessions })))
 }
 
