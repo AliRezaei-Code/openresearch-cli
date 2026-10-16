@@ -86,6 +86,13 @@ async fn submit_controller_run(
     // The run's env: everything the user synced (API keys), plus the tokens
     // the run script expects. Passed to the launcher process.
     let mut env = crate::config::run_env(&run_id);
+    env.insert(
+        crate::compute::TENSORBOARD_LOGDIR.to_string(),
+        crate::jobs::localbox::run_dir(&run_id)
+            .join("tensorboard")
+            .to_string_lossy()
+            .into_owned(),
+    );
     if let Ok(hf_token) = crate::jobs::huggingface::resolve_token() {
         env.entry("HF_TOKEN".to_string()).or_insert(hf_token);
     }

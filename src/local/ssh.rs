@@ -69,7 +69,11 @@ pub async fn submit_local_ssh_with_source(
         container.as_ref(),
     )
     .await?;
-    let script = crate::compute::staged_script(&run_command);
+    let script = format!(
+        "{} {}",
+        crate::compute::TENSORBOARD_LOGDIR_EXPORT,
+        crate::compute::staged_script(&run_command)
+    );
 
     // The remote env: everything the user synced (API keys), plus the tokens
     // the run script expects. Exported inside run.sh (written owner-only).
