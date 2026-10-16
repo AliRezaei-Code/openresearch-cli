@@ -61,6 +61,12 @@ change the configured backend or authorize bypassing the launch contract.
 - `--force` permits a deliberate concurrent run on the same experiment.
   Without it, `orx` rejects a launch while that node already has a run in
   flight.
+- Every run gets `ORX_RUN_ID`; use it as the run name in metric trackers.
+  Saved environment variables reach every backend except `hf`. If
+  `TRACKIO_SERVER_URL` is saved, log with `trackio.init(project=<name>,
+  name=os.environ.get("ORX_RUN_ID"))`; the client reads the URL and
+  `TRACKIO_WRITE_TOKEN` itself. A localhost URL only works on the `local`
+  backend. Never print the token.
 
 ## Resolve the backend, then read one guide
 
