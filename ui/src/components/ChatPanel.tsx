@@ -6487,7 +6487,8 @@ export function ChatPanel({
         {railOpen && rail}
         <section className="chat-pane flex-1 min-w-0 flex flex-col bg-background min-h-0">
           {!railOpen && <div className="flex h-12 shrink-0 items-center">{railReopen}</div>}
-          <div className="settings-view-scroll flex-1 min-h-0 overflow-y-auto [scrollbar-gutter:stable_both-edges]">
+          {/* Keyed per view so no tab inherits the chat thread's or another tab's scroll offset. */}
+          <div key={mainView} className="settings-view-scroll flex-1 min-h-0 overflow-y-auto [scrollbar-gutter:stable_both-edges]">
             {contentError ? <div role="alert" className="p-6 text-subtext">{contentError}<Button onClick={onRetryContent}>{m.app_retry()}</Button></div>
               : contentLoading ? <LoadingRow className="p-6"><Spinner />{m.chat_panel_loading_conversation()}</LoadingRow> : children}
           </div>
