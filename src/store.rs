@@ -555,6 +555,20 @@ fn queue_remote_cleanups(
     Ok(())
 }
 
+fn validate_deleted_runs(runs: &[StoredRun]) -> Result<()> {
+    for run in runs {
+        if run.id.is_empty()
+            || !run
+                .id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(anyhow!("Invalid run id for artifact cleanup: {}", run.id));
+        }
+    }
+    Ok(())
+}
+
 /// Failed remote cleanups retry after 5 minutes, doubling up to a day.
 const REMOTE_CLEANUP_RETRY_MS: i64 = 5 * 60 * 1000;
 const REMOTE_CLEANUP_MAX_RETRY_MS: i64 = 24 * 60 * 60 * 1000;
@@ -1377,8 +1391,6 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    // Consumed by later local-mode stages (supervise + `orx up` API).
-    #[allow(dead_code)]
     pub fn list_runs_by_experiment(&self, experiment_id: &str) -> Result<Vec<StoredRun>> {
         let mut stmt = self.conn.prepare(&format!(
             "{SELECT_RUN} WHERE experiment_id = ?1 ORDER BY created_at DESC"
@@ -2003,7 +2015,10 @@ impl Store {
         Ok(true)
     }
 
-    fn cleanup_run_artifacts_locked(&self, deleting_project: Option<&str>) -> Result<OrphanPass> {
+    fn cleanup_run_artifacts_locked(
+        &self,
+        deleting_runs: Option<&std::collections::HashSet<String>>,
+    ) -> Result<OrphanPass> {
         let started = std::time::Instant::now();
         let mut pass = OrphanPass::default();
         self.validate_run_artifact_roots()?;
@@ -2011,18 +2026,12 @@ impl Store {
         let mut retained_snapshots = std::collections::HashSet::new();
         let mut deleted_runs = std::collections::HashSet::new();
         let mut retain_all_snapshots = false;
-        let mut statement = self
-            .conn
-            .prepare("SELECT id, backend_json, project_id FROM runs")?;
+        let mut statement = self.conn.prepare("SELECT id, backend_json FROM runs")?;
         for row in statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })? {
-            let (id, json, project) = row?;
-            if deleting_project == Some(project.as_str()) {
+            let (id, json) = row?;
+            if deleting_runs.is_some_and(|ids| ids.contains(&id)) {
                 deleted_runs.insert(id);
                 continue;
             }
@@ -2058,10 +2067,8 @@ impl Store {
                 }
             };
             match fate {
-                // Project deletion leaves unrelated orphans to the periodic scan.
-                OrphanFate::Reclaim if deleting || deleting_project.is_none() => {
-                    reclaimable.push(id)
-                }
+                // Deletion leaves unrelated orphans to the periodic scan.
+                OrphanFate::Reclaim if deleting || deleting_runs.is_none() => reclaimable.push(id),
                 OrphanFate::Reclaim => {}
                 OrphanFate::Keep { snapshot } => retained_snapshots.extend(snapshot),
                 OrphanFate::KeepWithAllSnapshots => retain_all_snapshots = true,
@@ -2076,10 +2083,7 @@ impl Store {
             }
             remaining -= 1;
             // Checked after a removal so every pass makes progress.
-            if deleting_project.is_none()
-                && remaining > 0
-                && started.elapsed() >= ORPHAN_PASS_BUDGET
-            {
+            if deleting_runs.is_none() && remaining > 0 && started.elapsed() >= ORPHAN_PASS_BUDGET {
                 pass.more = true;
                 return Ok(pass);
             }
@@ -2110,7 +2114,7 @@ impl Store {
         let live = |reason: &str| {
             if deleting {
                 Err(anyhow!(
-                    "Run {id} {reason}; retry project deletion once it stops."
+                    "Run {id} {reason}; retry the deletion once it stops."
                 ))
             } else {
                 Ok(OrphanFate::KeepWithAllSnapshots)
@@ -2159,8 +2163,7 @@ impl Store {
         }
     }
 
-    fn cleanup_project_run_artifacts(&self, project_id: &str) -> Result<()> {
-        let runs = self.list_runs_by_project(project_id)?;
+    fn cleanup_deleted_run_artifacts(&self, runs: &[StoredRun], noun: &str) -> Result<()> {
         if runs.is_empty() {
             return Ok(());
         }
@@ -2169,20 +2172,122 @@ impl Store {
             .any(|run| !crate::local::is_terminal(&run.status))
         {
             return Err(anyhow!(
-                "Cannot delete a project with runs still in flight."
+                "Cannot delete this {noun} while its runs are still in flight."
             ));
         }
-        for run in &runs {
-            if run.id.is_empty()
-                || !run
-                    .id
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            {
-                return Err(anyhow!("Invalid run id for artifact cleanup: {}", run.id));
+        validate_deleted_runs(runs)?;
+        let ids = runs.iter().map(|run| run.id.clone()).collect();
+        self.cleanup_run_artifacts_locked(Some(&ids))?;
+        Ok(())
+    }
+
+    /// Runs `f` holding run artifacts shared, excluding deletes and orphan scans; waits up to
+    /// [`RUN_ARTIFACTS_WAIT`].
+    pub(crate) fn with_run_artifacts_shared<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let lock = self.run_artifacts_lock()?;
+        let deadline = std::time::Instant::now() + RUN_ARTIFACTS_WAIT;
+        let _guard = loop {
+            match lock.try_read() {
+                Ok(guard) => break guard,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(RUN_ARTIFACTS_POLL);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Err(anyhow!(
+                        "A deletion or artifact cleanup is in progress; retry shortly."
+                    ))
+                }
+                Err(error) => return Err(error.into()),
             }
+        };
+        f()
+    }
+
+    /// Runs `delete` with exclusive use of run artifacts, waiting up to [`RUN_ARTIFACTS_WAIT`].
+    fn while_deleting(&self, noun: &str, delete: impl FnOnce() -> Result<()>) -> Result<()> {
+        let mut lock = self.run_artifacts_lock()?;
+        let deadline = std::time::Instant::now() + RUN_ARTIFACTS_WAIT;
+        let _guard = loop {
+            match lock.try_write() {
+                Ok(guard) => break guard,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(RUN_ARTIFACTS_POLL);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Err(anyhow!("Run artifacts are busy; retry {noun} deletion."))
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        // A move can start while this waits; its copy must not race the removals below.
+        if self.data_dir_move_claimed()? {
+            return Err(anyhow!(
+                "The data directory is being moved; retry {noun} deletion afterwards."
+            ));
         }
-        self.cleanup_run_artifacts_locked(Some(project_id))?;
+        delete()
+    }
+
+    /// Delete a childless experiment with its runs' rows and local artifacts, queueing their
+    /// remote dirs. `before_rows` runs once the checks pass, so a refusal leaves it undone.
+    pub fn delete_local_experiment(
+        &self,
+        id: &str,
+        before_rows: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        self.while_deleting("experiment", || {
+            self.delete_local_experiment_locked(id, before_rows)
+        })
+    }
+
+    fn delete_local_experiment_locked(
+        &self,
+        id: &str,
+        before_rows: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        // A concurrent delete may have won, and a new experiment may now own its branch.
+        if self.get_local_experiment(id)?.is_none() {
+            return Err(anyhow!("Experiment {id} not found."));
+        }
+        let children: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM local_experiments WHERE parent_experiment_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        if children > 0 {
+            return Err(anyhow!(
+                "Experiment {id} has {children} child experiment(s); delete them or move them with `orx exp move` first."
+            ));
+        }
+        let runs = self.list_runs_by_experiment(id)?;
+        if runs
+            .iter()
+            .any(|run| !crate::local::is_terminal(&run.status))
+        {
+            return Err(anyhow!(
+                "Cannot delete this experiment while its runs are still in flight."
+            ));
+        }
+        // Refuse what cleanup would, such as a supervisor still winding down, before `before_rows` acts.
+        validate_deleted_runs(&runs)?;
+        self.validate_run_artifact_roots()?;
+        for run in &runs {
+            self.orphan_fate(&run.id, true)?;
+        }
+        before_rows()?;
+        // Keep rows on filesystem errors so deletion can be retried with the same handles.
+        self.cleanup_deleted_run_artifacts(&runs, "experiment")?;
+        let tx = self.begin()?;
+        queue_remote_cleanups(&tx, "experiment_id", id, true)?;
+        tx.execute("DELETE FROM runs WHERE experiment_id = ?1", params![id])?;
+        tx.execute("DELETE FROM local_experiments WHERE id = ?1", params![id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2301,35 +2406,22 @@ impl Store {
         id: &str,
         native_purge: Option<impl FnOnce() -> Result<()>>,
     ) -> Result<()> {
-        let mut lock = self.run_artifacts_lock()?;
-        let deadline = std::time::Instant::now() + RUN_ARTIFACTS_WAIT;
-        let _guard = loop {
-            match lock.try_write() {
-                Ok(guard) => break guard,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(RUN_ARTIFACTS_POLL);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    return Err(anyhow!("Run artifacts are busy; retry project deletion."))
-                }
-                Err(error) => return Err(error.into()),
-            }
-        };
-        // A move can start while this waits; its copy must not race the removals below.
-        if self.data_dir_move_claimed()? {
-            return Err(anyhow!(
-                "The data directory is being moved; retry project deletion afterwards."
-            ));
-        }
+        self.while_deleting("project", || {
+            self.delete_local_project_locked(id, native_purge)
+        })
+    }
+
+    fn delete_local_project_locked(
+        &self,
+        id: &str,
+        native_purge: Option<impl FnOnce() -> Result<()>>,
+    ) -> Result<()> {
         let _native_deletion = native_purge
             .is_some()
             .then(|| self.lock_native_deletion())
             .transpose()?;
         // Keep rows on filesystem errors so deletion can be retried with the same handles.
-        self.cleanup_project_run_artifacts(id)?;
+        self.cleanup_deleted_run_artifacts(&self.list_runs_by_project(id)?, "project")?;
         if let Some(purge) = native_purge {
             purge()?;
         }
@@ -4493,6 +4585,89 @@ mod tests {
         store.delete_local_project("malformed").unwrap();
         assert!(!dir.join("local-runs/malformed-run").exists());
         drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn experiment_delete_reclaims_its_run_artifacts_only_after_checks_pass() {
+        let dir = std::env::temp_dir().join(format!("orx-exp-artifacts-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let run = uuid::Uuid::new_v4().to_string();
+        let sibling = uuid::Uuid::new_v4().to_string();
+        let (digest, shared) = ("d".repeat(64), "e".repeat(64));
+        project_with_run_artifacts(&store, "p", &run, &digest);
+        project_with_run_artifacts(&store, "q", &sibling, &shared);
+        store
+            .conn
+            .execute(
+                "INSERT INTO local_experiments (id, project_id, slug, branch_name, title, description,
+                   run_command, agent_status, created_at, updated_at)
+                 VALUES ('experiment', 'p', 'e', 'orx/e', NULL, NULL, '', 'idle', 1, 1)",
+                [],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE runs SET experiment_id = 'other' WHERE id = ?1",
+                params![sibling],
+            )
+            .unwrap();
+        let refused = |store: &Store| {
+            let mut called = false;
+            assert!(store
+                .delete_local_experiment("experiment", || {
+                    called = true;
+                    Ok(())
+                })
+                .is_err());
+            assert!(!called);
+        };
+        store
+            .conn
+            .execute(
+                "UPDATE runs SET status = 'running' WHERE id = ?1",
+                params![run],
+            )
+            .unwrap();
+        refused(&store);
+        store
+            .conn
+            .execute(
+                "UPDATE runs SET status = 'done' WHERE id = ?1",
+                params![run],
+            )
+            .unwrap();
+        // A terminal run whose supervisor is still finishing is refused before anything is undone.
+        let mut supervisor =
+            open_lifecycle_lock_at(&dir.join("run-logs").join(format!("{run}.supervisor.lock")))
+                .unwrap();
+        let held = supervisor.write().unwrap();
+        refused(&store);
+        drop(held);
+        store
+            .delete_local_experiment("experiment", || Ok(()))
+            .unwrap();
+        // A repeat delete is refused before touching anything.
+        refused(&store);
+        assert!(!dir.join("local-runs").join(&run).exists());
+        assert!(!dir.join("run-logs").join(format!("{run}.log")).exists());
+        assert!(!dir
+            .join("source-snapshots")
+            .join(format!("{digest}.tar"))
+            .exists());
+        assert!(store.get_run(&run).unwrap().is_none());
+        assert!(dir
+            .join("local-runs")
+            .join(&sibling)
+            .join("repo/output")
+            .is_file());
+        assert!(dir
+            .join("source-snapshots")
+            .join(format!("{shared}.tar"))
+            .is_file());
+        assert!(store.get_run(&sibling).unwrap().is_some());
+        assert!(store.get_local_project("p").unwrap().is_some());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
