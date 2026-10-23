@@ -106,18 +106,26 @@ impl Drop for DataDirMoveLock {
     }
 }
 
-fn acquire_data_dir_move_lock(path: PathBuf) -> Result<DataDirMoveLock> {
+fn acquire_data_dir_lock(path: PathBuf, exclusive: bool) -> Result<DataDirMoveLock> {
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let thread = std::thread::spawn(move || {
         let result = (|| -> Result<()> {
             let mut lock = open_lifecycle_lock_at(&path)?;
-            let _guard = lock.try_write()?;
-            ready_tx
-                .send(Ok(()))
-                .map_err(|_| anyhow!("data-directory move lock receiver closed"))?;
-            let _ = release_rx.recv();
-            Ok(())
+            let wait = || -> Result<()> {
+                ready_tx
+                    .send(Ok(()))
+                    .map_err(|_| anyhow!("data-directory move lock receiver closed"))?;
+                let _ = release_rx.recv();
+                Ok(())
+            };
+            if exclusive {
+                let _guard = lock.try_write()?;
+                wait()
+            } else {
+                let _guard = lock.try_read()?;
+                wait()
+            }
         })();
         if let Err(error) = result {
             let _ = ready_tx.send(Err(error.to_string()));
@@ -137,6 +145,10 @@ fn acquire_data_dir_move_lock(path: PathBuf) -> Result<DataDirMoveLock> {
             Err(anyhow!("data-directory move lock thread exited"))
         }
     }
+}
+
+pub(crate) fn acquire_data_dir_read_lock() -> Result<DataDirMoveLock> {
+    acquire_data_dir_lock(data_dir_move_lock_path(), false)
 }
 
 /// Read an env var as a path, treating unset **and empty** the same (an empty
@@ -489,9 +501,13 @@ const SLIMMED_RUN_PATHS: [&[&str]; 2] = [&["repo", ".venv"], &["repo", ".cache",
 const SUBMISSION_HANDLE: (&str, &str) = ("submission-handles", ".json");
 const SUPERVISOR_LOCK: (&str, &str) = ("run-logs", ".supervisor.lock");
 /// Per-run files as (data-dir root, name suffix); the supervisor lock goes last so it excludes until the end.
-const RUN_ARTIFACTS: [(&str, &str); 7] = [
+const RUN_ARTIFACTS: [(&str, &str); 11] = [
     ("local-runs", ""),
     ("run-logs", ".log"),
+    ("run-logs", ".cursor.json"),
+    ("run-logs", ".pending.json"),
+    ("run-logs", ".cursor.lock"),
+    ("run-logs", ".supervisor.shared-ssh.lock"),
     ("run-logs", ".supervisor.log"),
     ("run-logs", ".supervisor.log.1"),
     ("run-logs", ".cancel.lock"),
@@ -1646,7 +1662,7 @@ impl Store {
     }
 
     pub(crate) fn acquire_data_dir_move_lock(&self) -> Result<DataDirMoveLock> {
-        acquire_data_dir_move_lock(self.data_dir_move_lock_path.clone())
+        acquire_data_dir_lock(self.data_dir_move_lock_path.clone(), true)
     }
 
     fn clear_stale_data_dir_move_lease(&self) -> Result<()> {
@@ -1661,8 +1677,8 @@ impl Store {
         let Some(token) = token else {
             return Ok(());
         };
-        let mut lock = open_lifecycle_lock_at(&self.data_dir_move_lock_path)?;
-        match lock.try_write() {
+        let lock = open_lifecycle_lock_at(&self.data_dir_move_lock_path)?;
+        match lock.try_read() {
             Ok(_guard) => {
                 self.conn.execute(
                     "DELETE FROM data_dir_move_lease WHERE id = 1 AND claim_token = ?1",
@@ -1931,6 +1947,11 @@ impl Store {
     }
 
     fn remove_run_artifacts(&self, run_id: &str) -> Result<()> {
+        for entry in artifact_entries(&self.data_dir.join("run-logs"))? {
+            if entry.file_name().to_str().and_then(log_generation_run_id) == Some(run_id) {
+                remove_run_artifact(&entry.path())?;
+            }
+        }
         for artifact in RUN_ARTIFACTS {
             remove_run_artifact(&self.run_artifact_path(artifact, run_id))?;
         }
@@ -2046,8 +2067,16 @@ impl Store {
         for (root, suffix) in RUN_ARTIFACTS {
             for entry in artifact_entries(&self.data_dir.join(root))? {
                 let name = entry.file_name();
-                let Some(id) = name.to_str().and_then(|name| name.strip_suffix(suffix)) else {
+                let Some(name) = name.to_str() else {
                     continue;
+                };
+                let Some(id) = name.strip_suffix(suffix) else {
+                    continue;
+                };
+                let id = if root == "run-logs" && suffix == ".log" {
+                    log_generation_run_id(name).unwrap_or(id)
+                } else {
+                    id
                 };
                 if uuid::Uuid::parse_str(id).is_ok() && !retained_runs.contains(id) {
                     candidates.insert(id.to_string());
@@ -4287,6 +4316,12 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn log_generation_run_id(name: &str) -> Option<&str> {
+    let (run, generation) = name.strip_suffix(".log")?.split_once('.')?;
+    uuid::Uuid::parse_str(generation).ok()?;
+    Some(run)
+}
+
 fn artifact_entries(path: &Path) -> Result<Vec<std::fs::DirEntry>> {
     match std::fs::read_dir(path) {
         Ok(entries) => Ok(entries.collect::<std::io::Result<Vec<_>>>()?),
@@ -4546,6 +4581,63 @@ mod tests {
         for kept in [running, supervised].into_iter().chain(newest_and_quiet) {
             assert!(run_dir(kept).join("repo/.venv").is_dir(), "{kept}");
         }
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn shared_ssh_log_cleanup_preserves_retained_runs_and_removes_deleted_generations() {
+        let dir =
+            std::env::temp_dir().join(format!("orx-ssh-log-cleanup-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let deleted = uuid::Uuid::new_v4().to_string();
+        let retained = uuid::Uuid::new_v4().to_string();
+        project_with_run_artifacts(&store, "deleted", &deleted, &"a".repeat(64));
+        project_with_run_artifacts(&store, "retained", &retained, &"b".repeat(64));
+        let suffixes = [
+            "cursor.json".to_string(),
+            "pending.json".to_string(),
+            "cursor.lock".to_string(),
+            "supervisor.shared-ssh.lock".to_string(),
+            format!("{}.log", uuid::Uuid::new_v4()),
+            format!("{}.log", uuid::Uuid::new_v4()),
+        ];
+        for run in [&deleted, &retained] {
+            for suffix in &suffixes {
+                std::fs::write(dir.join("run-logs").join(format!("{run}.{suffix}")), "log")
+                    .unwrap();
+            }
+        }
+        let orphan = dir.join("run-logs").join(format!(
+            "{}.{}.log",
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&orphan, "interrupted generation").unwrap();
+        let unrelated = dir.join("run-logs").join(format!("{deleted}.notes.log"));
+        std::fs::write(&unrelated, "unrecognized file").unwrap();
+        store.cleanup_orphaned_run_artifacts().unwrap();
+        assert!(!orphan.exists());
+        for run in [&deleted, &retained] {
+            for suffix in &suffixes {
+                assert!(dir
+                    .join("run-logs")
+                    .join(format!("{run}.{suffix}"))
+                    .is_file());
+            }
+        }
+        store.delete_local_project("deleted").unwrap();
+        for suffix in &suffixes {
+            assert!(!dir
+                .join("run-logs")
+                .join(format!("{deleted}.{suffix}"))
+                .exists());
+            assert!(dir
+                .join("run-logs")
+                .join(format!("{retained}.{suffix}"))
+                .is_file());
+        }
+        assert!(unrelated.is_file());
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -7493,8 +7585,12 @@ mod tests {
         second.release_data_dir_move("move_B").unwrap();
         assert!(!second.claim_chat_turn("chat_A", "token_B").unwrap());
         drop(move_lock);
+        let service_lock =
+            acquire_data_dir_lock(first.data_dir_move_lock_path.clone(), false).unwrap();
+        assert!(first.acquire_data_dir_move_lock().is_err());
         assert!(second.claim_chat_turn("chat_A", "token_B").unwrap());
 
+        drop(service_lock);
         drop(second);
         drop(first);
         let _ = std::fs::remove_dir_all(dir);

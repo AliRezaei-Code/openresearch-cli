@@ -25,6 +25,15 @@ impl Sandbox {
             .arg("--no-telemetry");
         cmd
     }
+    fn stop_service(&self, data: &std::path::Path) {
+        let _ = Command::new(env!("CARGO_BIN_EXE_orx"))
+            .env("HOME", &self.0)
+            .env("USERPROFILE", &self.0)
+            .env("XDG_CONFIG_HOME", self.0.join("config"))
+            .env("ORX_DATA_DIR", data)
+            .args(["ssh-service", "stop"])
+            .output();
+    }
     fn run(&self, args: &[&str]) -> Output {
         self.command().args(args).output().unwrap()
     }
@@ -40,6 +49,13 @@ impl Sandbox {
 }
 impl Drop for Sandbox {
     fn drop(&mut self) {
+        if let Ok(db) = rusqlite::Connection::open(self.0.join("data/orx.db")) {
+            let _ = db.execute(
+                "UPDATE runs SET status='cancelled' WHERE status IN ('running','starting')",
+                [],
+            );
+        }
+        self.stop_service(&self.0.join("data"));
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -318,6 +334,9 @@ fn interactive_ssh_retires_rejected_masters_without_unlinking_unknown_connection
     std::thread::scope(|scope| {
         for case in [
             "healthy",
+            "legacy_other",
+            "legacy_unresolvable",
+            "legacy_same",
             "rejection",
             "exit_zero",
             "stop_failure",
@@ -346,7 +365,11 @@ fn interactive_ssh_case(case: &str) {
     std::fs::create_dir(&bin).unwrap();
     let ssh = bin.join("ssh");
     std::fs::write(&ssh, r#"#!/bin/sh
-if [ "$1" = -G ]; then exec /usr/bin/ssh -F /dev/null "$@"; fi
+if [ "$1" = -G ]; then
+  for dest do :; done
+  if [ "$dest" = unresolvable-host ]; then echo "Invalid legacy SSH route" >&2; exit 1; fi
+  exec /usr/bin/ssh -F /dev/null "$@"
+fi
 printf '%s\n' "$*" >> "$HOME/calls"
 case "$*" in
   *'-O check -S '*)
@@ -376,62 +399,140 @@ case "$*" in
     esac
     exit 0;;
   *'-- lab true') echo LOGIN; exit 0;;
+  *'sys.stdin.buffer.read'*) for cmd do :; done; exec /bin/sh -c "$cmd";;
   *'command -v bash'*) exit 0;;
   *) exit 1;;
 esac
 "#).unwrap();
     std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let command = sandbox.command();
-    let mut builder = CommandBuilder::new(command.get_program());
-    builder.args(command.get_args());
-    for (key, value) in command.get_envs() {
-        match value {
-            Some(value) => builder.env(key, value),
-            None => builder.env_remove(key),
-        }
-    }
-    builder.env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
-    builder.env("CASE", case);
-    builder.args(["compute", "connect", "ssh", "--host", "lab"]);
-    let pair = native_pty_system().openpty(PtySize::default()).unwrap();
-    let mut child = pair.slave.spawn_command(builder).unwrap();
-    drop(pair.slave);
-    let mut reader = pair.master.try_clone_reader().unwrap();
-    let mut output = Vec::new();
-    // Linux PTYs report EIO instead of EOF when the slave closes.
-    if let Err(error) = reader.read_to_end(&mut output) {
-        assert_eq!(error.raw_os_error(), Some(libc::EIO));
-    }
-    let status = child.wait().unwrap();
-    let calls = std::fs::read_to_string(sandbox.0.join("calls")).unwrap();
-    let socket = PathBuf::from(std::fs::read_to_string(sandbox.0.join("socket-path")).unwrap());
-    let output = String::from_utf8_lossy(&output);
-    match case {
-        "healthy" => {
-            assert!(status.success(), "{output}");
-            assert!(!calls.contains("-O stop"));
-            assert!(socket.exists());
-            assert!(output.contains("LOGIN"));
-        }
-        "rejection" | "exit_zero" => {
-            assert!(status.success(), "{output}");
-            assert!(calls.find("-O stop").unwrap() < calls.find("-- lab true").unwrap());
-            assert!(!socket.exists());
-            assert!(output.contains("LOGIN"));
-        }
-        _ => {
-            assert!(!status.success(), "{case}: {output}");
-            assert!(socket.exists(), "{case} removed an unknown/live socket");
-            assert!(!output.contains("LOGIN"));
-            if case != "stop_failure" && case != "stop_timeout" {
-                assert!(!calls.contains("-O stop"));
+    for case in std::iter::once(case).chain((case == "healthy").then_some("backoff")) {
+        let _ = std::fs::remove_file(sandbox.0.join("calls"));
+        let command = sandbox.command();
+        let mut builder = CommandBuilder::new(command.get_program());
+        builder.args(command.get_args());
+        for (key, value) in command.get_envs() {
+            match value {
+                Some(value) => builder.env(key, value),
+                None => builder.env_remove(key),
             }
         }
+        builder.env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        let data = sandbox
+            .0
+            .join(if case == "backoff" { "healthy" } else { case });
+        if case == "backoff" {
+            let root = std::fs::read_dir(&data)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("ssh-service-")
+                })
+                .unwrap();
+            let db = rusqlite::Connection::open(root.join("state.sqlite3")).unwrap();
+            db.execute(
+                "UPDATE connections SET failures=6, next_at=?1",
+                [i64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis(),
+                )
+                .unwrap()
+                    + 300_000],
+            )
+            .unwrap();
+        }
+        let legacy = matches!(case, "legacy_other" | "legacy_same" | "legacy_unresolvable");
+        let mut legacy_lock = if legacy {
+            let output = sandbox
+                .command()
+                .env("ORX_DATA_DIR", &data)
+                .args(["projects", "--json"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let db = rusqlite::Connection::open(data.join("orx.db")).unwrap();
+            let host = match case {
+                "legacy_same" => "lab",
+                "legacy_unresolvable" => "unresolvable-host",
+                _ => "unrelated-host",
+            };
+            let backend = json!({"kind":"ssh_job", "namespace":host, "jobId":".orx/runs/legacy"});
+            db.execute("INSERT INTO local_experiments (id, project_id, slug, branch_name, run_command, created_at, updated_at) VALUES ('exp','project','exp','main','true',0,0)", []).unwrap();
+            db.execute("INSERT INTO runs (id, experiment_id, project_id, status, backend_json, created_at, updated_at) VALUES ('legacy','exp','project','running',?1,0,0)", [backend.to_string()]).unwrap();
+            std::fs::create_dir_all(data.join("run-logs")).unwrap();
+            Some(fd_lock::RwLock::new(
+                std::fs::File::create(data.join("run-logs/legacy.supervisor.lock")).unwrap(),
+            ))
+        } else {
+            None
+        };
+        let _legacy_guard = legacy_lock.as_mut().map(|lock| lock.write().unwrap());
+        builder.env("ORX_DATA_DIR", &data);
+        builder.env(
+            "CASE",
+            if case == "backoff" || legacy {
+                "healthy"
+            } else {
+                case
+            },
+        );
+        builder.args(["compute", "connect", "ssh", "--host", "lab"]);
+        let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+        let mut child = pair.slave.spawn_command(builder).unwrap();
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let mut output = Vec::new();
+        // Linux PTYs report EIO instead of EOF when the slave closes.
+        if let Err(error) = reader.read_to_end(&mut output) {
+            assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        }
+        let status = child.wait().unwrap();
+        let calls = std::fs::read_to_string(sandbox.0.join("calls")).unwrap();
+        let socket = PathBuf::from(std::fs::read_to_string(sandbox.0.join("socket-path")).unwrap());
+        let output = String::from_utf8_lossy(&output);
+        if legacy {
+            rusqlite::Connection::open(data.join("orx.db"))
+                .unwrap()
+                .execute("UPDATE runs SET status='cancelled' WHERE id='legacy'", [])
+                .unwrap();
+            sandbox.stop_service(&data);
+        }
+        match case {
+            "healthy" | "backoff" | "legacy_other" | "legacy_unresolvable" => {
+                assert!(status.success(), "{output}");
+                assert!(!calls.contains("-O stop"));
+                assert!(socket.exists());
+                assert!(output.contains("LOGIN"));
+            }
+            "legacy_same" => {
+                assert!(!status.success(), "{output}");
+                assert!(output.contains("older OpenResearch process"), "{output}");
+            }
+            "rejection" | "exit_zero" => {
+                assert!(status.success(), "{output}");
+                assert!(calls.find("-O stop").unwrap() < calls.find("-- lab true").unwrap());
+                assert!(!socket.exists());
+                assert!(output.contains("LOGIN"));
+            }
+            _ => {
+                assert!(!status.success(), "{case}: {output}");
+                assert!(socket.exists(), "{case} removed an unknown/live socket");
+                assert!(!output.contains("LOGIN"));
+                if case != "stop_failure" && case != "stop_timeout" {
+                    assert!(!calls.contains("-O stop"));
+                }
+            }
+        }
+        sandbox.stop_service(&data);
+        assert!(!calls.contains("-O exit"));
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_file(socket.with_extension("lock"));
     }
-    assert!(!calls.contains("-O exit"));
-    let _ = std::fs::remove_file(&socket);
-    let _ = std::fs::remove_file(socket.with_extension("lock"));
 }
 
 #[cfg(unix)]
@@ -521,11 +622,11 @@ fn supervisor_recovers_monitoring_and_logs(ssh_backend: bool) {
     let db = rusqlite::Connection::open(sandbox.0.join("data/orx.db")).unwrap();
     db.execute("INSERT INTO local_experiments (id, project_id, slug, branch_name, run_command, created_at, updated_at) VALUES ('exp','project','exp','main','true',0,0)", []).unwrap();
     let backend = if ssh_backend {
-        json!({"kind":"ssh_job", "namespace":"lab", "jobId":".orx/runs/run"})
+        json!({"kind":"ssh_job", "namespace":"lab", "jobId":".orx/runs/00000000-0000-4000-8000-000000000001"})
     } else {
         json!({"kind":"slurm_job", "namespace":"lab", "jobId":"42", "timeoutSecs":86400})
     };
-    db.execute("INSERT INTO runs (id, experiment_id, project_id, status, backend_json, created_at, updated_at) VALUES ('run','exp','project','running',?1,0,0)", [backend.to_string()]).unwrap();
+    db.execute("INSERT INTO runs (id, experiment_id, project_id, status, backend_json, created_at, updated_at) VALUES ('00000000-0000-4000-8000-000000000001','exp','project','running',?1,0,0)", [backend.to_string()]).unwrap();
     let bin = sandbox.0.join("bin");
     std::fs::create_dir(&bin).unwrap();
     let ssh = bin.join("ssh");
@@ -533,28 +634,17 @@ fn supervisor_recovers_monitoring_and_logs(ssh_backend: bool) {
         &ssh,
         r#"#!/bin/sh
 if [ "$1" = -G ]; then exec /usr/bin/ssh -F /dev/null "$@"; fi
-printf '%s\n' "$*" >> "$HOME/calls"
-case "$*" in
-  *sbatch*|*scancel*) exit 99;;
-  *exit_code*)
-    phase=$(cat "$HOME/phase")
-    case "$phase" in
-      outage) echo 'Permission denied (MFA expired)' >&2; exit 255;;
-      missing) if [ "$SSH_BACKEND" = 1 ]; then echo 'cannot assign requested address'; else echo GONE; fi;;
-      running|log_failure) if [ "$SSH_BACKEND" = 1 ]; then echo RUNNING; else echo 'SQ RUNNING'; fi;;
-      done) if [ "$SSH_BACKEND" = 1 ]; then echo 'EXIT 0'; else echo 'SA COMPLETED'; fi;;
-    esac;;
-  *tail*)
-    case "$(cat "$HOME/phase")" in
-      missing|outage|log_failure) echo 'proxy dial error';;
-      *) printf '__ORX_LOG_START__\n'; case "$*" in *'tail -n +1 '*) printf 'first\nsecond\n';; esac;;
-    esac;;
-  *) exit 0;;
-esac
+for cmd do :; done
+exec python3 "$HOME/ssh-monitor-fixture.py" "$cmd"
 "#,
     )
     .unwrap();
     std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        sandbox.0.join("ssh-monitor-fixture.py"),
+        include_str!("../ssh-monitor-fixture.py"),
+    )
+    .unwrap();
     let phase = sandbox.0.join("phase");
     std::fs::write(&phase, "missing").unwrap();
     struct ChildGuard(std::process::Child);
@@ -570,7 +660,7 @@ esac
             .command()
             .env("SSH_BACKEND", if ssh_backend { "1" } else { "0" })
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-            .args(["supervise", "run"])
+            .args(["supervise", "00000000-0000-4000-8000-000000000001"])
             .stdout(std::process::Stdio::null())
             .stderr(std::fs::File::create(&supervisor_log).unwrap())
             .spawn()
@@ -578,9 +668,11 @@ esac
     );
     let metadata = || -> Value {
         let raw: String = db
-            .query_row("SELECT backend_json FROM runs WHERE id='run'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT backend_json FROM runs WHERE id='00000000-0000-4000-8000-000000000001'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         serde_json::from_str(&raw).unwrap()
     };
@@ -619,12 +711,20 @@ esac
             .is_some_and(|s| s.contains("Reconnect"))
     });
     let status: String = db
-        .query_row("SELECT status FROM runs WHERE id='run'", [], |r| r.get(0))
+        .query_row(
+            "SELECT status FROM runs WHERE id='00000000-0000-4000-8000-000000000001'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(status, "running");
     assert_eq!(
         metadata()["jobId"],
-        if ssh_backend { ".orx/runs/run" } else { "42" }
+        if ssh_backend {
+            ".orx/runs/00000000-0000-4000-8000-000000000001"
+        } else {
+            "42"
+        }
     );
     if ssh_backend {
         std::fs::write(&phase, "log_failure").unwrap();
@@ -638,9 +738,11 @@ esac
     wait(&|| metadata()["monitoringError"].is_null());
     std::fs::write(&phase, "done").unwrap();
     wait(&|| {
-        db.query_row("SELECT status FROM runs WHERE id='run'", [], |r| {
-            r.get::<_, String>(0)
-        })
+        db.query_row(
+            "SELECT status FROM runs WHERE id='00000000-0000-4000-8000-000000000001'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
         .unwrap()
             == "done"
     });
@@ -652,7 +754,22 @@ esac
     let calls = std::fs::read_to_string(sandbox.0.join("calls")).unwrap();
     assert!(!calls.contains("sbatch") && !calls.contains("scancel"));
     assert_eq!(
-        std::fs::read_to_string(sandbox.0.join("data/run-logs/run.log")).unwrap(),
+        {
+            let cursor: Value = serde_json::from_slice(
+                &std::fs::read(
+                    sandbox
+                        .0
+                        .join("data/run-logs/00000000-0000-4000-8000-000000000001.cursor.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            std::fs::read_to_string(sandbox.0.join(format!(
+                "data/run-logs/00000000-0000-4000-8000-000000000001.{}.log",
+                cursor["generation"].as_str().unwrap()
+            )))
+            .unwrap()
+        },
         "first\nsecond\n"
     );
 }
@@ -727,7 +844,7 @@ fn slurm_cancel_requires_acknowledgement_and_survives_restart_without_accounting
     sandbox.json(&["projects", "--json"]);
     let db = rusqlite::Connection::open(sandbox.0.join("data/orx.db")).unwrap();
     db.execute("INSERT INTO local_experiments (id, project_id, slug, branch_name, run_command, created_at, updated_at) VALUES ('exp','project','exp','main','true',0,0)", []).unwrap();
-    db.execute("INSERT INTO runs (id, experiment_id, project_id, status, backend_json, cancel_requested, created_at, updated_at) VALUES ('run','exp','project','starting','{\"kind\":\"slurm_job\",\"namespace\":\"lab\",\"jobId\":\"42\"}',1,0,0)", []).unwrap();
+    db.execute("INSERT INTO runs (id, experiment_id, project_id, status, backend_json, cancel_requested, created_at, updated_at) VALUES ('00000000-0000-4000-8000-000000000001','exp','project','starting','{\"kind\":\"slurm_job\",\"namespace\":\"lab\",\"jobId\":\"42\"}',1,0,0)", []).unwrap();
     let bin = sandbox.0.join("bin");
     std::fs::create_dir(&bin).unwrap();
     for (name, script) in [
@@ -737,6 +854,7 @@ fn slurm_cancel_requires_acknowledgement_and_survives_restart_without_accounting
 if [ "$1" = -G ]; then exec /usr/bin/ssh -F /dev/null "$@"; fi
 for cmd do :; done
 case "$cmd" in
+  *sys.stdin.buffer.read*) exec /bin/sh -c "$cmd";;
   *scancel*|*exit_code*) exec /bin/sh -c "$cmd";;
   *__ORX_LOG_START__*) echo __ORX_LOG_START__;;
   *) exit 0;;
@@ -758,10 +876,11 @@ exit 1
 case "$(cat "$HOME/phase")" in
   unavailable) exit 1;;
   hidden) case "$*" in
-    *--jobs=*) exit 1;;
-    *--all*--states=all*) echo '42 SUSPENDED';;
+    *'-j '*|*--jobs=*) exit 1;;
+    *--all*--states=all*--user=*) echo '42 SUSPENDED';;
+    *--all*--states=all*'-u '*) echo '42|SUSPENDED';;
   esac;;
-  gone) case "$*" in *--jobs=*) echo 'slurm_load_jobs error: Invalid job id specified' >&2; exit 1;; esac;;
+  gone) case "$*" in *'-j '*|*--jobs=*) echo 'slurm_load_jobs error: Invalid job id specified' >&2; exit 1;; esac;;
 esac
 "#,
         ),
@@ -771,6 +890,19 @@ esac
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+    std::fs::create_dir_all(
+        sandbox
+            .0
+            .join(".orx/runs/00000000-0000-4000-8000-000000000001"),
+    )
+    .unwrap();
+    std::fs::write(
+        sandbox
+            .0
+            .join(".orx/runs/00000000-0000-4000-8000-000000000001/log"),
+        "",
+    )
+    .unwrap();
     std::fs::write(sandbox.0.join("phase"), "hidden").unwrap();
     struct Child(std::process::Child);
     impl Drop for Child {
@@ -784,7 +916,7 @@ esac
             sandbox
                 .command()
                 .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-                .args(["supervise", "run"])
+                .args(["supervise", "00000000-0000-4000-8000-000000000001"])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
@@ -793,17 +925,21 @@ esac
     };
     let metadata = || -> Value {
         serde_json::from_str(
-            &db.query_row("SELECT backend_json FROM runs WHERE id='run'", [], |r| {
-                r.get::<_, String>(0)
-            })
+            &db.query_row(
+                "SELECT backend_json FROM runs WHERE id='00000000-0000-4000-8000-000000000001'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
             .unwrap(),
         )
         .unwrap()
     };
     let status = || {
-        db.query_row("SELECT status FROM runs WHERE id='run'", [], |r| {
-            r.get::<_, String>(0)
-        })
+        db.query_row(
+            "SELECT status FROM runs WHERE id='00000000-0000-4000-8000-000000000001'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
         .unwrap()
     };
     let wait = |condition: &dyn Fn() -> bool| {
@@ -829,9 +965,40 @@ esac
     wait(&|| status() == "cancelled");
     drop(restarted);
     // Cancelling after the scheduler has already forgotten the job also finishes.
-    db.execute("UPDATE runs SET status='running', ended_at=NULL, backend_json='{\"kind\":\"slurm_job\",\"namespace\":\"lab\",\"jobId\":\"42\"}' WHERE id='run'", []).unwrap();
-    let _already_gone = spawn();
+    db.execute("UPDATE runs SET status='running', ended_at=NULL, backend_json='{\"kind\":\"slurm_job\",\"namespace\":\"lab\",\"jobId\":\"42\"}' WHERE id='00000000-0000-4000-8000-000000000001'", []).unwrap();
+    let already_gone = spawn();
     wait(&|| status() == "cancelled");
+    drop(already_gone);
+
+    // Queued jobs can be cancelled before Slurm creates their log.
+    std::fs::remove_file(
+        sandbox
+            .0
+            .join(".orx/runs/00000000-0000-4000-8000-000000000001/log"),
+    )
+    .unwrap();
+    db.execute("UPDATE runs SET status='starting', ended_at=NULL, backend_json='{\"kind\":\"slurm_job\",\"namespace\":\"lab\",\"jobId\":\"42\",\"monitoringError\":\"Waiting for logs\"}' WHERE id='00000000-0000-4000-8000-000000000001'", []).unwrap();
+    std::fs::write(sandbox.0.join("phase"), "hidden").unwrap();
+    let _without_log = spawn();
+    wait(&|| {
+        metadata()["monitoringError"]
+            .as_str()
+            .is_some_and(|error| error.contains("Remote log is not available"))
+    });
+    assert_ne!(status(), "cancelled");
+    std::fs::write(sandbox.0.join("accept"), "").unwrap();
+    std::fs::write(sandbox.0.join("phase"), "gone").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(35);
+    while status() != "cancelled" {
+        assert!(
+            Instant::now() < deadline,
+            "missing logs blocked cancellation"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(metadata()["monitoringError"]
+        .as_str()
+        .is_some_and(|error| error.contains("Remote log is not available")));
 }
 
 #[test]
