@@ -689,6 +689,20 @@ pub fn prepare_opencode(store: NativeStore) -> Result<PathBuf> {
     if let Some(parent) = db.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    if store == NativeStore::Isolated {
+        // OpenCode keeps sign-ins in its own database and does not follow
+        // `OPENCODE_DB` to find them, so the isolated store would otherwise stay
+        // credential-less and read as signed out. Not fatal: an unreadable or
+        // locked user database must not take the agent offline, and the resulting
+        // signed-out state is what the harness reports anyway.
+        if let Err(error) =
+            opencode_database::inherit_credentials(&db, &opencode_db(NativeStore::Legacy))
+        {
+            eprintln!(
+                "warning: could not copy OpenCode sign-ins into the OpenResearch database: {error}"
+            );
+        }
+    }
     Ok(db)
 }
 
