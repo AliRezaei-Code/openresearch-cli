@@ -186,7 +186,9 @@ const CREDENTIAL_TABLES: [&str; 4] = ["credential", "account", "account_state", 
 /// (`~/.local/share/opencode/opencode.db`). So the isolated database starts with
 /// none, the server orx spawns reports no connected integration, the harness
 /// reads as signed out while the user is plainly signed in, and its catalog
-/// collapses to the anonymous free models. Signing in from the harness cannot
+/// collapses to the anonymous free models. `source` must therefore be that
+/// default database — not the `OPENCODE_DB` override, which OpenCode ignores for
+/// credentials even though it honours it for sessions. Signing in from the harness cannot
 /// repair it either, because that login writes back to the user's own database
 /// and the isolated one stays empty.
 ///
@@ -226,11 +228,16 @@ pub fn inherit_credentials(database: &Path, source: &Path) -> Result<()> {
         return Ok(());
     }
     let reader = open_readonly(source)?;
+    // One snapshot across every table. Reading them independently lets a
+    // concurrent sign-in commit `account` between the two reads, so
+    // `account_state` could name an account this copy never saw and the isolated
+    // store would point at a missing row.
+    let snapshot = reader.unchecked_transaction()?;
     let mut writer = Connection::open(database)?;
     writer.busy_timeout(std::time::Duration::from_secs(5))?;
     let transaction = writer.transaction()?;
     for table in CREDENTIAL_TABLES {
-        let columns = shared_columns(&transaction, &reader, table)?;
+        let columns = shared_columns(&transaction, &snapshot, table)?;
         if columns.is_empty() {
             continue;
         }
@@ -297,7 +304,7 @@ pub fn inherit_credentials(database: &Path, source: &Path) -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(" AND ")
         );
-        for row in read_rows(&reader, table, &columns)? {
+        for row in read_rows(&snapshot, table, &columns)? {
             let current: Option<Option<i64>> = transaction
                 .query_row(
                     &lookup,
@@ -328,6 +335,8 @@ pub fn inherit_credentials(database: &Path, source: &Path) -> Result<()> {
         }
     }
     transaction.commit()?;
+    // The snapshot is read-only; committing it just releases the read lock.
+    snapshot.commit()?;
     Ok(())
 }
 

@@ -46,21 +46,39 @@ pub fn opencode_db(store: NativeStore) -> PathBuf {
     }
 }
 
-/// The database OpenCode itself would open — the one holding the user's sign-ins
-/// that [`inherit_credentials`](opencode_database::inherit_credentials) copies.
+/// Where OpenCode keeps the sign-ins the isolated store inherits.
 ///
-/// OpenCode resolves its data directory through `xdg-basedir`, which has no
-/// Windows branch: on Windows its database lives under
-/// `%USERPROFILE%\.local\share\opencode`, exactly as on macOS and Linux, and not
-/// under `%APPDATA%`. Resolving it identically for the CLI, the web dashboard and
-/// every desktop build is what lets credentials the user stored in any of them be
-/// found — the apps are one product on one crate, and this path is the only place
-/// the platforms could disagree.
-fn legacy_opencode_db(env: impl Fn(&str) -> Option<PathBuf>, home: PathBuf) -> PathBuf {
-    let data = env("XDG_DATA_HOME")
+/// Deliberately **not** [`opencode_db`]`(Legacy)`: that path honours
+/// `OPENCODE_DB`, and OpenCode ignores that variable for credentials — a user who
+/// points it elsewhere for their own sessions still signs in to the default
+/// database. Reading the override here would copy their session database and
+/// leave the harness signed out, which is the bug this change exists to fix.
+pub fn opencode_credential_db() -> PathBuf {
+    credential_opencode_db(user_env_path, home_dir())
+}
+
+fn credential_opencode_db(env: impl Fn(&str) -> Option<PathBuf>, home: PathBuf) -> PathBuf {
+    opencode_data_dir(env, home).join("opencode.db")
+}
+
+/// The data directory OpenCode resolves through `xdg-basedir`, which has no
+/// Windows branch: on Windows it is `%USERPROFILE%\.local\share`, exactly as on
+/// macOS and Linux, and never `%APPDATA%`. Doing this identically for the CLI, the
+/// web dashboard and every desktop build is what lets credentials the user stored
+/// in any of them be found — the apps are one product on one crate, and this path
+/// is the only place the platforms could disagree.
+fn opencode_data_dir(env: impl Fn(&str) -> Option<PathBuf>, home: PathBuf) -> PathBuf {
+    env("XDG_DATA_HOME")
         .unwrap_or_else(|| home.join(".local/share"))
-        .join("opencode");
-    data.join(env("OPENCODE_DB").unwrap_or_else(|| PathBuf::from("opencode.db")))
+        .join("opencode")
+}
+
+/// The database a *session lookup* searches, which does follow `OPENCODE_DB`: a
+/// session may legitimately live in a database the user selected, unlike a
+/// credential.
+fn legacy_opencode_db(env: impl Fn(&str) -> Option<PathBuf>, home: PathBuf) -> PathBuf {
+    opencode_data_dir(&env, home)
+        .join(env("OPENCODE_DB").unwrap_or_else(|| PathBuf::from("opencode.db")))
 }
 
 pub fn claude_home(store: NativeStore) -> PathBuf {
@@ -704,12 +722,12 @@ pub fn prepare_opencode(store: NativeStore) -> Result<PathBuf> {
     if store == NativeStore::Isolated {
         // OpenCode keeps sign-ins in its own database and does not follow
         // `OPENCODE_DB` to find them, so the isolated store would otherwise stay
-        // credential-less and read as signed out. Not fatal: an unreadable or
-        // locked user database must not take the agent offline, and the resulting
-        // signed-out state is what the harness reports anyway.
-        if let Err(error) =
-            opencode_database::inherit_credentials(&db, &opencode_db(NativeStore::Legacy))
-        {
+        // credential-less and read as signed out. The source is the *default*
+        // database, not `OPENCODE_DB`: OpenCode ignores that override for
+        // credentials. Not fatal: an unreadable or locked user database must not
+        // take the agent offline, and the resulting signed-out state is what the
+        // harness reports anyway.
+        if let Err(error) = opencode_database::inherit_credentials(&db, &opencode_credential_db()) {
             eprintln!(
                 "warning: could not copy OpenCode sign-ins into the OpenResearch database: {error}"
             );
@@ -1334,12 +1352,20 @@ mod path_tests {
     }
 
     #[test]
-    fn a_custom_database_filename_is_followed() {
+    fn a_session_database_override_is_followed_but_never_used_for_credentials() {
         let home = PathBuf::from("/Users/me");
-        let custom = legacy_opencode_db(
-            |key| (key == "OPENCODE_DB").then(|| PathBuf::from("work.db")),
-            home.clone(),
+        let env = |key: &str| (key == "OPENCODE_DB").then(|| PathBuf::from("work.db"));
+        // A session may live in the database the user selected…
+        assert_eq!(
+            legacy_opencode_db(env, home.clone()),
+            home.join(".local/share/opencode/work.db")
         );
-        assert_eq!(custom, home.join(".local/share/opencode/work.db"));
+        // …but OpenCode ignores that override for sign-ins, so the copy must too:
+        // reading the selected session database is how the harness stays signed
+        // out.
+        assert_eq!(
+            credential_opencode_db(env, home.clone()),
+            home.join(".local/share/opencode/opencode.db")
+        );
     }
 }
