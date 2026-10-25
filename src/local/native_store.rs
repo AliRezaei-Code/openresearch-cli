@@ -42,13 +42,25 @@ fn home_dir() -> PathBuf {
 pub fn opencode_db(store: NativeStore) -> PathBuf {
     match store {
         NativeStore::Isolated => crate::store::data_dir().join("agents/opencode/opencode.db"),
-        NativeStore::Legacy => {
-            let data = user_env_path("XDG_DATA_HOME")
-                .unwrap_or_else(|| home_dir().join(".local/share"))
-                .join("opencode");
-            data.join(user_env_path("OPENCODE_DB").unwrap_or_else(|| PathBuf::from("opencode.db")))
-        }
+        NativeStore::Legacy => legacy_opencode_db(user_env_path, home_dir()),
     }
+}
+
+/// The database OpenCode itself would open — the one holding the user's sign-ins
+/// that [`inherit_credentials`](opencode_database::inherit_credentials) copies.
+///
+/// OpenCode resolves its data directory through `xdg-basedir`, which has no
+/// Windows branch: on Windows its database lives under
+/// `%USERPROFILE%\.local\share\opencode`, exactly as on macOS and Linux, and not
+/// under `%APPDATA%`. Resolving it identically for the CLI, the web dashboard and
+/// every desktop build is what lets credentials the user stored in any of them be
+/// found — the apps are one product on one crate, and this path is the only place
+/// the platforms could disagree.
+fn legacy_opencode_db(env: impl Fn(&str) -> Option<PathBuf>, home: PathBuf) -> PathBuf {
+    let data = env("XDG_DATA_HOME")
+        .unwrap_or_else(|| home.join(".local/share"))
+        .join("opencode");
+    data.join(env("OPENCODE_DB").unwrap_or_else(|| PathBuf::from("opencode.db")))
 }
 
 pub fn claude_home(store: NativeStore) -> PathBuf {
@@ -1275,5 +1287,59 @@ mod tests {
         assert_eq!(remaining, ["fresh", "kept"]);
         assert!(std::fs::metadata(&db).unwrap().len() < before);
         std::fs::remove_dir_all(root).ok();
+    }
+}
+
+/// Path resolution is asserted on every runner, not only on the platform it
+/// describes: the same crate ships the CLI, the web dashboard and all three
+/// desktop apps, so a Windows-only mistake would otherwise be invisible until a
+/// user reported it.
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn the_users_database_sits_where_opencode_puts_it_on_every_platform() {
+        let macos = PathBuf::from("/Users/me");
+        assert_eq!(
+            legacy_opencode_db(|_| None, macos.clone()),
+            macos
+                .join(".local/share")
+                .join("opencode")
+                .join("opencode.db")
+        );
+
+        // `xdg-basedir` has no Windows branch: the data root is
+        // `%USERPROFILE%\.local\share`, never `%APPDATA%`.
+        let windows = PathBuf::from(r"C:\Users\me");
+        let path = legacy_opencode_db(|_| None, windows.clone());
+        assert_eq!(
+            path,
+            windows
+                .join(".local/share")
+                .join("opencode")
+                .join("opencode.db")
+        );
+        assert!(!path.to_string_lossy().contains("AppData"));
+    }
+
+    #[test]
+    fn a_relocated_opencode_data_home_is_followed() {
+        let home = PathBuf::from("/Users/me");
+        let relocated = legacy_opencode_db(
+            |key| (key == "XDG_DATA_HOME").then(|| PathBuf::from("/mnt/data")),
+            home,
+        );
+        assert_eq!(relocated, PathBuf::from("/mnt/data/opencode/opencode.db"));
+    }
+
+    #[test]
+    fn a_custom_database_filename_is_followed() {
+        let home = PathBuf::from("/Users/me");
+        let custom = legacy_opencode_db(
+            |key| (key == "OPENCODE_DB").then(|| PathBuf::from("work.db")),
+            home.clone(),
+        );
+        assert_eq!(custom, home.join(".local/share/opencode/work.db"));
     }
 }
